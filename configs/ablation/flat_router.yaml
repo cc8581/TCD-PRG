@@ -1,0 +1,3 @@
+ablation:
+  router_type: flat_candidate_classifier
+

@@ -1,0 +1,17 @@
+# Native Windows/Linux TCD-PRG training environment (Python 3.10).
+# PyBullet is intentionally absent: rendering/certification is delegated to the
+# already configured Python 3.8 GAPG environment through external workers.
+numpy>=1.23,<3
+torch>=2.1
+h5py>=3.9
+PyYAML>=6
+hydra-core>=1.3
+omegaconf>=2.3
+scipy>=1.10
+scikit-learn>=1.3
+tqdm>=4.66
+tensorboard>=2.14
+pandas>=2.0
+matplotlib>=3.7
+pytest>=8
+ruff>=0.6

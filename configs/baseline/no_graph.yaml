@@ -1,0 +1,4 @@
+baseline:
+  type: no_graph_action_classifier
+ablation:
+  use_dependency_graph: false

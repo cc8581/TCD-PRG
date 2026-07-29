@@ -1,0 +1,23 @@
+name: tcd-prg
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.4
+  - torchvision
+  - pytorch-cuda=11.8
+  - numpy
+  - scipy
+  - h5py
+  - pyyaml
+  - hydra-core
+  - scikit-learn
+  - tqdm
+  - pandas
+  - matplotlib
+  - pytest
+  - pip
+  - pip:
+      - ruff>=0.6

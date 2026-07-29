@@ -1,0 +1,202 @@
+defaults:
+  - _self_
+
+dataset:
+  root: G:/cc/抓取数据集/self-built-task-oriented-clusster-sense-dataset/TaskOrientedClutterSceneDataset
+  acronym_root: G:/cc/抓取数据集/ACRONYM
+  functional_region_root: G:/cc/抓取数据集/self-built-task-oriented-clusster-sense-dataset/Grasp_20_class_object_3D_model/data/manual_function_regions_v1
+  fr5_ag_urdf: D:/pycharm/Project/FR5_AG-160-95/urdf/fr5_ag160_95.urdf
+  adapter: task_oriented_clutter
+  scene_subdir: task_clutter_scenes_20_categories
+  step_labels_subdir: task_training_labels_steps1_6_v1
+  action_labels_subdir: task_positive_multistep_sequences
+  scene_points: 16384
+  target_points: 4096
+  include_rgb: true
+  allowed_camera_types: [mech_eye_pro_s]
+  oracle_camera_types: [oracle]
+  temporary_snapshot: true
+
+observation:
+  provider: cached
+  render_width: 320
+  render_height: 200
+  camera_profile: mecheye_pro_s_three_view
+  renderer_version: tcd_prg_pybullet_v1
+  pybullet_python: D:/Anaconda/envs/gapg/python.exe
+  worker_script: scripts/render_observation_worker_py38.py
+  runtime_mesh_root: D:/codex/pybullet_cache/TaskOrientedManipulationDataset/runtime_mesh_cache_v1
+  gripper_worker_script: scripts/sample_gripper_worker_py38.py
+  gripper_cache_dir: D:/codex/TCD-PRG/cache/grippers
+  allow_render_on_cache_miss: false
+  certification_worker_script: scripts/certify_actions_worker_py38.py
+
+cache:
+  enabled: true
+  directory: D:/codex/TCD-PRG/cache/observations
+  max_gb: 100
+  eviction: lru
+  prefetch_workers: 4
+
+backbone:
+  name: task_conditioned_point_transformer
+  pretrained_checkpoint: null
+  freeze: false
+  attention_points: 4096
+
+region_head:
+  enabled: true
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  dice_weight: 1.0
+  visibility_threshold: 0.5
+
+grasp_proposal:
+  task_conditioned: true
+  generic_remove_condition: true
+  predict_width: true
+  recall_k: [1, 5, 10]
+
+model:
+  feature_dim: 256
+  task_dim: 128
+  num_categories: 64
+  num_task_regions: 64
+  num_relation_types: 8
+  num_direction_bins: 16
+  num_grasp_rotation_bins: 12
+  num_grasp_depth_bins: 4
+  grasp_depth_bin_edges_m: [0.0, 0.095, 0.100, 0.105, 0.2]
+  min_grasp_width_m: 0.0
+  max_grasp_width_m: 0.095
+  candidate_topk: 64
+  task_grasp_candidates: 32
+  pick_remove_candidates: 16
+  push_candidates: 16
+  activation_checkpointing: true
+  verifier_local_scene_points: 512
+  verifier_gripper_points: 512
+  verifier_local_radius_m: 0.25
+  verifier_candidate_micro_batch: 16
+  verifier_validity_threshold: 0.5
+
+grasp_verifier:
+  local_scene_points: 512
+  gripper_points: 512
+  candidate_micro_batch: 16
+
+graph:
+  physical_relations: [near, contact, support, press, occlude]
+  task_relations: [block_task_region, block_task_grasp, block_grasp_approach]
+  layers: 3
+  heads: 4
+
+push:
+  distance_m: 0.15
+  direction_bins: 16
+  approach_modes: [top, side]
+
+pick_remove:
+  enabled: true
+  macro_action: true
+  deactivate_after_success: true
+  outcome_classes: 7
+
+router:
+  type: hierarchical
+  layers: 2
+  heads: 4
+  max_preparation_actions: 5
+
+losses:
+  region: 1.0
+  proposal: 1.0
+  verify: 1.0
+  graph: 1.0
+  remove: 1.0
+  push: 1.0
+  policy: 1.0
+  potential: 1.0
+
+sampling:
+  positive_grasps: 8
+  wrong_region_grasps: 8
+  collision_or_approach_negative_grasps: 8
+  perturbed_negative_grasps: 4
+  unit: action_state_group
+
+optimizer:
+  name: adamw
+  learning_rate: 0.0001
+  backbone_learning_rate: 0.00002
+  weight_decay: 0.01
+
+scheduler:
+  name: cosine
+  warmup_steps: 2000
+
+training:
+  seed: 2026
+  device: cuda
+  amp: true
+  amp_dtype: float16
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  candidate_micro_batch: 16
+  max_optimizer_steps: 100000
+  validation_interval: 1000
+  checkpoint_interval: 1000
+  gradient_clip_norm: 1.0
+  ema_decay: 0.999
+  early_stopping_patience: 20
+  deterministic: true
+  num_workers: 4
+  pin_memory: true
+  validation_fraction: 0.1
+  max_validation_groups: 256
+  max_train_groups: null
+  frozen_modules: []
+  unfreeze_at_optimizer_step: null
+  ddp_backend: auto
+
+evaluation:
+  max_preparation_actions: 5
+  horizons: [0, 1, 3, 5]
+  bootstrap_samples: 1000
+  confidence: 0.95
+  max_groups: null
+
+ablation:
+  use_task_region_condition: true
+  use_dependency_graph: true
+  use_indirect_dependency_reasoning: true
+  use_gripper_scene_verifier: true
+  use_push_potential: true
+  use_push_risk: true
+  router_type: hierarchical
+
+logging:
+  backend: tensorboard
+  log_interval: 20
+  save_resolved_config: true
+  save_git_commit: true
+
+reproducibility:
+  deterministic: true
+  cudnn_benchmark: false
+
+planner:
+  reobserve_after_action: true
+  exact_certification: true
+  max_preparation_actions: 5
+  reject_and_rerank: true
+
+baseline:
+  type: tcd_prg
+  gapg_root: .
+  grasp_checkpoint: pretrain_models/grasp_model.pt
+  push_checkpoint: pretrain_models/push_model.pt
+  graspnet_checkpoint: .deps/checkpoints/graspnet-rs.tar
+
+push_distance_m: 0.15
+output_dir: outputs/full

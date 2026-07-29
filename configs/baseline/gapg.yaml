@@ -1,0 +1,6 @@
+baseline:
+  type: original_gapg_wrapper
+  gapg_root: .
+  grasp_checkpoint: pretrain_models/grasp_model.pt
+  push_checkpoint: pretrain_models/push_model.pt
+  graspnet_checkpoint: .deps/checkpoints/graspnet-rs.tar

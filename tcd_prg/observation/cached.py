@@ -1,0 +1,84 @@
+"""Content-addressed observation cache with atomic writes and LRU eviction."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+
+from .base import ObservationProvider, ObservationRequest, PointObservation
+
+
+def request_hash(request: ObservationRequest) -> str:
+    payload = {
+        "scene_id": request.scene_id,
+        "state_id": request.state_id,
+        "object_pose": np.asarray(request.object_pose, dtype=np.float32).round(7).tolist(),
+        "object_active": np.asarray(request.object_active, dtype=bool).tolist(),
+        "object_present": np.asarray(request.object_present, dtype=bool).tolist(),
+        "object_asset_ids": request.object_asset_ids,
+        "object_model_ids": request.object_model_ids,
+        "object_scales": np.asarray(request.object_scales, dtype=np.float32).round(7).tolist(),
+        "render_seed": request.render_seed,
+        "camera_profile": request.camera_profile,
+        "point_count": request.point_count,
+        "renderer_version": request.renderer_version,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+class ObservationCacheMissError(FileNotFoundError):
+    """Raised when synchronous rendering is disabled and a state is not cached."""
+
+
+class CachedObservationProvider(ObservationProvider):
+    def __init__(self, cache_dir: str | Path, fallback: ObservationProvider | None = None,
+                 max_bytes: int = 100 << 30):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.fallback = fallback
+        self.max_bytes = max_bytes
+
+    def _path(self, key: str) -> Path:
+        return self.cache_dir / key[:2] / f"{key}.npz"
+
+    def get(self, request: ObservationRequest) -> PointObservation:
+        key = request_hash(request)
+        path = self._path(key)
+        if path.exists():
+            os.utime(path, None)
+            with np.load(path, allow_pickle=False) as data:
+                return PointObservation(data["xyz"], data["rgb"], data["instance_id"], data["source_view"])
+        if self.fallback is None:
+            raise ObservationCacheMissError(
+                f"Observation {key} is not cached; run tcd-prg-prefetch before training"
+            )
+        observation = self.fallback.get(request)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(f"{path.stem}.{os.getpid()}.tmp.npz")
+        np.savez_compressed(
+            temp,
+            xyz=observation.xyz,
+            rgb=observation.rgb,
+            instance_id=observation.instance_id,
+            source_view=observation.source_view,
+        )
+        os.replace(temp, path)
+        self.evict()
+        return observation
+
+    def evict(self) -> None:
+        files = list(self.cache_dir.glob("*/*.npz"))
+        total = sum(p.stat().st_size for p in files)
+        if total <= self.max_bytes:
+            return
+        for path in sorted(files, key=lambda p: p.stat().st_atime):
+            size = path.stat().st_size
+            path.unlink(missing_ok=True)
+            total -= size
+            if total <= self.max_bytes:
+                break

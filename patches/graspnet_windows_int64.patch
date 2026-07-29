@@ -1,0 +1,144 @@
+diff --git a/knn/src/cpu/vision.h b/knn/src/cpu/vision.h
+index 99b4f86..b99c6d8 100644
+--- a/knn/src/cpu/vision.h
++++ b/knn/src/cpu/vision.h
+@@ -1,6 +1,7 @@
+ #pragma once
++#include <cstdint>
+ #include <torch/extension.h>
+ 
+ void knn_cpu(float* ref_dev, int ref_width,
+     float* query_dev, int query_width,
+-    int height, int k, float* dist_dev, long* ind_dev, long* ind_buf);
+\ No newline at end of file
++    int height, int k, float* dist_dev, int64_t* ind_dev, int64_t* ind_buf);
+diff --git a/knn/src/cpu/knn_cpu.cpp b/knn/src/cpu/knn_cpu.cpp
+index a9883b0..f871336 100644
+--- a/knn/src/cpu/knn_cpu.cpp
++++ b/knn/src/cpu/knn_cpu.cpp
+@@ -2,7 +2,7 @@
+ 
+ 
+ void knn_cpu(float* ref_dev, int ref_width, float* query_dev, int query_width,
+-    int height, int k, float* dist_dev, long* ind_dev, long* ind_buf)
++    int height, int k, float* dist_dev, int64_t* ind_dev, int64_t* ind_buf)
+ {
+     // Compute all the distances
+     for(int query_idx = 0;query_idx<query_width;query_idx++)
+@@ -16,7 +16,7 @@ void knn_cpu(float* ref_dev, int ref_width, float* query_dev, int query_width,
+     }
+ 
+     float temp_value;
+-    long temp_idx;
++    int64_t temp_idx;
+     // sort the distance and get the index
+     for(int query_idx = 0;query_idx<query_width;query_idx++)
+     {
+diff --git a/knn/src/cuda/vision.h b/knn/src/cuda/vision.h
+index 86bf54a..f14692b 100644
+--- a/knn/src/cuda/vision.h
++++ b/knn/src/cuda/vision.h
+@@ -1,8 +1,9 @@
+ #pragma once
++#include <cstdint>
+ #include <torch/extension.h>
+ #include <ATen/cuda/CUDAContext.h>
+ #include <ATen/cuda/CUDAEvent.h>
+ 
+ void knn_device(float* ref_dev, int ref_width,
+     float* query_dev, int query_width,
+-    int height, int k, float* dist_dev, long* ind_dev, cudaStream_t stream);
+\ No newline at end of file
++    int height, int k, float* dist_dev, int64_t* ind_dev, cudaStream_t stream);
+diff --git a/knn/src/cuda/knn.cu b/knn/src/cuda/knn.cu
+index d39619b..904296c 100644
+--- a/knn/src/cuda/knn.cu
++++ b/knn/src/cuda/knn.cu
+@@ -9,6 +9,7 @@
+ 
+ // Includes
+ #include <cstdio>
++#include <cstdint>
+ #include "cuda.h"
+ 
+ #define IDX2D(i, j, dj) (dj * i + j)
+@@ -110,14 +111,14 @@ __shared__ float shared_B[BLOCK_DIM][BLOCK_DIM];
+   * @param height      height of the distance matrix and of the index matrix
+   * @param k           number of neighbors to consider
+   */
+-__global__ void cuInsertionSort(float *dist, long *ind, int width, int height, int k){
++__global__ void cuInsertionSort(float *dist, int64_t *ind, int width, int height, int k){
+ 
+   // Variables
+   int l, i, j;
+   float *p_dist;
+-  long  *p_ind;
++  int64_t *p_ind;
+   float curr_dist, max_dist;
+-  long  curr_row,  max_row;
++  int64_t curr_row, max_row;
+   unsigned int xIndex = blockIdx.x * blockDim.x + threadIdx.x;
+ 
+   if (xIndex<width){
+@@ -215,7 +216,7 @@ __global__ void cuParallelSqrt(float *dist, int width, int k){
+   *
+   */
+ void knn_device(float* ref_dev, int ref_nb, float* query_dev, int query_nb,
+-    int dim, int k, float* dist_dev, long* ind_dev, cudaStream_t stream){
++    int dim, int k, float* dist_dev, int64_t* ind_dev, cudaStream_t stream){
+ 
+   // Grids and threads
+   dim3 g_16x16(query_nb/16, ref_nb/16, 1);
+@@ -243,10 +244,10 @@ void knn_device(float* ref_dev, int ref_nb, float* query_dev, int query_nb,
+ 
+ #if DEBUG
+   unsigned int  size_of_float = sizeof(float);
+-  unsigned long size_of_long  = sizeof(long);
++  unsigned long size_of_long  = sizeof(int64_t);
+ 
+   float* dist_host = new float[query_nb * k];
+-  long*  idx_host  = new long[query_nb * k];
++  int64_t* idx_host = new int64_t[query_nb * k];
+ 
+   // Memory copy of output from device to host
+   cudaMemcpy(&dist_host[0], dist_dev,
+diff --git a/knn/src/knn.h b/knn/src/knn.h
+index 67df5bf..c2252fb 100644
+--- a/knn/src/knn.h
++++ b/knn/src/knn.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <cstdint>
+ #include "cpu/vision.h"
+ 
+ #ifdef WITH_CUDA
+@@ -13,16 +14,16 @@ int knn(at::Tensor& ref, at::Tensor& query, at::Tensor& idx)
+ {
+ 
+     // TODO check dimensions
+-    long batch, ref_nb, query_nb, dim, k;
++    int64_t batch, ref_nb, query_nb, dim, k;
+     batch = ref.size(0);
+     dim = ref.size(1);
+     k = idx.size(1);
+     ref_nb = ref.size(2);
+     query_nb = query.size(2);
+ 
+-    float *ref_dev = ref.data<float>();
+-    float *query_dev = query.data<float>();
+-    long *idx_dev = idx.data<long>();
++    float *ref_dev = ref.data_ptr<float>();
++    float *query_dev = query.data_ptr<float>();
++    int64_t *idx_dev = idx.data_ptr<int64_t>();
+ 
+ 
+ 
+@@ -51,7 +52,7 @@ int knn(at::Tensor& ref, at::Tensor& query, at::Tensor& idx)
+ 
+ 
+     float *dist_dev = (float*)malloc(ref_nb * query_nb * sizeof(float));
+-    long *ind_buf = (long*)malloc(ref_nb * sizeof(long));
++    int64_t *ind_buf = (int64_t*)malloc(ref_nb * sizeof(int64_t));
+     for (int b = 0; b < batch; b++) {
+     knn_cpu(ref_dev + b * dim * ref_nb, ref_nb, query_dev + b * dim * query_nb, query_nb, dim, k,
+       dist_dev, idx_dev + b * k * query_nb, ind_buf);

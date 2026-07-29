@@ -1,0 +1,3 @@
+ablation:
+  use_indirect_dependency_reasoning: false
+

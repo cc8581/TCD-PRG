@@ -1,0 +1,335 @@
+"""Typed configuration and invariant validation."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .constants import MAX_PREPARATION_ACTIONS, PUSH_DISTANCE_M
+
+
+@dataclass(slots=True)
+class DatasetConfig:
+    root: str = ""
+    acronym_root: str = ""
+    functional_region_root: str = ""
+    fr5_ag_urdf: str = "D:/pycharm/Project/FR5_AG-160-95/urdf/fr5_ag160_95.urdf"
+    adapter: str = "task_oriented_clutter"
+    scene_subdir: str = "task_clutter_scenes_20_categories"
+    step_labels_subdir: str = "task_training_labels_steps1_6_v1"
+    action_labels_subdir: str = "task_positive_multistep_sequences"
+    scene_points: int = 16_384
+    target_points: int = 4_096
+    include_rgb: bool = True
+    allowed_camera_types: tuple[str, ...] = ("mecheye_pro_s",)
+    oracle_camera_types: tuple[str, ...] = ("oracle",)
+    temporary_snapshot: bool = True
+
+
+@dataclass(slots=True)
+class ObservationConfig:
+    provider: str = "cached"
+    render_width: int = 320
+    render_height: int = 200
+    camera_profile: str = "mecheye_pro_s_three_view"
+    renderer_version: str = "tcd_prg_pybullet_v1"
+    pybullet_python: str = "D:/Anaconda/envs/gapg/python.exe"
+    worker_script: str = "scripts/render_observation_worker_py38.py"
+    runtime_mesh_root: str = (
+        "D:/codex/pybullet_cache/TaskOrientedManipulationDataset/runtime_mesh_cache_v1"
+    )
+    gripper_worker_script: str = "scripts/sample_gripper_worker_py38.py"
+    gripper_cache_dir: str = "D:/codex/TCD-PRG/cache/grippers"
+    allow_render_on_cache_miss: bool = False
+    certification_worker_script: str = "scripts/certify_actions_worker_py38.py"
+
+
+@dataclass(slots=True)
+class CacheConfig:
+    enabled: bool = True
+    directory: str = "D:/codex/TCD-PRG/cache/observations"
+    max_gb: float = 100.0
+    eviction: str = "lru"
+    prefetch_workers: int = 4
+
+
+@dataclass(slots=True)
+class BackboneConfig:
+    name: str = "task_conditioned_point_transformer"
+    pretrained_checkpoint: str | None = None
+    freeze: bool = False
+    attention_points: int = 4_096
+
+
+@dataclass(slots=True)
+class RegionHeadConfig:
+    enabled: bool = True
+    focal_alpha: float = 0.25
+    focal_gamma: float = 2.0
+    dice_weight: float = 1.0
+    visibility_threshold: float = 0.5
+
+
+@dataclass(slots=True)
+class GraspProposalConfig:
+    task_conditioned: bool = True
+    generic_remove_condition: bool = True
+    predict_width: bool = True
+    recall_k: tuple[int, ...] = (1, 5, 10)
+
+
+@dataclass(slots=True)
+class PickRemoveConfig:
+    enabled: bool = True
+    macro_action: bool = True
+    deactivate_after_success: bool = True
+    outcome_classes: int = 7
+
+
+@dataclass(slots=True)
+class PlannerConfig:
+    reobserve_after_action: bool = True
+    exact_certification: bool = True
+    max_preparation_actions: int = MAX_PREPARATION_ACTIONS
+    reject_and_rerank: bool = True
+
+
+@dataclass(slots=True)
+class BaselineConfig:
+    type: str = "tcd_prg"
+    gapg_root: str = "."
+    grasp_checkpoint: str = "pretrain_models/grasp_model.pt"
+    push_checkpoint: str = "pretrain_models/push_model.pt"
+    graspnet_checkpoint: str = ".deps/checkpoints/graspnet-rs.tar"
+
+
+@dataclass(slots=True)
+class ModelConfig:
+    feature_dim: int = 256
+    task_dim: int = 128
+    num_categories: int = 64
+    num_task_regions: int = 64
+    num_relation_types: int = 8
+    num_direction_bins: int = 16
+    num_grasp_rotation_bins: int = 12
+    num_grasp_depth_bins: int = 4
+    grasp_depth_bin_edges_m: tuple[float, ...] = (0.0, 0.095, 0.100, 0.105, 0.2)
+    max_grasp_width_m: float = 0.095
+    min_grasp_width_m: float = 0.0
+    candidate_topk: int = 64
+    task_grasp_candidates: int = 32
+    pick_remove_candidates: int = 16
+    push_candidates: int = 16
+    activation_checkpointing: bool = True
+    verifier_local_scene_points: int = 512
+    verifier_gripper_points: int = 512
+    verifier_local_radius_m: float = 0.25
+    verifier_candidate_micro_batch: int = 16
+    verifier_validity_threshold: float = 0.5
+
+
+@dataclass(slots=True)
+class AblationConfig:
+    use_task_region_condition: bool = True
+    use_dependency_graph: bool = True
+    use_indirect_dependency_reasoning: bool = True
+    use_gripper_scene_verifier: bool = True
+    use_push_potential: bool = True
+    use_push_risk: bool = True
+    router_type: str = "hierarchical"
+
+
+@dataclass(slots=True)
+class TrainingConfig:
+    seed: int = 2026
+    device: str = "cuda"
+    amp: bool = True
+    amp_dtype: str = "float16"
+    batch_size: int = 1
+    gradient_accumulation_steps: int = 8
+    candidate_micro_batch: int = 16
+    max_optimizer_steps: int = 100_000
+    validation_interval: int = 1_000
+    checkpoint_interval: int = 1_000
+    gradient_clip_norm: float = 1.0
+    ema_decay: float | None = 0.999
+    early_stopping_patience: int = 20
+    deterministic: bool = True
+    num_workers: int = 4
+    pin_memory: bool = True
+    validation_fraction: float = 0.1
+    max_validation_groups: int = 256
+    max_train_groups: int | None = None
+    frozen_modules: tuple[str, ...] = ()
+    unfreeze_at_optimizer_step: int | None = None
+    ddp_backend: str = "auto"
+
+
+@dataclass(slots=True)
+class EvaluationConfig:
+    max_preparation_actions: int = MAX_PREPARATION_ACTIONS
+    horizons: tuple[int, ...] = (0, 1, 3, 5)
+    bootstrap_samples: int = 1_000
+    confidence: float = 0.95
+    max_groups: int | None = None
+
+
+@dataclass(slots=True)
+class GraspVerifierConfig:
+    local_scene_points: int = 512
+    gripper_points: int = 512
+    candidate_micro_batch: int = 16
+
+
+@dataclass(slots=True)
+class GraphConfig:
+    physical_relations: tuple[str, ...] = ("near", "contact", "support", "press", "occlude")
+    task_relations: tuple[str, ...] = (
+        "block_task_region", "block_task_grasp", "block_grasp_approach"
+    )
+    layers: int = 3
+    heads: int = 4
+
+
+@dataclass(slots=True)
+class PushConfig:
+    distance_m: float = PUSH_DISTANCE_M
+    direction_bins: int = 16
+    approach_modes: tuple[str, ...] = ("top", "side")
+
+
+@dataclass(slots=True)
+class RouterConfig:
+    type: str = "hierarchical"
+    layers: int = 2
+    heads: int = 4
+    max_preparation_actions: int = MAX_PREPARATION_ACTIONS
+
+
+@dataclass(slots=True)
+class LossConfig:
+    region: float = 1.0
+    proposal: float = 1.0
+    verify: float = 1.0
+    graph: float = 1.0
+    remove: float = 1.0
+    push: float = 1.0
+    policy: float = 1.0
+    potential: float = 1.0
+
+
+@dataclass(slots=True)
+class SamplingConfig:
+    positive_grasps: int = 8
+    wrong_region_grasps: int = 8
+    collision_or_approach_negative_grasps: int = 8
+    perturbed_negative_grasps: int = 4
+    unit: str = "action_state_group"
+
+
+@dataclass(slots=True)
+class OptimizerConfig:
+    name: str = "adamw"
+    learning_rate: float = 1e-4
+    backbone_learning_rate: float = 2e-5
+    weight_decay: float = 0.01
+
+
+@dataclass(slots=True)
+class SchedulerConfig:
+    name: str = "cosine"
+    warmup_steps: int = 2_000
+
+
+@dataclass(slots=True)
+class LoggingConfig:
+    backend: str = "tensorboard"
+    log_interval: int = 20
+    save_resolved_config: bool = True
+    save_git_commit: bool = True
+
+
+@dataclass(slots=True)
+class ReproducibilityConfig:
+    deterministic: bool = True
+    cudnn_benchmark: bool = False
+
+
+@dataclass(slots=True)
+class TCDPRGConfig:
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    observation: ObservationConfig = field(default_factory=ObservationConfig)
+    cache: CacheConfig = field(default_factory=CacheConfig)
+    backbone: BackboneConfig = field(default_factory=BackboneConfig)
+    region_head: RegionHeadConfig = field(default_factory=RegionHeadConfig)
+    grasp_proposal: GraspProposalConfig = field(default_factory=GraspProposalConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    ablation: AblationConfig = field(default_factory=AblationConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+    grasp_verifier: GraspVerifierConfig = field(default_factory=GraspVerifierConfig)
+    graph: GraphConfig = field(default_factory=GraphConfig)
+    push: PushConfig = field(default_factory=PushConfig)
+    pick_remove: PickRemoveConfig = field(default_factory=PickRemoveConfig)
+    router: RouterConfig = field(default_factory=RouterConfig)
+    losses: LossConfig = field(default_factory=LossConfig)
+    sampling: SamplingConfig = field(default_factory=SamplingConfig)
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    reproducibility: ReproducibilityConfig = field(default_factory=ReproducibilityConfig)
+    planner: PlannerConfig = field(default_factory=PlannerConfig)
+    baseline: BaselineConfig = field(default_factory=BaselineConfig)
+    push_distance_m: float = PUSH_DISTANCE_M
+    output_dir: str = "outputs/default"
+    extra: dict[str, Any] = field(default_factory=dict)
+    name: str = "tcd-prg"
+
+    def validate(self) -> None:
+        if abs(self.push_distance_m - PUSH_DISTANCE_M) > 1e-7:
+            raise ValueError("The main TCD-PRG primitive requires push_distance_m == 0.15")
+        if abs(self.push.distance_m - PUSH_DISTANCE_M) > 1e-7:
+            raise ValueError("push.distance_m must be 0.15 for the main experiment")
+        if self.evaluation.max_preparation_actions != MAX_PREPARATION_ACTIONS:
+            raise ValueError("The main experiment requires H=5")
+        if self.router.max_preparation_actions != MAX_PREPARATION_ACTIONS:
+            raise ValueError("router.max_preparation_actions must be H=5")
+        if self.planner.max_preparation_actions != MAX_PREPARATION_ACTIONS:
+            raise ValueError("planner.max_preparation_actions must be H=5")
+        if not 0 <= self.model.min_grasp_width_m < self.model.max_grasp_width_m:
+            raise ValueError("Invalid AG gripper opening range")
+        if len(self.model.grasp_depth_bin_edges_m) != self.model.num_grasp_depth_bins + 1:
+            raise ValueError("grasp_depth_bin_edges_m must have num_grasp_depth_bins + 1 values")
+        if self.ablation.router_type not in {
+            "hierarchical",
+            "fixed_priority",
+            "flat_candidate_classifier",
+        }:
+            raise ValueError(f"Unsupported router_type={self.ablation.router_type}")
+        if self.training.amp_dtype not in {"float16", "bfloat16"}:
+            raise ValueError("training.amp_dtype must be float16 or bfloat16")
+        if self.cache.eviction != "lru":
+            raise ValueError("Only deterministic LRU cache eviction is supported")
+        if self.pick_remove.macro_action and not self.pick_remove.deactivate_after_success:
+            raise ValueError("PICK_REMOVE macro action must leave the object inactive")
+        if self.dataset.root and not Path(self.dataset.root).exists():
+            raise FileNotFoundError(self.dataset.root)
+
+
+def load_config(path: str | Path, overrides: list[str] | None = None) -> TCDPRGConfig:
+    """Load a strict structured YAML configuration with optional dot-list overrides."""
+
+    from omegaconf import OmegaConf
+
+    raw = OmegaConf.load(path)
+    if "defaults" in raw:
+        del raw["defaults"]
+    merged = OmegaConf.merge(
+        OmegaConf.structured(TCDPRGConfig), raw, OmegaConf.from_dotlist(overrides or [])
+    )
+    config = OmegaConf.to_object(merged)
+    if not isinstance(config, TCDPRGConfig):
+        raise TypeError("Structured configuration did not produce TCDPRGConfig")
+    config.validate()
+    return config
