@@ -148,11 +148,14 @@ class DenseCandidateGenerator:
                 point_index_parts.append(remove_index)
 
             push = output["push"]
-            # Target PUSH remains legal for self-pose blockage when the
-            # predicted task graph places the target on the actionable frontier.
+            # Target self-push is an explicit recovery primitive in the current
+            # dataset, including successful actions whose target is not on the
+            # graph frontier. The configurable override records that semantics
+            # directly instead of implying graph gating.
             push_eligible = active & actionable
             if output["graph"] is not None:
-                push_eligible[target_object] = active[target_object]
+                if self.config.allow_target_push_recovery:
+                    push_eligible[target_object] = active[target_object]
                 push_eligible = self._with_graph_fallback(
                     push_eligible, active, push["object_logits"][batch_row]
                 )

@@ -22,6 +22,13 @@ AG-160-95 total opening in `[0, 0.095]` m; it is not the push distance.
 - PICK_REMOVE object/removal-grasp ranking and PUSH object/contact/direction
   prediction, with low-weight potential/risk auxiliaries. PUSH approach,
   fixed-distance execution, removal transport and placement stay non-learning.
+- State graspability uses the adaptive required count and counts unique
+  verifier/certifier survivors after per-object SE(3) grasp NMS, not raw
+  candidate tensor slots.
+- The generated data contains successful target self-push transitions. This is
+  an explicit configurable recovery primitive (`allow_target_push_recovery`),
+  while all other PUSH/PICK_REMOVE objects use the graph frontier plus the
+  bounded recovery fallback.
 - Masked hierarchical, flat, and fixed-priority routing with multi-positive
   listwise supervision; UNKNOWN candidates never become negatives.
 - Deterministic three-PRO-S state reconstruction, free-space-aware LRU cache,
@@ -126,6 +133,10 @@ Training units are `(scene_id, state_id, task_index, action_state_group)`, not
 uniformly sampled action rows. Logs include optimizer steps, samples/states/
 candidate groups seen and effective epochs. `loss_routing.json` records losses
 automatically disabled by dataset capabilities or ablations.
+
+Each loss family is an internally weighted mean over only the child losses that
+have valid supervision in the current batch. Child losses remain individually
+logged, but family size alone cannot amplify shared-backbone gradients.
 
 ## Evaluation and inference
 

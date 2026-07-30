@@ -13,6 +13,7 @@ from tcd_prg.baselines.base import ManipulationPolicy
 from tcd_prg.config import TCDPRGConfig
 from tcd_prg.constants import ActionType, MAX_PREPARATION_ACTIONS
 from tcd_prg.datasets.types import SceneObservation
+from tcd_prg.geometry.grasp_nms import task_grasp_nms
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.models.grasp_verifier import build_verifier_inputs
 from tcd_prg.models.policy.router import MaskedHierarchicalCandidateRouter
@@ -31,14 +32,37 @@ def predicted_state_graspability_gate(
 
 
 def apply_verified_candidate_count_gate(
-    candidate_type: Tensor, candidate_valid: Tensor, required_count: Tensor
-) -> tuple[Tensor, Tensor]:
-    """Mask TASK_GRASP unless enough candidates survive verification/certification."""
+    candidate_type: Tensor,
+    candidate_object: Tensor,
+    candidate_pose_world: Tensor,
+    candidate_width_m: Tensor,
+    candidate_score: Tensor,
+    candidate_valid: Tensor,
+    required_count: Tensor,
+    *,
+    translation_threshold_m: float,
+    rotation_threshold_deg: float,
+    width_threshold_m: float,
+    approach_threshold_deg: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """NMS verified grasps, then apply the adaptive unique-grasp count gate."""
 
     task = candidate_type == int(ActionType.TASK_GRASP)
-    verified_count = (candidate_valid & task).sum(-1)
-    count_gate = verified_count >= required_count
-    return candidate_valid & (~task | count_gate[:, None]), verified_count
+    unique_task = task_grasp_nms(
+        candidate_pose_world,
+        candidate_width_m,
+        candidate_score,
+        candidate_object,
+        candidate_valid & task,
+        translation_threshold_m=translation_threshold_m,
+        rotation_threshold_deg=rotation_threshold_deg,
+        width_threshold_m=width_threshold_m,
+        approach_threshold_deg=approach_threshold_deg,
+    )
+    unique_count = unique_task.sum(-1)
+    count_gate = unique_count >= required_count
+    deduplicated = candidate_valid & (~task | unique_task)
+    return deduplicated & (~task | count_gate[:, None]), unique_count, unique_task
 
 
 class CandidateCertifier(Protocol):
@@ -79,6 +103,19 @@ class TCDPRGPolicy(ManipulationPolicy):
             if observation.point_valid is not None
             else np.ones(len(observation.xyz), dtype=bool)
         )
+        required_grasp_count = int(observation.metadata.get(
+            "required_grasp_count", self.config.model.default_required_grasp_count
+        ))
+        if required_grasp_count > self.config.model.max_required_grasp_count:
+            raise ValueError(
+                f"required_grasp_count={required_grasp_count} exceeds declared "
+                f"max_required_grasp_count={self.config.model.max_required_grasp_count}"
+            )
+        if required_grasp_count > self.config.model.task_grasp_candidates:
+            raise ValueError(
+                f"required_grasp_count={required_grasp_count} exceeds "
+                f"task_grasp_candidates={self.config.model.task_grasp_candidates}"
+            )
         cpu = {
             "xyz": torch.from_numpy(observation.xyz)[None].float(),
             "rgb": torch.from_numpy(observation.rgb)[None].float(),
@@ -95,12 +132,7 @@ class TCDPRGPolicy(ManipulationPolicy):
             "remaining_steps": torch.tensor(
                 [max(0, MAX_PREPARATION_ACTIONS - self.preparation_actions)], dtype=torch.long
             ),
-            "required_grasp_count": torch.tensor(
-                [int(observation.metadata.get(
-                    "required_grasp_count", self.config.model.default_required_grasp_count
-                ))],
-                dtype=torch.long,
-            ),
+            "required_grasp_count": torch.tensor([required_grasp_count], dtype=torch.long),
         }
         return cpu
 
@@ -207,9 +239,16 @@ class TCDPRGPolicy(ManipulationPolicy):
             # The learned gate replaces HDF5 truth at deployment; the number of
             # surviving verifier/certifier candidates provides a deterministic
             # second gate before TASK_GRASP can enter the router.
-            candidates["valid"], verified_count = apply_verified_candidate_count_gate(
-                candidates["type"], candidates["valid"],
+            (
+                candidates["valid"], verified_count, unique_task_mask
+            ) = apply_verified_candidate_count_gate(
+                candidates["type"], candidates["object"], candidates["pose_world"],
+                candidates["width_m"], candidates["proposal_score"], candidates["valid"],
                 encoded.device_batch["required_grasp_count"],
+                translation_threshold_m=self.config.model.grasp_nms_translation_m,
+                rotation_threshold_deg=self.config.model.grasp_nms_rotation_deg,
+                width_threshold_m=self.config.model.grasp_nms_width_m,
+                approach_threshold_deg=self.config.model.grasp_nms_approach_deg,
             )
             candidates["state_graspability_probability"] = torch.sigmoid(
                 state_output["graspable_logit"]
@@ -217,7 +256,10 @@ class TCDPRGPolicy(ManipulationPolicy):
             candidates["predicted_verified_grasp_count"] = state_output[
                 "verified_count_prediction"
             ]
+            candidates["verified_unique_grasp_count"] = verified_count
+            # Compatibility alias now has unique-grasp semantics.
             candidates["verified_candidate_count"] = verified_count
+            candidates["task_grasp_nms_keep"] = unique_task_mask
             router = self.model.route_cached(
                 encoded.device_batch, encoded.output, candidates
             )

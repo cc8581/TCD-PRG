@@ -11,6 +11,7 @@ from .numpy_se3 import (
 __all__ = [
     "SE3",
     "ExactAG16095GeometryProvider",
+    "task_grasp_nms",
     "compose_pose_with_transform",
     "matrix_to_quaternion_xyzw",
     "matrix_to_quaternion_xyzw_numpy",
@@ -26,6 +27,10 @@ def __getattr__(name: str) -> Any:
         from .gripper_provider import ExactAG16095GeometryProvider
 
         return ExactAG16095GeometryProvider
+    if name == "task_grasp_nms":
+        from .grasp_nms import task_grasp_nms
+
+        return task_grasp_nms
     if name in {"SE3", "matrix_to_quaternion_xyzw", "quaternion_xyzw_to_matrix"}:
         from .se3 import SE3, matrix_to_quaternion_xyzw, quaternion_xyzw_to_matrix
 

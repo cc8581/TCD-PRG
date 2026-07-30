@@ -105,9 +105,20 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
     })
     preparation = result["valid"][0] & (result["type"][0] != int(ActionType.TASK_GRASP))
     objects = set(result["object"][0, preparation].tolist())
+    assert 0 in objects  # explicit target self-push recovery rule
     assert 1 in objects  # graph-derived actionable object
     assert 3 in objects  # exactly one highest-scoring recovery object
     assert 2 not in objects
+
+    config.allow_target_push_recovery = False
+    without_target_recovery = DenseCandidateGenerator(config).generate(Model(), batch, {
+        "encoded": encoded, "task_grasp": point_head, "generic_grasp": point_head,
+        "push": push, "pick_remove": {"object_logits": push["object_logits"]}, "graph": graph,
+    })
+    push_rows = without_target_recovery["valid"][0] & (
+        without_target_recovery["type"][0] == int(ActionType.PUSH)
+    )
+    assert 0 not in set(without_target_recovery["object"][0, push_rows].tolist())
 
 
 def test_adaptive_task_grasp_gate_requires_state_and_candidate_counts() -> None:
@@ -116,11 +127,37 @@ def test_adaptive_task_grasp_gate_requires_state_and_candidate_counts() -> None:
         "verified_count_prediction": torch.tensor([20.0]),
     }
     assert predicted_state_graspability_gate(state, torch.tensor([20]), 0.5).item()
-    kinds = torch.tensor([[2, 2, 1]])
-    valid = torch.tensor([[True, False, True]])
-    masked, count = apply_verified_candidate_count_gate(kinds, valid, torch.tensor([2]))
-    assert count.item() == 1
-    assert masked.tolist() == [[False, False, True]]
+    kinds = torch.tensor([[2, 2, 2, 1]])
+    objects = torch.tensor([[0, 0, 0, 1]])
+    poses = torch.tensor([[[
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0
+    ], [
+        0.004, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0
+    ], [
+        0.030, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0
+    ], [
+        float("nan"), float("nan"), float("nan"), float("nan"),
+        float("nan"), float("nan"), float("nan")
+    ]]])
+    width = torch.tensor([[0.05, 0.052, 0.05, float("nan")]])
+    score = torch.tensor([[1.0, 0.9, 0.8, 0.7]])
+    valid = torch.ones_like(kinds, dtype=torch.bool)
+    masked, count, keep = apply_verified_candidate_count_gate(
+        kinds, objects, poses, width, score, valid, torch.tensor([2]),
+        translation_threshold_m=0.010, rotation_threshold_deg=12.0,
+        width_threshold_m=0.005, approach_threshold_deg=12.0,
+    )
+    assert count.item() == 2
+    assert keep.tolist() == [[True, False, True, False]]
+    assert masked.tolist() == [[True, False, True, True]]
+
+    masked, count, _ = apply_verified_candidate_count_gate(
+        kinds, objects, poses, width, score, valid, torch.tensor([3]),
+        translation_threshold_m=0.010, rotation_threshold_deg=12.0,
+        width_threshold_m=0.005, approach_threshold_deg=12.0,
+    )
+    assert count.item() == 2
+    assert masked.tolist() == [[False, False, False, True]]
 
 
 def test_one_shot_baseline_never_reencodes_after_initial_plan() -> None:

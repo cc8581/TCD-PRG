@@ -4,8 +4,9 @@ from pathlib import Path
 import re
 
 import numpy as np
+import pytest
 
-from tcd_prg.config import load_config
+from tcd_prg.config import ModelConfig, TCDPRGConfig, load_config
 from tcd_prg.paths import PROJECT_ROOT
 from tcd_prg.observation.base import ObservationRequest
 from tcd_prg.observation.cached import request_hash
@@ -67,3 +68,13 @@ def test_source_and_config_contain_no_absolute_drive_paths() -> None:
                     if pattern.search(line):
                         offenders.append(f"{path.relative_to(PROJECT_ROOT)}:{line_number}")
     assert offenders == []
+
+
+def test_task_grasp_candidate_capacity_covers_maximum_required_count() -> None:
+    config = TCDPRGConfig(model=ModelConfig(
+        task_grasp_candidates=19,
+        default_required_grasp_count=19,
+        max_required_grasp_count=20,
+    ))
+    with pytest.raises(ValueError, match="task_grasp_candidates"):
+        config.validate()

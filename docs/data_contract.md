@@ -32,7 +32,9 @@ training loop only reads saved/cache observations.
 
 World grasp poses are `[tx,ty,tz,qx,qy,qz,qw]`. Rotation matrices are proper
 right-handed matrices. The model's approach vector is the candidate local +Z
-axis; in-plane rotation is quantized around that axis. Depth is in metres.
+axis; in-plane rotation is quantized around that axis. The pose translation is
+the dataset's canonical contact midpoint. Legacy source-library depth remains
+available for audit compatibility but is not a predicted AG pose parameter.
 
 `grasp_width_m` means total AG-160-95 finger opening. The formal range is
 0–0.095 m. Exact gripper collision points are sampled from the supplied URDF in
@@ -52,6 +54,11 @@ support/press dependencies. Disabling indirect reasoning leaves direct task
 edges intact. Invalid topology only masks topology-order loss; it does not mask
 action, outcome, policy or result supervision.
 
+The current action vocabulary permits target self-push as a recovery primitive;
+successful sequence labels contain such actions. This exception is explicit in
+configuration. Other learned preparation candidates are constrained by the
+derived actionable frontier, with at most the configured bounded fallback.
+
 ## Candidate status and validity
 
 - `POSITIVE`: evaluated successful action.
@@ -62,6 +69,14 @@ Every regression/result field has its own validity mask, including
 `after_state_valid`, `after_pose_valid`, `potential_after_valid`,
 `acted_object_motion_valid` and `target_motion_valid`. NaN is storage for
 not-applicable values and is removed by its mask before loss/metric arithmetic.
+Family subtotals normalize by the weights of child losses with at least one
+valid supervised element in the current batch; absent supervision contributes
+neither a zero pseudo-target nor denominator weight.
+
+After learned verification and deterministic certification, TASK_GRASP
+candidates are deduplicated per object in SE(3). The state-level count is the
+number of unique retained grasps. Configuration requires
+`task_grasp_candidates >= max_required_grasp_count`.
 
 PUSH has an exact 0.15 m displacement. Raw top/side fields are retained only
 for dataset and execution compatibility; the learning policy does not predict

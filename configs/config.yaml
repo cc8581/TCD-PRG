@@ -84,7 +84,13 @@ model:
   graph_edge_threshold: 0.5
   state_graspability_threshold: 0.5
   default_required_grasp_count: 20
+  max_required_grasp_count: 20
+  grasp_nms_translation_m: 0.010
+  grasp_nms_rotation_deg: 12.0
+  grasp_nms_width_m: 0.005
+  grasp_nms_approach_deg: 12.0
   graph_candidate_fallback_objects: 1
+  allow_target_push_recovery: true
 
 grasp_verifier:
   local_scene_points: 512

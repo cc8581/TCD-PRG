@@ -132,7 +132,16 @@ class ModelConfig:
     graph_edge_threshold: float = 0.5
     state_graspability_threshold: float = 0.5
     default_required_grasp_count: int = 20
+    max_required_grasp_count: int = 20
+    grasp_nms_translation_m: float = 0.010
+    grasp_nms_rotation_deg: float = 12.0
+    grasp_nms_width_m: float = 0.005
+    grasp_nms_approach_deg: float = 12.0
     graph_candidate_fallback_objects: int = 1
+    # Successful generated sequences include target self-push transitions.
+    # Keep this recovery primitive explicit instead of silently overriding the
+    # learned graph frontier inside candidate generation.
+    allow_target_push_recovery: bool = True
 
 
 @dataclass(slots=True)
@@ -371,6 +380,20 @@ class TCDPRGConfig:
             raise ValueError("graph_edge_threshold must be in (0,1)")
         if self.model.default_required_grasp_count <= 0:
             raise ValueError("default_required_grasp_count must be positive")
+        if self.model.max_required_grasp_count < self.model.default_required_grasp_count:
+            raise ValueError("max_required_grasp_count cannot be smaller than the default")
+        if self.model.task_grasp_candidates < self.model.max_required_grasp_count:
+            raise ValueError(
+                "task_grasp_candidates must cover max_required_grasp_count so the "
+                "state gate can be satisfied"
+            )
+        if min(
+            self.model.grasp_nms_translation_m,
+            self.model.grasp_nms_rotation_deg,
+            self.model.grasp_nms_width_m,
+            self.model.grasp_nms_approach_deg,
+        ) <= 0:
+            raise ValueError("All grasp NMS thresholds must be positive")
         if self.model.graph_candidate_fallback_objects < 0:
             raise ValueError("graph_candidate_fallback_objects cannot be negative")
         if self.ablation.router_type not in {

@@ -1,8 +1,9 @@
 import torch
 
 from tcd_prg.losses.masked import multi_positive_listwise_loss, safe_smooth_l1
-from tcd_prg.config import AblationConfig
+from tcd_prg.config import AblationConfig, LossConfig, ModelConfig
 from tcd_prg.datasets.capabilities import DatasetCapabilities
+from tcd_prg.losses.objective import TCDPRGObjective
 from tcd_prg.losses.total import MultiTaskLoss
 
 
@@ -52,3 +53,20 @@ def test_multitask_total_uses_family_subtotal_only() -> None:
     })
     assert total.item() == 6.0
     assert logged["proposal_detail"].item() == 100.0
+
+
+def test_family_subtotal_is_weighted_mean_of_active_children_only() -> None:
+    objective = TCDPRGObjective(
+        DatasetCapabilities(has_task_grasps=True), ModelConfig(), AblationConfig(),
+        LossConfig(internal={"first": 2.0, "second": 1.0, "inactive": 100.0}),
+    )
+    first = torch.tensor(2.0, requires_grad=True)
+    second = torch.tensor(4.0, requires_grad=True)
+    inactive = torch.tensor(100.0, requires_grad=True)
+    family = objective._subtotal(
+        {"first": first, "second": second, "inactive": inactive},
+        {"first": True, "second": True, "inactive": False},
+    )
+    assert torch.allclose(family["loss"], torch.tensor(8.0 / 3.0))
+    family["loss"].backward()
+    assert inactive.grad == 0

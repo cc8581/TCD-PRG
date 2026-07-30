@@ -32,6 +32,24 @@ Python 3.8 worker.
 | Closed loop | `grasp_push_eval.py` loop | `planners/closed_loop.py` | policy, observations, executor | H=5 result and trace | evaluated through replay/simulation | reobserve and replan |
 | Exact safety | PyBullet execution environment | `execution/pybullet_certifier.py` + worker | candidate + full state + FR5/AG URDF | valid/reason | deterministic, not learned | final mask before execution |
 
+At inference, verified TASK_GRASP poses are clustered per target object before
+the adaptive state gate. The NMS metric uses translation, jaw-symmetric SO(3)
+rotation, approach-axis angle, and AG opening. The gate compares the resulting
+unique count—not the number of populated candidate slots—with the state's
+`required_grasp_count`. The configured TASK_GRASP capacity must cover the
+declared maximum required count.
+
+PUSH candidate semantics deliberately include target self-push as an explicit
+recovery primitive because it occurs in successful generated sequences. It is
+controlled by `model.allow_target_push_recovery`; disabling it restores strict
+`active & actionable` target eligibility. Non-graph recovery for other objects
+remains bounded by `graph_candidate_fallback_objects`.
+
+Within each loss family, only currently supervised child terms enter a weighted
+mean. The family subtotal is then multiplied once by its top-level family
+weight. Detached child terms remain available for diagnostics without being
+added to the optimization objective a second time.
+
 ## Reuse, extension and replacement
 
 Directly reused for the GAPG baseline: original grasp/push network definitions,

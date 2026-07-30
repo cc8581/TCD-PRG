@@ -1,8 +1,11 @@
 # Checkpoints and experiment outputs
 
-Checkpoint schema version 1 stores model, optimizer, scheduler, AMP scaler, EMA,
+Checkpoint schema version 3 stores model, optimizer, scheduler, AMP scaler, EMA,
 trainer counters, resolved structured configuration, CPU RNG and all CUDA RNG
-states. `best.pt`, periodic `step_XXXXXXXX.pt` and `last.pt` use the same schema.
+states, including per-DDP-rank RNG state. `best.pt`, periodic
+`step_XXXXXXXX.pt` and `last.pt` use the same schema. Older full TCD-PRG
+checkpoints are rejected with an explicit compatibility error; original GAPG
+encoder weights use the separate pretrained-backbone loading path.
 
 An experiment directory contains:
 
