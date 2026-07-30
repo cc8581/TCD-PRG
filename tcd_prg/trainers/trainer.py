@@ -22,6 +22,7 @@ from .reproducibility import seed_everything
 @dataclass(slots=True)
 class TrainerState:
     optimizer_steps: int = 0
+    amp_skipped_steps: int = 0
     samples_seen: int = 0
     states_seen: int = 0
     candidate_groups_seen: int = 0
@@ -42,6 +43,7 @@ class Trainer:
     ) -> None:
         config.validate()
         self.config = config
+        seed_everything(config.training.seed, config.training.deterministic)
         self.device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
         self.rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -55,7 +57,6 @@ class Trainer:
         self.scaler = torch.cuda.amp.GradScaler(enabled=config.training.amp and self.device.type == "cuda")
         source_model = self.model.module if hasattr(self.model, "module") else self.model
         self.ema = ModelEMA(source_model, config.training.ema_decay) if config.training.ema_decay else None
-        seed_everything(config.training.seed, config.training.deterministic)
         if self.is_primary:
             self._save_run_metadata()
         self.metrics_path = self.output_dir / "train_metrics.jsonl"
@@ -146,9 +147,26 @@ class Trainer:
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), self.config.training.gradient_clip_norm
                 )
+                previous_scale = float(self.scaler.get_scale())
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+                current_scale = float(self.scaler.get_scale())
                 self.optimizer.zero_grad(set_to_none=True)
+                # GradScaler deliberately skips optimizer.step when any
+                # unscaled gradient is non-finite.  Such an overflow is a
+                # micro-step retry, not a completed optimizer step: scheduler,
+                # EMA, counters and checkpoints must remain unchanged.
+                if self.scaler.is_enabled() and current_scale < previous_scale:
+                    self.state.amp_skipped_steps += 1
+                    if self.tensorboard is not None:
+                        self.tensorboard.add_scalar(
+                            "amp/skipped_steps", self.state.amp_skipped_steps,
+                            self.state.optimizer_steps,
+                        )
+                        self.tensorboard.add_scalar(
+                            "amp/scale", current_scale, self.state.optimizer_steps
+                        )
+                    continue
                 self.state.optimizer_steps += 1
                 if (
                     self.config.training.unfreeze_at_optimizer_step is not None
@@ -168,6 +186,8 @@ class Trainer:
                 if self.is_primary and (step % self.config.logging.log_interval == 0 or step == 1):
                     record = {
                         "optimizer_step": step,
+                        "amp_skipped_steps": self.state.amp_skipped_steps,
+                        "amp_scale": current_scale,
                         "samples_seen": self.state.samples_seen,
                         "states_seen": self.state.states_seen,
                         "candidate_groups_seen": self.state.candidate_groups_seen,
@@ -249,6 +269,9 @@ class Trainer:
         if self.ema and payload["ema"] is not None:
             self.ema.model.load_state_dict(payload["ema"])
         self.state = TrainerState(**payload["trainer_state"])
-        torch.set_rng_state(payload["rng_cpu"])
+        # ``map_location=self.device`` also moves serialized RNG byte tensors
+        # to CUDA.  PyTorch's RNG restoration APIs require CPU ByteTensors even
+        # when restoring the per-device CUDA generators.
+        torch.set_rng_state(payload["rng_cpu"].cpu())
         if torch.cuda.is_available() and payload["rng_cuda"] is not None:
-            torch.cuda.set_rng_state_all(payload["rng_cuda"])
+            torch.cuda.set_rng_state_all([state.cpu() for state in payload["rng_cuda"]])

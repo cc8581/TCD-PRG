@@ -147,6 +147,7 @@ and safe placement remain behind the `RobotClient` interface.
 - [Unified data and coordinate contract](docs/data_contract.md)
 - [Full reproduction procedure](docs/reproduction.md)
 - [Checkpoint and experiment format](docs/checkpoints_and_outputs.md)
+- [External pretrained checkpoint provenance](docs/pretrained_checkpoints.md)
 - [Known limitations](docs/known_limitations.md)
 
 Every run saves the resolved configuration, Git commit, framework version,
