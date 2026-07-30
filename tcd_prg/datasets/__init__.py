@@ -7,7 +7,7 @@ from .capabilities import DatasetCapabilities
 from .task_oriented_clutter import TaskOrientedClutterAdapter
 from .template import DatasetAdapterTemplate
 from .gapg_observation import GAPGObservationAdapter
-from .types import ActionCandidateGroup, SceneObservation, SequenceLabels, StateLabels
+from .types import ActionCandidateGroup, GlobalGraspLabels, SceneObservation, SequenceLabels, StateLabels
 
 __all__ = [
     "ActionCandidateGroup",
@@ -19,6 +19,7 @@ __all__ = [
     "DistributedWeightedStateSampler",
     "DatasetAdapterTemplate",
     "GAPGObservationAdapter",
+    "GlobalGraspLabels",
     "SceneObservation",
     "SequenceLabels",
     "StateLabels",

@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from tcd_prg.constants import ActionType
+from tcd_prg.baselines.base import GlobalGraspPrediction
 from tcd_prg.datasets.types import SceneObservation
 from tcd_prg.paths import project_path, resolve_executable
 
@@ -99,7 +100,7 @@ class GAPGPolicyWrapper(ManipulationPolicy):
         self._encoded = observation
         return observation
 
-    def _run(self, observation: SceneObservation) -> dict[str, Any]:
+    def _run(self, observation: SceneObservation, mode: str = "policy") -> dict[str, Any]:
         self.paths.validate()
         with tempfile.TemporaryDirectory(prefix="tcd_prg_gapg_") as directory:
             temporary = Path(directory)
@@ -124,6 +125,7 @@ class GAPGPolicyWrapper(ManipulationPolicy):
                 "--push-checkpoint", str(self.paths.push_checkpoint),
                 "--graspnet-checkpoint", str(self.paths.graspnet_checkpoint),
                 "--seed", str(self.seed), "--device", self.device,
+                "--mode", mode,
             ]
             completed = subprocess.run(
                 command, cwd=self.paths.repository, capture_output=True, text=True,
@@ -149,6 +151,24 @@ class GAPGPolicyWrapper(ManipulationPolicy):
         result = self._run(encoded)
         return [item for item in result.get("candidates", [])
                 if int(item["action_type"]) == int(ActionType.TASK_GRASP)]
+
+    def predict_global_grasps(
+        self, encoded: SceneObservation, track: str = "scene_only"
+    ) -> list[GlobalGraspPrediction]:
+        if track not in {"scene_only", "instance_assisted"}:
+            raise ValueError(f"Unknown global grasp track: {track}")
+        mode = "global_scene" if track == "scene_only" else "global_instance"
+        result = self._run(encoded, mode=mode)
+        predictions = []
+        for item in result.get("candidates", []):
+            pose = np.asarray(item["grasp_pose_world"], np.float32)
+            predictions.append(GlobalGraspPrediction(
+                object_index=int(item["acted_object"]), contact_point_world=pose[:3].copy(),
+                grasp_pose_world=pose, width_m=float(item["grasp_width_m"]),
+                score=float(item["score"]), intrinsic_score=None, certified=False,
+                source="gapg_global",
+            ))
+        return predictions
 
     def reset(self) -> None:
         self._encoded = None

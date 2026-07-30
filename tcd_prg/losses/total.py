@@ -14,6 +14,7 @@ class MultiTaskLoss(nn.Module):
     DEFAULT_WEIGHTS = {
         "region": 1.0,
         "proposal": 1.0,
+        "global_grasp": 1.0,
         "verify": 1.0,
         "graph": 1.0,
         "remove": 1.0,

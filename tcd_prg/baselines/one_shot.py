@@ -64,6 +64,12 @@ class OneShotSequencePolicy(ManipulationPolicy):
     def predict_grasps(self, encoded: Any) -> Any:
         return self.policy.predict_grasps(encoded)
 
+    def predict_task_grasps(self, encoded: Any) -> Any:
+        return self.policy.predict_task_grasps(encoded)
+
+    def predict_global_grasps(self, encoded: Any) -> Any:
+        return self.policy.predict_global_grasps(encoded)
+
     def reset(self) -> None:
         self._sequence.clear()
         self._planned = False

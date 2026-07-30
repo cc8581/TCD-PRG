@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from tcd_prg.baselines.base import ManipulationPolicy
+from tcd_prg.baselines.base import GlobalGraspPrediction, ManipulationPolicy
 from tcd_prg.config import TCDPRGConfig
 from tcd_prg.constants import ActionType, MAX_PREPARATION_ACTIONS
 from tcd_prg.datasets.types import SceneObservation
@@ -124,6 +124,7 @@ class TCDPRGPolicy(ManipulationPolicy):
             "target_mask": torch.from_numpy(observation.target_mask)[None].bool(),
             "target_object": torch.tensor([observation.target_object], dtype=torch.long),
             "object_mask": torch.from_numpy(observation.object_present)[None].bool(),
+            "object_present": torch.from_numpy(observation.object_present)[None].bool(),
             "object_active": torch.from_numpy(observation.object_active)[None].bool(),
             "task_category_id": torch.tensor(
                 [observation.object_category_id[observation.target_object]], dtype=torch.long
@@ -291,6 +292,29 @@ class TCDPRGPolicy(ManipulationPolicy):
             as_tuple=False,
         ).flatten()
         return [self._action(candidates, int(index)) for index in indices]
+
+    def predict_task_grasps(self, encoded: EncodedPolicyState) -> list[dict[str, Any]]:
+        return self.predict_grasps(encoded)
+
+    def predict_global_grasps(
+        self, encoded: EncodedPolicyState
+    ) -> list[GlobalGraspPrediction]:
+        decoded = self.generator.global_predictions(
+            encoded.device_batch, encoded.output, self.config.model.candidate_topk
+        )[0]
+        predictions: list[GlobalGraspPrediction] = []
+        for index in range(len(decoded["score"])):
+            predictions.append(GlobalGraspPrediction(
+                object_index=int(decoded["object"][index]),
+                contact_point_world=decoded["contact_world"][index].detach().cpu().numpy(),
+                grasp_pose_world=decoded["pose_world"][index].detach().cpu().numpy(),
+                width_m=float(decoded["width_m"][index]),
+                score=float(decoded["score"][index]),
+                intrinsic_score=float(decoded["intrinsic_score"][index]),
+                certified=False,
+                source="tcd_prg_global",
+            ))
+        return predictions
 
     def reset(self) -> None:
         self.preparation_actions = 0

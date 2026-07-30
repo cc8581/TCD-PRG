@@ -8,6 +8,7 @@ class DatasetCapabilities:
     has_instance_masks: bool = False
     has_task_regions: bool = False
     has_task_grasps: bool = False
+    has_global_grasps: bool = False
     has_push_actions: bool = False
     has_pick_remove_actions: bool = False
     has_sequences: bool = False
@@ -20,6 +21,7 @@ class DatasetCapabilities:
         requirements = {
             "region": self.has_task_regions,
             "proposal": self.has_task_grasps,
+            "global_grasp": self.has_global_grasps,
             "verify": self.has_task_grasps,
             "graph": self.has_relation_graph,
             "remove": self.has_pick_remove_actions,
@@ -29,4 +31,3 @@ class DatasetCapabilities:
         if name not in requirements:
             raise KeyError(name)
         return requirements[name]
-

@@ -51,6 +51,7 @@ def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
     target_mask, _ = _pad([x.target_mask for x in observations], False)
     have_region = all(x.region_target is not None and x.region_valid is not None for x in observations)
     object_pose, object_mask = _pad([x.object_pose for x in observations])
+    object_present, _ = _pad([x.object_present for x in observations], False)
     object_active, _ = _pad([x.object_active for x in observations], False)
     object_category_id, _ = _pad([x.object_category_id for x in observations], -1)
     action_type, candidate_mask = _pad([x.action_type for x in candidates], -1)
@@ -82,7 +83,13 @@ def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
     target_motion_valid, _ = _pad([x.target_motion_valid for x in candidates], False)
     action_parameters = {}
     for key in candidates[0].action_parameters:
-        fill = -1 if np.issubdtype(candidates[0].action_parameters[key].dtype, np.integer) else np.nan
+        dtype = candidates[0].action_parameters[key].dtype
+        if np.issubdtype(dtype, np.bool_):
+            fill = False
+        elif np.issubdtype(dtype, np.integer):
+            fill = -1
+        else:
+            fill = np.nan
         action_parameters[key], _ = _pad([x.action_parameters[key] for x in candidates], fill)
     relation_graph = _pad_square([x.state_labels.relation_graph for x in samples])
     task_block_graph, _ = _pad([x.state_labels.task_block_graph for x in samples])
@@ -122,6 +129,7 @@ def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
         "task_region_id": torch.tensor([x.task_region_id for x in observations], dtype=torch.long),
         "object_pose": object_pose.float(),
         "object_mask": object_mask,
+        "object_present": object_present.bool(),
         "object_active": object_active.bool(),
         "object_category_id": object_category_id.long(),
         "task_category_id": torch.tensor(
@@ -182,4 +190,21 @@ def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
         result["visibility_valid"] = torch.tensor(
             [x.task_region_visibility is not None for x in observations], dtype=torch.bool
         )
+    if all(sample.global_grasps is not None for sample in samples):
+        labels = [sample.global_grasps for sample in samples]
+        assert all(label is not None for label in labels)
+        packed = [label for label in labels if label is not None]
+        global_valid, _ = _pad([x.valid_mask for x in packed], False)
+        scene_executable, _ = _pad([x.scene_executable for x in packed], -1)
+        result["global_grasp_labels"] = {
+            "object_index": _pad([x.object_index for x in packed], -1)[0].long(),
+            "source_grasp_index": _pad([x.source_grasp_index for x in packed], -1)[0].long(),
+            "contact_point_world": _pad([x.contact_point_world for x in packed], np.nan)[0].float(),
+            "grasp_pose_world": _pad([x.grasp_pose_world for x in packed], np.nan)[0].float(),
+            "approach_direction_world": _pad([x.approach_direction_world for x in packed], np.nan)[0].float(),
+            "width_m": _pad([x.width_m for x in packed], np.nan)[0].float(),
+            "intrinsic_stable": _pad([x.intrinsic_stable for x in packed], False)[0].bool(),
+            "scene_executable": scene_executable.to(torch.int8),
+            "valid_mask": global_valid.bool(),
+        }
     return result

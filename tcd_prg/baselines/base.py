@@ -3,9 +3,26 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
 from tcd_prg.datasets.types import SceneObservation
+
+
+@dataclass(frozen=True, slots=True)
+class GlobalGraspPrediction:
+    """Common task-free grasp output shared by TCD-PRG and baselines."""
+
+    object_index: int
+    contact_point_world: np.ndarray
+    grasp_pose_world: np.ndarray
+    width_m: float
+    score: float
+    intrinsic_score: float | None
+    certified: bool
+    source: str
 
 
 class ManipulationPolicy(ABC):
@@ -21,9 +38,18 @@ class ManipulationPolicy(ABC):
     @abstractmethod
     def predict_grasps(self, encoded: Any) -> Any: ...
 
+    def predict_task_grasps(self, encoded: Any) -> Any:
+        """Task-conditioned grasp API; legacy policies delegate here."""
+
+        return self.predict_grasps(encoded)
+
+    def predict_global_grasps(self, encoded: Any) -> list[GlobalGraspPrediction]:
+        """Task-free grasp API. Baselines must opt in explicitly."""
+
+        raise NotImplementedError(f"{type(self).__name__} has no task-free global grasp output")
+
     @abstractmethod
     def reset(self) -> None: ...
 
     @abstractmethod
     def update_after_action(self, action: Any, observation: SceneObservation) -> None: ...
-

@@ -29,6 +29,9 @@ def arguments():
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--grasp-threshold", type=float, default=0.75)
+    parser.add_argument(
+        "--mode", choices=("policy", "global_scene", "global_instance"), default="policy"
+    )
     return parser.parse_args()
 
 
@@ -225,6 +228,29 @@ def main():
     active = data["object_active"].astype(bool)
     target = int(data["target_object"])
     device, verifier, push_model, proposal, decoder = load_networks(args)
+    if args.mode != "policy":
+        groups = []
+        if args.mode == "global_scene":
+            groups.append(propose_grasps(
+                scene, scene, np.random.RandomState(args.seed), device, proposal, decoder
+            ))
+        else:
+            for object_index in np.flatnonzero(active):
+                points = scene[instance == object_index]
+                if len(points):
+                    groups.append(propose_grasps(
+                        points, scene, np.random.RandomState(args.seed + int(object_index)),
+                        device, proposal, decoder,
+                    ))
+        candidates = evaluate_grasps(scene, groups, verifier, device)
+        for item in candidates:
+            contact = np.asarray(item["grasp_pose_world"][:3])
+            item["acted_object"] = int(instance[np.sum((scene - contact[None]) ** 2, axis=1).argmin()])
+        Path(args.output).write_text(json.dumps({
+            "selected_action": None, "candidates": candidates,
+            "backend": "original_gapg", "mode": args.mode, "seed": args.seed,
+        }), encoding="utf-8")
+        return
     target_points = scene[instance == target]
     candidates = []
     if len(target_points):

@@ -6,7 +6,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 
 from .capabilities import DatasetCapabilities
-from .types import ActionCandidateGroup, SceneObservation, SequenceLabels, StateLabels, UnifiedSample
+from .types import (
+    ActionCandidateGroup, GlobalGraspLabels, SceneObservation, SequenceLabels,
+    StateLabels, UnifiedSample,
+)
 
 
 class DatasetAdapter(ABC):
@@ -32,14 +35,24 @@ class DatasetAdapter(ABC):
     def load_sequences(self, scene_id: int, task_index: int | None = None) -> tuple[SequenceLabels, ...]:
         pass
 
+    def load_global_grasps(
+        self, scene_id: int, state_id: int, observation: SceneObservation
+    ) -> GlobalGraspLabels | None:
+        """Optional task-free grasp supervision supplied by capable datasets."""
+
+        return None
+
     def load_sample(self, scene_id: int, state_id: int, task_index: int, group_index: int) -> UnifiedSample:
+        observation = self.load_observation(scene_id, state_id, task_index)
         sample = UnifiedSample(
-            observation=self.load_observation(scene_id, state_id, task_index),
+            observation=observation,
             state_labels=self.load_state_labels(scene_id, state_id),
             candidates=self.load_action_group(scene_id, group_index),
             sequences=self.load_sequences(scene_id, task_index),
+            global_grasps=self.load_global_grasps(scene_id, state_id, observation),
         )
         sample.observation.validate()
         sample.candidates.validate()
+        if sample.global_grasps is not None:
+            sample.global_grasps.validate()
         return sample
-

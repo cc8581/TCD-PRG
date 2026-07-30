@@ -39,6 +39,14 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
         "task_compatibility_logit": torch.zeros(1, 4), "rotation_logits": torch.zeros(1, 4, 12),
         "approach_direction": torch.ones(1, 4, 3), "width_m": torch.ones(1, 4) * 0.05,
     }
+    global_head = {
+        "contact_logits": torch.zeros(1, 4),
+        "scene_confidence_logit": torch.zeros(1, 4, 4),
+        "intrinsic_confidence_logit": torch.zeros(1, 4, 4),
+        "rotation_logits": torch.zeros(1, 4, 4, 12),
+        "approach_direction": torch.ones(1, 4, 4, 3),
+        "width_m": torch.ones(1, 4, 4) * 0.05,
+    }
     push = {
         "object_logits": torch.zeros(1, 1), "contact_logits": torch.zeros(1, 4),
         "direction_logits": torch.zeros(1, 4, 16), "direction_residual": torch.zeros(1, 4, 2),
@@ -52,7 +60,7 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
             return torch.zeros(1, 1, 8)
 
     result = generator.generate(Model(), batch, {
-        "encoded": encoded, "task_grasp": point_head, "generic_grasp": point_head,
+        "encoded": encoded, "task_grasp": point_head, "global_grasp": global_head,
         "push": push, "graph": None,
     })
     assert result["type"].shape == (1, 1)
@@ -81,6 +89,14 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
         "approach_direction": torch.nn.functional.normalize(torch.ones(1, 8, 3), dim=-1),
         "width_m": torch.full((1, 8), 0.05),
     }
+    global_head = {
+        "contact_logits": torch.arange(8).float()[None],
+        "scene_confidence_logit": torch.zeros(1, 8, 4),
+        "intrinsic_confidence_logit": torch.zeros(1, 8, 4),
+        "rotation_logits": torch.zeros(1, 8, 4, 12),
+        "approach_direction": torch.nn.functional.normalize(torch.ones(1, 8, 4, 3), dim=-1),
+        "width_m": torch.full((1, 8, 4), 0.05),
+    }
     push = {
         "object_logits": torch.tensor([[0.0, 1.0, 2.0, 3.0]]),
         "contact_logits": torch.arange(8).float()[None],
@@ -100,7 +116,7 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
             return torch.zeros(candidate_type.shape + (8,))
 
     result = generator.generate(Model(), batch, {
-        "encoded": encoded, "task_grasp": point_head, "generic_grasp": point_head,
+        "encoded": encoded, "task_grasp": point_head, "global_grasp": global_head,
         "push": push, "pick_remove": {"object_logits": push["object_logits"]}, "graph": graph,
     })
     preparation = result["valid"][0] & (result["type"][0] != int(ActionType.TASK_GRASP))
@@ -112,7 +128,7 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
 
     config.allow_target_push_recovery = False
     without_target_recovery = DenseCandidateGenerator(config).generate(Model(), batch, {
-        "encoded": encoded, "task_grasp": point_head, "generic_grasp": point_head,
+        "encoded": encoded, "task_grasp": point_head, "global_grasp": global_head,
         "push": push, "pick_remove": {"object_logits": push["object_logits"]}, "graph": graph,
     })
     push_rows = without_target_recovery["valid"][0] & (

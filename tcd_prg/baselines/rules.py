@@ -61,6 +61,14 @@ class RulePolicy(ManipulationPolicy):
     def predict_grasps(self, encoded: Any) -> Any:
         return self.candidate_policy.predict_grasps(encoded) if self.candidate_policy else None
 
+    def predict_task_grasps(self, encoded: Any) -> Any:
+        return self.candidate_policy.predict_task_grasps(encoded) if self.candidate_policy else None
+
+    def predict_global_grasps(self, encoded: Any) -> Any:
+        if self.candidate_policy is None:
+            return None
+        return self.candidate_policy.predict_global_grasps(encoded)
+
     def reset(self) -> None:
         if self.candidate_policy is not None:
             self.candidate_policy.reset()

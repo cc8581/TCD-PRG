@@ -20,6 +20,9 @@ class DatasetConfig:
     scene_subdir: str = "task_clutter_scenes_20_categories"
     step_labels_subdir: str = "task_training_labels_steps1_6_v1"
     action_labels_subdir: str = "task_positive_multistep_sequences"
+    global_grasp_library_subdir: str = "generic_grasp_library_v1"
+    global_grasp_certification_subdir: str = "global_grasp_scene_certification_v1"
+    pick_remove_global_association_subdir: str = "pick_remove_global_grasp_association_v1"
     scene_points: int = 16_384
     target_points: int = 4_096
     include_rgb: bool = True
@@ -76,7 +79,6 @@ class RegionHeadConfig:
 @dataclass(slots=True)
 class GraspProposalConfig:
     task_conditioned: bool = True
-    generic_remove_condition: bool = True
     predict_width: bool = True
     recall_k: tuple[int, ...] = (1, 5, 10)
 
@@ -142,6 +144,8 @@ class ModelConfig:
     # Keep this recovery primitive explicit instead of silently overriding the
     # learned graph frontier inside candidate generation.
     allow_target_push_recovery: bool = True
+    global_grasp_input_mode: str = "scene_only"
+    global_grasp_modes_per_point: int = 4
 
 
 @dataclass(slots=True)
@@ -185,6 +189,7 @@ class TrainingConfig:
         "verify": 0.5,
         "graph": 0.5,
         "proposal": 0.25,
+        "global_grasp": 0.25,
         "region": 0.1,
         "push": 0.25,
         "remove": 0.25,
@@ -199,6 +204,11 @@ class EvaluationConfig:
     bootstrap_samples: int = 1_000
     confidence: float = 0.95
     max_groups: int | None = None
+    global_grasp_tracks: tuple[str, ...] = ("scene_only", "instance_assisted")
+    global_translation_threshold_m: float = 0.01
+    global_rotation_threshold_deg: float = 15.0
+    global_width_threshold_m: float = 0.005
+    global_metrics_after_nms: bool = True
 
 
 @dataclass(slots=True)
@@ -243,6 +253,7 @@ class LossConfig:
     push: float = 1.0
     policy: float = 1.0
     potential: float = 1.0
+    global_grasp: float = 1.0
     internal: dict[str, float] = field(default_factory=lambda: {
         "region_focal": 1.0,
         "region_dice": 1.0,
@@ -253,14 +264,14 @@ class LossConfig:
         "task_proposal_width": 1.0,
         "task_proposal_confidence": 0.25,
         "task_proposal_task_compatibility": 1.0,
-        "generic_proposal_contact": 0.5,
-        "generic_proposal_approach": 0.5,
-        "generic_proposal_rotation": 0.5,
-        "generic_proposal_width": 0.5,
-        "generic_proposal_confidence": 0.125,
-        "generic_proposal_task_compatibility": 0.5,
         "proposal_state_graspable": 1.0,
         "proposal_verified_count": 0.5,
+        "global_contact": 1.0,
+        "global_approach": 1.0,
+        "global_rotation": 1.0,
+        "global_width": 1.0,
+        "global_scene_confidence": 0.25,
+        "global_intrinsic_confidence": 0.1,
         "verify_stability": 0.5,
         "verify_task_compatibility": 1.0,
         "verify_collision": 1.0,
@@ -290,7 +301,7 @@ class LossConfig:
     def family_weights(self) -> dict[str, float]:
         return {
             name: float(getattr(self, name))
-            for name in ("region", "proposal", "verify", "graph", "remove", "push", "policy", "potential")
+            for name in ("region", "proposal", "global_grasp", "verify", "graph", "remove", "push", "policy", "potential")
         }
 
 
@@ -300,6 +311,7 @@ class SamplingConfig:
     wrong_region_grasps: int = 8
     collision_or_approach_negative_grasps: int = 8
     perturbed_negative_grasps: int = 4
+    global_grasps_per_object: int = 128
     unit: str = "action_state_group"
 
 
@@ -396,6 +408,10 @@ class TCDPRGConfig:
             raise ValueError("All grasp NMS thresholds must be positive")
         if self.model.graph_candidate_fallback_objects < 0:
             raise ValueError("graph_candidate_fallback_objects cannot be negative")
+        if self.model.global_grasp_input_mode not in {"scene_only", "instance_assisted"}:
+            raise ValueError("global_grasp_input_mode must be scene_only or instance_assisted")
+        if not 2 <= self.model.global_grasp_modes_per_point <= 8:
+            raise ValueError("global_grasp_modes_per_point must be in [2,8]")
         if self.ablation.router_type not in {
             "hierarchical",
             "fixed_priority",

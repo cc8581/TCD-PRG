@@ -9,6 +9,7 @@ from torch import Tensor
 
 from tcd_prg.config import ModelConfig
 from tcd_prg.constants import ActionType, CandidateStatus
+from tcd_prg.geometry.se3 import quaternion_xyzw_to_matrix
 
 
 def _nearest_point_indices(
@@ -139,6 +140,106 @@ def build_grasp_proposal_labels(
         "confidence_target": confidence_target,
         "compatibility_target": compatibility_target,
         "compatibility_valid": compatibility_valid,
+    }
+
+
+def build_global_grasp_labels(
+    batch: dict[str, Tensor], config: ModelConfig
+) -> dict[str, Tensor] | None:
+    """Map the task-free candidate set to unordered per-point grasp modes."""
+
+    source = batch.get("global_grasp_labels")
+    if source is None:
+        return None
+    xyz = batch["xyz"]
+    b, n = xyz.shape[:2]
+    modes = config.global_grasp_modes_per_point
+    contact_target = xyz.new_zeros((b, n))
+    contact_valid = torch.zeros((b, n), dtype=torch.bool, device=xyz.device)
+    matching_valid = torch.zeros((b, n, modes), dtype=torch.bool, device=xyz.device)
+    geometry_valid = torch.zeros_like(matching_valid)
+    approach = xyz.new_full((b, n, modes, 3), float("nan"))
+    rotation_bin = torch.full((b, n, modes), -1, dtype=torch.long, device=xyz.device)
+    width = xyz.new_full((b, n, modes), float("nan"))
+    intrinsic = xyz.new_zeros((b, n, modes))
+    intrinsic_valid = torch.zeros_like(matching_valid)
+    scene = xyz.new_zeros((b, n, modes))
+    scene_valid = torch.zeros_like(matching_valid)
+    candidate = source["valid_mask"] & torch.isfinite(source["grasp_pose_world"]).all(-1)
+    point_index, candidate = _nearest_point_indices(
+        xyz, batch["point_mask"], batch["instance_id"], source["contact_point_world"],
+        source["object_index"], candidate,
+    )
+    rotation = quaternion_xyzw_to_matrix(torch.nan_to_num(source["grasp_pose_world"][..., 3:]))
+    candidate_rotation_bin = _rotation_bins(rotation, config.num_grasp_rotation_bins)
+    candidate_approach = source["approach_direction_world"]
+    dominant_axis = candidate_approach.abs().argmax(-1)
+    dominant_sign = (candidate_approach.gather(-1, dominant_axis.unsqueeze(-1)).squeeze(-1) >= 0).long()
+    approach_anchor = dominant_axis * 2 + dominant_sign
+    width_anchor = torch.floor(torch.nan_to_num(source["width_m"], nan=0.0) / 0.005).long()
+    mode_anchor = (
+        (approach_anchor * config.num_grasp_rotation_bins + candidate_rotation_bin) * 32
+        + width_anchor.clamp(0, 31)
+    ).detach().cpu().tolist()
+    intrinsic_cpu = source["intrinsic_stable"].detach().cpu().tolist()
+    sigma_sq = float(config.contact_heatmap_sigma_m) ** 2
+    support_sq = 9.0 * sigma_sq
+    for row in range(b):
+        grouped: dict[int, list[int]] = {}
+        for candidate_index in torch.nonzero(candidate[row], as_tuple=False).flatten().tolist():
+            grouped.setdefault(int(point_index[row, candidate_index]), []).append(candidate_index)
+        for point, candidates_at_point in grouped.items():
+            # Anchor-diverse mode coverage avoids collapsing a dense ACRONYM
+            # contact neighbourhood to several nearly identical poses without
+            # per-candidate GPU synchronisation in the label builder.
+            stable = [index for index in candidates_at_point if bool(intrinsic_cpu[row][index])]
+            remaining = stable + [index for index in candidates_at_point if index not in stable]
+            selected: list[int] = []
+            used_anchors: set[int] = set()
+            for index in remaining:
+                anchor = int(mode_anchor[row][index])
+                if anchor not in used_anchors:
+                    selected.append(index)
+                    used_anchors.add(anchor)
+                if len(selected) == modes:
+                    break
+            if len(selected) < modes:
+                selected.extend(index for index in remaining if index not in selected)
+                selected = selected[:modes]
+            for slot, candidate_index in enumerate(selected):
+                object_index = int(source["object_index"][row, candidate_index])
+                domain = batch["point_mask"][row] & (batch["instance_id"][row] == object_index)
+                distance_sq = ((xyz[row] - source["contact_point_world"][row, candidate_index]) ** 2).sum(-1)
+                neighborhood = domain & (distance_sq <= support_sq)
+                contact_valid[row] |= neighborhood
+                if bool(intrinsic_cpu[row][candidate_index]):
+                    contact_target[row] = torch.maximum(
+                        contact_target[row], torch.exp(-0.5 * distance_sq / sigma_sq) * neighborhood
+                    )
+                matching_valid[row, point, slot] = True
+                geometry_valid[row, point, slot] = bool(intrinsic_cpu[row][candidate_index])
+                approach[row, point, slot] = source["approach_direction_world"][row, candidate_index]
+                rotation_bin[row, point, slot] = candidate_rotation_bin[row, candidate_index]
+                width[row, point, slot] = source["width_m"][row, candidate_index]
+                intrinsic[row, point, slot] = source["intrinsic_stable"][row, candidate_index].float()
+                intrinsic_valid[row, point, slot] = True
+                state = int(source["scene_executable"][row, candidate_index])
+                if state >= 0:
+                    scene[row, point, slot] = float(state)
+                    scene_valid[row, point, slot] = True
+    return {
+        "contact_target": contact_target,
+        "contact_valid": contact_valid,
+        "mode_valid": matching_valid,
+        "geometry_valid": geometry_valid,
+        "approach_target": approach,
+        "rotation_bin": rotation_bin,
+        "width_target_m": width,
+        "width_valid": torch.isfinite(width) & (width >= config.min_grasp_width_m) & (width <= config.max_grasp_width_m),
+        "intrinsic_target": intrinsic,
+        "intrinsic_valid": intrinsic_valid,
+        "scene_target": scene,
+        "scene_valid": scene_valid,
     }
 
 

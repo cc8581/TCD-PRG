@@ -171,8 +171,39 @@ class SequenceLabels:
 
 
 @dataclass(slots=True)
+class GlobalGraspLabels:
+    """Task-free grasps with intrinsic and tri-state scene supervision."""
+
+    object_index: np.ndarray
+    source_grasp_index: np.ndarray
+    contact_point_world: np.ndarray
+    grasp_pose_world: np.ndarray
+    approach_direction_world: np.ndarray
+    width_m: np.ndarray
+    intrinsic_stable: np.ndarray
+    scene_executable: np.ndarray
+    valid_mask: np.ndarray
+    conversion_version: str
+
+    def validate(self) -> None:
+        n = len(self.object_index)
+        expected = {
+            "source_grasp_index": (n,), "contact_point_world": (n, 3),
+            "grasp_pose_world": (n, 7), "approach_direction_world": (n, 3),
+            "width_m": (n,), "intrinsic_stable": (n,),
+            "scene_executable": (n,), "valid_mask": (n,),
+        }
+        for name, shape in expected.items():
+            if getattr(self, name).shape != shape:
+                raise ValueError(f"{name} must have shape {shape}")
+        if np.any(~np.isin(self.scene_executable, (-1, 0, 1))):
+            raise ValueError("scene_executable must use {-1,0,1}")
+
+
+@dataclass(slots=True)
 class UnifiedSample:
     observation: SceneObservation
     state_labels: StateLabels
     candidates: ActionCandidateGroup
     sequences: tuple[SequenceLabels, ...]
+    global_grasps: GlobalGraspLabels | None = None

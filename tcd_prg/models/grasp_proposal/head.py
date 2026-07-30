@@ -78,3 +78,76 @@ class TaskGraspProposalHead(nn.Module):
             "rotation_logits": output["rotation_logits"][row, index],
             "width_raw": output["width_raw"][row, index],
         }
+
+
+class GlobalGraspProposalHead(nn.Module):
+    """Task-free dense global grasp head with multiple modes per contact point.
+
+    ``input_mode='scene_only'`` consumes only neutral point/global features.
+    ``input_mode='instance_assisted'`` additionally gathers the neutral token
+    pooled from the externally supplied instance mask.  Neither mode accepts a
+    target mask, task token, task-region feature, or graph feature.
+    """
+
+    VALID_INPUT_MODES = {"scene_only", "instance_assisted"}
+
+    def __init__(
+        self, dim: int = 256, rotation_bins: int = 12, modes_per_point: int = 4,
+        input_mode: str = "scene_only",
+    ) -> None:
+        super().__init__()
+        if modes_per_point < 2:
+            raise ValueError("Global grasp prediction requires at least two modes per point")
+        if input_mode not in self.VALID_INPUT_MODES:
+            raise ValueError(f"Unsupported global grasp input mode: {input_mode}")
+        self.rotation_bins = rotation_bins
+        self.modes_per_point = modes_per_point
+        self.input_mode = input_mode
+        self.generic_token = nn.Parameter(torch.zeros(dim))
+        self.mode_embedding = nn.Parameter(torch.zeros(modes_per_point, dim))
+        nn.init.normal_(self.generic_token, std=0.02)
+        nn.init.normal_(self.mode_embedding, std=0.02)
+        self.shared = nn.Sequential(
+            nn.Linear(4 * dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim), nn.GELU()
+        )
+        self.contact = nn.Linear(dim, 1)
+        self.mode_shared = nn.Sequential(nn.Linear(dim, dim), nn.GELU())
+        self.approach = nn.Linear(dim, 3)
+        self.rotation = nn.Linear(dim, rotation_bins)
+        self.width = nn.Linear(dim, 1)
+        self.scene_confidence = nn.Linear(dim, 1)
+        self.intrinsic_confidence = nn.Linear(dim, 1)
+
+    def forward(
+        self, point_features: Tensor, object_tokens: Tensor, global_scene_token: Tensor,
+        instance_id: Tensor, point_domain: Tensor,
+    ) -> dict[str, Tensor]:
+        b, n, dim = point_features.shape
+        safe_instance = instance_id.clamp(0, object_tokens.shape[1] - 1)
+        row = torch.arange(b, device=point_features.device)[:, None]
+        per_point_object = object_tokens[row, safe_instance]
+        if self.input_mode == "scene_only":
+            per_point_object = torch.zeros_like(per_point_object)
+        context = torch.cat((
+            point_features,
+            per_point_object,
+            global_scene_token[:, None].expand(-1, n, -1),
+            self.generic_token[None, None].expand(b, n, -1),
+        ), -1)
+        shared = self.shared(context)
+        contact = self.contact(shared).squeeze(-1).masked_fill(~point_domain, -30.0)
+        modes = self.mode_shared(shared[:, :, None] + self.mode_embedding[None, None])
+        approach = torch.nn.functional.normalize(self.approach(modes), dim=-1, eps=1e-6)
+        return {
+            "contact_logits": contact,
+            "approach_direction": approach,
+            "rotation_logits": self.rotation(modes),
+            "width_raw": self.width(modes).squeeze(-1),
+            "scene_confidence_logit": self.scene_confidence(modes).squeeze(-1),
+            "intrinsic_confidence_logit": self.intrinsic_confidence(modes).squeeze(-1),
+            "point_domain": point_domain,
+        }
+
+    @staticmethod
+    def decode_width(width_raw: Tensor, min_width_m: float, max_width_m: float) -> Tensor:
+        return min_width_m + torch.sigmoid(width_raw) * (max_width_m - min_width_m)

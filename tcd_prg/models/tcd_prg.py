@@ -12,7 +12,7 @@ from tcd_prg.config import AblationConfig, BackboneConfig, GraphConfig, ModelCon
 from .backbones import TaskConditionedPointTransformer
 from .common import ActionCandidateEncoder
 from .dependency_graph import TaskConditionedDependencyGraph
-from .grasp_proposal import StateGraspabilityHead, TaskGraspProposalHead
+from .grasp_proposal import GlobalGraspProposalHead, StateGraspabilityHead, TaskGraspProposalHead
 from .grasp_verifier import GripperSceneTaskVerifier
 from .pick_remove import PickRemoveHead
 from .policy import FlatCandidateClassifier, MaskedHierarchicalCandidateRouter, fixed_priority_output
@@ -45,7 +45,10 @@ class TCDPRGModel(nn.Module):
         )
         self.region_head = TaskRegionHead(c.feature_dim)
         self.task_grasp = TaskGraspProposalHead(c.feature_dim, c.num_grasp_rotation_bins)
-        self.generic_grasp = TaskGraspProposalHead(c.feature_dim, c.num_grasp_rotation_bins)
+        self.global_grasp = GlobalGraspProposalHead(
+            c.feature_dim, c.num_grasp_rotation_bins, c.global_grasp_modes_per_point,
+            c.global_grasp_input_mode,
+        )
         self.state_graspability = StateGraspabilityHead(c.feature_dim)
         self.verifier = GripperSceneTaskVerifier(c.feature_dim, c.feature_dim)
         self.graph = TaskConditionedDependencyGraph(
@@ -101,10 +104,12 @@ class TCDPRGModel(nn.Module):
                         result["push"]["contact_logits"][row, point]
                     )
                 else:
-                    head = result["generic_grasp"] if int(kind[row, candidate]) == 1 else result["task_grasp"]
-                    if "proposal_confidence_logit" in head:
+                    if int(kind[row, candidate]) == 1:
+                        confidence = result["global_grasp"]["scene_confidence_logit"][row, point]
+                        evidence[row, candidate, 15] = torch.sigmoid(confidence).max()
+                    else:
                         evidence[row, candidate, 15] = torch.sigmoid(
-                            head["proposal_confidence_logit"][row, point]
+                            result["task_grasp"]["proposal_confidence_logit"][row, point]
                         )
         return evidence
 
@@ -218,10 +223,11 @@ class TCDPRGModel(nn.Module):
             batch["instance_id"],
             batch["point_mask"],
             batch["target_mask"],
-            batch["object_mask"],
+            batch.get("object_present", batch["object_mask"]),
             batch["task_category_id"],
             batch["task_region_id"],
             use_task_region_condition=self.ablation.use_task_region_condition,
+            target_object=batch["target_object"],
         )
         region = self.region_head(
             encoded.point_features, encoded.target_token, encoded.task_token, batch["target_mask"]
@@ -236,20 +242,20 @@ class TCDPRGModel(nn.Module):
         task_grasp["width_m"] = self.task_grasp.decode_width(
             task_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m
         )
-        generic_mask = batch["point_mask"] & batch["object_active"][
+        object_present = batch.get("object_present", batch["object_mask"])
+        global_mask = batch["point_mask"] & object_present[
             torch.arange(batch["xyz"].shape[0], device=batch["xyz"].device)[:, None],
-            batch["instance_id"].clamp(0, batch["object_active"].shape[1] - 1),
+            batch["instance_id"].clamp(0, object_present.shape[1] - 1),
         ]
-        generic_grasp = self.generic_grasp(
-            encoded.point_features,
-            encoded.global_scene_token,
-            encoded.task_token,
-            torch.ones_like(region["region_probability"]),
-            generic_mask,
-            generic_remove=True,
+        global_grasp = self.global_grasp(
+            encoded.scene_point_features,
+            encoded.scene_object_tokens,
+            encoded.scene_global_token,
+            batch["instance_id"],
+            global_mask,
         )
-        generic_grasp["width_m"] = self.generic_grasp.decode_width(
-            generic_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m
+        global_grasp["width_m"] = self.global_grasp.decode_width(
+            global_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m
         )
         state_graspability = self.state_graspability(
             encoded.global_scene_token, encoded.target_token, encoded.task_token
@@ -289,7 +295,7 @@ class TCDPRGModel(nn.Module):
             "encoded": encoded,
             "region": region,
             "task_grasp": task_grasp,
-            "generic_grasp": generic_grasp,
+            "global_grasp": global_grasp,
             "state_graspability": state_graspability,
             "graph": graph,
             "push": push,

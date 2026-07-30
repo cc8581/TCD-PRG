@@ -15,6 +15,7 @@ from .actions import PickRemoveLoss, PushLoss
 from .graph import DependencyGraphLoss
 from .labels import (
     build_graph_labels,
+    build_global_grasp_labels,
     build_grasp_proposal_labels,
     build_push_supervision,
     build_region_labels,
@@ -23,6 +24,7 @@ from .labels import (
 )
 from .policy import HierarchicalSetPolicyLoss
 from .proposal import GraspProposalLoss, StateGraspabilityLoss
+from .global_grasp import GlobalGraspLoss
 from .region import TaskRegionLoss
 from .verifier import GraspVerifierLoss
 from .total import MultiTaskLoss
@@ -49,6 +51,7 @@ class TCDPRGObjective(nn.Module):
             region_config.focal_alpha, region_config.focal_gamma, region_config.dice_weight
         )
         self.proposal = GraspProposalLoss()
+        self.global_grasp = GlobalGraspLoss()
         self.state_graspability = StateGraspabilityLoss()
         self.graph = DependencyGraphLoss()
         self.push = PushLoss()
@@ -141,14 +144,8 @@ class TCDPRGObjective(nn.Module):
             })
         if self.total.enabled("proposal"):
             task_labels = build_grasp_proposal_labels(batch, self.model_config)
-            generic_labels = build_grasp_proposal_labels(
-                batch, self.model_config, generic_remove=True
-            )
             task_losses = self.proposal(
                 output["task_grasp"], task_labels
-            )
-            generic_losses = self.proposal(
-                output["generic_grasp"], generic_labels,
             )
             state_losses = self.state_graspability(
                 output["state_graspability"],
@@ -161,12 +158,10 @@ class TCDPRGObjective(nn.Module):
             )
             proposal_losses = {
                 **{f"task_{key}": value for key, value in task_losses.items()},
-                **{f"generic_{key}": value for key, value in generic_losses.items()},
                 **state_losses,
             }
             proposal_active = {
                 **self._proposal_activity(task_labels, "task"),
-                **self._proposal_activity(generic_labels, "generic"),
                 "proposal_state_graspable": torch.ones(
                     (), dtype=torch.bool, device=batch["xyz"].device
                 ),
@@ -175,6 +170,19 @@ class TCDPRGObjective(nn.Module):
                 ),
             }
             families["proposal"] = self._subtotal(proposal_losses, proposal_active)
+        if self.total.enabled("global_grasp"):
+            global_labels = build_global_grasp_labels(batch, self.model_config)
+            if global_labels is None:
+                raise ValueError("Dataset declares global grasps but batch has no global_grasp_labels")
+            global_losses = self.global_grasp(output["global_grasp"], global_labels)
+            families["global_grasp"] = self._subtotal(global_losses, {
+                "global_contact": global_labels["contact_valid"].any(),
+                "global_approach": global_labels["geometry_valid"].any(),
+                "global_rotation": global_labels["geometry_valid"].any(),
+                "global_width": (global_labels["geometry_valid"] & global_labels["width_valid"]).any(),
+                "global_scene_confidence": global_labels["scene_valid"].any(),
+                "global_intrinsic_confidence": global_labels["intrinsic_valid"].any(),
+            })
         if output["verifier"] is not None and self.total.enabled("verify"):
             verifier_labels = build_verifier_labels(batch)
             verifier_losses = self.verify(output["verifier"], verifier_labels)

@@ -14,9 +14,12 @@ AG-160-95 total opening in `[0, 0.095]` m; it is not the push distance.
 
 ## What is implemented
 
-- A single task-conditioned point transformer pass shared by all learned heads.
+- A single expensive task-free scene geometry backbone pass, followed by a
+  lightweight task-conditioning adapter for task-specific heads.
 - Target-only functional-region segmentation and visibility prediction.
-- Task-region grasp and generic removal-grasp proposal heads.
+- Separate task-region and multimodal global task-free grasp heads. The global
+  branch predicts four pose/opening modes per point by default; PICK_REMOVE
+  filters and reranks its candidates instead of owning a grasp generator.
 - Exact-URDF local scene–gripper multi-head verifier.
 - Predicted-edge heterogeneous dependency graph ending at a `TASK_GRASP` node.
 - PICK_REMOVE object/removal-grasp ranking and PUSH object/contact/direction
@@ -102,6 +105,23 @@ The prefetch command deterministically reconstructs intermediate observations
 at configurable low resolution and samples them to `dataset.scene_points`.
 Cache keys bind scene/state, poses, present/active masks, model IDs, scales,
 camera profile, render seed, renderer version and point-sampling configuration.
+
+Build task-unfiltered global grasp supervision and scene certification outside
+the GPU loop (paths remain configurable and are not embedded in checkpoints):
+
+```powershell
+python tools/build_global_grasp_library.py `
+  --acronym-root $env:TCD_ACRONYM_ROOT `
+  --annotations $env:TCD_FUNCTIONAL_REGION_ROOT `
+  --task-library "$env:TCD_DATASET_ROOT/task_training_labels_steps1_6_v1/grasp_library" `
+  --output "$env:TCD_DATASET_ROOT/generic_grasp_library_v1"
+
+python tools/certify_global_grasps.py --config configs/config.yaml --allow-render
+```
+
+The global comparison has separate `scene_only` and `instance_assisted` tracks
+and reports raw proposal metrics independently from post-certification metrics.
+See [docs/global_grasp_protocol.md](docs/global_grasp_protocol.md).
 
 ## Training
 

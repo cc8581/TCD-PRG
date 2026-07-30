@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
@@ -20,11 +21,12 @@ from .capabilities import DatasetCapabilities
 from .types import (
     ActionCandidateGroup,
     CameraParameters,
+    GlobalGraspLabels,
     SceneObservation,
     SequenceLabels,
     StateLabels,
 )
-from .registries import FunctionalRegionRegistry, GraspLibraryRegistry
+from .registries import FunctionalRegionRegistry, GlobalGraspLibraryRegistry, GraspLibraryRegistry
 
 
 def _decode_strings(values: np.ndarray) -> tuple[str, ...]:
@@ -71,11 +73,19 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         scene_subdir: str = "task_clutter_scenes_20_categories",
         step_labels_subdir: str = "task_training_labels_steps1_6_v1",
         action_labels_subdir: str = "task_positive_multistep_sequences",
+        global_grasp_library_subdir: str = "generic_grasp_library_v1",
+        global_grasp_certification_subdir: str = "global_grasp_scene_certification_v1",
+        pick_remove_global_association_subdir: str = "pick_remove_global_grasp_association_v1",
+        global_grasps_per_object: int = 128,
     ) -> None:
         self.root = Path(root)
         self.scene_root = self.root / scene_subdir
         self.step_root = self.root / step_labels_subdir
         self.action_root = self.root / action_labels_subdir
+        self.global_grasp_root = self.root / global_grasp_library_subdir
+        self.global_grasp_certification_root = self.root / global_grasp_certification_subdir
+        self.pick_remove_global_association_root = self.root / pick_remove_global_association_subdir
+        self.global_grasps_per_object = int(global_grasps_per_object)
         for path in (self.scene_root, self.step_root, self.action_root):
             if not path.is_dir():
                 raise FileNotFoundError(path)
@@ -102,6 +112,13 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         )
         self.camera_parameters = self._formal_camera_parameters()
         self.grasp_registry = GraspLibraryRegistry(self.step_root / "grasp_library")
+        self.global_grasp_registry = (
+            GlobalGraspLibraryRegistry(self.global_grasp_root)
+            if self.global_grasp_root.is_dir() else None
+        )
+        self.capabilities = replace(
+            type(self).capabilities, has_global_grasps=self.global_grasp_registry is not None
+        )
         inferred_region_root = (
             self.root.parent
             / "Grasp_20_class_object_3D_model"
@@ -356,6 +373,87 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         observation.validate()
         return observation
 
+    def load_global_grasps(
+        self, scene_id: int, state_id: int, observation: SceneObservation
+    ) -> GlobalGraspLabels | None:
+        """Transform task-free object libraries to world labels for this state.
+
+        Scene executability remains UNKNOWN until an aligned offline
+        certification cache is present; unknown entries never become negatives.
+        """
+
+        if self.global_grasp_registry is None:
+            return None
+        category_keys = observation.metadata["object_category_key"]
+        h5_names = observation.metadata.get("object_h5_name")
+        if h5_names is None:
+            with np.load(
+                self.scene_root / f"scene_{scene_id:04d}" / "scene.npz", allow_pickle=False
+            ) as raw:
+                h5_names = tuple(str(x) for x in raw["object_h5_name"][: len(observation.object_pose)])
+        object_indices: list[int] = []
+        sources: list[int] = []
+        contacts: list[np.ndarray] = []
+        poses: list[np.ndarray] = []
+        approaches: list[np.ndarray] = []
+        widths: list[float] = []
+        intrinsic: list[bool] = []
+        scene_labels: list[int] = []
+        versions: set[str] = set()
+        certification_file = (
+            self.global_grasp_certification_root / f"scene_{scene_id:04d}" / f"state_{state_id:04d}.npz"
+        )
+        certification: dict[tuple[int, int], int] = {}
+        if certification_file.is_file():
+            with np.load(certification_file, allow_pickle=False) as cached:
+                certification = {
+                    (int(obj), int(source)): int(value)
+                    for obj, source, value in zip(
+                        cached["object_index"], cached["source_grasp_index"],
+                        cached["scene_executable"], strict=True,
+                    )
+                }
+        for object_index, present in enumerate(observation.object_present):
+            if not present:
+                continue
+            library = self.global_grasp_registry.load(category_keys[object_index], h5_names[object_index])
+            versions.add(library.conversion_version)
+            eligible = np.flatnonzero(library.width_compatible)
+            if len(eligible) > self.global_grasps_per_object:
+                order = np.argsort(library.quality[eligible], kind="stable")[::-1]
+                eligible = eligible[order[: self.global_grasps_per_object]]
+            rotation_world_object = quaternion_xyzw_to_matrix_numpy(observation.object_pose[object_index, 3:])
+            for row in eligible:
+                pose = compose_pose_with_transform(
+                    observation.object_pose[object_index], library.transform_object[row]
+                ).astype(np.float32)
+                object_indices.append(object_index)
+                sources.append(int(library.source_index[row]))
+                contacts.append(pose[:3])
+                poses.append(pose)
+                local_approach = library.approach_direction_object[row]
+                approaches.append(np.asarray([
+                    sum(float(rotation_world_object[axis, inner] * local_approach[inner]) for inner in range(3))
+                    for axis in range(3)
+                ], dtype=np.float32))
+                widths.append(float(library.ag_width_m[row]))
+                intrinsic.append(bool(library.stability_label[row]))
+                scene_labels.append(certification.get((object_index, int(library.source_index[row])), -1))
+        count = len(object_indices)
+        version = next(iter(versions)) if len(versions) == 1 else "+".join(sorted(versions))
+        return GlobalGraspLabels(
+            object_index=np.asarray(object_indices, np.int64),
+            source_grasp_index=np.asarray(sources, np.int64),
+            contact_point_world=np.asarray(contacts, np.float32).reshape(count, 3),
+            grasp_pose_world=np.asarray(poses, np.float32).reshape(count, 7),
+            approach_direction_world=np.asarray(approaches, np.float32).reshape(count, 3),
+            width_m=np.asarray(widths, np.float32),
+            intrinsic_stable=np.asarray(intrinsic, bool),
+            scene_executable=np.asarray(scene_labels, np.int8),
+            valid_mask=np.ones(count, bool),
+            conversion_version=version,
+        )
+
     def load_state_labels(self, scene_id: int, state_id: int) -> StateLabels:
         with h5py.File(self._h5_path(scene_id), "r", swmr=True) as handle:
             scene = self._scene_group(handle, scene_id)
@@ -468,6 +566,8 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 "push_distance_m": np.full(n, np.nan, np.float32),
                 "removal_grasp_pose_world": np.full((n, 7), np.nan, np.float32),
                 "removal_grasp_source_index": np.full(n, -1, np.int64),
+                "removal_global_library_row": np.full(n, -1, np.int64),
+                "removal_global_match_valid": np.zeros(n, bool),
                 "removal_destination_world": np.full((n, 3), np.nan, np.float32),
                 "task_grasp_source_index": np.full(n, -1, np.int64),
                 "task_grasp_pose_world": np.full((n, 7), np.nan, np.float32),
@@ -489,6 +589,17 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             with np.load(step_path, allow_pickle=False) as step_labels:
                 object_match_files = tuple(str(x) for x in step_labels["object_match_file"])
             state_pose_cache: dict[int, np.ndarray] = {}
+            association_path = self.pick_remove_global_association_root / f"scene_{scene_id:04d}.npz"
+            association: dict[int, tuple[int, bool]] = {}
+            if association_path.is_file():
+                with np.load(association_path, allow_pickle=False) as mapped:
+                    association = {
+                        int(action): (int(row), str(status) != "unmatched")
+                        for action, row, status in zip(
+                            mapped["action_id"], mapped["global_library_row"],
+                            mapped["match_status"], strict=True,
+                        )
+                    }
 
             def world_grasp(
                 object_index: int, state_id: int, source_index: int
@@ -520,6 +631,9 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                     acted_object[row] = p["acted_object"][payload]
                     parameters["removal_grasp_pose_world"][row] = p["removal_grasp_pose_world"][payload]
                     parameters["removal_grasp_source_index"][row] = p["removal_grasp_source_index"][payload]
+                    global_row, global_valid = association.get(int(action_ids[row]), (-1, False))
+                    parameters["removal_global_library_row"][row] = global_row
+                    parameters["removal_global_match_valid"][row] = global_valid
                     parameters["removal_destination_world"][row] = p["removal_destination_world"][payload]
                     _, width, rotation, depth_m, confidence = world_grasp(
                         int(acted_object[row]), int(actions["from_state"][action_ids[row]]),

@@ -27,7 +27,7 @@ def _rotation_from_approach(approach: Tensor, rotation_bin: Tensor, bins: int) -
 
 
 class DenseCandidateGenerator:
-    """Generate task grasp, generic removal, and fixed-distance push candidates."""
+    """Generate task grasp, global-grasp-based removal, and push candidates."""
 
     def __init__(self, config: ModelConfig) -> None:
         self.config = config
@@ -64,6 +64,54 @@ class DenseCandidateGenerator:
             eligible = eligible.clone()
             eligible[selected] = True
         return eligible
+
+    def global_predictions(
+        self, batch: dict[str, Tensor], output: dict[str, Any], topk: int | None = None
+    ) -> list[dict[str, Tensor]]:
+        """Decode task-free grasps for every physically present visible object.
+
+        This path deliberately does not inspect target, actionable, graph, task,
+        or router tensors. It is therefore suitable for standalone comparison.
+        """
+
+        head = output["global_grasp"]
+        rows: list[dict[str, Tensor]] = []
+        amount = int(topk or self.config.candidate_topk)
+        for row in range(batch["xyz"].shape[0]):
+            xyz = batch["xyz"][row]
+            instance = batch["instance_id"][row]
+            present = batch.get("object_present", batch["object_mask"])[row]
+            domain = batch["point_mask"][row] & present[
+                instance.clamp(0, present.shape[0] - 1)
+            ]
+            score = (
+                torch.sigmoid(head["contact_logits"][row, :, None])
+                * torch.sigmoid(head["scene_confidence_logit"][row])
+            ).masked_fill(~domain[:, None], -1.0)
+            count = min(amount, int(domain.sum()) * score.shape[1])
+            flat = score.flatten().topk(count).indices if count else torch.empty(
+                0, dtype=torch.long, device=xyz.device
+            )
+            point = torch.div(flat, score.shape[1], rounding_mode="floor")
+            mode = flat.remainder(score.shape[1])
+            rotation_bin = head["rotation_logits"][row, point, mode].argmax(-1)
+            rotation = _rotation_from_approach(
+                head["approach_direction"][row, point, mode], rotation_bin,
+                self.config.num_grasp_rotation_bins,
+            )
+            rows.append({
+                "object": instance[point],
+                "contact_world": xyz[point],
+                "pose_world": torch.cat((xyz[point], matrix_to_quaternion_xyzw(rotation)), -1),
+                "width_m": head["width_m"][row, point, mode],
+                "score": score[point, mode],
+                "intrinsic_score": torch.sigmoid(
+                    head["intrinsic_confidence_logit"][row, point, mode]
+                ),
+                "point_index": point,
+                "mode_index": mode,
+            })
+        return rows
 
     def generate(self, model: Any, batch: dict[str, Tensor], output: dict[str, Any]) -> dict[str, Tensor]:
         """Return padded tensors and learned candidate tokens for one encoded batch."""
@@ -109,10 +157,10 @@ class DenseCandidateGenerator:
                 approach_parts.append(torch.full_like(index, -1))
                 point_index_parts.append(index)
 
-            generic = output["generic_grasp"]
-            generic_score = (
-                torch.sigmoid(generic["contact_logits"][batch_row])
-                * torch.sigmoid(generic["proposal_confidence_logit"][batch_row])
+            global_grasp = output["global_grasp"]
+            global_score = (
+                torch.sigmoid(global_grasp["contact_logits"][batch_row, :, None])
+                * torch.sigmoid(global_grasp["scene_confidence_logit"][batch_row])
             )
             remove_domain = active.clone()
             remove_domain[target_object] = False
@@ -126,13 +174,21 @@ class DenseCandidateGenerator:
             if output["graph"] is not None and len(remove_objects):
                 priority = output["graph"].actionable_blocker_logits[batch_row, remove_objects]
                 remove_objects = remove_objects[priority.argsort(descending=True)]
-            remove_index = self._top_per_object(
-                generic_score, instance, remove_objects[:4], self.config.pick_remove_candidates
+            # Select point-mode pairs only after the dependency graph has
+            # restricted objects; the global head itself predicts all present objects.
+            flat_score = global_score.flatten()
+            flat_instance = instance[:, None].expand(-1, global_score.shape[1]).reshape(-1)
+            remove_flat = self._top_per_object(
+                flat_score, flat_instance, remove_objects[:4], self.config.pick_remove_candidates
             )
-            if len(remove_index):
-                rotation_bin = generic["rotation_logits"][batch_row, remove_index].argmax(-1)
+            if len(remove_flat):
+                remove_index = torch.div(remove_flat, global_score.shape[1], rounding_mode="floor")
+                remove_mode = remove_flat.remainder(global_score.shape[1])
+                rotation_bin = global_grasp["rotation_logits"][
+                    batch_row, remove_index, remove_mode
+                ].argmax(-1)
                 rotation = _rotation_from_approach(
-                    generic["approach_direction"][batch_row, remove_index], rotation_bin,
+                    global_grasp["approach_direction"][batch_row, remove_index, remove_mode], rotation_bin,
                     self.config.num_grasp_rotation_bins,
                 )
                 pose = torch.cat((xyz[remove_index], matrix_to_quaternion_xyzw(rotation)), -1)
@@ -142,8 +198,8 @@ class DenseCandidateGenerator:
                 direction_parts.append(torch.full((len(remove_index), 3), float("nan"), device=xyz.device))
                 pose_parts.append(pose)
                 destination_parts.append(torch.full((len(remove_index), 3), float("nan"), device=xyz.device))
-                width_parts.append(generic["width_m"][batch_row, remove_index])
-                score_parts.append(generic_score[remove_index])
+                width_parts.append(global_grasp["width_m"][batch_row, remove_index, remove_mode])
+                score_parts.append(global_score[remove_index, remove_mode])
                 approach_parts.append(torch.full_like(remove_index, -1))
                 point_index_parts.append(remove_index)
 
