@@ -65,10 +65,9 @@ conda activate tcd-prg
 pip install -e .
 ```
 
-Rendering, exact gripper sampling and action certification call the existing
-`D:\Anaconda\envs\gapg\python.exe` environment. No PyBullet reinstall is
-performed. On another machine, change `observation.pybullet_python` in YAML to
-an existing compatible environment.
+Rendering, exact gripper sampling and action certification call an existing
+PyBullet-capable Python environment. No PyBullet reinstall is performed. Set
+`TCD_PYBULLET_PYTHON` to that interpreter; otherwise `python` on `PATH` is used.
 
 External GraspNet source is pinned but not vendored:
 
@@ -81,8 +80,9 @@ datasets, caches and checkpoints.
 
 ## Data preparation
 
-Set the paths in `configs/config.yaml`. The training loop is cache-only and
-never synchronously invokes PyBullet on the GPU path:
+Place data under `data/`, or set `TCD_DATASET_ROOT`, `TCD_ACRONYM_ROOT` and
+`TCD_FUNCTIONAL_REGION_ROOT`. No source edit is required. The training loop is
+cache-only and never synchronously invokes PyBullet on the GPU path:
 
 ```powershell
 tcd-prg-audit --config configs/config.yaml --states 100
@@ -112,12 +112,14 @@ tcd-prg-train --config configs/config.yaml ablation.use_dependency_graph=false `
   output_dir=outputs/ablation_no_graph
 ```
 
-Windows DDP uses `gloo` by default; Linux CUDA DDP uses `nccl`:
+Windows DDP uses `gloo` by default; Linux CUDA DDP uses `nccl`. The launchers
+select one process per GPU and retain all runtime files inside this repository:
 
 ```powershell
-torchrun --standalone --nproc_per_node=2 -m tcd_prg.scripts.train `
-  --config configs/config.yaml
+.\scripts\train_ddp.ps1 -Gpus 2
 ```
+
+See `docs/portable_training.md` for Linux and environment-variable examples.
 
 Training units are `(scene_id, state_id, task_index, action_state_group)`, not
 uniformly sampled action rows. Logs include optimizer steps, samples/states/

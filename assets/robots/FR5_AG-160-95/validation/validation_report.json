@@ -1,0 +1,110 @@
+{
+  "urdf": "D:\\pycharm\\Project\\FR5_AG-160-95\\urdf\\fr5_ag160_95.urdf",
+  "pybullet_body_id": 0,
+  "joint_count": 21,
+  "joint_names": [
+    "world",
+    "j1",
+    "j2",
+    "j3",
+    "j4",
+    "j5",
+    "j6",
+    "ag_mount_joint",
+    "ag95_body_joint",
+    "left_inner_knuckle_joint",
+    "left_outer_knuckle_joint",
+    "left_finger_joint",
+    "left_inner_finger_pad_joint",
+    "right_inner_knuckle_joint",
+    "right_outer_knuckle_joint",
+    "right_finger_joint",
+    "right_inner_finger_pad_joint",
+    "grasp_joint",
+    "tcp_open_front_link_joint",
+    "tcp_closed_front_link_joint",
+    "tcp_link_joint"
+  ],
+  "controlled_gripper_joint": "left_outer_knuckle_joint",
+  "coupled_gripper_joints": [
+    "left_outer_knuckle_joint",
+    "left_finger_joint",
+    "left_inner_knuckle_joint",
+    "right_outer_knuckle_joint",
+    "right_finger_joint",
+    "right_inner_knuckle_joint"
+  ],
+  "command_range_rad": [
+    0.0,
+    0.93
+  ],
+  "configurations": {
+    "open": {
+      "command_rad": 0.0,
+      "left_pad_center_in_ag_frame_m": [
+        0.05460004311360981,
+        2.1835262058525484e-08,
+        0.15924056869485995
+      ],
+      "right_pad_center_in_ag_frame_m": [
+        -0.054600051560816106,
+        3.634206973551768e-09,
+        0.15924056837493772
+      ],
+      "pad_center_separation_m": 0.10920009467442592,
+      "self_contacts_after_filter": [],
+      "robot_aabb_m": [
+        [
+          -0.7549140719905301,
+          -0.2085281439785819,
+          -0.08291878820041629
+        ],
+        [
+          0.1554899523750722,
+          0.1554301392358954,
+          0.5589633817714665
+        ]
+      ]
+    },
+    "closed": {
+      "command_rad": 0.93,
+      "left_pad_center_in_ag_frame_m": [
+        0.007868216563327883,
+        1.8106204232107292e-08,
+        0.17502793617737078
+      ],
+      "right_pad_center_in_ag_frame_m": [
+        -0.007868234166185302,
+        6.718793804302847e-09,
+        0.1750279374809254
+      ],
+      "pad_center_separation_m": 0.015736450729513185,
+      "self_contacts_after_filter": [],
+      "robot_aabb_m": [
+        [
+          -0.7549140719905301,
+          -0.20639317512917615,
+          -0.08992077624487227
+        ],
+        [
+          0.1554899523750722,
+          0.1554301392358954,
+          0.5589633817714665
+        ]
+      ]
+    }
+  },
+  "ik_smoke_test": {
+    "target_xyz_m": [
+      0.45,
+      0.0,
+      0.35
+    ],
+    "actual_xyz_m": [
+      0.44999927282333374,
+      9.539681400383415e-08,
+      0.34999996423721313
+    ],
+    "position_error_m": 7.342788523535696e-07
+  }
+}

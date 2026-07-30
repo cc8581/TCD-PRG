@@ -15,6 +15,8 @@ __all__ = [
     "collate_unified",
     "DatasetAdapter",
     "DatasetCapabilities",
+    "DistributedEvaluationSampler",
+    "DistributedWeightedStateSampler",
     "DatasetAdapterTemplate",
     "GAPGObservationAdapter",
     "SceneObservation",
@@ -31,11 +33,25 @@ def __getattr__(name: str) -> Any:
         from .collate import collate_unified
 
         return collate_unified
-    if name in {"ActionStateGroupDataset", "StateGroupUnit", "split_units_by_scene"}:
-        from .torch_dataset import ActionStateGroupDataset, StateGroupUnit, split_units_by_scene
+    if name in {
+        "ActionStateGroupDataset",
+        "DistributedEvaluationSampler",
+        "DistributedWeightedStateSampler",
+        "StateGroupUnit",
+        "split_units_by_scene",
+    }:
+        from .torch_dataset import (
+            ActionStateGroupDataset,
+            DistributedEvaluationSampler,
+            DistributedWeightedStateSampler,
+            StateGroupUnit,
+            split_units_by_scene,
+        )
 
         return {
             "ActionStateGroupDataset": ActionStateGroupDataset,
+            "DistributedEvaluationSampler": DistributedEvaluationSampler,
+            "DistributedWeightedStateSampler": DistributedWeightedStateSampler,
             "StateGroupUnit": StateGroupUnit,
             "split_units_by_scene": split_units_by_scene,
         }[name]

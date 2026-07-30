@@ -5,6 +5,10 @@ import torch
 from tcd_prg.config import ModelConfig, TCDPRGConfig, TrainingConfig
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.trainers import Trainer
+from tcd_prg.datasets.torch_dataset import (
+    DistributedEvaluationSampler,
+    DistributedWeightedStateSampler,
+)
 
 
 class _SkipOnceScaler:
@@ -101,3 +105,18 @@ def test_ten_batch_overfit_smoke(tiny_batch) -> None:
         optimizer.step()
         losses.append(float(loss))
     assert losses[-1] < losses[0]
+
+
+def test_distributed_training_sampler_avoids_rank_overlap() -> None:
+    weights = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.double)
+    rank0 = set(DistributedWeightedStateSampler(weights, 0, 2, 4, seed=9))
+    rank1 = set(DistributedWeightedStateSampler(weights, 1, 2, 4, seed=9))
+    assert rank0.isdisjoint(rank1)
+    assert rank0 | rank1 == set(range(4))
+
+
+def test_distributed_validation_sampler_has_no_padding_or_overlap() -> None:
+    shards = [set(DistributedEvaluationSampler(7, rank, 3)) for rank in range(3)]
+    assert set.union(*shards) == set(range(7))
+    assert all(shards[left].isdisjoint(shards[right])
+               for left in range(3) for right in range(left + 1, 3))

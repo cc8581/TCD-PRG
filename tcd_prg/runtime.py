@@ -16,14 +16,8 @@ from tcd_prg.observation import (
     ExternalPyBulletObservationProvider,
     SavedObservationProvider,
 )
+from tcd_prg.paths import project_path
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-
-def _project_path(value: str | Path) -> Path:
-    path = Path(value)
-    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def create_observation_provider(config: TCDPRGConfig, allow_render: bool = False):
@@ -32,19 +26,25 @@ def create_observation_provider(config: TCDPRGConfig, allow_render: bool = False
         return SavedObservationProvider(
             scene_root, scene_root / "metadata.json", config.dataset.scene_points
         )
-    external = ExternalPyBulletObservationProvider(
-        config.observation.pybullet_python,
-        _project_path(config.observation.worker_script),
-        scene_root,
-        config.observation.runtime_mesh_root,
-        config.observation.render_width,
-        config.observation.render_height,
-    )
+    def external_provider() -> ExternalPyBulletObservationProvider:
+        return ExternalPyBulletObservationProvider(
+            config.observation.pybullet_python,
+            project_path(config.observation.worker_script),
+            scene_root,
+            config.observation.runtime_mesh_root,
+            config.observation.render_width,
+            config.observation.render_height,
+            config.observation.render_temporary_root,
+        )
+
     if config.observation.provider == "rendered":
-        return external
+        return external_provider()
     if config.observation.provider != "cached":
         raise ValueError(f"Unknown observation provider {config.observation.provider}")
-    fallback = external if allow_render or config.observation.allow_render_on_cache_miss else None
+    fallback = (
+        external_provider()
+        if allow_render or config.observation.allow_render_on_cache_miss else None
+    )
     return CachedObservationProvider(
         config.cache.directory,
         fallback,
@@ -76,7 +76,7 @@ def create_gripper_provider(
 ) -> ExactAG16095GeometryProvider:
     return ExactAG16095GeometryProvider(
         config.observation.pybullet_python,
-        _project_path(config.observation.gripper_worker_script),
+        project_path(config.observation.gripper_worker_script),
         config.dataset.fr5_ag_urdf,
         config.observation.gripper_cache_dir,
         point_count=config.grasp_verifier.gripper_points,
@@ -89,10 +89,11 @@ def create_action_certifier(config: TCDPRGConfig) -> ExternalFR5AG16095Certifier
     urdf = Path(config.dataset.fr5_ag_urdf)
     return ExternalFR5AG16095Certifier(
         config.observation.pybullet_python,
-        _project_path(config.observation.certification_worker_script),
+        project_path(config.observation.certification_worker_script),
         urdf.parent.parent,
         config.observation.runtime_mesh_root,
         Path(config.dataset.root) / config.dataset.scene_subdir,
+        config.observation.certification_temporary_root,
     )
 
 

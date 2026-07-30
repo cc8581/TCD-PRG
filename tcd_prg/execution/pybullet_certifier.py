@@ -11,17 +11,18 @@ import numpy as np
 
 from tcd_prg.constants import ActionType, PUSH_DISTANCE_M
 from tcd_prg.datasets.types import SceneObservation
+from tcd_prg.paths import project_path, resolve_executable
 
 
 class ExternalFR5AG16095Certifier:
     def __init__(self, python_executable: str | Path, worker_script: str | Path,
                  robot_root: str | Path, runtime_mesh_root: str | Path,
                  scene_root: str | Path,
-                 temporary_root: str | Path = "D:/codex/TCD-PRG/certification") -> None:
-        self.python = Path(python_executable); self.worker = Path(worker_script)
-        self.robot_root = Path(robot_root); self.mesh_root = Path(runtime_mesh_root)
-        self.scene_root = Path(scene_root); self.temporary_root = Path(temporary_root)
-        for path in (self.python, self.worker, self.robot_root, self.mesh_root, self.scene_root):
+                 temporary_root: str | Path = "runtime/tmp/certification") -> None:
+        self.python = resolve_executable(python_executable); self.worker = project_path(worker_script)
+        self.robot_root = project_path(robot_root); self.mesh_root = project_path(runtime_mesh_root)
+        self.scene_root = project_path(scene_root); self.temporary_root = project_path(temporary_root)
+        for path in (self.worker, self.robot_root, self.mesh_root, self.scene_root):
             if not path.exists():
                 raise FileNotFoundError(path)
         self.temporary_root.mkdir(parents=True, exist_ok=True)

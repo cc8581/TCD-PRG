@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from tcd_prg.config import load_config
-from tcd_prg.datasets import ActionStateGroupDataset
+from tcd_prg.datasets import ActionStateGroupDataset, DistributedEvaluationSampler
 from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter, create_gripper_provider
@@ -34,12 +34,26 @@ def main() -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    use_cuda = torch.cuda.is_available() and config.training.device.startswith("cuda")
     if world_size > 1:
         backend = config.training.ddp_backend
         if backend == "auto":
-            backend = "gloo" if os.name == "nt" else ("nccl" if torch.cuda.is_available() else "gloo")
-        torch.distributed.init_process_group(backend=backend)
-        if torch.cuda.is_available():
+            backend = "gloo" if os.name == "nt" else ("nccl" if use_cuda else "gloo")
+        if use_cuda and local_rank >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank}, but only {torch.cuda.device_count()} CUDA devices exist"
+            )
+        init_method = os.environ.get("TCD_DDP_INIT_METHOD")
+        if init_method:
+            torch.distributed.init_process_group(
+                backend=backend,
+                init_method=init_method,
+                rank=rank,
+                world_size=world_size,
+            )
+        else:
+            torch.distributed.init_process_group(backend=backend)
+        if use_cuda:
             torch.cuda.set_device(local_rank)
             config.training.device = f"cuda:{local_rank}"
     adapter = create_adapter(config, allow_render=False)
@@ -70,10 +84,15 @@ def main() -> None:
         persistent_workers=config.training.num_workers > 0,
         collate_fn=collator,
     )
+    validation_sampler = (
+        DistributedEvaluationSampler(len(validation_dataset), rank, world_size)
+        if world_size > 1 else None
+    )
     validation_loader = DataLoader(
         validation_dataset,
         batch_size=config.training.batch_size,
         shuffle=False,
+        sampler=validation_sampler,
         num_workers=config.training.num_workers,
         pin_memory=config.training.pin_memory,
         persistent_workers=config.training.num_workers > 0,
@@ -118,7 +137,9 @@ def main() -> None:
     if world_size > 1:
         model = model.to(torch.device(config.training.device))
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[local_rank] if torch.cuda.is_available() else None
+            model,
+            device_ids=[local_rank] if use_cuda else None,
+            find_unused_parameters=config.training.ddp_find_unused_parameters,
         )
     objective = TCDPRGObjective(
         adapter.capabilities, config.model, config.ablation, asdict(config.losses),
@@ -146,11 +167,13 @@ def main() -> None:
         loss, terms = objective(trainer.model, batch)
         loss.backward()
         print({"loss": float(loss.detach()), "terms": len(terms), "batch": len(raw["samples"])})
+        if world_size > 1:
+            torch.distributed.destroy_process_group()
         return
 
-    def validate(module: torch.nn.Module) -> float:
+    def validate(module: torch.nn.Module) -> tuple[float, int]:
         if validation_loader is None:
-            return float("inf")
+            return float("inf"), 1
         module.eval()
         total, count = 0.0, 0
         with torch.no_grad():
@@ -162,7 +185,7 @@ def main() -> None:
                 if count >= config.training.max_validation_groups:
                     break
         module.train()
-        return total / max(1, count)
+        return total, count
 
     state = trainer.train(
         train_loader,
@@ -170,6 +193,8 @@ def main() -> None:
         groups_per_effective_epoch=len(train_dataset),
     )
     trainer.save_checkpoint(f"{config.output_dir}/last.pt")
+    if world_size > 1:
+        torch.distributed.barrier()
     if rank == 0:
         print(asdict(state))
     if world_size > 1:

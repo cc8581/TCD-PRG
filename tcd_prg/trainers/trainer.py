@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 import subprocess
+from contextlib import nullcontext
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -43,10 +44,10 @@ class Trainer:
     ) -> None:
         config.validate()
         self.config = config
-        seed_everything(config.training.seed, config.training.deterministic)
+        self.rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        seed_everything(config.training.seed + self.rank, config.training.deterministic)
         self.device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
-        self.rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         self.is_primary = self.rank == 0
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -107,7 +108,7 @@ class Trainer:
     def train(
         self,
         loader: Iterable[Mapping[str, Any]],
-        validate: Callable[[nn.Module], float] | None = None,
+        validate: Callable[[nn.Module], float | tuple[float, int]] | None = None,
         groups_per_effective_epoch: int | None = None,
     ) -> TrainerState:
         accumulation = self.config.training.gradient_accumulation_steps
@@ -131,17 +132,28 @@ class Trainer:
                 batch = self._move(raw_batch, self.device)
                 autocast_enabled = self.config.training.amp and self.device.type == "cuda"
                 amp_dtype = torch.bfloat16 if self.config.training.amp_dtype == "bfloat16" else torch.float16
-                with torch.autocast(
-                    device_type=self.device.type, dtype=amp_dtype, enabled=autocast_enabled
-                ):
-                    loss, terms = self.loss_step(self.model, batch)
-                    scaled_loss = loss / accumulation
-                self.scaler.scale(scaled_loss).backward()
+                synchronize = micro_step % accumulation == 0
+                sync_context = (
+                    nullcontext()
+                    if synchronize or not hasattr(self.model, "no_sync")
+                    else self.model.no_sync()
+                )
+                with sync_context:
+                    with torch.autocast(
+                        device_type=self.device.type, dtype=amp_dtype, enabled=autocast_enabled
+                    ):
+                        loss, terms = self.loss_step(self.model, batch)
+                        scaled_loss = loss / accumulation
+                    self.scaler.scale(scaled_loss).backward()
                 batch_size = int(batch["xyz"].shape[0]) if "xyz" in batch else 1
-                self.state.samples_seen += batch_size
-                self.state.states_seen += batch_size
-                self.state.candidate_groups_seen += batch_size
-                if micro_step % accumulation:
+                global_batch_size = batch_size * (
+                    torch.distributed.get_world_size()
+                    if torch.distributed.is_initialized() else 1
+                )
+                self.state.samples_seen += global_batch_size
+                self.state.states_seen += global_batch_size
+                self.state.candidate_groups_seen += global_batch_size
+                if not synchronize:
                     continue
                 self.scaler.unscale_(self.optimizer)
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
@@ -205,19 +217,27 @@ class Trainer:
                                 self.tensorboard.add_scalar(key, value, step)
                         for index, rate in enumerate(record["learning_rates"]):
                             self.tensorboard.add_scalar(f"learning_rate/group_{index}", rate, step)
-                if self.is_primary and step % self.config.training.checkpoint_interval == 0:
+                if step % self.config.training.checkpoint_interval == 0:
                     self.save_checkpoint(self.output_dir / f"step_{step:08d}.pt")
                 if validate and step % self.config.training.validation_interval == 0:
-                    score = float(validate(self.ema.model if self.ema else self.model))
+                    validation = validate(self.ema.model if self.ema else self.model)
                     if torch.distributed.is_initialized():
-                        value = torch.tensor(score, device=self.device)
-                        torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
-                        score = float(value / torch.distributed.get_world_size())
+                        if isinstance(validation, tuple):
+                            value = torch.tensor(validation, dtype=torch.float64, device=self.device)
+                            torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+                            score = float(value[0] / value[1].clamp_min(1))
+                        else:
+                            value = torch.tensor(float(validation), device=self.device)
+                            torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+                            score = float(value / torch.distributed.get_world_size())
+                    elif isinstance(validation, tuple):
+                        score = float(validation[0] / max(1, validation[1]))
+                    else:
+                        score = float(validation)
                     if score < self.state.best_validation:
                         self.state.best_validation = score
                         self.state.validation_without_improvement = 0
-                        if self.is_primary:
-                            self.save_checkpoint(self.output_dir / "best.pt")
+                        self.save_checkpoint(self.output_dir / "best.pt")
                     else:
                         self.state.validation_without_improvement += 1
                     if (
@@ -237,13 +257,26 @@ class Trainer:
         return self.state
 
     def save_checkpoint(self, path: str | Path) -> None:
+        local_rng = {
+            "cpu": torch.get_rng_state().cpu(),
+            "cuda": (
+                torch.cuda.get_rng_state(self.device).cpu()
+                if self.device.type == "cuda" else None
+            ),
+        }
+        rng_by_rank: list[dict[str, Tensor]] | None = None
+        if torch.distributed.is_initialized():
+            rng_by_rank = [None] * torch.distributed.get_world_size() if self.is_primary else None  # type: ignore[list-item]
+            torch.distributed.gather_object(local_rng, rng_by_rank, dst=0)
+        else:
+            rng_by_rank = [local_rng]
         if not self.is_primary:
             return
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         source = self.model.module if hasattr(self.model, "module") else self.model
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "model": source.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler else None,
@@ -253,6 +286,7 @@ class Trainer:
             "config": asdict(self.config),
             "rng_cpu": torch.get_rng_state(),
             "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "rng_by_rank": rng_by_rank,
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
         torch.save(payload, temporary)
@@ -272,6 +306,13 @@ class Trainer:
         # ``map_location=self.device`` also moves serialized RNG byte tensors
         # to CUDA.  PyTorch's RNG restoration APIs require CPU ByteTensors even
         # when restoring the per-device CUDA generators.
-        torch.set_rng_state(payload["rng_cpu"].cpu())
-        if torch.cuda.is_available() and payload["rng_cuda"] is not None:
-            torch.cuda.set_rng_state_all([state.cpu() for state in payload["rng_cuda"]])
+        per_rank = payload.get("rng_by_rank")
+        if per_rank and self.rank < len(per_rank):
+            torch.set_rng_state(per_rank[self.rank]["cpu"].cpu())
+            cuda_rng = per_rank[self.rank].get("cuda")
+            if self.device.type == "cuda" and cuda_rng is not None:
+                torch.cuda.set_rng_state(cuda_rng.cpu(), self.device)
+        else:
+            torch.set_rng_state(payload["rng_cpu"].cpu())
+            if torch.cuda.is_available() and payload["rng_cuda"] is not None:
+                torch.cuda.set_rng_state_all([state.cpu() for state in payload["rng_cuda"]])

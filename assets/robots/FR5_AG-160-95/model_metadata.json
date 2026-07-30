@@ -1,0 +1,37 @@
+{
+  "source_file": "source/AG95.step",
+  "tessellated_source": "source/AG95.glb",
+  "source_configuration": "fully_open",
+  "source_component_occurrences": 24,
+  "source_extents_m": [
+    0.16234305500984192,
+    0.1881414414391251,
+    0.06700000166893005
+  ],
+  "urdf": "urdf/fr5_ag160_95.urdf",
+  "kinematic_model": "ag95_parallel_linkage_ros_reference_v3",
+  "kinematic_reference": "ian-chuang/dh_ag95_gripper_ros2, adapted and mass-normalized",
+  "reference_urdf_unscaled_mass_kg": 1.2605622160094558,
+  "ag_mass_kg": 1.0,
+  "controlled_gripper_joint": "left_outer_knuckle_joint",
+  "coupled_gripper_joints": [
+    "left_outer_knuckle_joint",
+    "left_finger_joint",
+    "left_inner_knuckle_joint",
+    "right_outer_knuckle_joint",
+    "right_finger_joint",
+    "right_inner_knuckle_joint"
+  ],
+  "gripper_joint_open_rad": 0.0,
+  "gripper_joint_closed_rad": 0.93,
+  "fr5_flange_to_ag_mount_m": [
+    0.0,
+    0.0,
+    0.12
+  ],
+  "tcp_from_ag_mount_m": [
+    0.0,
+    0.0,
+    0.19
+  ]
+}

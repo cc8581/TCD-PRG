@@ -2,10 +2,10 @@ defaults:
   - _self_
 
 dataset:
-  root: G:/cc/抓取数据集/self-built-task-oriented-clusster-sense-dataset/TaskOrientedClutterSceneDataset
-  acronym_root: G:/cc/抓取数据集/ACRONYM
-  functional_region_root: G:/cc/抓取数据集/self-built-task-oriented-clusster-sense-dataset/Grasp_20_class_object_3D_model/data/manual_function_regions_v1
-  fr5_ag_urdf: D:/pycharm/Project/FR5_AG-160-95/urdf/fr5_ag160_95.urdf
+  root: ${oc.env:TCD_DATASET_ROOT,data/TaskOrientedClutterSceneDataset}
+  acronym_root: ${oc.env:TCD_ACRONYM_ROOT,data/ACRONYM}
+  functional_region_root: ${oc.env:TCD_FUNCTIONAL_REGION_ROOT,data/manual_function_regions_v1}
+  fr5_ag_urdf: ${oc.env:TCD_ROBOT_URDF,assets/robots/FR5_AG-160-95/urdf/fr5_ag160_95.urdf}
   adapter: task_oriented_clutter
   scene_subdir: task_clutter_scenes_20_categories
   step_labels_subdir: task_training_labels_steps1_6_v1
@@ -23,17 +23,19 @@ observation:
   render_height: 200
   camera_profile: mecheye_pro_s_three_view
   renderer_version: tcd_prg_pybullet_v1
-  pybullet_python: D:/Anaconda/envs/gapg/python.exe
+  pybullet_python: ${oc.env:TCD_PYBULLET_PYTHON,python}
   worker_script: scripts/render_observation_worker_py38.py
-  runtime_mesh_root: D:/codex/pybullet_cache/TaskOrientedManipulationDataset/runtime_mesh_cache_v1
+  runtime_mesh_root: runtime/cache/meshes
   gripper_worker_script: scripts/sample_gripper_worker_py38.py
-  gripper_cache_dir: D:/codex/TCD-PRG/cache/grippers
+  gripper_cache_dir: runtime/cache/grippers
   allow_render_on_cache_miss: false
   certification_worker_script: scripts/certify_actions_worker_py38.py
+  render_temporary_root: runtime/tmp/render_requests
+  certification_temporary_root: runtime/tmp/certification
 
 cache:
   enabled: true
-  directory: D:/codex/TCD-PRG/cache/observations
+  directory: runtime/cache/observations
   max_gb: 100
   eviction: lru
   prefetch_workers: 4
@@ -158,6 +160,7 @@ training:
   frozen_modules: []
   unfreeze_at_optimizer_step: null
   ddp_backend: auto
+  ddp_find_unused_parameters: true
 
 evaluation:
   max_preparation_actions: 5

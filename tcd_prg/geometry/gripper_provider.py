@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from .gripper import AG16095Calibration, GripperGeometry
+from tcd_prg.paths import project_path, resolve_executable
 
 
 class ExactAG16095GeometryProvider:
@@ -22,14 +23,14 @@ class ExactAG16095GeometryProvider:
                  urdf: str | Path, cache_dir: str | Path, point_count: int = 512,
                  seed: int = 2026, calibration: AG16095Calibration | None = None,
                  allow_generate: bool = True) -> None:
-        self.python_executable = Path(python_executable)
-        self.worker_script = Path(worker_script)
-        self.urdf = Path(urdf)
-        self.cache_dir = Path(cache_dir)
+        self.python_executable = resolve_executable(python_executable)
+        self.worker_script = project_path(worker_script)
+        self.urdf = project_path(urdf)
+        self.cache_dir = project_path(cache_dir)
         self.point_count, self.seed = int(point_count), int(seed)
         self.calibration = calibration or AG16095Calibration()
         self.allow_generate = bool(allow_generate)
-        for path in (self.python_executable, self.worker_script, self.urdf):
+        for path in (self.worker_script, self.urdf):
             if not path.is_file():
                 raise FileNotFoundError(path)
         if self.point_count <= 0:

@@ -1,0 +1,80 @@
+{
+  "scene_id": 0,
+  "task_index": 4,
+  "sequence_index": 0,
+  "sequence_topology_valid": true,
+  "preparation_action_count": 3,
+  "within_horizon_h5": true,
+  "transitions": [
+    {
+      "step": 0,
+      "from_state": 8,
+      "action_id": 174,
+      "to_state": 9
+    },
+    {
+      "step": 1,
+      "from_state": 9,
+      "action_id": 195,
+      "to_state": 121
+    },
+    {
+      "step": 2,
+      "from_state": 121,
+      "action_id": 202,
+      "to_state": 127
+    }
+  ],
+  "terminal_action_ids": [
+    209,
+    210,
+    211,
+    212,
+    213,
+    214,
+    215,
+    216,
+    217,
+    218,
+    219,
+    220,
+    221,
+    222,
+    223,
+    224,
+    225,
+    226,
+    227,
+    228,
+    229,
+    230,
+    231,
+    232
+  ],
+  "final_grasp_source_indices": [
+    1011,
+    498,
+    539,
+    556,
+    1993,
+    1240,
+    394,
+    1012,
+    1992,
+    540,
+    1999,
+    1781,
+    555,
+    1817,
+    261,
+    1383,
+    497,
+    1816,
+    93,
+    1006,
+    1254,
+    1088,
+    1871,
+    96
+  ]
+}

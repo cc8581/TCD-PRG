@@ -113,6 +113,10 @@ class DistributedWeightedStateSampler(Sampler[int]):
 
     def __init__(self, weights: torch.Tensor, rank: int, world_size: int,
                  total_samples: int, seed: int = 2026) -> None:
+        if weights.numel() == 0:
+            raise ValueError("weights must not be empty")
+        if total_samples <= 0:
+            raise ValueError("total_samples must be positive")
         if not 0 <= rank < world_size:
             raise ValueError("rank must be in [0, world_size)")
         self.weights, self.rank, self.world_size = weights, rank, world_size
@@ -122,9 +126,15 @@ class DistributedWeightedStateSampler(Sampler[int]):
 
     def __iter__(self):
         generator = torch.Generator().manual_seed(self.seed + self.epoch)
-        global_indices = torch.multinomial(
-            self.weights, self.total_size, replacement=True, generator=generator
-        )
+        chunks: list[torch.Tensor] = []
+        remaining = self.total_size
+        while remaining > 0:
+            permutation = torch.multinomial(
+                self.weights, len(self.weights), replacement=False, generator=generator
+            )
+            chunks.append(permutation[:remaining])
+            remaining -= min(remaining, len(permutation))
+        global_indices = torch.cat(chunks)
         return iter(global_indices[self.rank : self.total_size : self.world_size].tolist())
 
     def __len__(self) -> int:
@@ -132,3 +142,24 @@ class DistributedWeightedStateSampler(Sampler[int]):
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
+
+
+class DistributedEvaluationSampler(Sampler[int]):
+    """Shard validation exactly, without replication or padding."""
+
+    def __init__(self, size: int, rank: int, world_size: int) -> None:
+        if size < 0:
+            raise ValueError("size must be non-negative")
+        if not 0 <= rank < world_size:
+            raise ValueError("rank must be in [0, world_size)")
+        self.size = int(size)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+
+    def __iter__(self):
+        return iter(range(self.rank, self.size, self.world_size))
+
+    def __len__(self) -> int:
+        if self.rank >= self.size:
+            return 0
+        return (self.size - 1 - self.rank) // self.world_size + 1

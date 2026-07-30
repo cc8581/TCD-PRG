@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .constants import MAX_PREPARATION_ACTIONS, PUSH_DISTANCE_M
+from .paths import project_path
 
 
 @dataclass(slots=True)
@@ -14,7 +15,7 @@ class DatasetConfig:
     root: str = ""
     acronym_root: str = ""
     functional_region_root: str = ""
-    fr5_ag_urdf: str = "D:/pycharm/Project/FR5_AG-160-95/urdf/fr5_ag160_95.urdf"
+    fr5_ag_urdf: str = "assets/robots/FR5_AG-160-95/urdf/fr5_ag160_95.urdf"
     adapter: str = "task_oriented_clutter"
     scene_subdir: str = "task_clutter_scenes_20_categories"
     step_labels_subdir: str = "task_training_labels_steps1_6_v1"
@@ -34,21 +35,21 @@ class ObservationConfig:
     render_height: int = 200
     camera_profile: str = "mecheye_pro_s_three_view"
     renderer_version: str = "tcd_prg_pybullet_v1"
-    pybullet_python: str = "D:/Anaconda/envs/gapg/python.exe"
+    pybullet_python: str = "python"
     worker_script: str = "scripts/render_observation_worker_py38.py"
-    runtime_mesh_root: str = (
-        "D:/codex/pybullet_cache/TaskOrientedManipulationDataset/runtime_mesh_cache_v1"
-    )
+    runtime_mesh_root: str = "runtime/cache/meshes"
     gripper_worker_script: str = "scripts/sample_gripper_worker_py38.py"
-    gripper_cache_dir: str = "D:/codex/TCD-PRG/cache/grippers"
+    gripper_cache_dir: str = "runtime/cache/grippers"
     allow_render_on_cache_miss: bool = False
     certification_worker_script: str = "scripts/certify_actions_worker_py38.py"
+    render_temporary_root: str = "runtime/tmp/render_requests"
+    certification_temporary_root: str = "runtime/tmp/certification"
 
 
 @dataclass(slots=True)
 class CacheConfig:
     enabled: bool = True
-    directory: str = "D:/codex/TCD-PRG/cache/observations"
+    directory: str = "runtime/cache/observations"
     max_gb: float = 100.0
     eviction: str = "lru"
     prefetch_workers: int = 4
@@ -164,6 +165,7 @@ class TrainingConfig:
     frozen_modules: tuple[str, ...] = ()
     unfreeze_at_optimizer_step: int | None = None
     ddp_backend: str = "auto"
+    ddp_find_unused_parameters: bool = True
 
 
 @dataclass(slots=True)
@@ -313,8 +315,6 @@ class TCDPRGConfig:
             raise ValueError("Only deterministic LRU cache eviction is supported")
         if self.pick_remove.macro_action and not self.pick_remove.deactivate_after_success:
             raise ValueError("PICK_REMOVE macro action must leave the object inactive")
-        if self.dataset.root and not Path(self.dataset.root).exists():
-            raise FileNotFoundError(self.dataset.root)
 
 
 def load_config(path: str | Path, overrides: list[str] | None = None) -> TCDPRGConfig:
@@ -331,5 +331,34 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> TCDPRGC
     config = OmegaConf.to_object(merged)
     if not isinstance(config, TCDPRGConfig):
         raise TypeError("Structured configuration did not produce TCDPRGConfig")
+    # Source configuration remains portable. At runtime, path-bearing fields
+    # are made absolute relative to the repository, not the launch directory.
+    path_fields = (
+        (config.dataset, "root"),
+        (config.dataset, "acronym_root"),
+        (config.dataset, "functional_region_root"),
+        (config.dataset, "fr5_ag_urdf"),
+        (config.observation, "worker_script"),
+        (config.observation, "runtime_mesh_root"),
+        (config.observation, "gripper_worker_script"),
+        (config.observation, "gripper_cache_dir"),
+        (config.observation, "certification_worker_script"),
+        (config.observation, "render_temporary_root"),
+        (config.observation, "certification_temporary_root"),
+        (config.cache, "directory"),
+        (config.baseline, "gapg_root"),
+        (config.baseline, "grasp_checkpoint"),
+        (config.baseline, "push_checkpoint"),
+        (config.baseline, "graspnet_checkpoint"),
+        (config, "output_dir"),
+    )
+    for owner, name in path_fields:
+        value = getattr(owner, name)
+        if value:
+            setattr(owner, name, str(project_path(value)))
+    if config.backbone.pretrained_checkpoint:
+        config.backbone.pretrained_checkpoint = str(
+            project_path(config.backbone.pretrained_checkpoint)
+        )
     config.validate()
     return config

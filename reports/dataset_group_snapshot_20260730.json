@@ -1,0 +1,10 @@
+{
+  "completed_scene_files_snapshot": 2480,
+  "scenes_by_split": {
+    "train": 2480
+  },
+  "action_state_groups_by_split": {
+    "train": 275286
+  },
+  "total_action_state_groups": 275286
+}

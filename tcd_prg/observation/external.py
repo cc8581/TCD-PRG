@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from .base import ObservationProvider, ObservationRequest, PointObservation
+from tcd_prg.paths import project_path, resolve_executable
 
 
 class ExternalPyBulletObservationProvider(ObservationProvider):
@@ -22,17 +23,16 @@ class ExternalPyBulletObservationProvider(ObservationProvider):
         runtime_mesh_root: str | Path,
         width: int = 320,
         height: int = 200,
-        temporary_root: str | Path = "D:/codex/TCD-PRG/render_requests",
+        temporary_root: str | Path = "runtime/tmp/render_requests",
     ) -> None:
-        self.python_executable = Path(python_executable)
-        self.worker_script = Path(worker_script)
-        self.scene_root = Path(scene_root)
-        self.runtime_mesh_root = Path(runtime_mesh_root)
+        self.python_executable = resolve_executable(python_executable)
+        self.worker_script = project_path(worker_script)
+        self.scene_root = project_path(scene_root)
+        self.runtime_mesh_root = project_path(runtime_mesh_root)
         self.width = int(width)
         self.height = int(height)
-        self.temporary_root = Path(temporary_root)
+        self.temporary_root = project_path(temporary_root)
         for path in (
-            self.python_executable,
             self.worker_script,
             self.scene_root,
             self.runtime_mesh_root,

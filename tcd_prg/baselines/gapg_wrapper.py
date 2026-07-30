@@ -13,6 +13,7 @@ import numpy as np
 
 from tcd_prg.constants import ActionType
 from tcd_prg.datasets.types import SceneObservation
+from tcd_prg.paths import project_path, resolve_executable
 
 from .base import ManipulationPolicy
 
@@ -64,14 +65,14 @@ class GAPGPolicyWrapper(ManipulationPolicy):
         push_checkpoint: str | Path,
         graspnet_checkpoint: str | Path,
         *,
-        python: str | Path = "D:/Anaconda/envs/gapg/python.exe",
+        python: str | Path = "python",
         graspnet_baseline: str | Path = ".deps/graspnet-baseline",
         graspnet_api: str | Path = ".deps/graspnetAPI",
         worker: str | Path = "scripts/run_gapg_baseline_worker_py38.py",
         seed: int = 2026,
         device: str = "cuda",
     ) -> None:
-        root = Path(repository).resolve()
+        root = project_path(repository)
 
         def rooted(value: str | Path) -> Path:
             path = Path(value)
@@ -79,7 +80,7 @@ class GAPGPolicyWrapper(ManipulationPolicy):
 
         self.paths = GAPGPaths(
             repository=root,
-            python=Path(python).resolve(),
+            python=resolve_executable(python, must_exist=False),
             graspnet_baseline=rooted(graspnet_baseline),
             graspnet_api=rooted(graspnet_api),
             grasp_checkpoint=rooted(grasp_checkpoint),
