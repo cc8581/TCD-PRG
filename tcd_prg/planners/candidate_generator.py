@@ -48,6 +48,23 @@ class DenseCandidateGenerator:
         candidates = torch.cat(selected)
         return candidates[score[candidates].topk(min(total, len(candidates))).indices]
 
+    def _with_graph_fallback(self, eligible: Tensor, domain: Tensor, score: Tensor) -> Tensor:
+        """Keep graph actionability hard, plus a bounded recovery frontier.
+
+        Published labels omit some task edges even for successful sequences.
+        One high-scoring non-graph object is therefore retained so a missing
+        predicted edge cannot make the closed-loop policy irrecoverable.
+        """
+
+        amount = self.config.graph_candidate_fallback_objects
+        fallback_domain = domain & ~eligible
+        if amount and fallback_domain.any():
+            indices = torch.nonzero(fallback_domain, as_tuple=False).flatten()
+            selected = indices[score[indices].topk(min(amount, len(indices))).indices]
+            eligible = eligible.clone()
+            eligible[selected] = True
+        return eligible
+
     def generate(self, model: Any, batch: dict[str, Tensor], output: dict[str, Any]) -> dict[str, Tensor]:
         """Return padded tensors and learned candidate tokens for one encoded batch."""
 
@@ -56,6 +73,12 @@ class DenseCandidateGenerator:
         for batch_row in range(batch["xyz"].shape[0]):
             xyz, instance = batch["xyz"][batch_row], batch["instance_id"][batch_row]
             active = batch["object_mask"][batch_row] & batch["object_active"][batch_row]
+            if output["graph"] is not None:
+                actionable = output["graph"].derived_actionable_mask[batch_row]
+            else:
+                # No-graph ablation intentionally falls back to all active
+                # objects; the full method always uses the derived hard mask.
+                actionable = active
             target_object = int(batch["target_object"][batch_row])
             type_parts, object_parts, contact_parts, direction_parts, point_index_parts = [], [], [], [], []
             pose_parts, destination_parts, width_parts, score_parts, approach_parts = [], [], [], [], []
@@ -91,8 +114,15 @@ class DenseCandidateGenerator:
                 torch.sigmoid(generic["contact_logits"][batch_row])
                 * torch.sigmoid(generic["proposal_confidence_logit"][batch_row])
             )
-            remove_objects = torch.nonzero(active, as_tuple=False).flatten()
-            remove_objects = remove_objects[remove_objects != target_object]
+            remove_domain = active.clone()
+            remove_domain[target_object] = False
+            remove_eligible = active & actionable & remove_domain
+            if output["graph"] is not None:
+                remove_eligible = self._with_graph_fallback(
+                    remove_eligible, remove_domain,
+                    output["pick_remove"]["object_logits"][batch_row],
+                )
+            remove_objects = torch.nonzero(remove_eligible, as_tuple=False).flatten()
             if output["graph"] is not None and len(remove_objects):
                 priority = output["graph"].actionable_blocker_logits[batch_row, remove_objects]
                 remove_objects = remove_objects[priority.argsort(descending=True)]
@@ -118,7 +148,15 @@ class DenseCandidateGenerator:
                 point_index_parts.append(remove_index)
 
             push = output["push"]
-            push_objects = torch.nonzero(active, as_tuple=False).flatten()
+            # Target PUSH remains legal for self-pose blockage when the
+            # predicted task graph places the target on the actionable frontier.
+            push_eligible = active & actionable
+            if output["graph"] is not None:
+                push_eligible[target_object] = active[target_object]
+                push_eligible = self._with_graph_fallback(
+                    push_eligible, active, push["object_logits"][batch_row]
+                )
+            push_objects = torch.nonzero(push_eligible, as_tuple=False).flatten()
             if len(push_objects):
                 push_objects = push_objects[
                     push["object_logits"][batch_row, push_objects].argsort(descending=True)
@@ -143,7 +181,7 @@ class DenseCandidateGenerator:
                 destination_parts.append(torch.full((len(push_index), 3), float("nan"), device=xyz.device))
                 width_parts.append(torch.full((len(push_index),), float("nan"), device=xyz.device))
                 score_parts.append(torch.sigmoid(push["contact_logits"][batch_row, push_index]))
-                approach_parts.append(push["approach_logits"][batch_row, push_index].argmax(-1))
+                approach_parts.append(torch.full_like(push_index, -1))
                 point_index_parts.append(push_index)
 
             if type_parts:
@@ -215,9 +253,6 @@ class DenseCandidateGenerator:
                 kind = int(result["type"][row, candidate])
                 evidence[row, candidate, 15] = result["proposal_score"][row, candidate]
                 if kind == int(ActionType.PUSH):
-                    evidence[row, candidate, :7] = torch.softmax(
-                        output["push"]["outcome_logits"][row, point], -1
-                    )
                     evidence[row, candidate, 7:12] = output["push"]["potential_delta"][row, point]
                     evidence[row, candidate, 12:15] = torch.sigmoid(
                         output["push"]["risk_logits"][row, point]

@@ -23,7 +23,6 @@ from .metrics import (
     dice_score,
     direction_angle_error_deg,
     intersection_over_union,
-    macro_f1,
     ndcg,
 )
 
@@ -108,7 +107,7 @@ class OfflineModelEvaluator:
             evaluated = self._numpy(
                 batch["evaluation_status"][row] != int(CandidateStatus.UNKNOWN_UNTESTED)
             ).astype(bool)
-            success = self._numpy(batch["success_mask"][row]).astype(bool)
+            success = self._numpy(batch["policy_success_mask"][row]).astype(bool)
             action_type = self._numpy(batch["action_type"][row]).astype(int)
             acted_object = self._numpy(batch["acted_object"][row]).astype(int)
             if selected is not None and int(selected[row]) >= 0:
@@ -166,12 +165,15 @@ class OfflineModelEvaluator:
                 sample.state_labels.verified_positive_grasp_count
                 >= sample.state_labels.required_grasp_count
             )
+            state_prediction = output["state_graspability"]
+            predicted_direct = bool(
+                self._numpy(torch.sigmoid(state_prediction["graspable_logit"][row])) >= 0.5
+                and self._numpy(state_prediction["verified_count_prediction"][row])
+                >= float(batch["required_grasp_count"][row])
+            )
+            record["state_graspability_accuracy"] = float(predicted_direct == graspable)
+            record["direct_grasp_false_positive"] = float(predicted_direct and not graspable)
             if output["verifier"] is not None:
-                task_grasp = candidate_valid & (action_type == int(ActionType.TASK_GRASP))
-                overall = self._numpy(output["verifier"]["overall_logit"][row])
-                predicted_direct = bool(np.any((overall >= 0) & task_grasp))
-                record["state_graspability_accuracy"] = float(predicted_direct == graspable)
-                record["direct_grasp_false_positive"] = float(predicted_direct and not graspable)
                 verifier_labels = build_verifier_labels(batch)
                 for head in ("stability", "task_compatibility", "collision", "clearance",
                              "approach", "overall"):
@@ -221,11 +223,6 @@ class OfflineModelEvaluator:
                 errors = [direction_angle_error_deg(predicted_direction[index], label_direction[index, :2])
                           for index in np.flatnonzero(push_parameter_valid)]
                 record["push_direction_angle_error_deg"] = float(np.mean(errors))
-                approach_valid = self._numpy(push_labels["approach_valid"][row]).astype(bool)
-                record["push_approach_accuracy"] = self._masked_accuracy(
-                    self._numpy(push_prediction["approach_logits"][row]).argmax(-1),
-                    self._numpy(push_labels["approach_mode"][row]).astype(int), approach_valid,
-                )
                 predicted_contact = int(self._numpy(output["push"]["contact_logits"][row]).argmax())
                 contacts = self._numpy(batch["action_parameters"]["push_contact_world"][row])
                 valid_contacts = contacts[push_parameter_valid]
@@ -234,11 +231,6 @@ class OfflineModelEvaluator:
                     record["push_contact_distance_error_m"] = float(
                         np.linalg.norm(valid_contacts - point[None], axis=1).min()
                     )
-            outcome_valid = self._numpy(push_labels["outcome_valid"][row]).astype(bool)
-            record["push_outcome_macro_f1"] = macro_f1(
-                self._numpy(push_prediction["outcome_logits"][row]).argmax(-1),
-                self._numpy(push_labels["outcome_code"][row]).astype(int), outcome_valid, 7,
-            )
             potential_valid = self._numpy(push_labels["potential_after_valid"][row]).astype(bool)
             if potential_valid.any():
                 error = np.abs(
@@ -269,14 +261,6 @@ class OfflineModelEvaluator:
                 )
                 record["remove_grasp_recall_at_5"] = self._recall_at_k(
                     remove_score, remove_positive.astype(bool), remove_valid, 5
-                )
-                remove_outcome_valid = self._numpy(
-                    remove_labels["outcome_valid"][row]
-                ).astype(bool)
-                record["remove_outcome_macro_f1"] = macro_f1(
-                    self._numpy(output["pick_remove"]["outcome_logits"][row]).argmax(-1),
-                    self._numpy(remove_labels["outcome_code"][row]).astype(int),
-                    remove_outcome_valid, 7,
                 )
             if "_inference_time_s_per_sample" in output:
                 record["planning_time_s"] = float(output["_inference_time_s_per_sample"])

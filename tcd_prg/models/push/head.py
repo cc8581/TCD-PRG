@@ -1,4 +1,4 @@
-"""Fixed-distance PUSH object/contact/direction/outcome/potential/risk head."""
+"""Fixed-distance PUSH object/contact/direction with potential/risk auxiliaries."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from torch import Tensor, nn
 class PushHead(nn.Module):
     RISK_NAMES = ("unstable", "out_of_workspace", "other_invalid")
 
-    def __init__(self, dim: int = 256, direction_bins: int = 16, outcomes: int = 7, potential_dim: int = 5) -> None:
+    def __init__(self, dim: int = 256, direction_bins: int = 16, potential_dim: int = 5) -> None:
         super().__init__()
         self.direction_bins = direction_bins
         self.object_pointer = nn.Sequential(nn.Linear(3 * dim, dim), nn.GELU(), nn.Linear(dim, 1))
@@ -17,8 +17,10 @@ class PushHead(nn.Module):
         self.contact = nn.Linear(dim, 1)
         self.direction = nn.Linear(dim, direction_bins)
         self.direction_residual = nn.Linear(dim, 2)
-        self.approach = nn.Linear(dim, 2)
-        self.outcome = nn.Linear(dim, outcomes)
+        # Contact establishment and the fixed 0.15 m trajectory belong to the
+        # deterministic execution layer.  The learned PUSH primitive predicts
+        # only the acted object, contact and planar direction, with optional
+        # potential/risk auxiliaries.
         self.potential = nn.Linear(dim, potential_dim)
         self.risk = nn.Linear(dim, len(self.RISK_NAMES))
 
@@ -61,9 +63,6 @@ class PushHead(nn.Module):
             "contact_logits": contact,
             "direction_logits": self.direction(x),
             "direction_residual": torch.tanh(self.direction_residual(x)),
-            "approach_logits": self.approach(x),
-            "outcome_logits": self.outcome(x),
             "potential_delta": self.potential(x),
             "risk_logits": self.risk(x),
         }
-

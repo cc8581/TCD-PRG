@@ -1,6 +1,9 @@
 import torch
 
 from tcd_prg.losses.masked import multi_positive_listwise_loss, safe_smooth_l1
+from tcd_prg.config import AblationConfig
+from tcd_prg.datasets.capabilities import DatasetCapabilities
+from tcd_prg.losses.total import MultiTaskLoss
 
 
 def test_nan_loss_is_masked() -> None:
@@ -38,3 +41,14 @@ def test_sequence_topology_mask_only_masks_order_loss() -> None:
     action = safe_bce_with_logits(logits, torch.zeros_like(logits), torch.ones_like(topology_valid))
     assert topology == 0
     assert action > 0
+
+
+def test_multitask_total_uses_family_subtotal_only() -> None:
+    loss = MultiTaskLoss(
+        DatasetCapabilities(has_task_grasps=True), AblationConfig(), {"proposal": 3.0}
+    )
+    total, logged = loss({
+        "proposal": {"loss": torch.tensor(2.0), "proposal_detail": torch.tensor(100.0)}
+    })
+    assert total.item() == 6.0
+    assert logged["proposal_detail"].item() == 100.0

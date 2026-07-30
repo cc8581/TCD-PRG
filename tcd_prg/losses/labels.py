@@ -67,7 +67,7 @@ def build_grasp_proposal_labels(
     batch_size, point_count = xyz.shape[:2]
     parameters = batch["action_parameters"]
     candidate = batch["candidate_mask"] & (batch["action_type"] == action_kind)
-    candidate &= parameters.get(
+    geometry_positive = parameters.get(
         "proposal_geometry_valid", torch.ones_like(candidate)
     ).bool()
     pose = parameters[pose_key]
@@ -75,32 +75,51 @@ def build_grasp_proposal_labels(
     candidate &= (
         torch.isfinite(pose).all(-1)
         & torch.isfinite(rotation).all(-1).all(-1)
-        & torch.isfinite(parameters["grasp_depth_m"])
         & torch.isfinite(parameters["grasp_width_m"])
     )
     point_index, candidate = _nearest_point_indices(
         xyz, point_domain, batch["instance_id"], pose[..., :3], batch["acted_object"], candidate
     )
-    contact_target = torch.zeros((batch_size, point_count), dtype=torch.bool, device=xyz.device)
+    contact_target = torch.zeros((batch_size, point_count), dtype=xyz.dtype, device=xyz.device)
+    proposal_valid = torch.zeros((batch_size, point_count), dtype=torch.bool, device=xyz.device)
+    mode_valid = torch.zeros_like(proposal_valid)
     approach_target = torch.full((batch_size, point_count, 3), float("nan"), device=xyz.device)
     rotation_bin = torch.full((batch_size, point_count), -1, dtype=torch.long, device=xyz.device)
-    depth_bin = torch.full((batch_size, point_count), -1, dtype=torch.long, device=xyz.device)
     width_target = torch.full((batch_size, point_count), float("nan"), device=xyz.device)
     confidence_target = torch.zeros((batch_size, point_count), device=xyz.device)
     candidate_rotation_bin = _rotation_bins(torch.nan_to_num(rotation), config.num_grasp_rotation_bins)
-    edges = torch.tensor(config.grasp_depth_bin_edges_m[1:-1], device=xyz.device)
-    candidate_depth_bin = torch.bucketize(torch.nan_to_num(parameters["grasp_depth_m"]), edges)
+    selected_confidence = torch.full(
+        (batch_size, point_count), -float("inf"), dtype=xyz.dtype, device=xyz.device
+    )
+    sigma_sq = float(config.contact_heatmap_sigma_m) ** 2
+    support_sq = 9.0 * sigma_sq
     for row in range(batch_size):
         for candidate_index in torch.nonzero(candidate[row], as_tuple=False).flatten().tolist():
             point = int(point_index[row, candidate_index])
-            contact_target[row, point] = True
-            approach_target[row, point] = parameters["grasp_approach_world"][row, candidate_index]
-            rotation_bin[row, point] = candidate_rotation_bin[row, candidate_index]
-            depth_bin[row, point] = candidate_depth_bin[row, candidate_index]
-            width_target[row, point] = parameters["grasp_width_m"][row, candidate_index]
-            confidence_target[row, point] = torch.nan_to_num(
+            object_index = int(batch["acted_object"][row, candidate_index])
+            domain = point_domain[row] & (batch["instance_id"][row] == object_index)
+            delta = xyz[row] - pose[row, candidate_index, :3]
+            distance_sq = (delta * delta).sum(-1)
+            neighborhood = domain & (distance_sq <= support_sq)
+            proposal_valid[row] |= neighborhood
+            if not bool(geometry_positive[row, candidate_index]):
+                continue
+            heat = torch.exp(-0.5 * distance_sq / sigma_sq) * neighborhood
+            contact_target[row] = torch.maximum(contact_target[row], heat)
+            confidence = torch.nan_to_num(
                 parameters["grasp_confidence"][row, candidate_index], nan=1.0
             )
+            # A single dense point cannot represent two rotation/width modes.
+            # Select the highest-confidence candidate deterministically instead
+            # of silently overwriting it with iteration order.
+            if confidence <= selected_confidence[row, point]:
+                continue
+            selected_confidence[row, point] = confidence
+            mode_valid[row, point] = True
+            approach_target[row, point] = parameters["grasp_approach_world"][row, candidate_index]
+            rotation_bin[row, point] = candidate_rotation_bin[row, candidate_index]
+            width_target[row, point] = parameters["grasp_width_m"][row, candidate_index]
+            confidence_target[row, point] = confidence
     if generic_remove:
         compatibility_target = point_domain
         compatibility_valid = point_domain
@@ -108,11 +127,11 @@ def build_grasp_proposal_labels(
         compatibility_target = batch.get("region_target", contact_target).bool()
         compatibility_valid = batch.get("region_valid", point_domain).bool() & point_domain
     return {
-        "proposal_valid": point_domain,
+        "proposal_valid": proposal_valid,
         "contact_target": contact_target,
+        "mode_valid": mode_valid,
         "approach_target": approach_target,
         "rotation_bin": rotation_bin,
-        "depth_bin": depth_bin,
         "width_target_m": width_target,
         "width_valid": torch.isfinite(width_target)
         & (width_target >= config.min_grasp_width_m)
@@ -161,8 +180,6 @@ def build_push_supervision(
         "contact_logits": output["contact_logits"],
         "direction_logits": output["direction_logits"][row, point_index],
         "direction_residual": output["direction_residual"][row, point_index],
-        "approach_logits": output["approach_logits"][row, point_index],
-        "outcome_logits": output["outcome_logits"][row, point_index],
         "potential_delta": output["potential_delta"][row, point_index],
         "risk_logits": output["risk_logits"][row, point_index],
     }
@@ -174,18 +191,28 @@ def build_push_supervision(
     direction_bin = torch.floor(angle * bins / (2 * math.pi)).long().remainder(bins)
     center_angle = (direction_bin.float() + 0.5) * 2 * math.pi / bins
     center = torch.stack((torch.cos(center_angle), torch.sin(center_angle)), -1)
-    contact_target = torch.zeros_like(output["contact_logits"], dtype=torch.bool)
+    contact_target = torch.zeros_like(output["contact_logits"])
+    contact_valid = torch.zeros_like(output["contact_logits"], dtype=torch.bool)
+    sigma_sq = float(batch.get("contact_heatmap_sigma_m", 0.008)) ** 2
+    support_sq = 9.0 * sigma_sq
     for batch_row in range(action_type.shape[0]):
-        contact_target[batch_row, point_index[batch_row, parameter_valid[batch_row]]] = True
-    actionable_objects = torch.zeros_like(batch["object_mask"])
-    for batch_row in range(action_type.shape[0]):
-        objects = batch["acted_object"][batch_row, parameter_valid[batch_row]]
-        actionable_objects[batch_row, objects[objects >= 0]] = True
-    contact_valid = batch["point_mask"] & actionable_objects.gather(
-        1, batch["instance_id"].clamp(0, actionable_objects.shape[1] - 1)
-    )
+        for candidate_index in torch.nonzero(
+            parameter_valid[batch_row], as_tuple=False
+        ).flatten().tolist():
+            object_index = int(batch["acted_object"][batch_row, candidate_index])
+            domain = batch["point_mask"][batch_row] & (
+                batch["instance_id"][batch_row] == object_index
+            )
+            delta = batch["xyz"][batch_row] - parameters["push_contact_world"][
+                batch_row, candidate_index
+            ]
+            distance_sq = (delta * delta).sum(-1)
+            neighborhood = domain & (distance_sq <= support_sq)
+            contact_valid[batch_row] |= neighborhood
+            heat = torch.exp(-0.5 * distance_sq / sigma_sq) * neighborhood
+            contact_target[batch_row] = torch.maximum(contact_target[batch_row], heat)
     evaluated = batch["evaluation_status"] != int(CandidateStatus.UNKNOWN_UNTESTED)
-    positive = batch["success_mask"] & candidate
+    positive = batch["action_improves_state"] & candidate
     object_positive = torch.zeros_like(batch["object_mask"])
     for batch_row in range(action_type.shape[0]):
         objects = batch["acted_object"][batch_row, positive[batch_row]]
@@ -206,10 +233,6 @@ def build_push_supervision(
         "direction_bin": direction_bin,
         "direction_residual": direction[..., :2] - center,
         "direction_valid": parameter_valid,
-        "approach_mode": parameters["push_approach_mode"],
-        "approach_valid": parameter_valid & (parameters["push_approach_mode"] >= 0),
-        "outcome_code": batch["outcome_code"],
-        "outcome_valid": candidate & evaluated & (batch["outcome_code"] >= 0),
         "potential_delta": batch["potential_delta"],
         "potential_after_valid": candidate & batch["potential_after_valid"],
         "risk_target": risk_target,
@@ -223,7 +246,7 @@ def build_push_supervision(
 def build_remove_labels(batch: dict[str, Tensor]) -> dict[str, Tensor]:
     candidate = batch["candidate_mask"] & (batch["action_type"] == int(ActionType.PICK_REMOVE))
     evaluated = batch["evaluation_status"] != int(CandidateStatus.UNKNOWN_UNTESTED)
-    positive = candidate & batch["success_mask"]
+    positive = candidate & batch["action_improves_state"]
     object_positive = torch.zeros_like(batch["object_mask"])
     for row in range(candidate.shape[0]):
         objects = batch["acted_object"][row, positive[row]]
@@ -233,8 +256,6 @@ def build_remove_labels(batch: dict[str, Tensor]) -> dict[str, Tensor]:
         "object_valid_mask": batch["object_mask"] & batch["object_active"],
         "candidate_positive": positive,
         "candidate_valid": candidate & evaluated,
-        "outcome_code": batch["outcome_code"],
-        "outcome_valid": candidate & evaluated & (batch["outcome_code"] >= 0),
     }
 
 

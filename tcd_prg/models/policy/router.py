@@ -84,7 +84,17 @@ class MaskedHierarchicalCandidateRouter(nn.Module):
         safe_object = candidate_object.clamp(0, object_tokens.shape[1] - 1)
         row = torch.arange(b, device=candidate_tokens.device)[:, None]
         enriched = candidate_tokens + self.action_embedding(safe_type) + object_tokens[row, safe_object]
-        encoded = self.candidate_transformer(enriched, src_key_padding_mask=~candidate_valid)
+        padding_mask = ~candidate_valid
+        all_invalid = ~candidate_valid.any(-1)
+        if all_invalid.any():
+            # PyTorch attention can emit NaN when every key is padded.  Expose
+            # one zero-valued sentinel internally while keeping the public
+            # validity mask entirely false.
+            padding_mask = padding_mask.clone()
+            padding_mask[all_invalid, 0] = False
+            enriched = enriched.clone()
+            enriched[all_invalid, 0] = 0.0
+        encoded = self.candidate_transformer(enriched, src_key_padding_mask=padding_mask)
         candidate_context = torch.cat(
             (
                 encoded,
@@ -170,10 +180,15 @@ class FlatCandidateClassifier(nn.Module):
             else torch.zeros_like(task_token)
         )
         remaining = self.remaining_embedding(remaining_steps.clamp(0, 5))
-        encoded = self.transformer(
-            candidate_tokens + self.action_embedding(safe_type) + object_tokens[row, safe_object],
-            src_key_padding_mask=~candidate_valid,
-        )
+        enriched = candidate_tokens + self.action_embedding(safe_type) + object_tokens[row, safe_object]
+        padding_mask = ~candidate_valid
+        all_invalid = ~candidate_valid.any(-1)
+        if all_invalid.any():
+            padding_mask = padding_mask.clone()
+            padding_mask[all_invalid, 0] = False
+            enriched = enriched.clone()
+            enriched[all_invalid, 0] = 0.0
+        encoded = self.transformer(enriched, src_key_padding_mask=padding_mask)
         context = torch.cat(
             (
                 encoded,

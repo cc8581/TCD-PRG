@@ -1,15 +1,14 @@
-"""Object pointer, grasp ranking and macro outcome for PICK_REMOVE."""
+"""Object pointer and removal-grasp ranking for PICK_REMOVE."""
 
 import torch
 from torch import Tensor, nn
 
 
 class PickRemoveHead(nn.Module):
-    def __init__(self, dim: int = 256, outcomes: int = 7) -> None:
+    def __init__(self, dim: int = 256) -> None:
         super().__init__()
         self.object_pointer = nn.Sequential(nn.Linear(3 * dim, dim), nn.GELU(), nn.Linear(dim, 1))
         self.candidate_rank = nn.Sequential(nn.Linear(4 * dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, 1))
-        self.outcome = nn.Sequential(nn.Linear(4 * dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, outcomes))
 
     def forward(
         self,
@@ -31,9 +30,7 @@ class PickRemoveHead(nn.Module):
             graph = graph_context[row, candidate_object.clamp(0, graph_context.shape[1] - 1)]
             context = torch.cat((candidate_tokens, acted, graph, task_token[:, None].expand_as(candidate_tokens)), -1)
             score = self.candidate_rank(context).squeeze(-1)
-            outcome = self.outcome(context)
             if candidate_mask is not None:
                 score = score.masked_fill(~candidate_mask, -30.0)
-            result.update(candidate_logits=score, outcome_logits=outcome, candidate_tokens=context[..., : candidate_tokens.shape[-1]])
+            result.update(candidate_logits=score, candidate_tokens=context[..., : candidate_tokens.shape[-1]])
         return result
-

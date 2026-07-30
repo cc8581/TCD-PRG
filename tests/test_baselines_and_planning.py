@@ -10,6 +10,10 @@ from tcd_prg.baselines import GAPGPolicyWrapper, OneShotSequencePolicy
 from tcd_prg.config import ModelConfig
 from tcd_prg.constants import ActionType
 from tcd_prg.planners import ClosedLoopPlanner, DenseCandidateGenerator
+from tcd_prg.planners.tcd_policy import (
+    apply_verified_candidate_count_gate,
+    predicted_state_graspability_gate,
+)
 
 
 def test_gapg_wrapper_reports_every_missing_external_dependency(tmp_path) -> None:
@@ -38,7 +42,6 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
     push = {
         "object_logits": torch.zeros(1, 1), "contact_logits": torch.zeros(1, 4),
         "direction_logits": torch.zeros(1, 4, 16), "direction_residual": torch.zeros(1, 4, 2),
-        "approach_logits": torch.zeros(1, 4, 2), "outcome_logits": torch.zeros(1, 4, 7),
         "potential_delta": torch.zeros(1, 4, 5), "risk_logits": torch.zeros(1, 4, 3),
     }
     encoded = SimpleNamespace(object_tokens=torch.zeros(1, 1, 8), task_token=torch.zeros(1, 8))
@@ -54,6 +57,70 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
     })
     assert result["type"].shape == (1, 1)
     assert not result["valid"].any()
+
+
+def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
+    config = ModelConfig(
+        feature_dim=8, task_dim=4, task_grasp_candidates=0,
+        pick_remove_candidates=8, push_candidates=8,
+        graph_candidate_fallback_objects=1,
+    )
+    generator = DenseCandidateGenerator(config)
+    instance = torch.tensor([[0, 0, 1, 1, 2, 2, 3, 3]])
+    batch = {
+        "xyz": torch.randn(1, 8, 3), "instance_id": instance,
+        "object_mask": torch.ones(1, 4, dtype=torch.bool),
+        "object_active": torch.ones(1, 4, dtype=torch.bool),
+        "target_object": torch.tensor([0]), "target_mask": instance == 0,
+    }
+    point_head = {
+        "contact_logits": torch.arange(8).float()[None],
+        "proposal_confidence_logit": torch.zeros(1, 8),
+        "task_compatibility_logit": torch.zeros(1, 8),
+        "rotation_logits": torch.zeros(1, 8, 12),
+        "approach_direction": torch.nn.functional.normalize(torch.ones(1, 8, 3), dim=-1),
+        "width_m": torch.full((1, 8), 0.05),
+    }
+    push = {
+        "object_logits": torch.tensor([[0.0, 1.0, 2.0, 3.0]]),
+        "contact_logits": torch.arange(8).float()[None],
+        "direction_logits": torch.zeros(1, 8, 16),
+        "direction_residual": torch.zeros(1, 8, 2),
+        "potential_delta": torch.zeros(1, 8, 5), "risk_logits": torch.zeros(1, 8, 3),
+    }
+    graph = SimpleNamespace(
+        derived_actionable_mask=torch.tensor([[False, True, False, False]]),
+        actionable_blocker_logits=torch.zeros(1, 4),
+    )
+    encoded = SimpleNamespace(object_tokens=torch.zeros(1, 4, 8), task_token=torch.zeros(1, 8))
+
+    class Model:
+        @staticmethod
+        def candidate_encoder(object_tokens, candidate_type, *args):
+            return torch.zeros(candidate_type.shape + (8,))
+
+    result = generator.generate(Model(), batch, {
+        "encoded": encoded, "task_grasp": point_head, "generic_grasp": point_head,
+        "push": push, "pick_remove": {"object_logits": push["object_logits"]}, "graph": graph,
+    })
+    preparation = result["valid"][0] & (result["type"][0] != int(ActionType.TASK_GRASP))
+    objects = set(result["object"][0, preparation].tolist())
+    assert 1 in objects  # graph-derived actionable object
+    assert 3 in objects  # exactly one highest-scoring recovery object
+    assert 2 not in objects
+
+
+def test_adaptive_task_grasp_gate_requires_state_and_candidate_counts() -> None:
+    state = {
+        "graspable_logit": torch.tensor([20.0]),
+        "verified_count_prediction": torch.tensor([20.0]),
+    }
+    assert predicted_state_graspability_gate(state, torch.tensor([20]), 0.5).item()
+    kinds = torch.tensor([[2, 2, 1]])
+    valid = torch.tensor([[True, False, True]])
+    masked, count = apply_verified_candidate_count_gate(kinds, valid, torch.tensor([2]))
+    assert count.item() == 1
+    assert masked.tolist() == [[False, False, True]]
 
 
 def test_one_shot_baseline_never_reencodes_after_initial_plan() -> None:

@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
-from tcd_prg.config import ModelConfig, TCDPRGConfig, TrainingConfig
+from tcd_prg.config import (
+    AblationConfig, BackboneConfig, GraphConfig, LossConfig, ModelConfig,
+    RegionHeadConfig, RouterConfig, TCDPRGConfig, TrainingConfig,
+)
+from tcd_prg.datasets import TaskOrientedClutterAdapter
+from tcd_prg.datasets.collate import collate_unified
+from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import TCDPRGModel
+from tcd_prg.observation.saved import SavedObservationProvider
 from tcd_prg.trainers import Trainer
 from tcd_prg.datasets.torch_dataset import (
     DistributedEvaluationSampler,
@@ -66,6 +74,25 @@ def test_checkpoint_save_resume_consistency(tmp_path, tiny_batch) -> None:
     assert all(torch.equal(reference[key], replacement.state_dict()[key]) for key in reference)
 
 
+def test_checkpoint_rejects_obsolete_schema(tmp_path, tiny_batch) -> None:
+    config = TCDPRGConfig(
+        model=ModelConfig(feature_dim=32, task_dim=16, activation_checkpointing=False),
+        training=TrainingConfig(device="cpu", amp=False),
+        output_dir=str(tmp_path),
+    )
+    model = TCDPRGModel(config.model)
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-4),
+        config,
+        lambda module, batch: (module(batch)["region"]["visibility_logit"].mean(), {}),
+    )
+    path = tmp_path / "obsolete.pt"
+    torch.save({"schema_version": 2}, path)
+    with pytest.raises(RuntimeError, match="expects schema 3"):
+        trainer.load_checkpoint(path)
+
+
 def test_amp_overflow_does_not_advance_optimizer_step(tmp_path) -> None:
     config = TCDPRGConfig(
         training=TrainingConfig(
@@ -105,6 +132,43 @@ def test_ten_batch_overfit_smoke(tiny_batch) -> None:
         optimizer.step()
         losses.append(float(loss))
     assert losses[-1] < losses[0]
+
+
+@pytest.mark.real_data
+def test_real_state_group_all_enabled_training_losses_are_finite(dataset_root) -> None:
+    scene_root = dataset_root / "task_clutter_scenes_20_categories"
+    provider = SavedObservationProvider(scene_root, scene_root / "metadata.json", 256)
+    region_root = (
+        dataset_root.parent / "Grasp_20_class_object_3D_model"
+        / "data" / "manual_function_regions_v1"
+    )
+    adapter = TaskOrientedClutterAdapter(
+        dataset_root, observation_provider=provider, point_count=256,
+        functional_region_root=region_root,
+    )
+    batch = collate_unified([adapter.load_sample(1, 0, 0, 0)])
+    config = ModelConfig(feature_dim=32, task_dim=16, activation_checkpointing=False)
+    ablation = AblationConfig(use_gripper_scene_verifier=False)
+    model = TCDPRGModel(
+        config, ablation, GraphConfig(layers=1), RouterConfig(layers=1),
+        BackboneConfig(attention_points=64),
+    )
+    objective = TCDPRGObjective(
+        adapter.capabilities, config, ablation, LossConfig(), RegionHeadConfig()
+    )
+    loss, terms = objective(model, batch)
+    assert torch.isfinite(loss)
+    assert all(torch.isfinite(value) for value in terms.values())
+    assert int(batch["policy_success_mask"].sum()) > 0
+    assert int(batch["policy_success_mask"].sum()) < int(batch["action_improves_state"].sum())
+    assert not any("approach" in key and key.startswith("push_") for key in terms)
+    assert not any("outcome" in key and key.startswith(("push_", "remove_")) for key in terms)
+    assert not any("depth" in key and "proposal" in key for key in terms)
+    loss.backward()
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters() if parameter.grad is not None
+    )
 
 
 def test_distributed_training_sampler_avoids_rank_overlap() -> None:

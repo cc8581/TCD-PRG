@@ -47,12 +47,16 @@ class MultiTaskLoss(nn.Module):
         for family, values in families.items():
             if not self.enabled(family):
                 continue
+            if "loss" not in values:
+                raise KeyError(f"Loss family {family!r} did not provide an explicit subtotal")
+            family_total = values["loss"]
+            selected[f"loss_{family}"] = family_total.detach()
             for name, value in values.items():
-                selected[name] = value
-                weighted = self.weights.get(family, 1.0) * value
-                total = weighted if total is None else total + weighted
+                if name != "loss":
+                    selected[name] = value.detach()
+            weighted = self.weights.get(family, 1.0) * family_total
+            total = weighted if total is None else total + weighted
         if total is None:
             raise ValueError("No applicable loss family for this dataset/configuration")
         selected["loss_total"] = total
         return total, selected
-

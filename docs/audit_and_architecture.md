@@ -22,12 +22,12 @@ Python 3.8 worker.
 |---|---|---|---|---|---|---|
 | Shared encoder | PointNet++ concepts | `models/backbones/task_point_transformer.py` | `[B,N,3]` XYZ/RGB/masks/task | point/object/target/global/task tokens | joint downstream gradients | exactly one scene pass |
 | Functional region | none | `models/region/head.py` | target point features + task | point probability, visibility | focal BCE + Dice + visibility | constrains task grasp |
-| Task grasp proposal | external GraspNet concepts | `models/grasp_proposal/head.py` | shared points + target/task/region | contact, approach, rotation, depth, width, confidence, compatibility | masked classification/regression | dense TASK_GRASP candidates |
+| Task grasp proposal | external GraspNet concepts | `models/grasp_proposal/head.py` | shared points + target/task/region | canonical contact frame, approach, rotation, AG total opening, confidence, compatibility | masked classification/regression | dense TASK_GRASP candidates |
 | Generic removal grasp | GraspNet concepts | same head under generic condition | active object points | removal grasp fields | PICK_REMOVE grasp labels | candidate proposals |
 | Grasp verifier | `Space_GraspFusion` concept | `models/grasp_verifier/` | local scene + exact AG cloud + task context | six validity heads | explicit per-head valid masks | learned filtering/ranking |
 | Dependency graph | none | `models/dependency_graph/hgt.py` | object/task tokens and predicted edges | physical/task edges, blockers, topology | edge/blocker/order losses | direct/indirect dependency context |
-| PICK_REMOVE | none | `models/pick_remove/head.py` | object/graph/candidate tokens | object pointer, rank, outcome | masked pointer/listwise/outcome | safe removal macro action |
-| PUSH | `Push_model` concept | `models/push/head.py` | point/object/task/graph/geometry/steps | object, contact, direction, approach, outcome, potential, risks | independently masked heads | fixed 0.15 m action |
+| PICK_REMOVE | none | `models/pick_remove/head.py` | object/graph/candidate tokens | object pointer, removal-grasp rank | masked pointer/listwise | reliable removal macro selection |
+| PUSH | `Push_model` concept | `models/push/head.py` | point/object/task/graph/geometry/steps | object, contact, direction, low-weight potential and risks | independently masked heads | fixed 0.15 m action; approach is execution-layer geometry |
 | Router | fixed grasp→push rule | `models/policy/router.py` | heterogeneous candidates + evidence | type/object/candidate scores, steps | multi-positive listwise | legal hierarchical selection |
 | Closed loop | `grasp_push_eval.py` loop | `planners/closed_loop.py` | policy, observations, executor | H=5 result and trace | evaluated through replay/simulation | reobserve and replan |
 | Exact safety | PyBullet execution environment | `execution/pybullet_certifier.py` + worker | candidate + full state + FR5/AG URDF | valid/reason | deterministic, not learned | final mask before execution |

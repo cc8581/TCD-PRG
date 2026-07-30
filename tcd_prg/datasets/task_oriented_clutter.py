@@ -276,6 +276,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             states = scene["states"]
             catalog = scene["catalog"]
             object_pose = states["object_pose"][state_id].astype(np.float32)
+            required_grasp_count = int(states["required_grasp_count"][state_id])
             target_object = int(catalog["task_object_index"][task_index])
             task_region = int(catalog["task_label"][task_index])
             active = self._object_active(scene, state_id, task_index)
@@ -343,6 +344,10 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 "quaternion_order": "xyzw",
                 "length_unit": "m",
                 "oracle_excluded": True,
+                # This is the task acceptance criterion, not the state's
+                # verified-positive truth count.  Deployment supplies the same
+                # criterion from the task/object registry.
+                "required_grasp_count": required_grasp_count,
                 "object_category_key": category_keys,
                 "object_model_id": model_ids,
                 "object_scale": object_scales,

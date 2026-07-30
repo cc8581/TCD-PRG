@@ -50,7 +50,8 @@ class ObservationConfig:
 class CacheConfig:
     enabled: bool = True
     directory: str = "runtime/cache/observations"
-    max_gb: float = 100.0
+    max_gb: float = 15.0
+    min_free_gb: float = 20.0
     eviction: str = "lru"
     prefetch_workers: int = 4
 
@@ -85,7 +86,6 @@ class PickRemoveConfig:
     enabled: bool = True
     macro_action: bool = True
     deactivate_after_success: bool = True
-    outcome_classes: int = 7
 
 
 @dataclass(slots=True)
@@ -114,8 +114,9 @@ class ModelConfig:
     num_relation_types: int = 8
     num_direction_bins: int = 16
     num_grasp_rotation_bins: int = 12
-    num_grasp_depth_bins: int = 4
-    grasp_depth_bin_edges_m: tuple[float, ...] = (0.0, 0.095, 0.100, 0.105, 0.2)
+    # Grasp translation is the dataset's canonical contact midpoint.  Legacy
+    # Panda-frame depth is intentionally not part of the AG policy output.
+    contact_heatmap_sigma_m: float = 0.008
     max_grasp_width_m: float = 0.095
     min_grasp_width_m: float = 0.0
     candidate_topk: int = 64
@@ -128,6 +129,10 @@ class ModelConfig:
     verifier_local_radius_m: float = 0.25
     verifier_candidate_micro_batch: int = 16
     verifier_validity_threshold: float = 0.5
+    graph_edge_threshold: float = 0.5
+    state_graspability_threshold: float = 0.5
+    default_required_grasp_count: int = 20
+    graph_candidate_fallback_objects: int = 1
 
 
 @dataclass(slots=True)
@@ -166,6 +171,16 @@ class TrainingConfig:
     unfreeze_at_optimizer_step: int | None = None
     ddp_backend: str = "auto"
     ddp_find_unused_parameters: bool = True
+    validation_family_weights: dict[str, float] = field(default_factory=lambda: {
+        "policy": 1.0,
+        "verify": 0.5,
+        "graph": 0.5,
+        "proposal": 0.25,
+        "region": 0.1,
+        "push": 0.25,
+        "remove": 0.25,
+        "potential": 0.1,
+    })
 
 
 @dataclass(slots=True)
@@ -219,6 +234,55 @@ class LossConfig:
     push: float = 1.0
     policy: float = 1.0
     potential: float = 1.0
+    internal: dict[str, float] = field(default_factory=lambda: {
+        "region_focal": 1.0,
+        "region_dice": 1.0,
+        "region_visibility": 0.2,
+        "task_proposal_contact": 1.0,
+        "task_proposal_approach": 1.0,
+        "task_proposal_rotation": 1.0,
+        "task_proposal_width": 1.0,
+        "task_proposal_confidence": 0.25,
+        "task_proposal_task_compatibility": 1.0,
+        "generic_proposal_contact": 0.5,
+        "generic_proposal_approach": 0.5,
+        "generic_proposal_rotation": 0.5,
+        "generic_proposal_width": 0.5,
+        "generic_proposal_confidence": 0.125,
+        "generic_proposal_task_compatibility": 0.5,
+        "proposal_state_graspable": 1.0,
+        "proposal_verified_count": 0.5,
+        "verify_stability": 0.5,
+        "verify_task_compatibility": 1.0,
+        "verify_collision": 1.0,
+        "verify_clearance": 0.25,
+        "verify_approach": 1.0,
+        "verify_overall": 0.5,
+        "graph_physical_edge": 1.0,
+        "graph_task_edge": 1.0,
+        "graph_direct_blocker": 0.25,
+        "graph_indirect_blocker": 0.25,
+        "graph_actionable": 1.0,
+        "graph_topology_order": 0.1,
+        "push_object": 1.0,
+        "push_contact": 1.0,
+        "push_direction_bin": 1.0,
+        "push_direction_residual": 1.0,
+        "push_risk": 0.5,
+        "push_potential": 1.0,
+        "remove_object": 1.0,
+        "remove_candidate": 1.0,
+        "policy_type": 0.2,
+        "policy_object": 0.2,
+        "policy_candidate": 1.0,
+        "policy_remaining_steps": 0.1,
+    })
+
+    def family_weights(self) -> dict[str, float]:
+        return {
+            name: float(getattr(self, name))
+            for name in ("region", "proposal", "verify", "graph", "remove", "push", "policy", "potential")
+        }
 
 
 @dataclass(slots=True)
@@ -301,8 +365,14 @@ class TCDPRGConfig:
             raise ValueError("planner.max_preparation_actions must be H=5")
         if not 0 <= self.model.min_grasp_width_m < self.model.max_grasp_width_m:
             raise ValueError("Invalid AG gripper opening range")
-        if len(self.model.grasp_depth_bin_edges_m) != self.model.num_grasp_depth_bins + 1:
-            raise ValueError("grasp_depth_bin_edges_m must have num_grasp_depth_bins + 1 values")
+        if self.model.contact_heatmap_sigma_m <= 0:
+            raise ValueError("contact_heatmap_sigma_m must be positive")
+        if not 0 < self.model.graph_edge_threshold < 1:
+            raise ValueError("graph_edge_threshold must be in (0,1)")
+        if self.model.default_required_grasp_count <= 0:
+            raise ValueError("default_required_grasp_count must be positive")
+        if self.model.graph_candidate_fallback_objects < 0:
+            raise ValueError("graph_candidate_fallback_objects cannot be negative")
         if self.ablation.router_type not in {
             "hierarchical",
             "fixed_priority",
@@ -313,6 +383,8 @@ class TCDPRGConfig:
             raise ValueError("training.amp_dtype must be float16 or bfloat16")
         if self.cache.eviction != "lru":
             raise ValueError("Only deterministic LRU cache eviction is supported")
+        if self.cache.max_gb <= 0 or self.cache.min_free_gb <= 0:
+            raise ValueError("cache max_gb and min_free_gb must be positive")
         if self.pick_remove.macro_action and not self.pick_remove.deactivate_after_success:
             raise ValueError("PICK_REMOVE macro action must leave the object inactive")
 

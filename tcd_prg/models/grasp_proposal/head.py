@@ -7,15 +7,20 @@ from torch import Tensor, nn
 
 
 class TaskGraspProposalHead(nn.Module):
-    def __init__(self, dim: int = 256, rotation_bins: int = 12, depth_bins: int = 4) -> None:
+    """Predict a canonical 6D contact frame and AG total opening.
+
+    The dataset canonicalizes the translation at the two-contact midpoint.
+    Its legacy ``grasp_depth_m`` is the offset to the source Panda frame, not
+    an AG-160-95 TCP quantity, and is deliberately not predicted here.
+    """
+
+    def __init__(self, dim: int = 256, rotation_bins: int = 12) -> None:
         super().__init__()
         self.rotation_bins = rotation_bins
-        self.depth_bins = depth_bins
         self.shared = nn.Sequential(nn.Linear(3 * dim + 1, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim), nn.GELU())
         self.contact = nn.Linear(dim, 1)
         self.approach = nn.Linear(dim, 3)
         self.rotation = nn.Linear(dim, rotation_bins)
-        self.depth = nn.Linear(dim, depth_bins)
         self.width = nn.Linear(dim, 1)
         self.confidence = nn.Linear(dim, 1)
         self.task_compatibility = nn.Linear(dim, 1)
@@ -47,7 +52,6 @@ class TaskGraspProposalHead(nn.Module):
             "contact_logits": contact,
             "approach_direction": approach,
             "rotation_logits": self.rotation(x),
-            "depth_logits": self.depth(x),
             "width_raw": self.width(x).squeeze(-1),
             "proposal_confidence_logit": self.confidence(x).squeeze(-1),
             "task_compatibility_logit": self.task_compatibility(x).squeeze(-1),
@@ -72,7 +76,5 @@ class TaskGraspProposalHead(nn.Module):
             "contact_point": xyz[row, index],
             "approach_direction": output["approach_direction"][row, index],
             "rotation_logits": output["rotation_logits"][row, index],
-            "depth_logits": output["depth_logits"][row, index],
             "width_raw": output["width_raw"][row, index],
         }
-

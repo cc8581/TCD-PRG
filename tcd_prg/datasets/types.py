@@ -127,6 +127,12 @@ class ActionCandidateGroup:
     success_mask: np.ndarray
     action_parameters: dict[str, np.ndarray]
 
+    @property
+    def action_improves_state(self) -> np.ndarray:
+        """Local action-effect label; never use this for policy cloning."""
+
+        return self.success_mask
+
     def validate(self) -> None:
         n = len(self.candidate_action_ids)
         for name in (

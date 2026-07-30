@@ -63,7 +63,8 @@ Every regression/result field has its own validity mask, including
 `acted_object_motion_valid` and `target_motion_valid`. NaN is storage for
 not-applicable values and is removed by its mask before loss/metric arithmetic.
 
-PUSH has an exact 0.15 m displacement. Top and side refer to closed-gripper
-approach modes. PICK_REMOVE is a reliable high-level manipulation primitive;
+PUSH has an exact 0.15 m displacement. Raw top/side fields are retained only
+for dataset and execution compatibility; the learning policy does not predict
+or supervise an approach mode. PICK_REMOVE is a reliable high-level manipulation primitive;
 transport and safe placement are certified/executed by the non-learning layer
 and are not inferred as universally feasible from a positive macro label.

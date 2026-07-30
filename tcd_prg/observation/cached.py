@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import time
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -37,11 +37,12 @@ class ObservationCacheMissError(FileNotFoundError):
 
 class CachedObservationProvider(ObservationProvider):
     def __init__(self, cache_dir: str | Path, fallback: ObservationProvider | None = None,
-                 max_bytes: int = 100 << 30):
+                 max_bytes: int = 15 << 30, min_free_bytes: int = 20 << 30):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.fallback = fallback
         self.max_bytes = max_bytes
+        self.min_free_bytes = min_free_bytes
 
     def _path(self, key: str) -> Path:
         return self.cache_dir / key[:2] / f"{key}.npz"
@@ -58,6 +59,19 @@ class CachedObservationProvider(ObservationProvider):
                 f"Observation {key} is not cached; run tcd-prg-prefetch before training"
             )
         observation = self.fallback.get(request)
+        estimated_bytes = sum(
+            int(value.nbytes)
+            for value in (
+                observation.xyz, observation.rgb,
+                observation.instance_id, observation.source_view,
+            )
+        )
+        self.evict(reserve_bytes=estimated_bytes)
+        if shutil.disk_usage(self.cache_dir).free < self.min_free_bytes + estimated_bytes:
+            raise OSError(
+                "Observation cache write refused: configured free-space reserve "
+                f"({self.min_free_bytes} bytes) cannot be maintained"
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(f"{path.stem}.{os.getpid()}.tmp.npz")
         np.savez_compressed(
@@ -71,14 +85,16 @@ class CachedObservationProvider(ObservationProvider):
         self.evict()
         return observation
 
-    def evict(self) -> None:
+    def evict(self, reserve_bytes: int = 0) -> None:
         files = list(self.cache_dir.glob("*/*.npz"))
         total = sum(p.stat().st_size for p in files)
-        if total <= self.max_bytes:
+        free = shutil.disk_usage(self.cache_dir).free
+        if total <= self.max_bytes and free >= self.min_free_bytes + reserve_bytes:
             return
         for path in sorted(files, key=lambda p: p.stat().st_atime):
             size = path.stat().st_size
             path.unlink(missing_ok=True)
             total -= size
-            if total <= self.max_bytes:
+            free = shutil.disk_usage(self.cache_dir).free
+            if total <= self.max_bytes and free >= self.min_free_bytes + reserve_bytes:
                 break

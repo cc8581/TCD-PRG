@@ -138,7 +138,7 @@ def main() -> None:
     model = model.to(device).train()
     optimizer.load_state_dict(checkpoint["optimizer"])
     objective = TCDPRGObjective(
-        adapter.capabilities, config.model, config.ablation, asdict(config.losses),
+        adapter.capabilities, config.model, config.ablation, config.losses,
         config.region_head,
     )
     model_setup_seconds = time.perf_counter() - model_started

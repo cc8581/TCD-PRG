@@ -123,7 +123,6 @@ class TaskConditionedPointTransformer(nn.Module):
         instance_id: Tensor,
         point_mask: Tensor,
         target_mask: Tensor,
-        object_pose: Tensor,
         object_mask: Tensor,
         task_category_id: Tensor,
         task_region_id: Tensor,
@@ -137,10 +136,24 @@ class TaskConditionedPointTransformer(nn.Module):
         if not use_task_region_condition:
             region = torch.zeros_like(region)
         task = self.task_projection(torch.cat((category, region), dim=-1))
-        safe_instance = instance_id.clamp(0, object_pose.shape[1] - 1)
+        object_count = object_mask.shape[1]
+        safe_instance = instance_id.clamp(0, object_count - 1)
         row = torch.arange(b, device=xyz.device)[:, None]
-        centers = object_pose[row, safe_instance, :3]
-        local_xyz = xyz - centers
+        # Formal perception provides instance membership, not object 6D poses.
+        # Build translation-invariant object-local coordinates exclusively from
+        # the visible instance points so simulation pose truth cannot leak into
+        # the learned policy.
+        instance_valid = point_mask & (instance_id >= 0) & (instance_id < object_count)
+        centers = xyz.new_zeros((b, object_count, 3))
+        counts = xyz.new_zeros((b, object_count))
+        centers.scatter_add_(
+            1,
+            safe_instance.unsqueeze(-1).expand(-1, -1, 3),
+            xyz * instance_valid.unsqueeze(-1),
+        )
+        counts.scatter_add_(1, safe_instance, instance_valid.to(xyz.dtype))
+        centers = centers / counts.clamp_min(1.0).unsqueeze(-1)
+        local_xyz = (xyz - centers[row, safe_instance]) * instance_valid.unsqueeze(-1)
         input_features = torch.cat(
             (xyz, rgb, target_mask.unsqueeze(-1).float(), local_xyz, point_mask.unsqueeze(-1).float()), dim=-1
         )
@@ -159,11 +172,10 @@ class TaskConditionedPointTransformer(nn.Module):
         context = anchor_features[row, nearest]
         point_features = self.context_projection(torch.cat((base, context), dim=-1)) * point_mask.unsqueeze(-1)
         object_tokens = []
-        for object_index in range(object_pose.shape[1]):
+        for object_index in range(object_count):
             mask = point_mask & (instance_id == object_index)
             object_tokens.append(self.object_pool(point_features, mask, task))
         objects = torch.stack(object_tokens, dim=1) * object_mask.unsqueeze(-1)
         target = self.target_pool(point_features, point_mask & target_mask, task)
         global_token = self.global_pool(point_features, point_mask, task)
         return EncoderOutput(point_features, objects, object_mask, target, global_token, task)
-

@@ -19,12 +19,13 @@ AG-160-95 total opening in `[0, 0.095]` m; it is not the push distance.
 - Task-region grasp and generic removal-grasp proposal heads.
 - Exact-URDF local scene–gripper multi-head verifier.
 - Predicted-edge heterogeneous dependency graph ending at a `TASK_GRASP` node.
-- PICK_REMOVE object/candidate/outcome and PUSH object/contact/direction/
-  approach/outcome/potential/risk prediction.
+- PICK_REMOVE object/removal-grasp ranking and PUSH object/contact/direction
+  prediction, with low-weight potential/risk auxiliaries. PUSH approach,
+  fixed-distance execution, removal transport and placement stay non-learning.
 - Masked hierarchical, flat, and fixed-priority routing with multi-positive
   listwise supervision; UNKNOWN candidates never become negatives.
-- Deterministic three-PRO-S state reconstruction, content-addressed LRU cache,
-  Windows-safe external PyBullet workers, and exact FR5/AG certification.
+- Deterministic three-PRO-S state reconstruction, free-space-aware LRU cache,
+  Windows-safe external PyBullet workers, and FR5/AG execution interfaces.
 - AMP, accumulation, activation checkpointing, EMA, resume, freeze/unfreeze,
   two learning rates, DDP, deterministic seeds, validation, early stopping,
   JSONL/TensorBoard logging, and exact state-group progress counters.

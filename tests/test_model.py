@@ -7,6 +7,7 @@ from tcd_prg.config import AblationConfig, ModelConfig
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.models.grasp_verifier import GripperSceneTaskVerifier
 from tcd_prg.models.policy import MaskedHierarchicalCandidateRouter
+from tcd_prg.models.dependency_graph.hgt import derive_dependency_masks
 
 
 def _config() -> ModelConfig:
@@ -43,6 +44,35 @@ def test_router_never_selects_invalid_candidate() -> None:
     assert selected.item() == 1
 
 
+def test_router_all_invalid_is_finite_and_selects_nothing() -> None:
+    router = MaskedHierarchicalCandidateRouter(32, layers=1)
+    valid = torch.zeros(1, 2, dtype=torch.bool)
+    candidate_type = torch.tensor([[-1, -1]])
+    candidate_object = torch.tensor([[-1, -1]])
+    output = router(
+        torch.randn(1, 32), torch.randn(1, 32), torch.randn(1, 2, 32),
+        torch.ones(1, 2, dtype=torch.bool), torch.randn(1, 2, 32),
+        candidate_type, candidate_object, valid, torch.tensor([5]),
+    )
+    assert torch.isfinite(output.candidate_logits).all()
+    assert router.select(output, candidate_type, candidate_object).item() == -1
+
+
+def test_dependency_closure_returns_only_topmost_actionable_object() -> None:
+    physical = torch.full((1, 3, 3, 5), -20.0)
+    task = torch.full((1, 3, 3), -20.0)
+    task[0, 0, 0] = 20.0  # object 0 directly blocks TASK_GRASP
+    physical[0, 0, 1, 2] = 20.0  # object 1 is prerequisite of object 0
+    physical[0, 1, 2, 2] = 20.0  # object 2 is prerequisite of object 1
+    direct, indirect, dependency, actionable = derive_dependency_masks(
+        physical, task, torch.ones(1, 3, dtype=torch.bool)
+    )
+    assert direct.tolist() == [[True, False, False]]
+    assert indirect.tolist() == [[False, True, True]]
+    assert dependency.all()
+    assert actionable.tolist() == [[False, False, True]]
+
+
 @pytest.mark.parametrize(
     "ablation",
     [
@@ -71,3 +101,20 @@ def test_fixed_seed_reproducibility(tiny_batch) -> None:
         two = second(tiny_batch)["region"]["region_logits"]
     assert torch.equal(one, two)
 
+
+def test_network_features_do_not_depend_on_simulation_object_pose(tiny_batch) -> None:
+    model = TCDPRGModel(_config()).eval()
+    changed = dict(tiny_batch)
+    changed.pop("object_pose")
+    with torch.no_grad():
+        first = model(tiny_batch)["encoded"].point_features
+        second = model(changed)["encoded"].point_features
+    assert torch.equal(first, second)
+
+
+def test_policy_heads_match_training_contract(tiny_batch) -> None:
+    output = TCDPRGModel(_config()).eval()(tiny_batch)
+    assert "depth_logits" not in output["task_grasp"]
+    assert "approach_logits" not in output["push"]
+    assert "outcome_logits" not in output["push"]
+    assert "outcome_logits" not in output["pick_remove"]

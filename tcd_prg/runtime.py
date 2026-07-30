@@ -49,6 +49,7 @@ def create_observation_provider(config: TCDPRGConfig, allow_render: bool = False
         config.cache.directory,
         fallback,
         max_bytes=int(config.cache.max_gb * (1 << 30)),
+        min_free_bytes=int(config.cache.min_free_gb * (1 << 30)),
     )
 
 

@@ -5,6 +5,7 @@ import numpy as np
 
 from tcd_prg.constants import ActionType, CandidateStatus, PUSH_DISTANCE_M
 from tcd_prg.datasets import TaskOrientedClutterAdapter
+from tcd_prg.datasets.collate import collate_unified
 
 
 def test_real_hdf5_primary_keys_and_shapes(dataset_root) -> None:
@@ -58,6 +59,19 @@ def test_required_grasp_count_is_state_adaptive(dataset_root) -> None:
     assert labels.graspable == (
         labels.verified_positive_grasp_count >= labels.required_grasp_count
     )
+
+
+def test_policy_positive_mask_comes_only_from_successful_sequences(dataset_root) -> None:
+    adapter = TaskOrientedClutterAdapter(dataset_root, point_count=64)
+    sample = adapter.load_sample(*next(iter(adapter.iter_action_groups())))
+    batch = collate_unified([sample])
+    successful_ids = np.unique(np.concatenate([
+        np.concatenate((sequence.policy_action_ids, sequence.terminal_action_ids))
+        for sequence in sample.sequences
+    ])) if sample.sequences else np.empty(0, dtype=np.int64)
+    expected = np.isin(sample.candidates.candidate_action_ids, successful_ids)
+    actual = batch["policy_success_mask"][0, :len(expected)].numpy()
+    assert np.array_equal(actual, expected)
 
 
 def test_pick_remove_marks_object_inactive_but_present(dataset_root) -> None:

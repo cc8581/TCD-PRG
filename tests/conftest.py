@@ -28,6 +28,7 @@ def tiny_batch() -> dict[str, torch.Tensor]:
         "instance_id": instance,
         "point_mask": torch.ones(b, n, dtype=torch.bool),
         "target_mask": instance == 1,
+        "target_object": torch.tensor([1]),
         "object_pose": torch.cat((torch.randn(b, o, 3), torch.tensor([0, 0, 0, 1.0]).repeat(b, o, 1)), -1),
         "object_mask": torch.ones(b, o, dtype=torch.bool),
         "object_active": torch.ones(b, o, dtype=torch.bool),
@@ -36,4 +37,3 @@ def tiny_batch() -> dict[str, torch.Tensor]:
         "relation_graph": relation,
         "remaining_steps": torch.tensor([5]),
     }
-

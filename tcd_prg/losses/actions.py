@@ -25,12 +25,6 @@ class PushLoss(nn.Module):
             "push_direction_residual": safe_smooth_l1(
                 output["direction_residual"], labels["direction_residual"], labels["direction_valid"]
             ),
-            "push_approach": safe_cross_entropy(
-                output["approach_logits"], labels["approach_mode"], labels["approach_valid"]
-            ),
-            "push_outcome": safe_cross_entropy(
-                output["outcome_logits"], labels["outcome_code"], labels["outcome_valid"]
-            ),
         }
         if labels.get("use_potential", True):
             result["push_potential"] = safe_smooth_l1(
@@ -53,8 +47,5 @@ class PickRemoveLoss(nn.Module):
         if "candidate_logits" in output:
             result["remove_candidate"] = multi_positive_listwise_loss(
                 output["candidate_logits"], labels["candidate_positive"], labels["candidate_valid"]
-            )
-            result["remove_outcome"] = safe_cross_entropy(
-                output["outcome_logits"], labels["outcome_code"], labels["outcome_valid"]
             )
         return result

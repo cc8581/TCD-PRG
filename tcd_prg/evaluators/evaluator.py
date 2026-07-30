@@ -25,10 +25,10 @@ REQUIRED_METRICS = (
     "direct_blocker_recall_at_3", "indirect_blocker_f1",
     "actionable_blocker_accuracy", "push_acted_object_top1",
     "push_contact_distance_error_m", "push_direction_angle_error_deg",
-    "push_approach_accuracy", "push_outcome_macro_f1", "push_candidate_ndcg",
+    "push_candidate_ndcg",
     "potential_delta_mae", "push_unstable_auroc", "push_out_of_workspace_auroc",
     "remove_acted_object_top1", "remove_grasp_recall_at_5",
-    "remove_candidate_ndcg", "remove_outcome_macro_f1", "action_type_accuracy",
+    "remove_candidate_ndcg", "action_type_accuracy",
     "acted_object_accuracy", "successful_action_set_recall", "candidate_ndcg",
     "remaining_steps_mae",
 )

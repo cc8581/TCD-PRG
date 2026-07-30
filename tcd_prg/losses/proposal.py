@@ -10,14 +10,13 @@ class GraspProposalLoss(nn.Module):
     def forward(self, output: dict[str, Tensor], labels: dict[str, Tensor]) -> dict[str, Tensor]:
         valid = labels["proposal_valid"].bool()
         contact = safe_bce_with_logits(output["contact_logits"], labels["contact_target"].float(), valid)
-        positive = valid & (labels["contact_target"] > 0)
+        positive = labels["mode_valid"].bool()
         approach_target = torch.nn.functional.normalize(
             torch.nan_to_num(labels["approach_target"].float()), dim=-1, eps=1e-6
         )
         cosine = 1 - (output["approach_direction"] * approach_target).sum(-1)
         approach = masked_mean(cosine, positive & torch.isfinite(labels["approach_target"]).all(-1))
         rotation = safe_cross_entropy(output["rotation_logits"], labels["rotation_bin"], positive)
-        depth = safe_cross_entropy(output["depth_logits"], labels["depth_bin"], positive)
         width = safe_smooth_l1(output["width_m"], labels["width_target_m"], positive & labels["width_valid"])
         confidence = safe_bce_with_logits(
             output["proposal_confidence_logit"], labels["confidence_target"].float(), valid
@@ -31,8 +30,24 @@ class GraspProposalLoss(nn.Module):
             "proposal_contact": contact,
             "proposal_approach": approach,
             "proposal_rotation": rotation,
-            "proposal_depth": depth,
             "proposal_width": width,
             "proposal_confidence": confidence,
             "proposal_task_compatibility": compatibility,
+        }
+
+
+class StateGraspabilityLoss(nn.Module):
+    """Binary adaptive gate plus calibrated reliable-candidate count."""
+
+    def forward(self, output: dict[str, Tensor], labels: dict[str, Tensor]) -> dict[str, Tensor]:
+        valid = torch.ones_like(labels["graspable_target"], dtype=torch.bool)
+        return {
+            "proposal_state_graspable": safe_bce_with_logits(
+                output["graspable_logit"], labels["graspable_target"].float(), valid
+            ),
+            "proposal_verified_count": safe_smooth_l1(
+                output["verified_count_log_prediction"],
+                torch.log1p(labels["verified_count_target"].float()),
+                valid,
+            ),
         }

@@ -142,7 +142,7 @@ def main() -> None:
             find_unused_parameters=config.training.ddp_find_unused_parameters,
         )
     objective = TCDPRGObjective(
-        adapter.capabilities, config.model, config.ablation, asdict(config.losses),
+        adapter.capabilities, config.model, config.ablation, config.losses,
         config.region_head,
     )
     if rank == 0:
@@ -179,8 +179,13 @@ def main() -> None:
         with torch.no_grad():
             for raw in validation_loader:
                 batch = trainer._move(raw, trainer.device)
-                loss, _ = objective(module, batch)
-                total += float(loss)
+                _, terms = objective(module, batch)
+                score = sum(
+                    weight * float(terms[f"loss_{family}"])
+                    for family, weight in config.training.validation_family_weights.items()
+                    if f"loss_{family}" in terms
+                )
+                total += score
                 count += 1
                 if count >= config.training.max_validation_groups:
                     break

@@ -20,6 +20,27 @@ from tcd_prg.models.policy.router import MaskedHierarchicalCandidateRouter
 from .candidate_generator import DenseCandidateGenerator
 
 
+def predicted_state_graspability_gate(
+    output: dict[str, Tensor], required_count: Tensor, probability_threshold: float
+) -> Tensor:
+    """Deployment gate using predictions rather than HDF5 state truth."""
+
+    return (
+        torch.sigmoid(output["graspable_logit"]) >= probability_threshold
+    ) & (output["verified_count_prediction"] >= required_count.float())
+
+
+def apply_verified_candidate_count_gate(
+    candidate_type: Tensor, candidate_valid: Tensor, required_count: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Mask TASK_GRASP unless enough candidates survive verification/certification."""
+
+    task = candidate_type == int(ActionType.TASK_GRASP)
+    verified_count = (candidate_valid & task).sum(-1)
+    count_gate = verified_count >= required_count
+    return candidate_valid & (~task | count_gate[:, None]), verified_count
+
+
 class CandidateCertifier(Protocol):
     def certify(self, action: dict[str, Any]) -> tuple[bool, str]: ...
 
@@ -65,7 +86,6 @@ class TCDPRGPolicy(ManipulationPolicy):
             "point_mask": torch.from_numpy(point_valid)[None].bool(),
             "target_mask": torch.from_numpy(observation.target_mask)[None].bool(),
             "target_object": torch.tensor([observation.target_object], dtype=torch.long),
-            "object_pose": torch.from_numpy(observation.object_pose)[None].float(),
             "object_mask": torch.from_numpy(observation.object_present)[None].bool(),
             "object_active": torch.from_numpy(observation.object_active)[None].bool(),
             "task_category_id": torch.tensor(
@@ -74,6 +94,12 @@ class TCDPRGPolicy(ManipulationPolicy):
             "task_region_id": torch.tensor([observation.task_region_id], dtype=torch.long),
             "remaining_steps": torch.tensor(
                 [max(0, MAX_PREPARATION_ACTIONS - self.preparation_actions)], dtype=torch.long
+            ),
+            "required_grasp_count": torch.tensor(
+                [int(observation.metadata.get(
+                    "required_grasp_count", self.config.model.default_required_grasp_count
+                ))],
+                dtype=torch.long,
             ),
         }
         return cpu
@@ -120,6 +146,14 @@ class TCDPRGPolicy(ManipulationPolicy):
             candidates = self.generator.generate(
                 self.model, encoded.device_batch, encoded.output
             )
+            task = candidates["type"] == int(ActionType.TASK_GRASP)
+            state_output = encoded.output["state_graspability"]
+            learned_state_valid = predicted_state_graspability_gate(
+                state_output,
+                encoded.device_batch["required_grasp_count"],
+                self.config.model.state_graspability_threshold,
+            )
+            candidates["valid"] &= ~task | learned_state_valid[:, None]
             if self.previous_action is not None:
                 candidates["previous_action"] = torch.tensor(
                     [self.previous_action], device=self.device
@@ -144,7 +178,6 @@ class TCDPRGPolicy(ManipulationPolicy):
                 learned_valid = torch.sigmoid(
                     encoded.output["verifier"]["overall_logit"]
                 ) >= self.config.model.verifier_validity_threshold
-                task = candidates["type"] == int(ActionType.TASK_GRASP)
                 task_valid = torch.sigmoid(
                     encoded.output["verifier"]["task_compatibility_logit"]
                 ) >= self.config.model.verifier_validity_threshold
@@ -170,6 +203,21 @@ class TCDPRGPolicy(ManipulationPolicy):
                     ok, reason = decision_by_index[index]
                     candidates["valid"][0, index] = ok
                     certification_reasons.append(reason)
+            # State graspability is a count criterion, not an existential one.
+            # The learned gate replaces HDF5 truth at deployment; the number of
+            # surviving verifier/certifier candidates provides a deterministic
+            # second gate before TASK_GRASP can enter the router.
+            candidates["valid"], verified_count = apply_verified_candidate_count_gate(
+                candidates["type"], candidates["valid"],
+                encoded.device_batch["required_grasp_count"],
+            )
+            candidates["state_graspability_probability"] = torch.sigmoid(
+                state_output["graspable_logit"]
+            )
+            candidates["predicted_verified_grasp_count"] = state_output[
+                "verified_count_prediction"
+            ]
+            candidates["verified_candidate_count"] = verified_count
             router = self.model.route_cached(
                 encoded.device_batch, encoded.output, candidates
             )

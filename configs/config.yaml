@@ -36,7 +36,8 @@ observation:
 cache:
   enabled: true
   directory: runtime/cache/observations
-  max_gb: 100
+  max_gb: 15
+  min_free_gb: 20
   eviction: lru
   prefetch_workers: 4
 
@@ -67,8 +68,7 @@ model:
   num_relation_types: 8
   num_direction_bins: 16
   num_grasp_rotation_bins: 12
-  num_grasp_depth_bins: 4
-  grasp_depth_bin_edges_m: [0.0, 0.095, 0.100, 0.105, 0.2]
+  contact_heatmap_sigma_m: 0.008
   min_grasp_width_m: 0.0
   max_grasp_width_m: 0.095
   candidate_topk: 64
@@ -81,6 +81,10 @@ model:
   verifier_local_radius_m: 0.25
   verifier_candidate_micro_batch: 16
   verifier_validity_threshold: 0.5
+  graph_edge_threshold: 0.5
+  state_graspability_threshold: 0.5
+  default_required_grasp_count: 20
+  graph_candidate_fallback_objects: 1
 
 grasp_verifier:
   local_scene_points: 512
@@ -102,7 +106,6 @@ pick_remove:
   enabled: true
   macro_action: true
   deactivate_after_success: true
-  outcome_classes: 7
 
 router:
   type: hierarchical
@@ -119,6 +122,48 @@ losses:
   push: 1.0
   policy: 1.0
   potential: 1.0
+  internal:
+    region_focal: 1.0
+    region_dice: 1.0
+    region_visibility: 0.2
+    task_proposal_contact: 1.0
+    task_proposal_approach: 1.0
+    task_proposal_rotation: 1.0
+    task_proposal_width: 1.0
+    task_proposal_confidence: 0.25
+    task_proposal_task_compatibility: 1.0
+    generic_proposal_contact: 0.5
+    generic_proposal_approach: 0.5
+    generic_proposal_rotation: 0.5
+    generic_proposal_width: 0.5
+    generic_proposal_confidence: 0.125
+    generic_proposal_task_compatibility: 0.5
+    proposal_state_graspable: 1.0
+    proposal_verified_count: 0.5
+    verify_stability: 0.5
+    verify_task_compatibility: 1.0
+    verify_collision: 1.0
+    verify_clearance: 0.25
+    verify_approach: 1.0
+    verify_overall: 0.5
+    graph_physical_edge: 1.0
+    graph_task_edge: 1.0
+    graph_direct_blocker: 0.25
+    graph_indirect_blocker: 0.25
+    graph_actionable: 1.0
+    graph_topology_order: 0.1
+    push_object: 1.0
+    push_contact: 1.0
+    push_direction_bin: 1.0
+    push_direction_residual: 1.0
+    push_risk: 0.5
+    push_potential: 1.0
+    remove_object: 1.0
+    remove_candidate: 1.0
+    policy_type: 0.2
+    policy_object: 0.2
+    policy_candidate: 1.0
+    policy_remaining_steps: 0.1
 
 sampling:
   positive_grasps: 8
@@ -161,6 +206,15 @@ training:
   unfreeze_at_optimizer_step: null
   ddp_backend: auto
   ddp_find_unused_parameters: true
+  validation_family_weights:
+    policy: 1.0
+    verify: 0.5
+    graph: 0.5
+    proposal: 0.25
+    region: 0.1
+    push: 0.25
+    remove: 0.25
+    potential: 0.1
 
 evaluation:
   max_preparation_actions: 5

@@ -12,7 +12,7 @@ from tcd_prg.config import AblationConfig, BackboneConfig, GraphConfig, ModelCon
 from .backbones import TaskConditionedPointTransformer
 from .common import ActionCandidateEncoder
 from .dependency_graph import TaskConditionedDependencyGraph
-from .grasp_proposal import TaskGraspProposalHead
+from .grasp_proposal import StateGraspabilityHead, TaskGraspProposalHead
 from .grasp_verifier import GripperSceneTaskVerifier
 from .pick_remove import PickRemoveHead
 from .policy import FlatCandidateClassifier, MaskedHierarchicalCandidateRouter, fixed_priority_output
@@ -44,17 +44,14 @@ class TCDPRGModel(nn.Module):
             activation_checkpointing=c.activation_checkpointing,
         )
         self.region_head = TaskRegionHead(c.feature_dim)
-        self.task_grasp = TaskGraspProposalHead(
-            c.feature_dim, c.num_grasp_rotation_bins, c.num_grasp_depth_bins
-        )
-        self.generic_grasp = TaskGraspProposalHead(
-            c.feature_dim, c.num_grasp_rotation_bins, c.num_grasp_depth_bins
-        )
+        self.task_grasp = TaskGraspProposalHead(c.feature_dim, c.num_grasp_rotation_bins)
+        self.generic_grasp = TaskGraspProposalHead(c.feature_dim, c.num_grasp_rotation_bins)
+        self.state_graspability = StateGraspabilityHead(c.feature_dim)
         self.verifier = GripperSceneTaskVerifier(c.feature_dim, c.feature_dim)
         self.graph = TaskConditionedDependencyGraph(
             c.feature_dim, physical_relations=len(graph_config.physical_relations),
             task_relations=len(graph_config.task_relations), layers=graph_config.layers,
-            heads=graph_config.heads,
+            heads=graph_config.heads, edge_threshold=c.graph_edge_threshold,
         )
         self.pick_remove = PickRemoveHead(c.feature_dim)
         self.push = PushHead(c.feature_dim, c.num_direction_bins)
@@ -96,9 +93,6 @@ class TCDPRGModel(nn.Module):
                 delta = batch["xyz"][row, points] - query
                 point = points[(delta * delta).sum(-1).argmin()]
                 if is_push:
-                    evidence[row, candidate, :7] = torch.softmax(
-                        result["push"]["outcome_logits"][row, point], -1
-                    )
                     evidence[row, candidate, 7:12] = result["push"]["potential_delta"][row, point]
                     evidence[row, candidate, 12:15] = torch.sigmoid(
                         result["push"]["risk_logits"][row, point]
@@ -172,11 +166,7 @@ class TCDPRGModel(nn.Module):
             )
         else:
             evidence = evidence.clone()
-        if "outcome_logits" in preliminary_remove:
-            remove_probability = torch.softmax(preliminary_remove["outcome_logits"], -1)
-            evidence[..., :7] = torch.where(
-                remove_candidates.unsqueeze(-1), remove_probability, evidence[..., :7]
-            )
+        if "candidate_logits" in preliminary_remove:
             evidence[..., 15] = torch.where(
                 remove_candidates,
                 torch.sigmoid(preliminary_remove["candidate_logits"]),
@@ -228,7 +218,6 @@ class TCDPRGModel(nn.Module):
             batch["instance_id"],
             batch["point_mask"],
             batch["target_mask"],
-            batch["object_pose"],
             batch["object_mask"],
             batch["task_category_id"],
             batch["task_region_id"],
@@ -262,11 +251,15 @@ class TCDPRGModel(nn.Module):
         generic_grasp["width_m"] = self.generic_grasp.decode_width(
             generic_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m
         )
+        state_graspability = self.state_graspability(
+            encoded.global_scene_token, encoded.target_token, encoded.task_token
+        )
         if self.ablation.use_dependency_graph:
             graph = self.graph(
                 encoded.object_tokens,
                 encoded.object_mask & batch["object_active"],
                 encoded.task_token,
+                batch["target_object"],
                 batch.get("relation_graph"),
                 self.ablation.use_indirect_dependency_reasoning,
             )
@@ -297,6 +290,7 @@ class TCDPRGModel(nn.Module):
             "region": region,
             "task_grasp": task_grasp,
             "generic_grasp": generic_grasp,
+            "state_graspability": state_graspability,
             "graph": graph,
             "push": push,
             "pick_remove": remove,

@@ -58,7 +58,22 @@ def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
     valid_mask, _ = _pad([x.valid_mask for x in candidates], False)
     status, _ = _pad([x.evaluation_status for x in candidates], -1)
     outcome, _ = _pad([x.outcome_code for x in candidates], -1)
-    success, _ = _pad([x.success_mask for x in candidates], False)
+    success, _ = _pad([x.action_improves_state for x in candidates], False)
+    policy_success_arrays = []
+    for sample in samples:
+        successful_ids: list[np.ndarray] = []
+        for sequence in sample.sequences:
+            if len(sequence.policy_action_ids):
+                successful_ids.append(sequence.policy_action_ids)
+            if len(sequence.terminal_action_ids):
+                successful_ids.append(sequence.terminal_action_ids)
+        union = (
+            np.unique(np.concatenate(successful_ids))
+            if successful_ids
+            else np.empty(0, dtype=np.int64)
+        )
+        policy_success_arrays.append(np.isin(sample.candidates.candidate_action_ids, union))
+    policy_success, _ = _pad(policy_success_arrays, False)
     potential_delta, _ = _pad([x.potential_delta for x in candidates], np.nan)
     after_state_valid, _ = _pad([x.after_state_valid for x in candidates], False)
     after_pose_valid, _ = _pad([x.after_pose_valid for x in candidates], False)
@@ -117,7 +132,12 @@ def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
         "candidate_mask": candidate_mask & valid_mask.bool(),
         "evaluation_status": status.long(),
         "outcome_code": outcome.long(),
-        "success_mask": success.bool(),
+        # Local transition improvement supervises action-effect heads.  Policy
+        # behavior cloning uses only actions that occur in a successful
+        # sequence; the two concepts must never be conflated.
+        "action_improves_state": success.bool(),
+        "success_mask": success.bool(),  # compatibility alias for reporting
+        "policy_success_mask": policy_success.bool(),
         "potential_delta": potential_delta.float(),
         "after_state_valid": after_state_valid.bool(),
         "after_pose_valid": after_pose_valid.bool(),
