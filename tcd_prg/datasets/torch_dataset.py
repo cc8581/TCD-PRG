@@ -50,6 +50,10 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
         self.units = tuple(
             StateGroupUnit(*unit, stratum=strata.get(unit, "unclassified")) for unit in raw_units
         )
+        representatives: dict[tuple[int, int], int] = {}
+        for index, unit in enumerate(self.units):
+            representatives.setdefault((unit.scene_id, unit.state_id), index)
+        self._global_grasp_representatives = frozenset(representatives.values())
 
     def __len__(self) -> int:
         return len(self.units)
@@ -57,7 +61,11 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
     def __getitem__(self, index: int) -> UnifiedSample:
         unit = self.units[index]
         return self.adapter.load_sample(
-            unit.scene_id, unit.state_id, unit.task_index, unit.group_index
+            unit.scene_id,
+            unit.state_id,
+            unit.task_index,
+            unit.group_index,
+            include_global_grasps=index in self._global_grasp_representatives,
         )
 
     def balanced_sampler(self, seed: int = 2026, samples: int | None = None) -> WeightedRandomSampler:

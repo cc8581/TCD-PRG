@@ -59,29 +59,56 @@ class GlobalGraspLoss(nn.Module):
             pred_approach = output["approach_direction"][rows[0], rows[1], prediction_index]
             pred_rotation = output["rotation_logits"][rows[0], rows[1], prediction_index]
             pred_width = output["width_m"][rows[0], rows[1], prediction_index]
+            pred_center_offset = output["center_offset_m"][rows[0], rows[1], prediction_index]
             target_approach = labels["approach_target"][rows]
             target_rotation = labels["rotation_bin"][rows]
             target_width = labels["width_target_m"][rows]
+            target_center_offset = labels["center_offset_target_m"][rows]
             geometry = labels["geometry_valid"][rows]
             approach = masked_mean(1.0 - (pred_approach * target_approach).sum(-1), geometry)
             rotation = safe_cross_entropy(pred_rotation, target_rotation, geometry)
             width = safe_smooth_l1(pred_width, target_width, geometry & labels["width_valid"][rows])
-            scene_logits = output["scene_confidence_logit"][rows[0], rows[1], prediction_index]
-            intrinsic_logits = output["intrinsic_confidence_logit"][rows[0], rows[1], prediction_index]
-            scene_confidence = safe_bce_with_logits(
-                scene_logits, labels["scene_target"][rows], labels["scene_valid"][rows]
-            )
-            intrinsic_confidence = safe_bce_with_logits(
-                intrinsic_logits, labels["intrinsic_target"][rows], labels["intrinsic_valid"][rows]
+            center_offset = safe_smooth_l1(
+                pred_center_offset, target_center_offset,
+                (geometry & labels["center_offset_valid"][rows]).unsqueeze(-1).expand_as(pred_center_offset),
             )
         else:
             zero = output["contact_logits"].sum() * 0.0
-            approach = rotation = width = scene_confidence = intrinsic_confidence = zero
+            approach = rotation = width = center_offset = zero
+
+        # DETR-style no-grasp supervision: every unmatched prediction mode at
+        # a supervised point is an explicit confidence negative. Scene
+        # confidence uses this negative only when every matched target at that
+        # point has a known scene certification label.
+        predicted_matched = torch.zeros_like(output["scene_confidence_logit"], dtype=torch.bool)
+        intrinsic_target = torch.zeros_like(output["intrinsic_confidence_logit"])
+        scene_target = torch.zeros_like(output["scene_confidence_logit"])
+        intrinsic_valid = torch.zeros_like(predicted_matched)
+        scene_valid = torch.zeros_like(predicted_matched)
+        supervised_point = labels["mode_valid"].any(-1)
+        scene_complete = supervised_point & (labels["scene_valid"] | ~labels["mode_valid"]).all(-1)
+        if rows[0].numel():
+            prediction_index = assignment[rows]
+            predicted_matched[rows[0], rows[1], prediction_index] = True
+            intrinsic_target[rows[0], rows[1], prediction_index] = labels["intrinsic_target"][rows]
+            intrinsic_valid[rows[0], rows[1], prediction_index] = labels["intrinsic_valid"][rows]
+            scene_target[rows[0], rows[1], prediction_index] = labels["scene_target"][rows]
+            scene_valid[rows[0], rows[1], prediction_index] = labels["scene_valid"][rows]
+        unmatched = supervised_point.unsqueeze(-1) & ~predicted_matched
+        intrinsic_valid |= unmatched
+        scene_valid |= unmatched & scene_complete.unsqueeze(-1)
+        intrinsic_confidence = safe_bce_with_logits(
+            output["intrinsic_confidence_logit"], intrinsic_target, intrinsic_valid
+        )
+        scene_confidence = safe_bce_with_logits(
+            output["scene_confidence_logit"], scene_target, scene_valid
+        )
         return {
             "global_contact": contact,
             "global_approach": approach,
             "global_rotation": rotation,
             "global_width": width,
+            "global_center_offset": center_offset,
             "global_scene_confidence": scene_confidence,
             "global_intrinsic_confidence": intrinsic_confidence,
         }

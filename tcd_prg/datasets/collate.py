@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .types import UnifiedSample
+from .types import GlobalGraspLabels, UnifiedSample
 
 
 def _pad(arrays: list[np.ndarray], value: float | int | bool = 0) -> tuple[Tensor, Tensor]:
@@ -190,10 +190,33 @@ def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
         result["visibility_valid"] = torch.tensor(
             [x.task_region_visibility is not None for x in observations], dtype=torch.bool
         )
-    if all(sample.global_grasps is not None for sample in samples):
-        labels = [sample.global_grasps for sample in samples]
-        assert all(label is not None for label in labels)
-        packed = [label for label in labels if label is not None]
+    result["global_loss_sample_valid"] = torch.tensor(
+        [sample.global_loss_valid and sample.global_grasps is not None for sample in samples],
+        dtype=torch.bool,
+    )
+    if any(sample.global_grasps is not None for sample in samples):
+        template = next(sample.global_grasps for sample in samples if sample.global_grasps is not None)
+        assert template is not None
+
+        def empty_like(label: GlobalGraspLabels) -> GlobalGraspLabels:
+            return GlobalGraspLabels(
+                object_index=np.empty((0,), dtype=label.object_index.dtype),
+                source_grasp_index=np.empty((0,), dtype=label.source_grasp_index.dtype),
+                contact_point_world=np.empty((0, 3), dtype=label.contact_point_world.dtype),
+                grasp_pose_world=np.empty((0, 7), dtype=label.grasp_pose_world.dtype),
+                approach_direction_world=np.empty(
+                    (0, 3), dtype=label.approach_direction_world.dtype
+                ),
+                width_m=np.empty((0,), dtype=label.width_m.dtype),
+                intrinsic_stable=np.empty((0,), dtype=label.intrinsic_stable.dtype),
+                scene_executable=np.empty((0,), dtype=label.scene_executable.dtype),
+                valid_mask=np.empty((0,), dtype=label.valid_mask.dtype),
+                anchor_visible_distance_m=np.empty(
+                    (0,), dtype=label.anchor_visible_distance_m.dtype
+                ),
+            )
+
+        packed = [sample.global_grasps or empty_like(template) for sample in samples]
         global_valid, _ = _pad([x.valid_mask for x in packed], False)
         scene_executable, _ = _pad([x.scene_executable for x in packed], -1)
         result["global_grasp_labels"] = {
@@ -205,6 +228,9 @@ def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
             "width_m": _pad([x.width_m for x in packed], np.nan)[0].float(),
             "intrinsic_stable": _pad([x.intrinsic_stable for x in packed], False)[0].bool(),
             "scene_executable": scene_executable.to(torch.int8),
+            "anchor_visible_distance_m": _pad(
+                [x.anchor_visible_distance_m for x in packed], np.nan
+            )[0].float(),
             "valid_mask": global_valid.bool(),
         }
     return result

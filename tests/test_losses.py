@@ -4,7 +4,9 @@ from tcd_prg.losses.masked import multi_positive_listwise_loss, safe_smooth_l1
 from tcd_prg.config import AblationConfig, LossConfig, ModelConfig
 from tcd_prg.datasets.capabilities import DatasetCapabilities
 from tcd_prg.losses.objective import TCDPRGObjective
+from tcd_prg.losses.labels import build_remove_labels
 from tcd_prg.losses.total import MultiTaskLoss
+from tcd_prg.constants import ActionType, CandidateStatus
 
 
 def test_nan_loss_is_masked() -> None:
@@ -70,3 +72,22 @@ def test_family_subtotal_is_weighted_mean_of_active_children_only() -> None:
     assert torch.allclose(family["loss"], torch.tensor(8.0 / 3.0))
     family["loss"].backward()
     assert inactive.grad == 0
+
+
+def test_pick_remove_unmatched_success_is_unknown_for_candidate_ranking() -> None:
+    batch = {
+        "candidate_mask": torch.tensor([[True, True]]),
+        "action_type": torch.full((1, 2), int(ActionType.PICK_REMOVE)),
+        "evaluation_status": torch.full((1, 2), int(CandidateStatus.POSITIVE)),
+        "action_improves_state": torch.tensor([[True, True]]),
+        "acted_object": torch.tensor([[0, 1]]),
+        "object_mask": torch.ones(1, 2, dtype=torch.bool),
+        "object_active": torch.ones(1, 2, dtype=torch.bool),
+        "action_parameters": {
+            "removal_global_match_valid": torch.tensor([[True, False]])
+        },
+    }
+    labels = build_remove_labels(batch)
+    assert labels["candidate_positive"].tolist() == [[True, False]]
+    assert labels["candidate_valid"].tolist() == [[True, False]]
+    assert labels["object_positive"].tolist() == [[True, True]]

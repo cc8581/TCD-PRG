@@ -109,6 +109,7 @@ class TCDPRGObjective(nn.Module):
             f"{prefix}_proposal_width": (
                 mode & labels["width_valid"].bool() & torch.isfinite(labels["width_target_m"])
             ).any(),
+            f"{prefix}_proposal_center_offset": labels["center_offset_valid"].any(),
             f"{prefix}_proposal_confidence": proposal.any(),
             f"{prefix}_proposal_task_compatibility": (
                 compatibility & torch.isfinite(labels["compatibility_target"])
@@ -172,17 +173,17 @@ class TCDPRGObjective(nn.Module):
             families["proposal"] = self._subtotal(proposal_losses, proposal_active)
         if self.total.enabled("global_grasp"):
             global_labels = build_global_grasp_labels(batch, self.model_config)
-            if global_labels is None:
-                raise ValueError("Dataset declares global grasps but batch has no global_grasp_labels")
-            global_losses = self.global_grasp(output["global_grasp"], global_labels)
-            families["global_grasp"] = self._subtotal(global_losses, {
-                "global_contact": global_labels["contact_valid"].any(),
-                "global_approach": global_labels["geometry_valid"].any(),
-                "global_rotation": global_labels["geometry_valid"].any(),
-                "global_width": (global_labels["geometry_valid"] & global_labels["width_valid"]).any(),
-                "global_scene_confidence": global_labels["scene_valid"].any(),
-                "global_intrinsic_confidence": global_labels["intrinsic_valid"].any(),
-            })
+            if global_labels is not None and global_labels["intrinsic_valid"].any():
+                global_losses = self.global_grasp(output["global_grasp"], global_labels)
+                families["global_grasp"] = self._subtotal(global_losses, {
+                    "global_contact": global_labels["contact_valid"].any(),
+                    "global_approach": global_labels["geometry_valid"].any(),
+                    "global_rotation": global_labels["geometry_valid"].any(),
+                    "global_width": (global_labels["geometry_valid"] & global_labels["width_valid"]).any(),
+                    "global_center_offset": global_labels["center_offset_valid"].any(),
+                    "global_scene_confidence": global_labels["scene_valid"].any(),
+                    "global_intrinsic_confidence": global_labels["intrinsic_valid"].any(),
+                })
         if output["verifier"] is not None and self.total.enabled("verify"):
             verifier_labels = build_verifier_labels(batch)
             verifier_losses = self.verify(output["verifier"], verifier_labels)

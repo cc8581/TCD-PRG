@@ -172,7 +172,11 @@ class SequenceLabels:
 
 @dataclass(slots=True)
 class GlobalGraspLabels:
-    """Task-free grasps with intrinsic and tri-state scene supervision."""
+    """Task-free grasps with a visible-surface anchor and contact-centre pose.
+
+    ``contact_point_world`` is one physical finger-contact anchor, not the
+    grasp-frame translation. The latter is ``grasp_pose_world[:3]``.
+    """
 
     object_index: np.ndarray
     source_grasp_index: np.ndarray
@@ -182,6 +186,7 @@ class GlobalGraspLabels:
     width_m: np.ndarray
     intrinsic_stable: np.ndarray
     scene_executable: np.ndarray
+    anchor_visible_distance_m: np.ndarray
     valid_mask: np.ndarray
     conversion_version: str
 
@@ -192,6 +197,7 @@ class GlobalGraspLabels:
             "grasp_pose_world": (n, 7), "approach_direction_world": (n, 3),
             "width_m": (n,), "intrinsic_stable": (n,),
             "scene_executable": (n,), "valid_mask": (n,),
+            "anchor_visible_distance_m": (n,),
         }
         for name, shape in expected.items():
             if getattr(self, name).shape != shape:
@@ -207,3 +213,7 @@ class UnifiedSample:
     candidates: ActionCandidateGroup
     sequences: tuple[SequenceLabels, ...]
     global_grasps: GlobalGraspLabels | None = None
+    # A state can occur in several task/action groups.  Only one representative
+    # group carries task-free global-grasp supervision so a state is not
+    # overweighted by its number of downstream policy labels.
+    global_loss_valid: bool = True

@@ -22,6 +22,7 @@ class TaskGraspProposalHead(nn.Module):
         self.approach = nn.Linear(dim, 3)
         self.rotation = nn.Linear(dim, rotation_bins)
         self.width = nn.Linear(dim, 1)
+        self.center_offset = nn.Linear(dim, 3)
         self.confidence = nn.Linear(dim, 1)
         self.task_compatibility = nn.Linear(dim, 1)
 
@@ -53,6 +54,7 @@ class TaskGraspProposalHead(nn.Module):
             "approach_direction": approach,
             "rotation_logits": self.rotation(x),
             "width_raw": self.width(x).squeeze(-1),
+            "center_offset_m": self.center_offset(x),
             "proposal_confidence_logit": self.confidence(x).squeeze(-1),
             "task_compatibility_logit": self.task_compatibility(x).squeeze(-1),
         }
@@ -77,6 +79,7 @@ class TaskGraspProposalHead(nn.Module):
             "approach_direction": output["approach_direction"][row, index],
             "rotation_logits": output["rotation_logits"][row, index],
             "width_raw": output["width_raw"][row, index],
+            "center_offset_m": output["center_offset_m"][row, index],
         }
 
 
@@ -115,6 +118,7 @@ class GlobalGraspProposalHead(nn.Module):
         self.approach = nn.Linear(dim, 3)
         self.rotation = nn.Linear(dim, rotation_bins)
         self.width = nn.Linear(dim, 1)
+        self.center_offset = nn.Linear(dim, 3)
         self.scene_confidence = nn.Linear(dim, 1)
         self.intrinsic_confidence = nn.Linear(dim, 1)
 
@@ -143,6 +147,7 @@ class GlobalGraspProposalHead(nn.Module):
             "approach_direction": approach,
             "rotation_logits": self.rotation(modes),
             "width_raw": self.width(modes).squeeze(-1),
+            "center_offset_m": self.center_offset(modes),
             "scene_confidence_logit": self.scene_confidence(modes).squeeze(-1),
             "intrinsic_confidence_logit": self.intrinsic_confidence(modes).squeeze(-1),
             "point_domain": point_domain,

@@ -165,7 +165,8 @@ class GAPGPolicyWrapper(ManipulationPolicy):
             predictions.append(GlobalGraspPrediction(
                 object_index=int(item["acted_object"]), contact_point_world=pose[:3].copy(),
                 grasp_pose_world=pose, width_m=float(item["grasp_width_m"]),
-                score=float(item["score"]), intrinsic_score=None, certified=False,
+                raw_score=float(item["score"]), scene_score=float(item["score"]),
+                intrinsic_score=None, certified=False,
                 source="gapg_global",
             ))
         return predictions

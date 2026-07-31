@@ -28,6 +28,10 @@ def main() -> None:
     parser.add_argument("--max-states", type=int)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--allow-render", action="store_true")
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Recompute existing caches after certifier or geometry changes.",
+    )
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
@@ -45,10 +49,10 @@ def main() -> None:
     output_root = Path(config.dataset.root) / config.dataset.global_grasp_certification_subdir
     for (scene_id, state_id), task_index in selected:
         output = output_root / f"scene_{scene_id:04d}" / f"state_{state_id:04d}.npz"
-        if output.is_file():
+        if output.is_file() and not args.overwrite:
             continue
         observation = adapter.load_observation(scene_id, state_id, task_index)
-        labels = adapter.load_global_grasps(scene_id, state_id, observation)
+        labels = adapter.load_global_grasps(scene_id, state_id, observation, training=False)
         if labels is None:
             raise RuntimeError("Global labels disappeared after capability check")
         certifier.set_observation(observation)

@@ -119,6 +119,13 @@ python tools/build_global_grasp_library.py `
 python tools/certify_global_grasps.py --config configs/config.yaml --allow-render
 ```
 
+Evaluate the global branch independently of the task graph and router:
+
+```powershell
+tcd-prg-eval-global --config configs/config.yaml --checkpoint outputs/full/last.pt `
+  --scene-id 0 --state-id 0 --task-index 0 --output outputs/global/state_0.json
+```
+
 The global comparison has separate `scene_only` and `instance_assisted` tracks
 and reports raw proposal metrics independently from post-certification metrics.
 See [docs/global_grasp_protocol.md](docs/global_grasp_protocol.md).

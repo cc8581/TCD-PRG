@@ -303,13 +303,14 @@ class TCDPRGPolicy(ManipulationPolicy):
             encoded.device_batch, encoded.output, self.config.model.candidate_topk
         )[0]
         predictions: list[GlobalGraspPrediction] = []
-        for index in range(len(decoded["score"])):
+        for index in range(len(decoded["raw_score"])):
             predictions.append(GlobalGraspPrediction(
                 object_index=int(decoded["object"][index]),
                 contact_point_world=decoded["contact_world"][index].detach().cpu().numpy(),
                 grasp_pose_world=decoded["pose_world"][index].detach().cpu().numpy(),
                 width_m=float(decoded["width_m"][index]),
-                score=float(decoded["score"][index]),
+                raw_score=float(decoded["raw_score"][index]),
+                scene_score=float(decoded["scene_score"][index]),
                 intrinsic_score=float(decoded["intrinsic_score"][index]),
                 certified=False,
                 source="tcd_prg_global",

@@ -19,10 +19,17 @@ class GlobalGraspPrediction:
     contact_point_world: np.ndarray
     grasp_pose_world: np.ndarray
     width_m: float
-    score: float
+    raw_score: float
+    scene_score: float
     intrinsic_score: float | None
     certified: bool
     source: str
+
+    @property
+    def score(self) -> float:
+        """Compatibility alias for execution-oriented scene ranking."""
+
+        return self.scene_score
 
 
 class ManipulationPolicy(ABC):

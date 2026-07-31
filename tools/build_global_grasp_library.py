@@ -99,7 +99,8 @@ def convert_one(task_adapter: Path, annotations: Path, acronym_root: Path, outpu
         output,
         format=np.asarray(FORMAT), conversion_version=np.asarray(CONVERSION_VERSION),
         model_id=np.asarray(model_id), category_key=np.asarray(category), object_scale=np.float32(scale),
-        source_h5=np.asarray(str(h5_path)), source_gripper=np.asarray(source_gripper),
+        source_h5=np.asarray(h5_path.relative_to(acronym_root).as_posix()),
+        source_gripper=np.asarray(source_gripper),
         source_grasp_index=rows_array,
         canonical_contact_pose_object=canonical.astype(np.float32),
         contact_points_object=contact_array,
@@ -130,7 +131,9 @@ def main() -> None:
         target = args.output / relative
         if target.exists() and not args.overwrite:
             continue
-        records.append(convert_one(source, args.annotations, args.acronym_root, target))
+        record = convert_one(source, args.annotations, args.acronym_root, target)
+        record["file"] = relative.as_posix()
+        records.append(record)
     manifest = {
         "format": FORMAT, "conversion_version": CONVERSION_VERSION,
         "records": records, "source_file_count": len(files),

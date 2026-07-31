@@ -89,7 +89,7 @@ def test_checkpoint_rejects_obsolete_schema(tmp_path, tiny_batch) -> None:
     )
     path = tmp_path / "obsolete.pt"
     torch.save({"schema_version": 2}, path)
-    with pytest.raises(RuntimeError, match="expects schema 4"):
+    with pytest.raises(RuntimeError, match="expects schema 5"):
         trainer.load_checkpoint(path)
 
 

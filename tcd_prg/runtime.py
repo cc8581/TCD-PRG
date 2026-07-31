@@ -72,7 +72,9 @@ def create_adapter(config: TCDPRGConfig, allow_render: bool = False):
         global_grasp_library_subdir=config.dataset.global_grasp_library_subdir,
         global_grasp_certification_subdir=config.dataset.global_grasp_certification_subdir,
         pick_remove_global_association_subdir=config.dataset.pick_remove_global_association_subdir,
-        global_grasps_per_object=config.sampling.global_grasps_per_object,
+        global_positive_grasps_per_object=config.sampling.global_positive_grasps_per_object,
+        global_intrinsic_negative_grasps_per_object=config.sampling.global_intrinsic_negative_grasps_per_object,
+        global_scene_negative_grasps_per_object=config.sampling.global_scene_negative_grasps_per_object,
     )
 
 

@@ -69,7 +69,7 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
 
 def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
     config = ModelConfig(
-        feature_dim=8, task_dim=4, task_grasp_candidates=0,
+        feature_dim=8, task_dim=4, task_grasp_candidates=1,
         pick_remove_candidates=8, push_candidates=8,
         graph_candidate_fallback_objects=1,
     )
@@ -88,6 +88,7 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
         "rotation_logits": torch.zeros(1, 8, 12),
         "approach_direction": torch.nn.functional.normalize(torch.ones(1, 8, 3), dim=-1),
         "width_m": torch.full((1, 8), 0.05),
+        "center_offset_m": torch.tensor([0.01, -0.02, 0.03]).expand(1, 8, 3),
     }
     global_head = {
         "contact_logits": torch.arange(8).float()[None],
@@ -96,6 +97,7 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
         "rotation_logits": torch.zeros(1, 8, 4, 12),
         "approach_direction": torch.nn.functional.normalize(torch.ones(1, 8, 4, 3), dim=-1),
         "width_m": torch.full((1, 8, 4), 0.05),
+        "center_offset_m": torch.zeros(1, 8, 4, 3),
     }
     push = {
         "object_logits": torch.tensor([[0.0, 1.0, 2.0, 3.0]]),
@@ -119,6 +121,15 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
         "encoded": encoded, "task_grasp": point_head, "global_grasp": global_head,
         "push": push, "pick_remove": {"object_logits": push["object_logits"]}, "graph": graph,
     })
+    task_row = torch.nonzero(
+        result["valid"][0] & (result["type"][0] == int(ActionType.TASK_GRASP)),
+        as_tuple=False,
+    ).flatten().item()
+    source_point = int(result["point_index"][0, task_row])
+    assert torch.allclose(
+        result["pose_world"][0, task_row, :3],
+        batch["xyz"][0, source_point] + torch.tensor([0.01, -0.02, 0.03]),
+    )
     preparation = result["valid"][0] & (result["type"][0] != int(ActionType.TASK_GRASP))
     objects = set(result["object"][0, preparation].tolist())
     assert 0 in objects  # explicit target self-push recovery rule

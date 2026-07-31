@@ -95,6 +95,11 @@ model:
   allow_target_push_recovery: true
   global_grasp_input_mode: scene_only
   global_grasp_modes_per_point: 4
+  grasp_anchor_association_max_m: 0.02
+  global_grasp_nms_translation_m: 0.01
+  global_grasp_nms_rotation_deg: 15.0
+  global_grasp_nms_width_m: 0.005
+  global_grasp_nms_approach_deg: 15.0
 
 grasp_verifier:
   local_scene_points: 512
@@ -141,12 +146,14 @@ losses:
     task_proposal_approach: 1.0
     task_proposal_rotation: 1.0
     task_proposal_width: 1.0
+    task_proposal_center_offset: 1.0
     task_proposal_confidence: 0.25
     task_proposal_task_compatibility: 1.0
     global_contact: 1.0
     global_approach: 1.0
     global_rotation: 1.0
     global_width: 1.0
+    global_center_offset: 1.0
     global_scene_confidence: 0.25
     global_intrinsic_confidence: 0.1
     proposal_state_graspable: 1.0
@@ -181,7 +188,9 @@ sampling:
   wrong_region_grasps: 8
   collision_or_approach_negative_grasps: 8
   perturbed_negative_grasps: 4
-  global_grasps_per_object: 128
+  global_positive_grasps_per_object: 64
+  global_intrinsic_negative_grasps_per_object: 32
+  global_scene_negative_grasps_per_object: 32
   unit: action_state_group
 
 optimizer:

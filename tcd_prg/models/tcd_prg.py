@@ -81,10 +81,12 @@ class TCDPRGModel(nn.Module):
         for row in range(b):
             for candidate in torch.nonzero(batch["candidate_mask"][row], as_tuple=False).flatten().tolist():
                 is_push = int(kind[row, candidate]) == 0
-                query = (
-                    parameters["push_contact_world"][row, candidate]
-                    if is_push else pose[row, candidate, :3]
-                )
+                is_remove = int(kind[row, candidate]) == 1
+                if is_remove and not bool(parameters.get(
+                    "removal_global_match_valid", torch.zeros_like(kind, dtype=torch.bool)
+                )[row, candidate]):
+                    continue
+                query = parameters["push_contact_world"][row, candidate] if is_push else pose[row, candidate, :3]
                 if not torch.isfinite(query).all():
                     continue
                 mask = batch["point_mask"][row] & (
@@ -93,6 +95,11 @@ class TCDPRGModel(nn.Module):
                 points = torch.nonzero(mask, as_tuple=False).flatten()
                 if not len(points):
                     continue
+                if not is_push and "grasp_contact_points_world" in parameters:
+                    contacts = parameters["grasp_contact_points_world"][row, candidate]
+                    if torch.isfinite(contacts).all():
+                        contact_distance = torch.cdist(contacts, batch["xyz"][row, points])
+                        query = contacts[contact_distance.min(-1).values.argmin()]
                 delta = batch["xyz"][row, points] - query
                 point = points[(delta * delta).sum(-1).argmin()]
                 if is_push:
@@ -105,8 +112,27 @@ class TCDPRGModel(nn.Module):
                     )
                 else:
                     if int(kind[row, candidate]) == 1:
-                        confidence = result["global_grasp"]["scene_confidence_logit"][row, point]
-                        evidence[row, candidate, 15] = torch.sigmoid(confidence).max()
+                        global_head = result["global_grasp"]
+                        predicted_center = (
+                            batch["xyz"][row, point]
+                            + global_head["center_offset_m"][row, point]
+                        )
+                        center_cost = torch.linalg.vector_norm(
+                            predicted_center - pose[row, candidate, :3], dim=-1
+                        ) / 0.02
+                        approach_target = parameters["grasp_approach_world"][row, candidate]
+                        approach_cost = 1.0 - (
+                            global_head["approach_direction"][row, point] * approach_target
+                        ).sum(-1).clamp(-1.0, 1.0)
+                        width_cost = torch.abs(
+                            global_head["width_m"][row, point]
+                            - parameters["grasp_width_m"][row, candidate]
+                        ) / 0.005
+                        mode = (center_cost + approach_cost + width_cost).argmin()
+                        evidence[row, candidate, 15] = (
+                            torch.sigmoid(global_head["intrinsic_confidence_logit"][row, point, mode])
+                            * torch.sigmoid(global_head["scene_confidence_logit"][row, point, mode])
+                        )
                     else:
                         evidence[row, candidate, 15] = torch.sigmoid(
                             result["task_grasp"]["proposal_confidence_logit"][row, point]
@@ -243,10 +269,17 @@ class TCDPRGModel(nn.Module):
             task_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m
         )
         object_present = batch.get("object_present", batch["object_mask"])
-        global_mask = batch["point_mask"] & object_present[
-            torch.arange(batch["xyz"].shape[0], device=batch["xyz"].device)[:, None],
-            batch["instance_id"].clamp(0, object_present.shape[1] - 1),
-        ]
+        if self.config.global_grasp_input_mode == "scene_only":
+            global_mask = batch["point_mask"]
+        else:
+            valid_instance = (
+                (batch["instance_id"] >= 0)
+                & (batch["instance_id"] < object_present.shape[1])
+            )
+            global_mask = (
+                batch["point_mask"] & valid_instance
+                & object_present.gather(1, batch["instance_id"].clamp(0, object_present.shape[1] - 1))
+            )
         global_grasp = self.global_grasp(
             encoded.scene_point_features,
             encoded.scene_object_tokens,

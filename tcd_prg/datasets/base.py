@@ -36,20 +36,33 @@ class DatasetAdapter(ABC):
         pass
 
     def load_global_grasps(
-        self, scene_id: int, state_id: int, observation: SceneObservation
+        self, scene_id: int, state_id: int, observation: SceneObservation,
+        training: bool = True,
     ) -> GlobalGraspLabels | None:
         """Optional task-free grasp supervision supplied by capable datasets."""
 
         return None
 
-    def load_sample(self, scene_id: int, state_id: int, task_index: int, group_index: int) -> UnifiedSample:
+    def load_sample(
+        self,
+        scene_id: int,
+        state_id: int,
+        task_index: int,
+        group_index: int,
+        *,
+        include_global_grasps: bool = True,
+    ) -> UnifiedSample:
         observation = self.load_observation(scene_id, state_id, task_index)
         sample = UnifiedSample(
             observation=observation,
             state_labels=self.load_state_labels(scene_id, state_id),
             candidates=self.load_action_group(scene_id, group_index),
             sequences=self.load_sequences(scene_id, task_index),
-            global_grasps=self.load_global_grasps(scene_id, state_id, observation),
+            global_grasps=(
+                self.load_global_grasps(scene_id, state_id, observation, training=True)
+                if include_global_grasps else None
+            ),
+            global_loss_valid=include_global_grasps,
         )
         sample.observation.validate()
         sample.candidates.validate()

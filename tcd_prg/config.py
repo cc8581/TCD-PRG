@@ -146,6 +146,11 @@ class ModelConfig:
     allow_target_push_recovery: bool = True
     global_grasp_input_mode: str = "scene_only"
     global_grasp_modes_per_point: int = 4
+    grasp_anchor_association_max_m: float = 0.02
+    global_grasp_nms_translation_m: float = 0.01
+    global_grasp_nms_rotation_deg: float = 15.0
+    global_grasp_nms_width_m: float = 0.005
+    global_grasp_nms_approach_deg: float = 15.0
 
 
 @dataclass(slots=True)
@@ -262,6 +267,7 @@ class LossConfig:
         "task_proposal_approach": 1.0,
         "task_proposal_rotation": 1.0,
         "task_proposal_width": 1.0,
+        "task_proposal_center_offset": 1.0,
         "task_proposal_confidence": 0.25,
         "task_proposal_task_compatibility": 1.0,
         "proposal_state_graspable": 1.0,
@@ -270,6 +276,7 @@ class LossConfig:
         "global_approach": 1.0,
         "global_rotation": 1.0,
         "global_width": 1.0,
+        "global_center_offset": 1.0,
         "global_scene_confidence": 0.25,
         "global_intrinsic_confidence": 0.1,
         "verify_stability": 0.5,
@@ -311,7 +318,9 @@ class SamplingConfig:
     wrong_region_grasps: int = 8
     collision_or_approach_negative_grasps: int = 8
     perturbed_negative_grasps: int = 4
-    global_grasps_per_object: int = 128
+    global_positive_grasps_per_object: int = 64
+    global_intrinsic_negative_grasps_per_object: int = 32
+    global_scene_negative_grasps_per_object: int = 32
     unit: str = "action_state_group"
 
 
@@ -406,10 +415,26 @@ class TCDPRGConfig:
             self.model.grasp_nms_approach_deg,
         ) <= 0:
             raise ValueError("All grasp NMS thresholds must be positive")
+        if min(
+            self.model.global_grasp_nms_translation_m,
+            self.model.global_grasp_nms_rotation_deg,
+            self.model.global_grasp_nms_width_m,
+            self.model.global_grasp_nms_approach_deg,
+            self.model.grasp_anchor_association_max_m,
+        ) <= 0:
+            raise ValueError("Global grasp NMS/association thresholds must be positive")
         if self.model.graph_candidate_fallback_objects < 0:
             raise ValueError("graph_candidate_fallback_objects cannot be negative")
         if self.model.global_grasp_input_mode not in {"scene_only", "instance_assisted"}:
             raise ValueError("global_grasp_input_mode must be scene_only or instance_assisted")
+        if min(
+            self.sampling.global_positive_grasps_per_object,
+            self.sampling.global_intrinsic_negative_grasps_per_object,
+            self.sampling.global_scene_negative_grasps_per_object,
+        ) < 0:
+            raise ValueError("Global grasp stratum sizes cannot be negative")
+        if self.sampling.global_positive_grasps_per_object == 0:
+            raise ValueError("Global grasp training requires positive samples")
         if not 2 <= self.model.global_grasp_modes_per_point <= 8:
             raise ValueError("global_grasp_modes_per_point must be in [2,8]")
         if self.ablation.router_type not in {

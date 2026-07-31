@@ -18,6 +18,10 @@ class GraspProposalLoss(nn.Module):
         approach = masked_mean(cosine, positive & torch.isfinite(labels["approach_target"]).all(-1))
         rotation = safe_cross_entropy(output["rotation_logits"], labels["rotation_bin"], positive)
         width = safe_smooth_l1(output["width_m"], labels["width_target_m"], positive & labels["width_valid"])
+        center_offset = safe_smooth_l1(
+            output["center_offset_m"], labels["center_offset_target_m"],
+            labels["center_offset_valid"].unsqueeze(-1).expand_as(output["center_offset_m"]),
+        )
         confidence = safe_bce_with_logits(
             output["proposal_confidence_logit"], labels["confidence_target"].float(), valid
         )
@@ -31,6 +35,7 @@ class GraspProposalLoss(nn.Module):
             "proposal_approach": approach,
             "proposal_rotation": rotation,
             "proposal_width": width,
+            "proposal_center_offset": center_offset,
             "proposal_confidence": confidence,
             "proposal_task_compatibility": compatibility,
         }

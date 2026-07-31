@@ -37,6 +37,71 @@ def _ragged(values: np.ndarray, offsets: np.ndarray, index: int) -> np.ndarray:
     return values[int(offsets[index]) : int(offsets[index + 1])]
 
 
+def _se3_diverse_rows(library, rows: np.ndarray, count: int) -> np.ndarray:
+    """Deterministic farthest-first object-frame pose/opening sampling."""
+
+    rows = np.asarray(rows, np.int64)
+    if count <= 0 or not len(rows):
+        return np.empty(0, np.int64)
+    if len(rows) <= count:
+        return rows
+    transform = library.transform_object[rows]
+    translation = transform[:, :3, 3]
+    approach = transform[:, :3, 2]
+    closing_axis = transform[:, :3, 0]
+    width = library.ag_width_m[rows]
+    first = int(np.argmax(library.quality[rows]))
+    selected = [first]
+    minimum = np.full(len(rows), np.inf, np.float64)
+    while len(selected) < count:
+        prior = selected[-1]
+        translation_distance = np.sqrt(np.sum((translation - translation[prior]) ** 2, axis=-1)) / 0.01
+        approach_distance = 1.0 - np.clip(np.sum(approach * approach[prior], axis=-1), -1.0, 1.0)
+        jaw_distance = 1.0 - np.abs(np.clip(np.sum(closing_axis * closing_axis[prior], axis=-1), -1.0, 1.0))
+        width_distance = np.abs(width - width[prior]) / 0.005
+        minimum = np.minimum(
+            minimum, translation_distance + approach_distance + jaw_distance + width_distance
+        )
+        minimum[selected] = -1.0
+        selected.append(int(np.argmax(minimum)))
+    return rows[np.asarray(selected, np.int64)]
+
+
+def _object_frame_nms_rows(
+    library, rows: np.ndarray, translation_m: float = 0.01,
+    rotation_cosine: float = 0.965925826, width_m: float = 0.005,
+) -> np.ndarray:
+    """NMS full evaluation truth under parallel-jaw symmetry."""
+
+    rows = np.asarray(rows, np.int64)
+    order = rows[np.argsort(library.quality[rows], kind="stable")[::-1]]
+    selected: list[int] = []
+    transforms = library.transform_object
+    for row in order.tolist():
+        if not selected:
+            selected.append(row)
+            continue
+        prior = np.asarray(selected, np.int64)
+        candidate = transforms[row]
+        translation_close = np.sum(
+            (transforms[prior, :3, 3] - candidate[:3, 3]) ** 2, axis=-1
+        ) <= translation_m**2
+        if not translation_close.any():
+            selected.append(row)
+            continue
+        nearby = prior[translation_close]
+        approach_close = np.sum(
+            transforms[nearby, :3, 2] * candidate[:3, 2], axis=-1
+        ) >= rotation_cosine
+        jaw_close = np.abs(np.sum(
+            transforms[nearby, :3, 0] * candidate[:3, 0], axis=-1
+        )) >= rotation_cosine
+        opening_close = np.abs(library.ag_width_m[nearby] - library.ag_width_m[row]) <= width_m
+        if not np.any(approach_close & jaw_close & opening_close):
+            selected.append(row)
+    return np.asarray(selected, np.int64)
+
+
 class TaskOrientedClutterAdapter(DatasetAdapter):
     """Map the current dataset to the model-independent contract.
 
@@ -76,7 +141,9 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         global_grasp_library_subdir: str = "generic_grasp_library_v1",
         global_grasp_certification_subdir: str = "global_grasp_scene_certification_v1",
         pick_remove_global_association_subdir: str = "pick_remove_global_grasp_association_v1",
-        global_grasps_per_object: int = 128,
+        global_positive_grasps_per_object: int = 64,
+        global_intrinsic_negative_grasps_per_object: int = 32,
+        global_scene_negative_grasps_per_object: int = 32,
     ) -> None:
         self.root = Path(root)
         self.scene_root = self.root / scene_subdir
@@ -85,7 +152,11 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         self.global_grasp_root = self.root / global_grasp_library_subdir
         self.global_grasp_certification_root = self.root / global_grasp_certification_subdir
         self.pick_remove_global_association_root = self.root / pick_remove_global_association_subdir
-        self.global_grasps_per_object = int(global_grasps_per_object)
+        self.global_sampling = (
+            int(global_positive_grasps_per_object),
+            int(global_intrinsic_negative_grasps_per_object),
+            int(global_scene_negative_grasps_per_object),
+        )
         for path in (self.scene_root, self.step_root, self.action_root):
             if not path.is_dir():
                 raise FileNotFoundError(path)
@@ -374,7 +445,8 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         return observation
 
     def load_global_grasps(
-        self, scene_id: int, state_id: int, observation: SceneObservation
+        self, scene_id: int, state_id: int, observation: SceneObservation,
+        training: bool = True,
     ) -> GlobalGraspLabels | None:
         """Transform task-free object libraries to world labels for this state.
 
@@ -394,6 +466,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         object_indices: list[int] = []
         sources: list[int] = []
         contacts: list[np.ndarray] = []
+        anchor_distances: list[float] = []
         poses: list[np.ndarray] = []
         approaches: list[np.ndarray] = []
         widths: list[float] = []
@@ -404,8 +477,10 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             self.global_grasp_certification_root / f"scene_{scene_id:04d}" / f"state_{state_id:04d}.npz"
         )
         certification: dict[tuple[int, int], int] = {}
+        certification_version = ""
         if certification_file.is_file():
             with np.load(certification_file, allow_pickle=False) as cached:
+                certification_version = str(cached.get("conversion_version", ""))
                 certification = {
                     (int(obj), int(source)): int(value)
                     for obj, source, value in zip(
@@ -418,18 +493,59 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 continue
             library = self.global_grasp_registry.load(category_keys[object_index], h5_names[object_index])
             versions.add(library.conversion_version)
-            eligible = np.flatnonzero(library.width_compatible)
-            if len(eligible) > self.global_grasps_per_object:
-                order = np.argsort(library.quality[eligible], kind="stable")[::-1]
-                eligible = eligible[order[: self.global_grasps_per_object]]
+            object_certification = (
+                certification if certification_version == library.conversion_version else {}
+            )
+            intrinsic_positive = library.stability_label & library.width_compatible
+            if training:
+                scene_negative = np.asarray([
+                    object_certification.get((object_index, int(source)), -1) == 0
+                    for source in library.source_index
+                ], bool) & intrinsic_positive
+                hard_rows = _se3_diverse_rows(
+                    library, np.flatnonzero(scene_negative), self.global_sampling[2]
+                )
+                positive_pool = np.flatnonzero(intrinsic_positive & ~scene_negative)
+                positive_rows = _se3_diverse_rows(library, positive_pool, self.global_sampling[0])
+                intrinsic_negative_rows = _se3_diverse_rows(
+                    library, np.flatnonzero(~intrinsic_positive), self.global_sampling[1]
+                )
+                eligible = np.unique(np.concatenate((positive_rows, intrinsic_negative_rows, hard_rows)))
+            else:
+                eligible = _object_frame_nms_rows(library, np.flatnonzero(intrinsic_positive))
             rotation_world_object = quaternion_xyzw_to_matrix_numpy(observation.object_pose[object_index, 3:])
-            for row in eligible:
+            visible_points = observation.xyz[observation.instance_id == object_index]
+            local_contacts = library.contact_points_object[eligible]
+            world_contacts = np.empty_like(local_contacts, dtype=np.float32)
+            for candidate_row in range(len(local_contacts)):
+                for side in range(2):
+                    for axis in range(3):
+                        world_contacts[candidate_row, side, axis] = (
+                            sum(float(rotation_world_object[axis, inner] * local_contacts[candidate_row, side, inner]) for inner in range(3))
+                            + float(observation.object_pose[object_index, axis])
+                        )
+            anchors = np.empty((len(eligible), 3), np.float32)
+            distances = np.full(len(eligible), np.inf, np.float32)
+            if len(visible_points):
+                for start in range(0, len(eligible), 256):
+                    stop = min(len(eligible), start + 256)
+                    delta = world_contacts[start:stop, :, None] - visible_points[None, None]
+                    distance_sq = np.sum(delta * delta, axis=-1)
+                    side_distance = np.min(distance_sq, axis=-1)
+                    side = np.argmin(side_distance, axis=-1)
+                    rows = np.arange(stop - start)
+                    anchors[start:stop] = world_contacts[start:stop][rows, side]
+                    distances[start:stop] = np.sqrt(side_distance[rows, side])
+            else:
+                anchors[:] = world_contacts[:, 0]
+            for selected_index, row in enumerate(eligible):
                 pose = compose_pose_with_transform(
                     observation.object_pose[object_index], library.transform_object[row]
                 ).astype(np.float32)
                 object_indices.append(object_index)
                 sources.append(int(library.source_index[row]))
-                contacts.append(pose[:3])
+                contacts.append(anchors[selected_index])
+                anchor_distances.append(float(distances[selected_index]))
                 poses.append(pose)
                 local_approach = library.approach_direction_object[row]
                 approaches.append(np.asarray([
@@ -437,8 +553,10 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                     for axis in range(3)
                 ], dtype=np.float32))
                 widths.append(float(library.ag_width_m[row]))
-                intrinsic.append(bool(library.stability_label[row]))
-                scene_labels.append(certification.get((object_index, int(library.source_index[row])), -1))
+                intrinsic.append(bool(intrinsic_positive[row]))
+                scene_labels.append(
+                    object_certification.get((object_index, int(library.source_index[row])), -1)
+                )
         count = len(object_indices)
         version = next(iter(versions)) if len(versions) == 1 else "+".join(sorted(versions))
         return GlobalGraspLabels(
@@ -450,6 +568,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             width_m=np.asarray(widths, np.float32),
             intrinsic_stable=np.asarray(intrinsic, bool),
             scene_executable=np.asarray(scene_labels, np.int8),
+            anchor_visible_distance_m=np.asarray(anchor_distances, np.float32),
             valid_mask=np.ones(count, bool),
             conversion_version=version,
         )
@@ -573,6 +692,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 "task_grasp_pose_world": np.full((n, 7), np.nan, np.float32),
                 "grasp_width_m": np.full(n, np.nan, np.float32),
                 "grasp_approach_world": np.full((n, 3), np.nan, np.float32),
+                "grasp_contact_points_world": np.full((n, 2, 3), np.nan, np.float32),
                 "grasp_rotation_matrix_world": np.full((n, 3, 3), np.nan, np.float32),
                 "grasp_depth_m": np.full(n, np.nan, np.float32),
                 "grasp_confidence": np.full(n, np.nan, np.float32),
@@ -603,7 +723,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
 
             def world_grasp(
                 object_index: int, state_id: int, source_index: int
-            ) -> tuple[np.ndarray, float, np.ndarray, float, float]:
+            ) -> tuple[np.ndarray, float, np.ndarray, float, float, np.ndarray]:
                 library = self.grasp_registry.load(object_match_files[object_index])
                 library_row = int(library.rows_for_source(np.asarray([source_index]))[0])
                 if state_id not in state_pose_cache:
@@ -611,12 +731,22 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 object_pose = state_pose_cache[state_id][object_index]
                 pose = compose_pose_with_transform(object_pose, library.transform_object[library_row])
                 rotation = quaternion_xyzw_to_matrix_numpy(pose[3:]).astype(np.float32)
+                object_rotation = quaternion_xyzw_to_matrix_numpy(object_pose[3:])
+                local_contacts = library.contact_points_object[library_row]
+                world_contacts = np.empty((2, 3), np.float32)
+                for side in range(2):
+                    for axis in range(3):
+                        world_contacts[side, axis] = (
+                            sum(float(object_rotation[axis, inner] * local_contacts[side, inner]) for inner in range(3))
+                            + float(object_pose[axis])
+                        )
                 return (
                     pose,
                     float(library.contact_span_m[library_row]),
                     rotation,
                     float(library.depth_m[library_row]),
                     float(library.confidence[library_row]),
+                    world_contacts,
                 )
             for row, (kind, payload) in enumerate(zip(action_type, payload_index, strict=True)):
                 if kind == ActionType.PUSH:
@@ -635,7 +765,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                     parameters["removal_global_library_row"][row] = global_row
                     parameters["removal_global_match_valid"][row] = global_valid
                     parameters["removal_destination_world"][row] = p["removal_destination_world"][payload]
-                    _, width, rotation, depth_m, confidence = world_grasp(
+                    _, width, rotation, depth_m, confidence, contacts_world = world_grasp(
                         int(acted_object[row]), int(actions["from_state"][action_ids[row]]),
                         int(parameters["removal_grasp_source_index"][row])
                     )
@@ -644,11 +774,12 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                     parameters["grasp_rotation_matrix_world"][row] = rotation
                     parameters["grasp_depth_m"][row] = depth_m
                     parameters["grasp_confidence"][row] = confidence
+                    parameters["grasp_contact_points_world"][row] = contacts_world
                 elif kind == ActionType.TASK_GRASP:
                     p = actions["task_grasp"]
                     acted_object[row] = p["target_object"][payload]
                     parameters["task_grasp_source_index"][row] = p["grasp_source_index"][payload]
-                    pose, width, rotation, depth_m, confidence = world_grasp(
+                    pose, width, rotation, depth_m, confidence, contacts_world = world_grasp(
                         int(acted_object[row]), int(actions["from_state"][action_ids[row]]),
                         int(parameters["task_grasp_source_index"][row])
                     )
@@ -658,6 +789,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                     parameters["grasp_rotation_matrix_world"][row] = rotation
                     parameters["grasp_depth_m"][row] = depth_m
                     parameters["grasp_confidence"][row] = confidence
+                    parameters["grasp_contact_points_world"][row] = contacts_world
                 else:
                     raise ValueError(f"Unknown action type {kind}")
             push_rows = action_type == ActionType.PUSH
@@ -783,7 +915,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 extension[key] = np.full(shape, np.nan, original.dtype)
         for row, library_row in enumerate(selected_array):
             source_index = int(library.source_index[library_row])
-            pose, width, rotation, depth_m, confidence = world_grasp(
+            pose, width, rotation, depth_m, confidence, contacts_world = world_grasp(
                 target_object, state_id, source_index
             )
             extension["task_grasp_source_index"][row] = source_index
@@ -793,6 +925,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             extension["grasp_rotation_matrix_world"][row] = rotation
             extension["grasp_depth_m"][row] = depth_m
             extension["grasp_confidence"][row] = confidence
+            extension["grasp_contact_points_world"][row] = contacts_world
             is_wrong, is_collision, is_approach = kinds_array[row] == np.arange(3)
             extension["proposal_geometry_valid"][row] = not is_wrong
             targets = {

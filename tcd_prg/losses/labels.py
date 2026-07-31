@@ -19,21 +19,35 @@ def _nearest_point_indices(
     contacts: Tensor,
     acted_object: Tensor,
     candidate_valid: Tensor,
+    max_distance_m: float | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """Find candidate contact points without allocating a K-by-N-by-3 tensor."""
+    """Associate candidates with visible object points in object-wise chunks."""
 
     batch_size, candidate_count = contacts.shape[:2]
     indices = torch.zeros((batch_size, candidate_count), dtype=torch.long, device=xyz.device)
     valid = candidate_valid.clone()
     for row in range(batch_size):
-        for candidate in torch.nonzero(candidate_valid[row], as_tuple=False).flatten().tolist():
-            mask = point_mask[row] & (instance_id[row] == acted_object[row, candidate])
-            points = torch.nonzero(mask, as_tuple=False).flatten()
-            if not len(points) or not torch.isfinite(contacts[row, candidate]).all():
-                valid[row, candidate] = False
+        objects = torch.unique(acted_object[row, candidate_valid[row]])
+        for object_index in objects.tolist():
+            candidates = torch.nonzero(
+                candidate_valid[row] & (acted_object[row] == object_index), as_tuple=False
+            ).flatten()
+            points = torch.nonzero(
+                point_mask[row] & (instance_id[row] == object_index), as_tuple=False
+            ).flatten()
+            finite = torch.isfinite(contacts[row, candidates]).all(-1)
+            valid[row, candidates[~finite]] = False
+            candidates = candidates[finite]
+            if not len(points) or not len(candidates):
+                valid[row, candidates] = False
                 continue
-            delta = xyz[row, points] - contacts[row, candidate]
-            indices[row, candidate] = points[(delta * delta).sum(-1).argmin()]
+            for start in range(0, len(candidates), 256):
+                selected = candidates[start : start + 256]
+                distance = torch.cdist(contacts[row, selected], xyz[row, points])
+                nearest_distance, nearest = distance.min(-1)
+                indices[row, selected] = points[nearest]
+                if max_distance_m is not None:
+                    valid[row, selected] &= nearest_distance <= max_distance_m
     return indices, valid
 
 
@@ -49,6 +63,29 @@ def _rotation_bins(rotation: Tensor, bins: int) -> Tensor:
     tangent_y = torch.cross(approach, tangent_x, dim=-1)
     angle = torch.atan2((x_axis * tangent_y).sum(-1), (x_axis * tangent_x).sum(-1))
     return torch.floor((angle + math.pi) * bins / (2 * math.pi)).long().remainder(bins)
+
+
+def _visible_contact_anchors(
+    xyz: Tensor, point_mask: Tensor, instance_id: Tensor, contacts: Tensor,
+    acted_object: Tensor, candidate_valid: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Choose the labelled finger contact closest to the visible object surface."""
+
+    anchors = contacts[..., 0, :].clone()
+    valid = candidate_valid.clone()
+    for row in range(xyz.shape[0]):
+        for candidate in torch.nonzero(candidate_valid[row], as_tuple=False).flatten().tolist():
+            points = torch.nonzero(
+                point_mask[row] & (instance_id[row] == acted_object[row, candidate]),
+                as_tuple=False,
+            ).flatten()
+            if not len(points) or not torch.isfinite(contacts[row, candidate]).all():
+                valid[row, candidate] = False
+                continue
+            distance = torch.cdist(contacts[row, candidate], xyz[row, points])
+            side = distance.min(-1).values.argmin()
+            anchors[row, candidate] = contacts[row, candidate, side]
+    return anchors, valid
 
 
 def build_grasp_proposal_labels(
@@ -78,8 +115,13 @@ def build_grasp_proposal_labels(
         & torch.isfinite(rotation).all(-1).all(-1)
         & torch.isfinite(parameters["grasp_width_m"])
     )
+    contact_anchors, candidate = _visible_contact_anchors(
+        xyz, point_domain, batch["instance_id"], parameters["grasp_contact_points_world"],
+        batch["acted_object"], candidate,
+    )
     point_index, candidate = _nearest_point_indices(
-        xyz, point_domain, batch["instance_id"], pose[..., :3], batch["acted_object"], candidate
+        xyz, point_domain, batch["instance_id"], contact_anchors,
+        batch["acted_object"], candidate, config.grasp_anchor_association_max_m,
     )
     contact_target = torch.zeros((batch_size, point_count), dtype=xyz.dtype, device=xyz.device)
     proposal_valid = torch.zeros((batch_size, point_count), dtype=torch.bool, device=xyz.device)
@@ -87,6 +129,7 @@ def build_grasp_proposal_labels(
     approach_target = torch.full((batch_size, point_count, 3), float("nan"), device=xyz.device)
     rotation_bin = torch.full((batch_size, point_count), -1, dtype=torch.long, device=xyz.device)
     width_target = torch.full((batch_size, point_count), float("nan"), device=xyz.device)
+    center_offset_target = torch.full((batch_size, point_count, 3), float("nan"), device=xyz.device)
     confidence_target = torch.zeros((batch_size, point_count), device=xyz.device)
     candidate_rotation_bin = _rotation_bins(torch.nan_to_num(rotation), config.num_grasp_rotation_bins)
     selected_confidence = torch.full(
@@ -99,9 +142,11 @@ def build_grasp_proposal_labels(
             point = int(point_index[row, candidate_index])
             object_index = int(batch["acted_object"][row, candidate_index])
             domain = point_domain[row] & (batch["instance_id"][row] == object_index)
-            delta = xyz[row] - pose[row, candidate_index, :3]
+            delta = xyz[row] - contact_anchors[row, candidate_index]
             distance_sq = (delta * delta).sum(-1)
             neighborhood = domain & (distance_sq <= support_sq)
+            if not bool(neighborhood.any()):
+                continue
             proposal_valid[row] |= neighborhood
             if not bool(geometry_positive[row, candidate_index]):
                 continue
@@ -120,6 +165,7 @@ def build_grasp_proposal_labels(
             approach_target[row, point] = parameters["grasp_approach_world"][row, candidate_index]
             rotation_bin[row, point] = candidate_rotation_bin[row, candidate_index]
             width_target[row, point] = parameters["grasp_width_m"][row, candidate_index]
+            center_offset_target[row, point] = pose[row, candidate_index, :3] - xyz[row, point]
             confidence_target[row, point] = confidence
     if generic_remove:
         compatibility_target = point_domain
@@ -134,6 +180,8 @@ def build_grasp_proposal_labels(
         "approach_target": approach_target,
         "rotation_bin": rotation_bin,
         "width_target_m": width_target,
+        "center_offset_target_m": center_offset_target,
+        "center_offset_valid": mode_valid & torch.isfinite(center_offset_target).all(-1),
         "width_valid": torch.isfinite(width_target)
         & (width_target >= config.min_grasp_width_m)
         & (width_target <= config.max_grasp_width_m),
@@ -161,14 +209,23 @@ def build_global_grasp_labels(
     approach = xyz.new_full((b, n, modes, 3), float("nan"))
     rotation_bin = torch.full((b, n, modes), -1, dtype=torch.long, device=xyz.device)
     width = xyz.new_full((b, n, modes), float("nan"))
+    center_offset = xyz.new_full((b, n, modes, 3), float("nan"))
     intrinsic = xyz.new_zeros((b, n, modes))
     intrinsic_valid = torch.zeros_like(matching_valid)
     scene = xyz.new_zeros((b, n, modes))
     scene_valid = torch.zeros_like(matching_valid)
-    candidate = source["valid_mask"] & torch.isfinite(source["grasp_pose_world"]).all(-1)
+    sample_valid = batch.get(
+        "global_loss_sample_valid",
+        torch.ones((b,), dtype=torch.bool, device=xyz.device),
+    )
+    candidate = (
+        source["valid_mask"]
+        & sample_valid[:, None]
+        & torch.isfinite(source["grasp_pose_world"]).all(-1)
+    )
     point_index, candidate = _nearest_point_indices(
         xyz, batch["point_mask"], batch["instance_id"], source["contact_point_world"],
-        source["object_index"], candidate,
+        source["object_index"], candidate, config.grasp_anchor_association_max_m,
     )
     rotation = quaternion_xyzw_to_matrix(torch.nan_to_num(source["grasp_pose_world"][..., 3:]))
     candidate_rotation_bin = _rotation_bins(rotation, config.num_grasp_rotation_bins)
@@ -206,21 +263,40 @@ def build_global_grasp_labels(
             if len(selected) < modes:
                 selected.extend(index for index in remaining if index not in selected)
                 selected = selected[:modes]
-            for slot, candidate_index in enumerate(selected):
+            written = 0
+            for candidate_index in selected:
                 object_index = int(source["object_index"][row, candidate_index])
                 domain = batch["point_mask"][row] & (batch["instance_id"][row] == object_index)
-                distance_sq = ((xyz[row] - source["contact_point_world"][row, candidate_index]) ** 2).sum(-1)
-                neighborhood = domain & (distance_sq <= support_sq)
-                contact_valid[row] |= neighborhood
+                object_points = torch.nonzero(domain, as_tuple=False).flatten()
+                if object_points.numel() == 0:
+                    continue
+                object_distance_sq = (
+                    (xyz[row, object_points] - source["contact_point_world"][row, candidate_index])
+                    ** 2
+                ).sum(-1)
+                near_object_points = object_points[object_distance_sq <= support_sq]
+                if near_object_points.numel() == 0:
+                    continue
+                slot = written
+                written += 1
+                contact_valid[row, near_object_points] = True
                 if bool(intrinsic_cpu[row][candidate_index]):
-                    contact_target[row] = torch.maximum(
-                        contact_target[row], torch.exp(-0.5 * distance_sq / sigma_sq) * neighborhood
+                    contact_target[row, near_object_points] = torch.maximum(
+                        contact_target[row, near_object_points],
+                        torch.exp(
+                            -0.5
+                            * object_distance_sq[object_distance_sq <= support_sq]
+                            / sigma_sq
+                        ),
                     )
                 matching_valid[row, point, slot] = True
                 geometry_valid[row, point, slot] = bool(intrinsic_cpu[row][candidate_index])
                 approach[row, point, slot] = source["approach_direction_world"][row, candidate_index]
                 rotation_bin[row, point, slot] = candidate_rotation_bin[row, candidate_index]
                 width[row, point, slot] = source["width_m"][row, candidate_index]
+                center_offset[row, point, slot] = (
+                    source["grasp_pose_world"][row, candidate_index, :3] - xyz[row, point]
+                )
                 intrinsic[row, point, slot] = source["intrinsic_stable"][row, candidate_index].float()
                 intrinsic_valid[row, point, slot] = True
                 state = int(source["scene_executable"][row, candidate_index])
@@ -235,6 +311,8 @@ def build_global_grasp_labels(
         "approach_target": approach,
         "rotation_bin": rotation_bin,
         "width_target_m": width,
+        "center_offset_target_m": center_offset,
+        "center_offset_valid": geometry_valid & torch.isfinite(center_offset).all(-1),
         "width_valid": torch.isfinite(width) & (width >= config.min_grasp_width_m) & (width <= config.max_grasp_width_m),
         "intrinsic_target": intrinsic,
         "intrinsic_valid": intrinsic_valid,
@@ -347,16 +425,25 @@ def build_push_supervision(
 def build_remove_labels(batch: dict[str, Tensor]) -> dict[str, Tensor]:
     candidate = batch["candidate_mask"] & (batch["action_type"] == int(ActionType.PICK_REMOVE))
     evaluated = batch["evaluation_status"] != int(CandidateStatus.UNKNOWN_UNTESTED)
-    positive = candidate & batch["action_improves_state"]
+    action_positive = candidate & batch["action_improves_state"]
+    association_valid = batch["action_parameters"].get(
+        "removal_global_match_valid", torch.zeros_like(candidate)
+    ).bool()
+    positive = action_positive & association_valid
     object_positive = torch.zeros_like(batch["object_mask"])
     for row in range(candidate.shape[0]):
-        objects = batch["acted_object"][row, positive[row]]
+        # Object choice remains valid supervision even when a legacy grasp has
+        # no representation in the new global library.
+        objects = batch["acted_object"][row, action_positive[row]]
         object_positive[row, objects[objects >= 0]] = True
     return {
         "object_positive": object_positive,
         "object_valid_mask": batch["object_mask"] & batch["object_active"],
         "candidate_positive": positive,
-        "candidate_valid": candidate & evaluated,
+        # An unmatched successful legacy grasp is UNKNOWN for global-candidate
+        # ranking, never a positive and never a negative.
+        "candidate_valid": candidate & evaluated & (~action_positive | association_valid),
+        "association_valid": association_valid,
     }
 
 

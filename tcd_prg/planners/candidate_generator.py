@@ -11,6 +11,7 @@ from torch import Tensor
 from tcd_prg.config import ModelConfig
 from tcd_prg.constants import ActionType, PUSH_DISTANCE_M
 from tcd_prg.geometry.se3 import matrix_to_quaternion_xyzw
+from tcd_prg.geometry.grasp_nms import task_grasp_nms
 
 
 def _rotation_from_approach(approach: Tensor, rotation_bin: Tensor, bins: int) -> Tensor:
@@ -66,7 +67,8 @@ class DenseCandidateGenerator:
         return eligible
 
     def global_predictions(
-        self, batch: dict[str, Tensor], output: dict[str, Any], topk: int | None = None
+        self, batch: dict[str, Tensor], output: dict[str, Any], topk: int | None = None,
+        score_kind: str = "raw",
     ) -> list[dict[str, Tensor]]:
         """Decode task-free grasps for every physically present visible object.
 
@@ -76,35 +78,78 @@ class DenseCandidateGenerator:
 
         head = output["global_grasp"]
         rows: list[dict[str, Tensor]] = []
+        if score_kind not in {"raw", "scene"}:
+            raise ValueError("score_kind must be raw or scene")
         amount = int(topk or self.config.candidate_topk)
         for row in range(batch["xyz"].shape[0]):
             xyz = batch["xyz"][row]
             instance = batch["instance_id"][row]
             present = batch.get("object_present", batch["object_mask"])[row]
-            domain = batch["point_mask"][row] & present[
-                instance.clamp(0, present.shape[0] - 1)
-            ]
-            score = (
+            valid_instance = (instance >= 0) & (instance < present.shape[0])
+            if self.config.global_grasp_input_mode == "scene_only":
+                domain = batch["point_mask"][row]
+            else:
+                domain = (
+                    batch["point_mask"][row] & valid_instance
+                    & present[instance.clamp(0, present.shape[0] - 1)]
+                )
+            raw_score = (
                 torch.sigmoid(head["contact_logits"][row, :, None])
-                * torch.sigmoid(head["scene_confidence_logit"][row])
+                * torch.sigmoid(head["intrinsic_confidence_logit"][row])
             ).masked_fill(~domain[:, None], -1.0)
-            count = min(amount, int(domain.sum()) * score.shape[1])
-            flat = score.flatten().topk(count).indices if count else torch.empty(
+            scene_score = raw_score * torch.sigmoid(head["scene_confidence_logit"][row])
+            ranking_score = raw_score if score_kind == "raw" else scene_score
+            count = min(amount * 8, int(domain.sum()) * ranking_score.shape[1])
+            flat = ranking_score.flatten().topk(count).indices if count else torch.empty(
                 0, dtype=torch.long, device=xyz.device
             )
-            point = torch.div(flat, score.shape[1], rounding_mode="floor")
-            mode = flat.remainder(score.shape[1])
+            point = torch.div(flat, ranking_score.shape[1], rounding_mode="floor")
+            mode = flat.remainder(ranking_score.shape[1])
             rotation_bin = head["rotation_logits"][row, point, mode].argmax(-1)
             rotation = _rotation_from_approach(
                 head["approach_direction"][row, point, mode], rotation_bin,
                 self.config.num_grasp_rotation_bins,
             )
+            pose_world = torch.cat((
+                xyz[point] + head["center_offset_m"][row, point, mode],
+                matrix_to_quaternion_xyzw(rotation),
+            ), -1)
+            object_index = instance[point]
+            # Strict scene-only comparison may annotate selected grasps after
+            # decoding, but instance IDs must not influence ranking or NMS.
+            nms_object_index = (
+                torch.zeros_like(object_index)
+                if self.config.global_grasp_input_mode == "scene_only"
+                else object_index
+            )
+            width_m = head["width_m"][row, point, mode]
+            ranked_score = ranking_score[point, mode]
+            if len(point):
+                keep = task_grasp_nms(
+                    pose_world[None], width_m[None], ranked_score[None], nms_object_index[None],
+                    torch.ones((1, len(point)), dtype=torch.bool, device=point.device),
+                    translation_threshold_m=self.config.global_grasp_nms_translation_m,
+                    rotation_threshold_deg=self.config.global_grasp_nms_rotation_deg,
+                    width_threshold_m=self.config.global_grasp_nms_width_m,
+                    approach_threshold_deg=self.config.global_grasp_nms_approach_deg,
+                )[0]
+                if self.config.global_grasp_input_mode != "scene_only":
+                    keep |= object_index < 0
+                selected = torch.nonzero(keep, as_tuple=False).flatten()
+                selected = selected[
+                    ranked_score[selected].argsort(descending=True, stable=True)
+                ][:amount]
+                point, mode, rotation = point[selected], mode[selected], rotation[selected]
+                pose_world, object_index, width_m = (
+                    pose_world[selected], object_index[selected], width_m[selected]
+                )
             rows.append({
-                "object": instance[point],
+                "object": object_index,
                 "contact_world": xyz[point],
-                "pose_world": torch.cat((xyz[point], matrix_to_quaternion_xyzw(rotation)), -1),
-                "width_m": head["width_m"][row, point, mode],
-                "score": score[point, mode],
+                "pose_world": pose_world,
+                "width_m": width_m,
+                "raw_score": raw_score[point, mode],
+                "scene_score": scene_score[point, mode],
                 "intrinsic_score": torch.sigmoid(
                     head["intrinsic_confidence_logit"][row, point, mode]
                 ),
@@ -145,7 +190,10 @@ class DenseCandidateGenerator:
                     task_head["approach_direction"][batch_row, index], rotation_bin,
                     self.config.num_grasp_rotation_bins,
                 )
-                pose = torch.cat((xyz[index], matrix_to_quaternion_xyzw(rotation)), -1)
+                pose = torch.cat((
+                    xyz[index] + task_head["center_offset_m"][batch_row, index],
+                    matrix_to_quaternion_xyzw(rotation),
+                ), -1)
                 type_parts.append(torch.full_like(index, int(ActionType.TASK_GRASP)))
                 object_parts.append(torch.full_like(index, target_object))
                 contact_parts.append(torch.full((len(index), 3), float("nan"), device=xyz.device))
@@ -158,9 +206,12 @@ class DenseCandidateGenerator:
                 point_index_parts.append(index)
 
             global_grasp = output["global_grasp"]
-            global_score = (
+            global_raw_score = (
                 torch.sigmoid(global_grasp["contact_logits"][batch_row, :, None])
-                * torch.sigmoid(global_grasp["scene_confidence_logit"][batch_row])
+                * torch.sigmoid(global_grasp["intrinsic_confidence_logit"][batch_row])
+            )
+            global_score = global_raw_score * torch.sigmoid(
+                global_grasp["scene_confidence_logit"][batch_row]
             )
             remove_domain = active.clone()
             remove_domain[target_object] = False
@@ -191,7 +242,12 @@ class DenseCandidateGenerator:
                     global_grasp["approach_direction"][batch_row, remove_index, remove_mode], rotation_bin,
                     self.config.num_grasp_rotation_bins,
                 )
-                pose = torch.cat((xyz[remove_index], matrix_to_quaternion_xyzw(rotation)), -1)
+                pose = torch.cat((
+                    xyz[remove_index] + global_grasp["center_offset_m"][
+                        batch_row, remove_index, remove_mode
+                    ],
+                    matrix_to_quaternion_xyzw(rotation),
+                ), -1)
                 type_parts.append(torch.full_like(remove_index, int(ActionType.PICK_REMOVE)))
                 object_parts.append(instance[remove_index])
                 contact_parts.append(torch.full((len(remove_index), 3), float("nan"), device=xyz.device))
