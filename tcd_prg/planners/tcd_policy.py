@@ -163,7 +163,6 @@ class TCDPRGPolicy(ManipulationPolicy):
             action.update(
                 push_contact_world=array("contact_world"),
                 push_direction_world=array("direction_world"),
-                push_approach_mode=int(array("push_approach_mode")),
                 push_distance_m=float(array("push_distance_m")),
             )
         else:

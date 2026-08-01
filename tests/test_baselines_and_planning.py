@@ -65,6 +65,7 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
     })
     assert result["type"].shape == (1, 1)
     assert not result["valid"].any()
+    assert "push_approach_mode" not in result
 
 
 def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:

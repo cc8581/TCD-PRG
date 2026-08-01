@@ -174,7 +174,7 @@ class DenseCandidateGenerator:
                 actionable = active
             target_object = int(batch["target_object"][batch_row])
             type_parts, object_parts, contact_parts, direction_parts, point_index_parts = [], [], [], [], []
-            pose_parts, destination_parts, width_parts, score_parts, approach_parts = [], [], [], [], []
+            pose_parts, destination_parts, width_parts, score_parts = [], [], [], []
 
             task_head = output["task_grasp"]
             task_score = (
@@ -202,7 +202,6 @@ class DenseCandidateGenerator:
                 destination_parts.append(torch.full((len(index), 3), float("nan"), device=xyz.device))
                 width_parts.append(task_head["width_m"][batch_row, index])
                 score_parts.append(task_score[index])
-                approach_parts.append(torch.full_like(index, -1))
                 point_index_parts.append(index)
 
             global_grasp = output["global_grasp"]
@@ -256,7 +255,6 @@ class DenseCandidateGenerator:
                 destination_parts.append(torch.full((len(remove_index), 3), float("nan"), device=xyz.device))
                 width_parts.append(global_grasp["width_m"][batch_row, remove_index, remove_mode])
                 score_parts.append(global_score[remove_index, remove_mode])
-                approach_parts.append(torch.full_like(remove_index, -1))
                 point_index_parts.append(remove_index)
 
             push = output["push"]
@@ -296,7 +294,6 @@ class DenseCandidateGenerator:
                 destination_parts.append(torch.full((len(push_index), 3), float("nan"), device=xyz.device))
                 width_parts.append(torch.full((len(push_index),), float("nan"), device=xyz.device))
                 score_parts.append(torch.sigmoid(push["contact_logits"][batch_row, push_index]))
-                approach_parts.append(torch.full_like(push_index, -1))
                 point_index_parts.append(push_index)
 
             if type_parts:
@@ -308,7 +305,6 @@ class DenseCandidateGenerator:
                     "destination_world": torch.cat(destination_parts),
                     "width_m": torch.cat(width_parts),
                     "proposal_score": torch.cat(score_parts),
-                    "push_approach_mode": torch.cat(approach_parts),
                     "point_index": torch.cat(point_index_parts),
                 }
             else:
@@ -323,13 +319,12 @@ class DenseCandidateGenerator:
                     "destination_world": xyz.new_empty((0, 3)),
                     "width_m": xyz.new_empty((0,)),
                     "proposal_score": xyz.new_empty((0,)),
-                    "push_approach_mode": torch.empty(0, dtype=torch.long, device=xyz.device),
                     "point_index": torch.empty(0, dtype=torch.long, device=xyz.device),
                 }
             rows.append(row)
         max_candidates = max(1, max(len(row["type"]) for row in rows))
         result: dict[str, Tensor] = {}
-        fill = {"type": -1, "object": -1, "push_approach_mode": -1, "point_index": -1,
+        fill = {"type": -1, "object": -1, "point_index": -1,
                 "width_m": float("nan"), "proposal_score": -1.0,
                 "contact_world": float("nan"), "direction_world": float("nan"),
                 "pose_world": float("nan"), "destination_world": float("nan")}

@@ -134,7 +134,7 @@ class Certifier(object):
         return result
 
     @staticmethod
-    def push_waypoints(contact, direction, approach_mode):
+    def push_waypoints(contact, direction):
         direction = normalize(direction, (1, 0, 0))
         tool_z = np.asarray((0.0, 0.0, -1.0))
         tool_y = direction
@@ -165,15 +165,16 @@ class Certifier(object):
                 quaternion=np.array([(rotation[0,2]+rotation[2,0])/s,
                     (rotation[1,2]+rotation[2,1])/s,.25*s,(rotation[1,0]-rotation[0,1])/s])
         start = np.asarray(contact, dtype=np.float64) - direction * 0.01
-        pre = start + np.asarray((0, 0, PREGRASP_M)) if int(approach_mode) == 0 \
-            else start - direction * PREGRASP_M
+        # PUSH uses one deterministic side-entry primitive. Approach selection
+        # is execution geometry, not a learned or candidate-level decision.
+        pre = start - direction * PREGRASP_M
         positions = [pre, start, start + direction * 0.075, start + direction * 0.15]
         return [np.r_[position, quaternion] for position in positions]
 
-    def certify(self, kind, acted, pose, width, contact, direction, approach):
+    def certify(self, kind, acted, pose, width, contact, direction):
         if int(kind) == 0:
             self.set_gripper(self.robot, 1.0, use_motor=False)
-            waypoints = self.push_waypoints(contact, direction, approach)
+            waypoints = self.push_waypoints(contact, direction)
         else:
             closure = (0.095 - min(0.095, max(0.0, float(width)))) / 0.095
             self.set_gripper(self.robot, closure, use_motor=False)
@@ -202,8 +203,7 @@ def main():
             success, reasons = [], []
             for values in zip(request["action_type"], request["acted_object"],
                               request["pose_world"], request["width_m"],
-                              request["contact_world"], request["direction_world"],
-                              request["approach_mode"]):
+                              request["contact_world"], request["direction_world"]):
                 ok, reason = certifier.certify(*values); success.append(ok); reasons.append(reason)
         output = Path(args.output); output.parent.mkdir(parents=True, exist_ok=True)
         temporary = output.with_suffix(output.suffix + ".tmp.npz")

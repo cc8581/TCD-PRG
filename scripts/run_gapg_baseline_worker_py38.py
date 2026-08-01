@@ -209,7 +209,7 @@ def push_candidates(scene, instance, active, target, push_model, device):
             "action_type": 0, "acted_object": nearest,
             "push_contact_world": contact.tolist(),
             "push_direction_world": direction.tolist(),
-            "push_distance_m": 0.15, "push_approach_mode": 0,
+            "push_distance_m": 0.15,
             "score": float(scores[int(index)]),
         })
     return results

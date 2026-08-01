@@ -64,7 +64,7 @@ class BackboneConfig:
     name: str = "task_conditioned_point_transformer"
     pretrained_checkpoint: str | None = None
     freeze: bool = False
-    attention_points: int = 4_096
+    attention_points: int = 1_024
 
 
 @dataclass(slots=True)
@@ -237,7 +237,6 @@ class GraphConfig:
 class PushConfig:
     distance_m: float = PUSH_DISTANCE_M
     direction_bins: int = 16
-    approach_modes: tuple[str, ...] = ("top", "side")
 
 
 @dataclass(slots=True)

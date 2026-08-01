@@ -6,9 +6,10 @@ from types import SimpleNamespace
 
 from tcd_prg.baselines.base import GlobalGraspPrediction
 from tcd_prg.config import AblationConfig, BackboneConfig, GraphConfig, ModelConfig, RouterConfig
-from tcd_prg.datasets.types import GlobalGraspLabels
+from tcd_prg.datasets.collate import _empty_global_grasps_like
 from tcd_prg.datasets.task_oriented_clutter import _se3_diverse_rows
 from tcd_prg.datasets.torch_dataset import ActionStateGroupDataset
+from tcd_prg.datasets.types import GlobalGraspLabels
 from tcd_prg.evaluators.global_grasp import GlobalGraspEvaluator
 from tcd_prg.losses.global_grasp import GlobalGraspLoss
 from tcd_prg.models import TCDPRGModel
@@ -269,3 +270,20 @@ def test_global_evaluator_accepts_parallel_jaw_symmetric_pose() -> None:
     )
     metrics = GlobalGraspEvaluator().evaluate([prediction], labels, certified=False, topk=(1,))
     assert metrics["raw_recall@1"] == 1.0
+
+
+def test_empty_global_grasp_placeholder_preserves_complete_contract() -> None:
+    labels = GlobalGraspLabels(
+        object_index=np.array([0]), source_grasp_index=np.array([1]),
+        contact_point_world=np.zeros((1, 3), np.float32),
+        grasp_pose_world=np.array([[0, 0, 0, 0, 0, 0, 1]], np.float32),
+        approach_direction_world=np.array([[0, 0, 1]], np.float32),
+        width_m=np.array([0.05], np.float32), intrinsic_stable=np.array([True]),
+        scene_executable=np.array([1], np.int8), valid_mask=np.array([True]),
+        anchor_visible_distance_m=np.array([0.0], np.float32),
+        conversion_version="generic_grasp_v2",
+    )
+    empty = _empty_global_grasps_like(labels)
+    empty.validate()
+    assert empty.conversion_version == labels.conversion_version
+    assert len(empty.object_index) == 0

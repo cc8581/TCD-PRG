@@ -681,7 +681,6 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             parameters = {
                 "push_contact_world": np.full((n, 3), np.nan, np.float32),
                 "push_direction_world": np.full((n, 3), np.nan, np.float32),
-                "push_approach_mode": np.full(n, -1, np.int64),
                 "push_distance_m": np.full(n, np.nan, np.float32),
                 "removal_grasp_pose_world": np.full((n, 7), np.nan, np.float32),
                 "removal_grasp_source_index": np.full(n, -1, np.int64),
@@ -754,7 +753,6 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                     acted_object[row] = p["acted_object"][payload]
                     parameters["push_contact_world"][row] = p["contact_point_world"][payload]
                     parameters["push_direction_world"][row] = p["direction_world"][payload]
-                    parameters["push_approach_mode"][row] = p["approach_mode"][payload]
                     parameters["push_distance_m"][row] = p["push_distance"][payload]
                 elif kind == ActionType.PICK_REMOVE:
                     p = actions["pick_remove"]

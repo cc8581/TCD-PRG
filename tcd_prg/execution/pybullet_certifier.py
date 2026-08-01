@@ -57,12 +57,10 @@ class ExternalFR5AG16095Certifier:
         width = np.full(count, np.nan, np.float32)
         contact = np.full((count, 3), np.nan, np.float32)
         direction = np.full((count, 3), np.nan, np.float32)
-        approach = np.full(count, -1, np.int8)
         for index, item in enumerate(actions):
             if int(item["action_type"]) == int(ActionType.PUSH):
                 contact[index] = item["push_contact_world"]
                 direction[index] = item["push_direction_world"]
-                approach[index] = item["push_approach_mode"]
             else:
                 pose[index] = item["grasp_pose_world"]
                 width[index] = item["grasp_width_m"]
@@ -75,7 +73,7 @@ class ExternalFR5AG16095Certifier:
                 action_type=action_type,
                 acted_object=np.asarray([item["acted_object"] for item in actions], np.int16),
                 pose_world=pose, width_m=width, contact_world=contact,
-                direction_world=direction, approach_mode=approach,
+                direction_world=direction,
             )
             completed = subprocess.run(
                 [str(self.python), str(self.worker), "--request", str(request), "--output",

@@ -17,13 +17,99 @@ from torch.utils.checkpoint import checkpoint
 from ..common import MaskedAttentionPool, masked_softmax
 
 
-def _chunked_knn(query: Tensor, reference: Tensor, reference_mask: Tensor, k: int, chunk: int = 512) -> Tensor:
-    chunks = []
-    for start in range(0, query.shape[1], chunk):
-        distance = torch.cdist(query[:, start : start + chunk], reference)
-        distance = distance.masked_fill(~reference_mask[:, None, :], float("inf"))
-        chunks.append(distance.topk(min(k, reference.shape[1]), largest=False).indices)
-    return torch.cat(chunks, dim=1)
+def _expand_bits_10(value: Tensor) -> Tensor:
+    """Spread ten low bits so three integer coordinates can be interleaved."""
+
+    value = value.long() & 0x3FF
+    value = (value | (value << 16)) & 0x030000FF
+    value = (value | (value << 8)) & 0x0300F00F
+    value = (value | (value << 4)) & 0x030C30C3
+    return (value | (value << 2)) & 0x09249249
+
+
+def _morton_codes(points: Tensor, lower: Tensor, upper: Tensor) -> Tensor:
+    scale = (upper - lower).clamp_min(1e-6)
+    quantized = (((points - lower) / scale).clamp(0.0, 1.0) * 1023.0).round().long()
+    return (
+        _expand_bits_10(quantized[..., 0])
+        | (_expand_bits_10(quantized[..., 1]) << 1)
+        | (_expand_bits_10(quantized[..., 2]) << 2)
+    )
+
+
+def _local_knn(
+    query: Tensor, reference: Tensor, reference_mask: Tensor, k: int, candidate_window: int = 256
+) -> Tensor:
+    """Approximate spatial kNN without materializing a ``Q x R`` distance matrix.
+
+    Morton ordering limits exact distance evaluation to a small spatially local
+    candidate window. Complexity is ``O((Q + R) log R + Q * W)`` rather than
+    ``O(Q * R)``; neighbor indices are discrete and intentionally non-differentiable.
+    """
+
+    neighbor_count = min(k, reference.shape[1])
+    rows = []
+    with torch.no_grad():
+        for batch_row in range(query.shape[0]):
+            valid_index = torch.nonzero(reference_mask[batch_row], as_tuple=False).squeeze(-1)
+            if not len(valid_index):
+                raise ValueError("A scene has no valid reference points")
+            valid_reference = reference[batch_row, valid_index]
+            lower = valid_reference.amin(0)
+            upper = valid_reference.amax(0)
+            reference_code = _morton_codes(valid_reference, lower, upper)
+            order = reference_code.argsort(stable=True)
+            sorted_code = reference_code[order]
+            query_code = _morton_codes(query[batch_row], lower, upper)
+            insertion = torch.searchsorted(sorted_code, query_code)
+            window = min(len(valid_index), max(candidate_window, 4 * neighbor_count))
+            offsets = torch.arange(window, device=query.device) - window // 2
+            candidate_position = (insertion[:, None] + offsets).clamp(0, len(valid_index) - 1)
+            candidate_index = valid_index[order[candidate_position]]
+            candidate_xyz = reference[batch_row, candidate_index]
+            squared_distance = ((query[batch_row, :, None] - candidate_xyz) ** 2).sum(-1)
+            nearest = squared_distance.topk(min(neighbor_count, window), largest=False).indices
+            selected = candidate_index.gather(1, nearest)
+            if selected.shape[1] < neighbor_count:
+                selected = torch.cat(
+                    (selected, selected[:, :1].expand(-1, neighbor_count - selected.shape[1])), 1
+                )
+            rows.append(selected)
+    return torch.stack(rows)
+
+
+def _farthest_point_indices(xyz: Tensor, mask: Tensor, count: int) -> tuple[Tensor, Tensor]:
+    """Deterministic geometric FPS with explicit padding validity."""
+
+    index_rows, valid_rows = [], []
+    with torch.no_grad():
+        for batch_row in range(mask.shape[0]):
+            valid_index = torch.nonzero(mask[batch_row], as_tuple=False).squeeze(-1)
+            if not len(valid_index):
+                raise ValueError("A scene has no valid points")
+            points = xyz[batch_row, valid_index]
+            selected_count = min(count, len(points))
+            centroid = points.mean(0)
+            farthest = ((points - centroid) ** 2).sum(-1).argmax()
+            minimum_distance = torch.full(
+                (len(points),), float("inf"), dtype=points.dtype, device=points.device
+            )
+            selected = []
+            for _ in range(selected_count):
+                selected.append(valid_index[farthest])
+                distance = ((points - points[farthest]) ** 2).sum(-1)
+                minimum_distance = torch.minimum(minimum_distance, distance)
+                farthest = minimum_distance.argmax()
+            row = torch.stack(selected)
+            row_valid = torch.ones(selected_count, dtype=torch.bool, device=mask.device)
+            if selected_count < count:
+                row = torch.cat((row, row[:1].expand(count - selected_count)))
+                row_valid = torch.cat(
+                    (row_valid, torch.zeros(count - selected_count, dtype=torch.bool, device=mask.device))
+                )
+            index_rows.append(row)
+            valid_rows.append(row_valid)
+    return torch.stack(index_rows), torch.stack(valid_rows)
 
 
 def _gather_neighbors(features: Tensor, index: Tensor) -> Tensor:
@@ -47,7 +133,7 @@ class PointTransformerBlock(nn.Module):
         self.ffn = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
 
     def forward(self, xyz: Tensor, features: Tensor, valid: Tensor) -> Tensor:
-        index = _chunked_knn(xyz, xyz, valid, self.k)
+        index = _local_knn(xyz, xyz, valid, self.k)
         neighbor_xyz = _gather_neighbors(xyz, index)
         neighbor_features = _gather_neighbors(features, index)
         relative = neighbor_xyz - xyz[:, :, None]
@@ -97,7 +183,7 @@ class TaskFreeSceneGeometryBackbone(nn.Module):
 
     def __init__(
         self, dim: int = 256, blocks: int = 3, heads: int = 4, neighbors: int = 16,
-        attention_points: int = 4096, activation_checkpointing: bool = True,
+        attention_points: int = 1024, activation_checkpointing: bool = True,
     ) -> None:
         super().__init__()
         self.attention_points = attention_points
@@ -111,20 +197,6 @@ class TaskFreeSceneGeometryBackbone(nn.Module):
         self.object_pool = MaskedAttentionPool(dim, dim)
         self.global_pool = MaskedAttentionPool(dim, dim)
 
-    @staticmethod
-    def _anchor_indices(mask: Tensor, count: int) -> Tensor:
-        rows = []
-        for batch_row in range(mask.shape[0]):
-            valid = torch.nonzero(mask[batch_row], as_tuple=False).squeeze(-1)
-            if len(valid) == 0:
-                raise ValueError("A scene has no valid points")
-            if len(valid) >= count:
-                position = torch.linspace(0, len(valid) - 1, count, device=mask.device).round().long()
-                rows.append(valid[position])
-            else:
-                rows.append(valid[torch.arange(count, device=mask.device) % len(valid)])
-        return torch.stack(rows)
-
     def forward(
         self, xyz: Tensor, rgb: Tensor, instance_id: Tensor, point_mask: Tensor, object_mask: Tensor
     ) -> SceneGeometryOutput:
@@ -132,17 +204,16 @@ class TaskFreeSceneGeometryBackbone(nn.Module):
         base = self.input_projection(torch.cat((xyz, rgb, point_mask.unsqueeze(-1).float()), -1))
         base = base * point_mask.unsqueeze(-1)
         anchor_count = min(self.attention_points, n)
-        anchor_index = self._anchor_indices(point_mask, anchor_count)
+        anchor_index, anchor_valid = _farthest_point_indices(xyz, point_mask, anchor_count)
         row = torch.arange(b, device=xyz.device)[:, None]
         anchor_xyz = xyz[row, anchor_index]
         anchor_features = base[row, anchor_index]
-        anchor_valid = point_mask[row, anchor_index]
         for block in self.blocks:
             if self.activation_checkpointing and self.training:
                 anchor_features = checkpoint(block, anchor_xyz, anchor_features, anchor_valid, use_reentrant=False)
             else:
                 anchor_features = block(anchor_xyz, anchor_features, anchor_valid)
-        nearest = _chunked_knn(xyz, anchor_xyz, anchor_valid, 1).squeeze(-1)
+        nearest = _local_knn(xyz, anchor_xyz, anchor_valid, 1).squeeze(-1)
         context = anchor_features[row, nearest]
         point_features = self.context_projection(torch.cat((base, context), -1)) * point_mask.unsqueeze(-1)
         query = self.pool_query.unsqueeze(0).expand(b, -1)
@@ -219,7 +290,7 @@ class TaskConditionedPointTransformer(nn.Module):
     def __init__(
         self, dim: int = 256, task_dim: int = 128, num_categories: int = 64,
         num_regions: int = 64, blocks: int = 3, heads: int = 4, neighbors: int = 16,
-        attention_points: int = 4096, activation_checkpointing: bool = True,
+        attention_points: int = 1024, activation_checkpointing: bool = True,
     ) -> None:
         super().__init__()
         self.scene_backbone = TaskFreeSceneGeometryBackbone(

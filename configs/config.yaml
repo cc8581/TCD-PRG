@@ -48,7 +48,7 @@ backbone:
   name: task_conditioned_point_transformer
   pretrained_checkpoint: null
   freeze: false
-  attention_points: 4096
+  attention_points: 1024
 
 region_head:
   enabled: true
@@ -115,7 +115,6 @@ graph:
 push:
   distance_m: 0.15
   direction_bins: 16
-  approach_modes: [top, side]
 
 pick_remove:
   enabled: true
