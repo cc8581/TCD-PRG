@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
-import json
 from dataclasses import asdict
 
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
 from tcd_prg.config import load_config
 from tcd_prg.datasets import ActionStateGroupDataset, DistributedEvaluationSampler
+from tcd_prg.datasets.policy_candidates import checkpoint_sha256
 from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter, create_gripper_provider
@@ -23,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--resume")
+    parser.add_argument("--initialize", help="Load model/EMA weights without optimizer state")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("overrides", nargs="*")
     return parser.parse_args()
@@ -31,6 +33,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_config(args.config, args.overrides)
+    if args.resume and args.initialize:
+        raise ValueError("--resume and --initialize are mutually exclusive")
+    if config.training.generated_policy_candidate_ratio > 0:
+        if args.initialize:
+            actual_sha256 = checkpoint_sha256(args.initialize)
+            expected = config.training.generated_policy_checkpoint_sha256
+            if expected and expected != actual_sha256:
+                raise ValueError("--initialize checkpoint does not match generated cache SHA-256")
+            config.training.generated_policy_checkpoint_sha256 = actual_sha256
+        elif not config.training.generated_policy_checkpoint_sha256:
+            raise ValueError(
+                "Generated policy training requires --initialize or an explicit "
+                "training.generated_policy_checkpoint_sha256"
+            )
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -101,6 +117,9 @@ def main() -> None:
     model = TCDPRGModel(
         config.model, config.ablation, config.graph, config.router, config.backbone
     )
+    if args.initialize:
+        initialized = torch.load(args.initialize, map_location="cpu", weights_only=False)
+        model.load_state_dict(initialized.get("ema") or initialized.get("model") or initialized)
     if config.backbone.freeze and "encoder" not in config.training.frozen_modules:
         config.training.frozen_modules = (*config.training.frozen_modules, "encoder")
     if config.backbone.pretrained_checkpoint:
@@ -144,6 +163,7 @@ def main() -> None:
     objective = TCDPRGObjective(
         adapter.capabilities, config.model, config.ablation, config.losses,
         config.region_head,
+        config.training.generated_policy_candidate_ratio,
     )
     if rank == 0:
         enabled = {name: objective.total.enabled(name) for name in objective.total.DEFAULT_WEIGHTS}

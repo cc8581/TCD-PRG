@@ -127,6 +127,7 @@ class DenseCandidateGenerator:
             target_object = int(batch["target_object"][batch_row])
             type_parts, object_parts, contact_parts, direction_parts, point_parts = [], [], [], [], []
             pose_parts, destination_parts, width_parts, score_parts = [], [], [], []
+            direction_bin_parts, direction_score_parts = [], []
 
             task = output["task_grasp"]
             task_pose = torch.cat((
@@ -152,6 +153,8 @@ class DenseCandidateGenerator:
                 width_parts.append(task["width_m"][batch_row, selected])
                 score_parts.append(task_score[selected])
                 point_parts.append(points)
+                direction_bin_parts.append(torch.full_like(selected, -1))
+                direction_score_parts.append(torch.full_like(task_score[selected], float("nan")))
 
             global_head = output["global_grasp"]
             global_pose = torch.cat((
@@ -189,6 +192,8 @@ class DenseCandidateGenerator:
                 width_parts.append(global_head["width_m"][batch_row, selected])
                 score_parts.append(global_score[selected])
                 point_parts.append(global_point[selected])
+                direction_bin_parts.append(torch.full_like(selected, -1))
+                direction_score_parts.append(torch.full_like(global_score[selected], float("nan")))
 
             push = output["push"]
             push_eligible = active & actionable
@@ -204,20 +209,47 @@ class DenseCandidateGenerator:
                 push_objects, self.config.push_candidates,
             )
             if len(push_index):
-                direction_bin = push["direction_logits"][batch_row, push_index].argmax(-1)
+                direction_probability = torch.softmax(
+                    push["direction_logits"][batch_row, push_index], dim=-1
+                )
+                directions_per_contact = min(
+                    self.config.push_directions_per_contact, direction_probability.shape[-1]
+                )
+                direction_score, direction_bin = direction_probability.topk(
+                    directions_per_contact, dim=-1
+                )
+                expanded_point = push_index[:, None].expand(-1, directions_per_contact).reshape(-1)
+                direction_bin = direction_bin.reshape(-1)
+                direction_score = direction_score.reshape(-1)
+                contact_score = torch.sigmoid(
+                    push["contact_logits"][batch_row, expanded_point]
+                )
+                if len(expanded_point) > self.config.max_push_candidates:
+                    keep = (contact_score * direction_score).topk(
+                        self.config.max_push_candidates
+                    ).indices
+                    expanded_point = expanded_point[keep]
+                    direction_bin = direction_bin[keep]
+                    direction_score = direction_score[keep]
+                    contact_score = contact_score[keep]
                 angle = (direction_bin.float() + 0.5) * 2.0 * math.pi / self.config.num_direction_bins
                 center = torch.stack((torch.cos(angle), torch.sin(angle)), -1)
-                planar = torch.nn.functional.normalize(center + push["direction_residual"][batch_row, push_index], dim=-1)
+                residual = push["direction_residual"][
+                    batch_row, expanded_point, direction_bin
+                ]
+                planar = torch.nn.functional.normalize(center + residual, dim=-1)
                 direction = torch.cat((planar, torch.zeros(len(planar), 1, device=xyz.device)), -1)
-                type_parts.append(torch.full_like(push_index, int(ActionType.PUSH)))
-                object_parts.append(instance[push_index])
-                contact_parts.append(xyz[push_index])
+                type_parts.append(torch.full_like(expanded_point, int(ActionType.PUSH)))
+                object_parts.append(instance[expanded_point])
+                contact_parts.append(xyz[expanded_point])
                 direction_parts.append(direction)
-                pose_parts.append(torch.full((len(push_index), 7), float("nan"), device=xyz.device))
-                destination_parts.append(torch.full((len(push_index), 3), float("nan"), device=xyz.device))
-                width_parts.append(torch.full((len(push_index),), float("nan"), device=xyz.device))
-                score_parts.append(torch.sigmoid(push["contact_logits"][batch_row, push_index]))
-                point_parts.append(push_index)
+                pose_parts.append(torch.full((len(expanded_point), 7), float("nan"), device=xyz.device))
+                destination_parts.append(torch.full((len(expanded_point), 3), float("nan"), device=xyz.device))
+                width_parts.append(torch.full((len(expanded_point),), float("nan"), device=xyz.device))
+                score_parts.append(contact_score)
+                point_parts.append(expanded_point)
+                direction_bin_parts.append(direction_bin)
+                direction_score_parts.append(direction_score)
 
             def joined(parts: list[Tensor], shape: tuple[int, ...], dtype: torch.dtype, fill: float = float("nan")) -> Tensor:
                 return torch.cat(parts) if parts else torch.full(shape, fill, dtype=dtype, device=xyz.device)
@@ -232,10 +264,13 @@ class DenseCandidateGenerator:
                 "width_m": joined(width_parts, (0,), xyz.dtype),
                 "proposal_score": joined(score_parts, (0,), xyz.dtype, -1.0),
                 "point_index": joined(point_parts, (0,), torch.long, -1),
+                "direction_bin": joined(direction_bin_parts, (0,), torch.long, -1),
+                "direction_score": joined(direction_score_parts, (0,), xyz.dtype),
             })
 
         max_candidates = max(1, max(len(row["type"]) for row in rows))
-        fill = {"type": -1, "object": -1, "point_index": -1, "width_m": float("nan"),
+        fill = {"type": -1, "object": -1, "point_index": -1, "direction_bin": -1,
+                "width_m": float("nan"), "direction_score": float("nan"),
                 "proposal_score": -1.0, "contact_world": float("nan"),
                 "direction_world": float("nan"), "pose_world": float("nan"),
                 "destination_world": float("nan")}
@@ -275,9 +310,12 @@ class DenseCandidateGenerator:
             ).flatten()
             if len(push_candidates):
                 points = result["point_index"][row, push_candidates]
-                direction_bin = output["push"]["direction_logits"][row, points].argmax(-1)
+                direction_bin = result["direction_bin"][row, push_candidates]
                 evidence[row, push_candidates, 0] = output["push"]["utility_delta"][
                     row, points, direction_bin
+                ]
+                evidence[row, push_candidates, 3] = result["direction_score"][
+                    row, push_candidates
                 ]
         result["evidence"] = evidence
         return result

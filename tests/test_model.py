@@ -112,6 +112,27 @@ def test_fixed_seed_reproducibility(tiny_batch) -> None:
     assert torch.equal(one, two)
 
 
+def test_model_routes_cached_generated_candidates_without_teacher_axis(tiny_batch) -> None:
+    model = TCDPRGModel(_config()).eval()
+    generated = {
+        "type": torch.tensor([[0, 2]]),
+        "object": torch.tensor([[0, 1]]),
+        "contact_world": torch.tensor([[[0.0, 0.0, 0.0], [float("nan")] * 3]]),
+        "direction_world": torch.tensor([[[1.0, 0.0, 0.0], [float("nan")] * 3]]),
+        "pose_world": torch.tensor([[[float("nan")] * 7, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]]]),
+        "destination_world": torch.full((1, 2, 3), float("nan")),
+        "width_m": torch.tensor([[float("nan"), 0.05]]),
+        "evidence": torch.zeros(1, 2, 7),
+        "valid": torch.ones(1, 2, dtype=torch.bool),
+        "label_status": torch.tensor([[0, 1]], dtype=torch.int8),
+        "policy_success": torch.tensor([[False, True]]),
+    }
+    batch = {**tiny_batch, "generated_policy_candidates": generated}
+    output = model(batch)
+    assert output["generated_router"].candidate_logits.shape == (1, 2)
+    assert torch.isfinite(output["generated_router"].candidate_logits).all()
+
+
 def test_network_features_do_not_depend_on_simulation_object_pose(tiny_batch) -> None:
     model = TCDPRGModel(_config()).eval()
     changed = dict(tiny_batch)

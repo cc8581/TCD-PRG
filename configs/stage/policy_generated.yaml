@@ -1,0 +1,23 @@
+# Stage C: train the router only on deployment-path generated candidates.
+defaults:
+  - ../config.yaml
+  - _self_
+
+training:
+  frozen_modules: [encoder, region_head, task_grasp, global_grasp, verifier, graph, push]
+  generated_policy_candidate_cache: runtime/cache/policy_candidates
+  generated_policy_candidate_ratio: 1.0
+  generated_policy_checkpoint_sha256: ""
+
+losses:
+  region: 0.0
+  task_grasp: 0.0
+  global_grasp: 0.0
+  physical_edge: 0.0
+  task_edge: 0.0
+  verify_overall: 0.0
+  push_object: 0.0
+  push_contact: 0.0
+  push_direction: 0.0
+  push_potential: 0.0
+  policy_candidate: 1.0

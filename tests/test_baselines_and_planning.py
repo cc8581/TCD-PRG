@@ -49,7 +49,8 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
     }
     push = {
         "object_logits": torch.zeros(1, 1), "contact_logits": torch.zeros(1, 4),
-        "direction_logits": torch.zeros(1, 4, 16), "direction_residual": torch.zeros(1, 4, 2),
+        "direction_logits": torch.zeros(1, 4, 16),
+        "direction_residual": torch.zeros(1, 4, 16, 2),
         "utility_delta": torch.zeros(1, 4, 16),
     }
     encoded = SimpleNamespace(object_tokens=torch.zeros(1, 1, 8), task_token=torch.zeros(1, 8))
@@ -66,6 +67,61 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
     assert result["type"].shape == (1, 1)
     assert not result["valid"].any()
     assert "push_approach_mode" not in result
+
+
+def test_dense_generator_expands_top_directions_and_routes_utility_evidence() -> None:
+    config = ModelConfig(
+        feature_dim=8, task_grasp_candidates=1, global_grasp_candidates=1,
+        push_candidates=1, push_directions_per_contact=2, max_push_candidates=2,
+        num_direction_bins=4,
+    )
+    generator = DenseCandidateGenerator(config)
+    batch = {
+        "xyz": torch.zeros(1, 1, 3),
+        "instance_id": torch.zeros(1, 1, dtype=torch.long),
+        "point_mask": torch.ones(1, 1, dtype=torch.bool),
+        "object_mask": torch.ones(1, 1, dtype=torch.bool),
+        "object_active": torch.ones(1, 1, dtype=torch.bool),
+        "target_object": torch.tensor([0]),
+        "target_mask": torch.zeros(1, 1, dtype=torch.bool),
+    }
+    grasp = {
+        "translation_world": torch.zeros(1, 1, 3),
+        "rotation_matrix": torch.eye(3).reshape(1, 1, 3, 3),
+        "width_m": torch.full((1, 1), 0.05),
+        "quality_logit": torch.zeros(1, 1),
+        "attention_point_index": torch.zeros(1, 1, dtype=torch.long),
+    }
+    global_grasp = {**grasp, "object_logits": torch.zeros(1, 1, 1)}
+    push = {
+        "object_logits": torch.ones(1, 1),
+        "contact_logits": torch.ones(1, 1),
+        "direction_logits": torch.tensor([[[0.0, 3.0, 0.0, 2.0]]]),
+        "direction_residual": torch.zeros(1, 1, 4, 2),
+        "utility_delta": torch.tensor([[[0.0, -1.5, 0.0, 2.0]]]),
+    }
+    encoded = SimpleNamespace(
+        object_tokens=torch.zeros(1, 1, 8), task_token=torch.zeros(1, 8)
+    )
+
+    class Model:
+        @staticmethod
+        def candidate_encoder(object_tokens, candidate_type, *args):
+            return torch.zeros(candidate_type.shape + (8,))
+
+    result = generator.generate(Model(), batch, {
+        "encoded": encoded, "task_grasp": grasp, "global_grasp": global_grasp,
+        "push": push, "graph": None,
+    })
+    assert result["valid"].sum().item() == 2
+    assert set(result["direction_bin"][0].tolist()) == {1, 3}
+    by_bin = {int(result["direction_bin"][0, index]): index for index in range(2)}
+    assert result["evidence"][0, by_bin[1], 0].item() == pytest.approx(-1.5)
+    assert result["evidence"][0, by_bin[3], 0].item() == pytest.approx(2.0)
+    probability = torch.softmax(push["direction_logits"][0, 0], dim=-1)
+    assert result["evidence"][0, by_bin[1], 3].item() == pytest.approx(
+        probability[1].item()
+    )
 
 
 def test_offline_evaluator_accepts_overall_only_verifier(monkeypatch) -> None:
@@ -140,7 +196,7 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
         "object_logits": torch.tensor([[0.0, 1.0, 2.0, 3.0]]),
         "contact_logits": torch.arange(8).float()[None],
         "direction_logits": torch.zeros(1, 8, 16),
-        "direction_residual": torch.zeros(1, 8, 2),
+        "direction_residual": torch.zeros(1, 8, 16, 2),
         "utility_delta": torch.zeros(1, 8, 16),
     }
     graph = SimpleNamespace(

@@ -42,6 +42,7 @@ class TCDPRGObjective(nn.Module):
         self, capabilities: DatasetCapabilities, model_config: ModelConfig,
         ablation: AblationConfig, loss_config: LossConfig | None = None,
         region_config: RegionHeadConfig | None = None,
+        generated_policy_candidate_ratio: float = 0.0,
     ) -> None:
         super().__init__()
         self.model_config = model_config
@@ -66,6 +67,7 @@ class TCDPRGObjective(nn.Module):
         self.push = PushLoss()
         self.verify = GraspVerifierLoss()
         self.policy = HierarchicalSetPolicyLoss()
+        self.generated_policy_candidate_ratio = float(generated_policy_candidate_ratio)
         self.total = MultiTaskLoss(capabilities, ablation, loss_config.family_weights())
 
     @staticmethod
@@ -144,12 +146,35 @@ class TCDPRGObjective(nn.Module):
             if self.total.enabled("push_potential"):
                 families["push_potential"] = {"loss": push_losses["push_potential"]}
 
-        if (
-            "router" in output and self.total.enabled("policy_candidate")
-            and self.ablation.router_type != "fixed_priority"
-        ):
-            evaluated = batch["evaluation_status"] != int(CandidateStatus.UNKNOWN_UNTESTED)
-            families["policy_candidate"] = {
-                "loss": self.policy(output["router"], batch["policy_success_mask"], evaluated)
-            }
+        if self.total.enabled("policy_candidate") and self.ablation.router_type != "fixed_priority":
+            teacher_loss = None
+            if "router" in output:
+                evaluated = batch["policy_success_mask"] | (
+                    batch["evaluation_status"] == int(CandidateStatus.NEGATIVE)
+                )
+                teacher_loss = self.policy(
+                    output["router"], batch["policy_success_mask"], evaluated
+                )
+            generated_loss = None
+            generated = batch.get("generated_policy_candidates")
+            if "generated_router" in output and generated is not None:
+                generated_evaluated = (
+                    generated["label_status"] != int(CandidateStatus.UNKNOWN_UNTESTED)
+                )
+                generated_loss = self.policy(
+                    output["generated_router"], generated["policy_success"],
+                    generated_evaluated,
+                )
+            ratio = self.generated_policy_candidate_ratio
+            if generated_loss is not None and teacher_loss is not None:
+                policy_loss = (1.0 - ratio) * teacher_loss + ratio * generated_loss
+            elif generated_loss is not None:
+                policy_loss = generated_loss
+            elif teacher_loss is not None and ratio == 0.0:
+                policy_loss = teacher_loss
+            else:
+                raise RuntimeError(
+                    "Generated policy training is enabled but the batch has no generated candidates"
+                )
+            families["policy_candidate"] = {"loss": policy_loss}
         return self.total(families)

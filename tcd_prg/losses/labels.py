@@ -246,8 +246,8 @@ def build_push_supervision(
     gathered = {
         "object_logits": output["object_logits"],
         "contact_logits": output["contact_logits"],
+        "point_index": point_index,
         "direction_logits": output["direction_logits"][row, point_index],
-        "direction_residual": output["direction_residual"][row, point_index],
     }
     direction = torch.nn.functional.normalize(
         torch.nan_to_num(parameters["push_direction_world"]), dim=-1
@@ -255,6 +255,9 @@ def build_push_supervision(
     angle = torch.atan2(direction[..., 1], direction[..., 0]).remainder(2 * math.pi)
     bins = output["direction_logits"].shape[-1]
     direction_bin = torch.floor(angle * bins / (2 * math.pi)).long().remainder(bins)
+    gathered["direction_residual"] = output["direction_residual"][
+        row, point_index, direction_bin
+    ]
     gathered["utility_delta"] = output["utility_delta"][row, point_index, direction_bin]
     center_angle = (direction_bin.float() + 0.5) * 2 * math.pi / bins
     center = torch.stack((torch.cos(center_angle), torch.sin(center_angle)), -1)

@@ -102,10 +102,10 @@ class OfflineModelEvaluator:
                             positives.intersection(ranked[:k].tolist())
                         ) / len(positives)
             candidate_valid = self._numpy(batch["candidate_mask"][row]).astype(bool)
-            evaluated = self._numpy(
-                batch["evaluation_status"][row] != int(CandidateStatus.UNKNOWN_UNTESTED)
-            ).astype(bool)
             success = self._numpy(batch["policy_success_mask"][row]).astype(bool)
+            evaluated = success | self._numpy(
+                batch["evaluation_status"][row] == int(CandidateStatus.NEGATIVE)
+            ).astype(bool)
             action_type = self._numpy(batch["action_type"][row]).astype(int)
             acted_object = self._numpy(batch["acted_object"][row]).astype(int)
             if selected is not None and int(selected[row]) >= 0:
@@ -136,6 +136,39 @@ class OfflineModelEvaluator:
                     self._numpy(output["router"].candidate_logits[row]), success.astype(float),
                     candidate_valid & evaluated,
                 )
+            generated = batch.get("generated_policy_candidates")
+            if generated is not None and "generated_router" in output:
+                generated_valid = self._numpy(generated["valid"][row]).astype(bool)
+                generated_known = self._numpy(
+                    generated["label_status"][row]
+                    != int(CandidateStatus.UNKNOWN_UNTESTED)
+                ).astype(bool)
+                generated_success = self._numpy(
+                    generated["policy_success"][row]
+                ).astype(bool)
+                generated_logits = self._numpy(
+                    output["generated_router"].candidate_logits[row]
+                )
+                known_valid = generated_valid & generated_known
+                record["generated_candidate_ndcg"] = ndcg(
+                    generated_logits, generated_success.astype(float), known_valid
+                )
+                record["generated_candidate_positive_coverage"] = float(
+                    generated_success[known_valid].any()
+                )
+                if generated_valid.any():
+                    generated_selected = int(
+                        np.flatnonzero(generated_valid)[
+                            np.argmax(generated_logits[generated_valid])
+                        ]
+                    )
+                    record["generated_selected_candidate_known"] = float(
+                        generated_known[generated_selected]
+                    )
+                    if generated_known[generated_selected]:
+                        record["generated_selected_candidate_success"] = float(
+                            generated_success[generated_selected]
+                        )
             if output["verifier"] is not None:
                 verifier_labels = build_verifier_labels(batch)
                 for head in ("overall",):
@@ -174,7 +207,12 @@ class OfflineModelEvaluator:
                 predicted_bin = self._numpy(
                     push_prediction["direction_logits"][row]
                 ).argmax(-1)
-                residual = self._numpy(push_prediction["direction_residual"][row])
+                point_index = push_prediction["point_index"][row]
+                residual = self._numpy(
+                    output["push"]["direction_residual"][
+                        row, point_index, torch.from_numpy(predicted_bin).to(point_index.device)
+                    ]
+                )
                 angles = (predicted_bin + 0.5) * 2.0 * np.pi / self.model_config.num_direction_bins
                 predicted_direction = np.stack((np.cos(angles), np.sin(angles)), axis=-1) + residual
                 errors = [direction_angle_error_deg(predicted_direction[index], label_direction[index, :2])

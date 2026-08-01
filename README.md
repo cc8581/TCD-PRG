@@ -141,6 +141,20 @@ tcd-prg-train --config configs/config.yaml output_dir=outputs/full
 # Resume
 tcd-prg-train --config configs/config.yaml --resume outputs/full/last.pt
 
+# Freeze the trained geometry/action stack, generate deployment-path candidates
+tcd-prg-generate-policy-candidates --config configs/config.yaml `
+  --checkpoint outputs/full/best.pt --split train `
+  --output-dir runtime/cache/policy_candidates
+tcd-prg-generate-policy-candidates --config configs/config.yaml `
+  --checkpoint outputs/full/best.pt --split val `
+  --output-dir runtime/cache/policy_candidates
+
+# Train the router on generated candidates, then optionally mix clean teachers
+tcd-prg-train --config configs/stage/policy_generated.yaml `
+  --initialize outputs/full/best.pt output_dir=outputs/policy_generated
+tcd-prg-train --config configs/stage/policy_mixed.yaml `
+  --initialize outputs/full/best.pt output_dir=outputs/policy_mixed
+
 # Example ablation override
 tcd-prg-train --config configs/config.yaml ablation.use_dependency_graph=false `
   output_dir=outputs/ablation_no_graph
@@ -159,6 +173,13 @@ Training units are `(scene_id, state_id, task_index, action_state_group)`, not
 uniformly sampled action rows. Logs include optimizer steps, samples/states/
 candidate groups seen and effective epochs. `loss_routing.json` records losses
 automatically disabled by dataset capabilities or ablations.
+
+Generated policy caches are tied to the upstream checkpoint SHA-256 and the
+candidate-generation/matching configuration. Matching is tri-state: candidates
+near successful sequence actions are positive, candidates near explicitly
+evaluated unsuccessful actions are negative, and unmatched candidates remain
+UNKNOWN and are excluded from policy loss. Generate both train and validation
+splits into the same cache directory before starting a generated-candidate stage.
 
 The paper-level objective has exactly eleven modules: region, task grasp,
 global grasp, physical edge, task edge, verifier overall, four PUSH objectives,

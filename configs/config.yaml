@@ -77,6 +77,8 @@ model:
   global_grasp_candidates: 64
   pick_remove_candidates: 16
   push_candidates: 16
+  push_directions_per_contact: 2
+  max_push_candidates: 32
   activation_checkpointing: true
   verifier_local_scene_points: 512
   verifier_gripper_points: 512
@@ -97,6 +99,11 @@ model:
   global_grasp_nms_rotation_deg: 15.0
   global_grasp_nms_width_m: 0.005
   global_grasp_nms_approach_deg: 15.0
+  policy_push_match_contact_m: 0.020
+  policy_push_match_direction_deg: 22.5
+  policy_grasp_match_translation_m: 0.020
+  policy_grasp_match_rotation_deg: 20.0
+  policy_grasp_match_width_m: 0.010
   push_utility_component_weights: [0.05, 1.0, -1.0, -0.25, 1.0]
   push_failure_penalties: [1.0, 2.0, 1.0]
 
@@ -187,6 +194,9 @@ training:
   unfreeze_at_optimizer_step: null
   ddp_backend: auto
   ddp_find_unused_parameters: true
+  generated_policy_candidate_cache: ""
+  generated_policy_candidate_ratio: 0.0
+  generated_policy_checkpoint_sha256: ""
   validation_family_weights:
     policy_candidate: 1.0
     verify_overall: 0.5

@@ -110,6 +110,9 @@ class TCDPRGModel(nn.Module):
                     evidence[row, candidate, 1] = torch.sigmoid(
                         result["push"]["contact_logits"][row, point]
                     )
+                    evidence[row, candidate, 3] = torch.softmax(
+                        result["push"]["direction_logits"][row, point], dim=-1
+                    )[direction_bin]
                 else:
                     head = result["global_grasp"] if is_remove else result["task_grasp"]
                     nearest = torch.linalg.vector_norm(
@@ -148,7 +151,7 @@ class TCDPRGModel(nn.Module):
         return {key: torch.cat(values, dim=1) for key, values in outputs.items()}
 
     def route_cached(
-        self, batch: dict[str, Tensor], result: dict[str, Any], candidate_inputs: dict[str, Tensor]
+        self, batch: dict[str, Tensor], result: dict[str, Any], candidate_inputs: dict[str, Any]
     ) -> Any:
         """Route externally generated candidates using the already encoded scene."""
 
@@ -161,7 +164,10 @@ class TCDPRGModel(nn.Module):
             )
         else:
             evidence = evidence.clone()
-        if result.get("verifier") is not None:
+        if (
+            result.get("verifier") is not None
+            and not candidate_inputs.get("verifier_evidence_cached", False)
+        ):
             evidence[..., 2] = torch.sigmoid(result["verifier"]["overall_logit"])
         routed_tokens = candidate_inputs["tokens"] + self.candidate_evidence(evidence)
         router_args = (
@@ -186,6 +192,27 @@ class TCDPRGModel(nn.Module):
                 candidate_inputs["valid"], encoded.object_mask & batch["object_active"],
             )
         raise ValueError(f"Unsupported router type {self.ablation.router_type}")
+
+    def _external_candidate_inputs(
+        self, encoded: Any, candidates: dict[str, Tensor]
+    ) -> dict[str, Any]:
+        flags = torch.stack((
+            torch.isfinite(candidates["contact_world"]).all(-1),
+            torch.isfinite(candidates["direction_world"]).all(-1),
+            torch.isfinite(candidates["pose_world"]).all(-1),
+            torch.isfinite(candidates["destination_world"]).all(-1),
+            torch.isfinite(candidates["width_m"]),
+        ), -1)
+        return {
+            **candidates,
+            "verifier_evidence_cached": True,
+            "tokens": self.candidate_encoder(
+                encoded.object_tokens, candidates["type"], candidates["object"],
+                candidates["contact_world"], candidates["direction_world"],
+                candidates["pose_world"], candidates["destination_world"],
+                flags, encoded.task_token,
+            ),
+        }
 
     def forward(self, batch: dict[str, Tensor], candidate_inputs: dict[str, Tensor] | None = None) -> dict[str, Any]:
         object_present = batch.get("object_present", batch["object_mask"])
@@ -312,4 +339,10 @@ class TCDPRGModel(nn.Module):
             )
         if candidate_inputs is not None:
             result["router"] = self.route_cached(batch, result, candidate_inputs)
+        generated = batch.get("generated_policy_candidates")
+        if generated is not None:
+            generated_inputs = self._external_candidate_inputs(encoded, generated)
+            result["generated_router"] = self.route_cached(
+                batch, result, generated_inputs
+            )
         return result

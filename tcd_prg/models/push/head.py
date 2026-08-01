@@ -14,7 +14,7 @@ class PushHead(nn.Module):
         self.point = nn.Sequential(nn.Linear(4 * dim + 4, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.contact = nn.Linear(dim, 1)
         self.direction = nn.Linear(dim, direction_bins)
-        self.direction_residual = nn.Linear(dim, 2)
+        self.direction_residual = nn.Linear(dim, 2 * direction_bins)
         self.utility = nn.Linear(dim, direction_bins)
 
     def forward(
@@ -55,6 +55,8 @@ class PushHead(nn.Module):
             "object_logits": object_logits,
             "contact_logits": contact,
             "direction_logits": self.direction(x),
-            "direction_residual": torch.tanh(self.direction_residual(x)),
+            "direction_residual": torch.tanh(self.direction_residual(x)).reshape(
+                x.shape[0], x.shape[1], self.direction_bins, 2
+            ),
             "utility_delta": self.utility(x),
         }

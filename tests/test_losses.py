@@ -284,7 +284,7 @@ def test_push_utility_uses_ground_truth_direction_and_keeps_failed_transition() 
         "object_logits": torch.zeros(1, 1),
         "contact_logits": torch.zeros(1, 1),
         "direction_logits": torch.zeros(1, 1, 4),
-        "direction_residual": torch.zeros(1, 1, 2),
+        "direction_residual": torch.zeros(1, 1, 4, 2),
         "utility_delta": torch.arange(4.0).reshape(1, 1, 4),
     }
     batch = {

@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import Any
 
 from tcd_prg.config import TCDPRGConfig
-from tcd_prg.datasets import TaskOrientedClutterAdapter, collate_unified
-from tcd_prg.geometry.gripper_provider import ExactAG16095GeometryProvider
+from tcd_prg.datasets import TaskOrientedClutterAdapter, collate_unified, load_candidate_batch
 from tcd_prg.execution import ExternalFR5AG16095Certifier
+from tcd_prg.geometry.gripper_provider import ExactAG16095GeometryProvider
 from tcd_prg.models.grasp_verifier import build_verifier_inputs
 from tcd_prg.observation import (
     CachedObservationProvider,
@@ -17,8 +17,6 @@ from tcd_prg.observation import (
     SavedObservationProvider,
 )
 from tcd_prg.paths import project_path
-
-
 
 def create_observation_provider(config: TCDPRGConfig, allow_render: bool = False):
     scene_root = Path(config.dataset.root) / config.dataset.scene_subdir
@@ -113,6 +111,13 @@ class UnifiedBatchCollator:
 
     def __call__(self, samples: list[Any]) -> dict[str, Any]:
         batch = collate_unified(samples)
+        if self.config.training.generated_policy_candidate_cache:
+            batch["generated_policy_candidates"] = load_candidate_batch(
+                samples,
+                self.config.training.generated_policy_candidate_cache,
+                self.config.model,
+                self.config.training.generated_policy_checkpoint_sha256,
+            )
         if self.config.ablation.use_gripper_scene_verifier:
             if self.gripper_provider is None:
                 raise RuntimeError("The verifier is enabled but no gripper provider was configured")
