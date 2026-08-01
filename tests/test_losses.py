@@ -1,17 +1,18 @@
 import torch
 
-from tcd_prg.losses.masked import multi_positive_listwise_loss, safe_smooth_l1
 from tcd_prg.config import AblationConfig, LossConfig, ModelConfig
-from tcd_prg.datasets.capabilities import DatasetCapabilities
 from tcd_prg.constants import ActionType, CandidateStatus
+from tcd_prg.datasets.capabilities import DatasetCapabilities
 from tcd_prg.losses.labels import (
     _pack_grasp_set,
+    build_global_grasp_labels,
     build_grasp_proposal_labels,
     build_push_supervision,
 )
+from tcd_prg.losses.masked import multi_positive_listwise_loss, safe_smooth_l1
 from tcd_prg.losses.objective import TCDPRGObjective
-from tcd_prg.losses.total import MultiTaskLoss
 from tcd_prg.losses.proposal import CompleteGraspSetLoss
+from tcd_prg.losses.total import MultiTaskLoss
 
 
 def test_nan_loss_is_masked() -> None:
@@ -166,6 +167,35 @@ def test_partial_grasp_set_does_not_make_unmatched_queries_negative() -> None:
     assert torch.allclose(quality, torch.log(torch.tensor(2.0)))
 
 
+def test_only_queries_near_explicit_negatives_receive_negative_supervision() -> None:
+    identity = torch.eye(3)
+    output = {
+        "translation_world": torch.tensor([[
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [10.0, 0.0, 0.0]
+        ]]),
+        "rotation_matrix": identity.expand(1, 3, 3, 3).clone(),
+        "width_m": torch.full((1, 3), 0.05),
+        # The far open-world query must be ignored despite its high score.
+        "quality_logit": torch.tensor([[0.0, 0.0, 100.0]]),
+    }
+    labels = {
+        "translation_world": torch.tensor([[[0.0, 0.0, 0.0]]]),
+        "rotation_matrix": identity.expand(1, 1, 3, 3).clone(),
+        "width_m": torch.full((1, 1), 0.05),
+        "quality_target": torch.ones(1, 1),
+        "target_valid": torch.ones(1, 1, dtype=torch.bool),
+        "quality_valid": torch.ones(1, 1, dtype=torch.bool),
+        "sample_valid": torch.tensor([True]),
+        "unmatched_quality_valid": torch.tensor([False]),
+        "negative_translation_world": torch.tensor([[[1.0, 0.0, 0.0]]]),
+        "negative_rotation_matrix": identity.expand(1, 1, 3, 3).clone(),
+        "negative_width_m": torch.full((1, 1), 0.05),
+        "negative_valid": torch.ones(1, 1, dtype=torch.bool),
+    }
+    quality = CompleteGraspSetLoss()(output, labels)["grasp_quality"]
+    assert torch.allclose(quality, torch.log(torch.tensor(2.0)))
+
+
 def test_unknown_task_grasp_marks_label_set_non_exhaustive() -> None:
     pose = torch.zeros(1, 2, 7)
     pose[..., 6] = 1.0
@@ -185,6 +215,27 @@ def test_unknown_task_grasp_marks_label_set_non_exhaustive() -> None:
     assert labels["sample_valid"].item()
     assert not labels["unmatched_quality_valid"].item()
     assert labels["target_valid"].sum().item() == 1
+
+
+def test_sampled_global_labels_never_imply_complete_unmatched_negatives() -> None:
+    pose = torch.zeros(1, 3, 7)
+    pose[..., 6] = 1.0
+    batch = {
+        "global_loss_sample_valid": torch.tensor([True]),
+        "global_grasp_labels": {
+            "object_index": torch.zeros(1, 3, dtype=torch.long),
+            "grasp_pose_world": pose,
+            "width_m": torch.full((1, 3), 0.05),
+            "scene_executable": torch.tensor([[1, 0, -1]], dtype=torch.int8),
+            "valid_mask": torch.ones(1, 3, dtype=torch.bool),
+            "label_set_complete": torch.tensor([False]),
+        },
+    }
+    labels = build_global_grasp_labels(batch, ModelConfig(global_grasp_candidates=3))
+    assert labels is not None
+    assert labels["target_valid"].sum().item() == 1
+    assert labels["negative_valid"].sum().item() == 1
+    assert not labels["unmatched_quality_valid"].item()
 
 
 def test_global_grasp_packing_balances_objects_before_truncation() -> None:

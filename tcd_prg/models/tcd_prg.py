@@ -188,13 +188,15 @@ class TCDPRGModel(nn.Module):
         raise ValueError(f"Unsupported router type {self.ablation.router_type}")
 
     def forward(self, batch: dict[str, Tensor], candidate_inputs: dict[str, Tensor] | None = None) -> dict[str, Any]:
+        object_present = batch.get("object_present", batch["object_mask"])
+        physical_active = object_present & batch["object_active"]
         encoded = self.encoder(
             batch["xyz"],
             batch["rgb"],
             batch["instance_id"],
             batch["point_mask"],
             batch["target_mask"],
-            batch.get("object_present", batch["object_mask"]),
+            physical_active,
             batch["task_category_id"],
             batch["task_region_id"],
             use_task_region_condition=self.ablation.use_task_region_condition,
@@ -214,17 +216,18 @@ class TCDPRGModel(nn.Module):
         task_grasp["width_m"] = self.task_grasp.decode_width(
             task_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m
         )
-        object_present = batch.get("object_present", batch["object_mask"])
         if self.config.global_grasp_input_mode == "scene_only":
             global_mask = batch["point_mask"]
         else:
             valid_instance = (
                 (batch["instance_id"] >= 0)
-                & (batch["instance_id"] < object_present.shape[1])
+                & (batch["instance_id"] < physical_active.shape[1])
             )
             global_mask = (
                 batch["point_mask"] & valid_instance
-                & object_present.gather(1, batch["instance_id"].clamp(0, object_present.shape[1] - 1))
+                & physical_active.gather(
+                    1, batch["instance_id"].clamp(0, physical_active.shape[1] - 1)
+                )
             )
         global_grasp = self.global_grasp(
             encoded.scene_point_features,
@@ -233,7 +236,7 @@ class TCDPRGModel(nn.Module):
             encoded.scene_global_token,
             batch["instance_id"],
             global_mask,
-            object_present,
+            physical_active,
         )
         global_grasp["width_m"] = self.global_grasp.decode_width(
             global_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m

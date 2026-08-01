@@ -7,10 +7,17 @@ import torch
 
 from tcd_prg.baselines.base import GlobalGraspPrediction
 from tcd_prg.config import AblationConfig, BackboneConfig, GraphConfig, ModelConfig, RouterConfig
+from tcd_prg.constants import (
+    GLOBAL_GRASP_CERTIFICATION_FORMAT,
+    GLOBAL_GRASP_CERTIFIER_VERSION,
+)
 from tcd_prg.datasets.collate import _empty_global_grasps_like
-from tcd_prg.datasets.task_oriented_clutter import _se3_diverse_rows
+from tcd_prg.datasets.task_oriented_clutter import (
+    TaskOrientedClutterAdapter,
+    _se3_diverse_rows,
+)
 from tcd_prg.datasets.torch_dataset import ActionStateGroupDataset
-from tcd_prg.datasets.types import GlobalGraspLabels
+from tcd_prg.datasets.types import GlobalGraspLabels, SceneObservation
 from tcd_prg.evaluators.global_grasp import GlobalGraspEvaluator
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.planners.candidate_generator import DenseCandidateGenerator
@@ -70,6 +77,15 @@ def test_complete_global_branch_outputs_fixed_grasp_set(tiny_batch) -> None:
     assert torch.allclose(determinant, torch.ones_like(determinant), atol=1e-5)
 
 
+def test_global_object_assignment_masks_inactive_objects(tiny_batch) -> None:
+    batch = {key: value.clone() for key, value in tiny_batch.items()}
+    batch["object_present"] = torch.ones_like(batch["object_active"])
+    batch["object_active"][:, 2] = False
+    output = _small_model()(batch)
+    assert not output["encoded"].object_mask[0, 2]
+    assert torch.all(output["global_grasp"]["object_logits"][0, :, 2] == -30.0)
+
+
 def test_global_prediction_uses_complete_pose_and_se3_nms() -> None:
     config = ModelConfig(feature_dim=8, global_grasp_candidates=2, candidate_topk=2)
     generator = DenseCandidateGenerator(config)
@@ -105,6 +121,80 @@ def test_global_sampling_is_pose_diverse_and_respects_quota() -> None:
     assert len(selected) == 4
     assert len(np.unique(selected)) == 4
     assert np.ptp(transform[selected, 0, 3]) >= 0.06
+
+
+def test_global_labels_exclude_inactive_removed_objects(tmp_path) -> None:
+    transform = np.eye(4, dtype=np.float32)[None]
+    library = SimpleNamespace(
+        conversion_version="test",
+        stability_label=np.array([True]),
+        width_compatible=np.array([True]),
+        source_index=np.array([0], np.int64),
+        transform_object=transform,
+        contact_points_object=np.zeros((1, 2, 3), np.float32),
+        approach_direction_object=np.array([[0.0, 0.0, 1.0]], np.float32),
+        ag_width_m=np.array([0.05], np.float32),
+        quality=np.array([1.0], np.float32),
+    )
+
+    class Registry:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def load(self, category: str, name: str):
+            self.calls.append((category, name))
+            return library
+
+    registry = Registry()
+    adapter = object.__new__(TaskOrientedClutterAdapter)
+    adapter.global_grasp_registry = registry
+    adapter.global_grasp_certification_root = tmp_path / "certification"
+    adapter.global_sampling = (64, 32, 32)
+    stale_cache = adapter.global_grasp_certification_root / "scene_0000"
+    stale_cache.mkdir(parents=True)
+    np.savez(
+        stale_cache / "state_0001.npz",
+        format=np.asarray("global_grasp_scene_certification_v1"),
+        scene_id=np.int64(0), state_id=np.int64(1),
+        object_index=np.array([0]), source_grasp_index=np.array([0]),
+        scene_executable=np.array([1], np.int8), conversion_version=np.asarray("test"),
+    )
+    pose = np.array([
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    ], np.float32)
+    observation = SceneObservation(
+        scene_id=0, state_id=1, task_index=0,
+        xyz=np.zeros((1, 3), np.float32), rgb=np.zeros((1, 3), np.float32),
+        instance_id=np.array([0], np.int64), target_mask=np.array([True]),
+        target_object=0, task_region_id=0, object_uuid=("0", "1"),
+        object_pose=pose, object_category_id=np.array([0, 1], np.int64),
+        object_present=np.array([True, True]), object_active=np.array([True, False]),
+        camera_parameters=(),
+        metadata={
+            "object_category_key": ("cup", "bottle"),
+            "object_h5_name": ("cup.h5", "bottle.h5"),
+        },
+    )
+    labels = adapter.load_global_grasps(0, 1, observation, training=False)
+    assert labels is not None
+    assert labels.object_index.tolist() == [0]
+    assert labels.scene_executable.tolist() == [-1]
+    assert registry.calls == [("cup", "cup.h5")]
+    np.savez(
+        stale_cache / "state_0001.npz",
+        format=np.asarray(GLOBAL_GRASP_CERTIFICATION_FORMAT),
+        certifier_version=np.asarray(GLOBAL_GRASP_CERTIFIER_VERSION),
+        scene_id=np.int64(0), state_id=np.int64(1),
+        physical_active=observation.physical_active,
+        object_index=np.array([0]), source_grasp_index=np.array([0]),
+        scene_executable=np.array([1], np.int8), conversion_version=np.asarray("test"),
+        label_set_complete=np.asarray(True),
+    )
+    current = adapter.load_global_grasps(0, 1, observation, training=False)
+    assert current is not None
+    assert current.scene_executable.tolist() == [1]
+    assert current.label_set_complete
 
 
 def test_global_supervision_has_one_representative_per_scene_state() -> None:

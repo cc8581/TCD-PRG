@@ -35,3 +35,9 @@ PUSH_DISTANCE_M = 0.15
 MAX_PREPARATION_ACTIONS = 5
 QUATERNION_ORDER = "xyzw"
 
+# Bump this whenever the exact scene-certification protocol changes in a way
+# that can alter cached outcomes.  Version 2 makes the current physical object
+# mask part of the cache contract, so caches produced with removed objects
+# still present cannot supervise a later state.
+GLOBAL_GRASP_CERTIFICATION_FORMAT = "global_grasp_scene_certification_v2"
+GLOBAL_GRASP_CERTIFIER_VERSION = "fr5_ag16095_exact_v2_physical_active"

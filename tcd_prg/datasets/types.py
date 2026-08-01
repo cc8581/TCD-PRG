@@ -52,6 +52,12 @@ class SceneObservation:
     task_region_visibility: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def physical_active(self) -> np.ndarray:
+        """Objects that physically participate in this observed state."""
+
+        return self.object_present & self.object_active
+
     def validate(self) -> None:
         n = self.xyz.shape[0]
         if self.xyz.shape != (n, 3) or self.rgb.shape != (n, 3):
@@ -126,6 +132,9 @@ class ActionCandidateGroup:
     potential_delta: np.ndarray
     success_mask: np.ndarray
     action_parameters: dict[str, np.ndarray]
+    # False for sampled/open-world candidate groups. It may be true only when
+    # the data producer explicitly certified a versioned, complete universe.
+    label_set_complete: bool = False
 
     @property
     def action_improves_state(self) -> np.ndarray:
@@ -189,6 +198,9 @@ class GlobalGraspLabels:
     anchor_visible_distance_m: np.ndarray
     valid_mask: np.ndarray
     conversion_version: str
+    # Completeness applies to the represented set, not merely to whether every
+    # sampled row has a known outcome.
+    label_set_complete: bool = False
 
     def validate(self) -> None:
         n = len(self.object_index)

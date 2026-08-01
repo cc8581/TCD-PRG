@@ -19,9 +19,12 @@ functional-region vocabulary are not hardcoded to the current dataset.
 - pose quaternion: `(qx,qy,qz,qw)` after translation.
 - `instance_id`: grouping/association only.
 - `target_mask`: external mask equality with target instance.
-- `object_present`: body still exists in the state.
-- `object_active`: body may still be manipulated.
+- `object_present`: the scene catalog/pose slot contains this object.
+- `object_active`: the object has not been removed from the current state.
 - after PICK_REMOVE: `present=true`, `active=false`.
+- `physical_active = object_present & object_active`: the only object domain
+  used for current geometry pooling, global-grasp assignment and exact
+  collision certification.
 - cameras: exactly the allowed external sensor profiles; Oracle is rejected.
 
 Intermediate states are reconstructed from source scene, state object poses,
@@ -64,6 +67,12 @@ derived actionable frontier, with at most the configured bounded fallback.
 - `POSITIVE`: evaluated successful action.
 - `NEGATIVE`: evaluated unsuccessful action.
 - `UNKNOWN_UNTESTED`: no outcome statement; never a negative.
+
+`label_set_complete` is false by default and may be true only for an explicitly
+versioned, fully certified candidate universe with no unknown rows. Without
+that declaration, unmatched grasp queries are ignored. A query becomes a
+negative only when it is geometrically associated with an explicit evaluated
+negative; the absence of a sampled positive label is not a negative outcome.
 
 Every regression/result field has its own validity mask, including
 `after_state_valid`, `after_pose_valid`, `potential_after_valid`,

@@ -26,6 +26,7 @@ def _empty_global_grasps_like(label: GlobalGraspLabels) -> GlobalGraspLabels:
         valid_mask=np.empty((0,), dtype=label.valid_mask.dtype),
         anchor_visible_distance_m=np.empty((0,), dtype=label.anchor_visible_distance_m.dtype),
         conversion_version=label.conversion_version,
+        label_set_complete=False,
     )
 
 
@@ -157,6 +158,9 @@ def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
         "acted_object": acted_object.long(),
         "candidate_mask": candidate_mask & valid_mask.bool(),
         "evaluation_status": status.long(),
+        "task_grasp_label_set_complete": torch.tensor(
+            [x.label_set_complete for x in candidates], dtype=torch.bool
+        ),
         "outcome_code": outcome.long(),
         # Local transition improvement supervises action-effect heads.  Policy
         # behavior cloning uses only actions that occur in a successful
@@ -232,5 +236,8 @@ def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
                 [x.anchor_visible_distance_m for x in packed], np.nan
             )[0].float(),
             "valid_mask": global_valid.bool(),
+            "label_set_complete": torch.tensor(
+                [x.label_set_complete for x in packed], dtype=torch.bool
+            ),
         }
     return result

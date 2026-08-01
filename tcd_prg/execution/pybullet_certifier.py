@@ -68,7 +68,8 @@ class ExternalFR5AG16095Certifier:
             request, output = Path(directory) / "request.npz", Path(directory) / "result.npz"
             np.savez_compressed(
                 request, object_model_ids=model_ids, object_scales=scales,
-                object_pose=observation.object_pose, object_present=observation.object_present,
+                object_pose=observation.object_pose,
+                object_present=observation.physical_active,
                 support_present=support_present, support_pose=support_pose, support_size=support_size,
                 action_type=action_type,
                 acted_object=np.asarray([item["acted_object"] for item in actions], np.int16),

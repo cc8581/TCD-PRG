@@ -11,7 +11,7 @@ dataset:
   step_labels_subdir: task_training_labels_steps1_6_v1
   action_labels_subdir: task_positive_multistep_sequences
   global_grasp_library_subdir: generic_grasp_library_v1
-  global_grasp_certification_subdir: global_grasp_scene_certification_v1
+  global_grasp_certification_subdir: global_grasp_scene_certification_v2
   pick_remove_global_association_subdir: pick_remove_global_grasp_association_v1
   scene_points: 16384
   target_points: 4096

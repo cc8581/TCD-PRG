@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -21,10 +23,17 @@ class CompleteGraspSetLoss(nn.Module):
         self, translation_weight: float = 1.0, rotation_weight: float = 1.0,
         width_weight: float = 0.5, quality_weight: float = 1.0,
         object_weight: float = 1.0,
+        negative_translation_m: float = 0.01,
+        negative_rotation_deg: float = 12.0,
+        negative_width_m: float = 0.005,
     ) -> None:
         super().__init__()
         self.weights = (
             translation_weight, rotation_weight, width_weight, quality_weight, object_weight
+        )
+        self.negative_thresholds = (
+            float(negative_translation_m), math.radians(float(negative_rotation_deg)),
+            float(negative_width_m),
         )
 
     def forward(self, output: dict[str, Tensor], labels: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -36,10 +45,13 @@ class CompleteGraspSetLoss(nn.Module):
         matched_prediction: list[Tensor] = []
         matched_target: list[Tensor] = []
         quality_target = torch.zeros_like(quality_logit)
-        unmatched_quality_valid = labels.get("unmatched_quality_valid", sample_valid).bool()
+        unmatched_quality_valid = labels.get(
+            "unmatched_quality_valid", torch.zeros_like(sample_valid)
+        ).bool()
         quality_valid = unmatched_quality_valid[:, None].expand_as(quality_logit).clone()
         object_logits = output.get("object_logits")
         object_target = labels.get("object_index")
+        matched_query = torch.zeros_like(quality_logit, dtype=torch.bool)
         for row in range(prediction_t.shape[0]):
             targets = torch.nonzero(labels["target_valid"][row], as_tuple=False).flatten()
             if not bool(sample_valid[row]) or not len(targets):
@@ -73,6 +85,42 @@ class CompleteGraspSetLoss(nn.Module):
             ), -1))
             quality_target[row, pred_index] = labels["quality_target"][row, target_index]
             quality_valid[row, pred_index] = labels["quality_valid"][row, target_index]
+            matched_query[row, pred_index] = True
+        negative_valid = labels.get("negative_valid")
+        if negative_valid is not None:
+            translation_threshold, rotation_threshold, width_threshold = self.negative_thresholds
+            negative_object = labels.get("negative_object_index")
+            for row in range(prediction_t.shape[0]):
+                if not bool(sample_valid[row]):
+                    continue
+                queries = torch.nonzero(~matched_query[row], as_tuple=False).flatten()
+                negatives = torch.nonzero(negative_valid[row], as_tuple=False).flatten()
+                if not len(queries) or not len(negatives):
+                    continue
+                translation_close = torch.cdist(
+                    prediction_t[row, queries],
+                    labels["negative_translation_world"][row, negatives],
+                ) <= translation_threshold
+                pred_rotation = prediction_r[row, queries, None].expand(
+                    -1, len(negatives), -1, -1
+                )
+                target_rotation = labels["negative_rotation_matrix"][row, negatives][None].expand(
+                    len(queries), -1, -1, -1
+                )
+                rotation_close = parallel_jaw_rotation_distance(
+                    pred_rotation, target_rotation
+                ) <= rotation_threshold
+                width_close = (
+                    prediction_w[row, queries, None]
+                    - labels["negative_width_m"][row, negatives][None]
+                ).abs() <= width_threshold
+                associated = translation_close & rotation_close & width_close
+                if object_logits is not None and negative_object is not None:
+                    predicted_object = object_logits[row, queries].argmax(-1)
+                    associated &= (
+                        predicted_object[:, None] == negative_object[row, negatives][None]
+                    )
+                quality_valid[row, queries[associated.any(-1)]] = True
         if matched_prediction:
             prediction_index = torch.cat(matched_prediction)
             target_index = torch.cat(matched_target)

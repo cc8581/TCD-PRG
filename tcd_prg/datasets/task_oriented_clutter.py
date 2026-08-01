@@ -3,21 +3,29 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from collections import defaultdict
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 
 import h5py
 import numpy as np
 
-from tcd_prg.constants import ActionType, CandidateStatus, OutcomeCode, PUSH_DISTANCE_M
+from tcd_prg.constants import (
+    GLOBAL_GRASP_CERTIFICATION_FORMAT,
+    GLOBAL_GRASP_CERTIFIER_VERSION,
+    PUSH_DISTANCE_M,
+    ActionType,
+    CandidateStatus,
+    OutcomeCode,
+)
 from tcd_prg.geometry.numpy_se3 import compose_pose_with_transform, quaternion_xyzw_to_matrix_numpy
 from tcd_prg.observation.base import ObservationProvider, ObservationRequest
 from tcd_prg.observation.saved import SavedObservationProvider
 
 from .base import DatasetAdapter
 from .capabilities import DatasetCapabilities
+from .registries import FunctionalRegionRegistry, GlobalGraspLibraryRegistry, GraspLibraryRegistry
 from .types import (
     ActionCandidateGroup,
     CameraParameters,
@@ -26,7 +34,6 @@ from .types import (
     SequenceLabels,
     StateLabels,
 )
-from .registries import FunctionalRegionRegistry, GlobalGraspLibraryRegistry, GraspLibraryRegistry
 
 
 def _decode_strings(values: np.ndarray) -> tuple[str, ...]:
@@ -139,7 +146,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         step_labels_subdir: str = "task_training_labels_steps1_6_v1",
         action_labels_subdir: str = "task_positive_multistep_sequences",
         global_grasp_library_subdir: str = "generic_grasp_library_v1",
-        global_grasp_certification_subdir: str = "global_grasp_scene_certification_v1",
+        global_grasp_certification_subdir: str = "global_grasp_scene_certification_v2",
         pick_remove_global_association_subdir: str = "pick_remove_global_grasp_association_v1",
         global_positive_grasps_per_object: int = 64,
         global_intrinsic_negative_grasps_per_object: int = 32,
@@ -476,20 +483,36 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         certification_file = (
             self.global_grasp_certification_root / f"scene_{scene_id:04d}" / f"state_{state_id:04d}.npz"
         )
+        physical_active = observation.physical_active
         certification: dict[tuple[int, int], int] = {}
         certification_version = ""
+        certification_complete = False
         if certification_file.is_file():
             with np.load(certification_file, allow_pickle=False) as cached:
-                certification_version = str(cached.get("conversion_version", ""))
-                certification = {
-                    (int(obj), int(source)): int(value)
-                    for obj, source, value in zip(
-                        cached["object_index"], cached["source_grasp_index"],
-                        cached["scene_executable"], strict=True,
-                    )
-                }
-        for object_index, present in enumerate(observation.object_present):
-            if not present:
+                cache_valid = (
+                    str(cached.get("format", "")) == GLOBAL_GRASP_CERTIFICATION_FORMAT
+                    and str(cached.get("certifier_version", ""))
+                    == GLOBAL_GRASP_CERTIFIER_VERSION
+                    and int(cached.get("scene_id", -1)) == scene_id
+                    and int(cached.get("state_id", -1)) == state_id
+                    and "physical_active" in cached
+                    and np.array_equal(cached["physical_active"].astype(bool), physical_active)
+                )
+                if cache_valid:
+                    certification_version = str(cached.get("conversion_version", ""))
+                    values = cached["scene_executable"].astype(np.int8)
+                    certification = {
+                        (int(obj), int(source)): int(value)
+                        for obj, source, value in zip(
+                            cached["object_index"], cached["source_grasp_index"],
+                            values, strict=True,
+                        )
+                    }
+                    certification_complete = bool(
+                        cached.get("label_set_complete", False)
+                    ) and not np.any(values < 0)
+        for object_index, active in enumerate(physical_active):
+            if not active:
                 continue
             library = self.global_grasp_registry.load(category_keys[object_index], h5_names[object_index])
             versions.add(library.conversion_version)
@@ -571,6 +594,9 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             anchor_visible_distance_m=np.asarray(anchor_distances, np.float32),
             valid_mask=np.ones(count, bool),
             conversion_version=version,
+            # Training uses a quota-sampled subset and is therefore open-world
+            # even when the underlying full certification cache is complete.
+            label_set_complete=certification_complete and not training,
         )
 
     def load_state_labels(self, scene_id: int, state_id: int) -> StateLabels:
@@ -844,6 +870,10 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 potential_delta=actions["potential_delta"][action_ids].astype(np.float32),
                 success_mask=positive & executed,
                 action_parameters=parameters,
+                label_set_complete=(
+                    bool(groups["label_set_complete"][group_index])
+                    if "label_set_complete" in groups else False
+                ),
             )
             from_state_id = int(groups["from_state"][group_index])
             task_index = int(groups["task_index"][group_index])
@@ -940,8 +970,6 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             key: np.concatenate((value, extension[key]), axis=0)
             for key, value in base.action_parameters.items()
         }
-        n = len(base.action_type)
-
         def append(name: str, values: np.ndarray) -> np.ndarray:
             return np.concatenate((getattr(base, name), values), axis=0)
 
@@ -975,6 +1003,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             ),
             success_mask=append("success_mask", np.zeros(count_new, bool)),
             action_parameters=parameters,
+            label_set_complete=base.label_set_complete,
         )
 
     def load_sequences(self, scene_id: int, task_index: int | None = None) -> tuple[SequenceLabels, ...]:

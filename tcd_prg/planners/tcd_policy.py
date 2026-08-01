@@ -113,7 +113,7 @@ class TCDPRGPolicy(ManipulationPolicy):
             "point_mask": torch.from_numpy(point_valid)[None].bool(),
             "target_mask": torch.from_numpy(observation.target_mask)[None].bool(),
             "target_object": torch.tensor([observation.target_object], dtype=torch.long),
-            "object_mask": torch.from_numpy(observation.object_present)[None].bool(),
+            "object_mask": torch.from_numpy(observation.physical_active)[None].bool(),
             "object_present": torch.from_numpy(observation.object_present)[None].bool(),
             "object_active": torch.from_numpy(observation.object_active)[None].bool(),
             "task_category_id": torch.tensor(

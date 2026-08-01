@@ -17,7 +17,11 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tcd_prg.config import load_config
-from tcd_prg.constants import ActionType
+from tcd_prg.constants import (
+    GLOBAL_GRASP_CERTIFICATION_FORMAT,
+    GLOBAL_GRASP_CERTIFIER_VERSION,
+    ActionType,
+)
 from tcd_prg.runtime import create_action_certifier, create_adapter
 
 
@@ -73,11 +77,14 @@ def main() -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
         temporary = output.with_suffix(".tmp.npz")
         np.savez_compressed(
-            temporary, format=np.asarray("global_grasp_scene_certification_v1"),
+            temporary, format=np.asarray(GLOBAL_GRASP_CERTIFICATION_FORMAT),
+            certifier_version=np.asarray(GLOBAL_GRASP_CERTIFIER_VERSION),
             scene_id=np.int64(scene_id), state_id=np.int64(state_id),
+            physical_active=observation.physical_active,
             object_index=labels.object_index, source_grasp_index=labels.source_grasp_index,
             scene_executable=executable, reason=reasons,
             conversion_version=np.asarray(labels.conversion_version),
+            label_set_complete=np.asarray(True),
         )
         temporary.replace(output)
 

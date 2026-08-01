@@ -48,8 +48,17 @@ Training uses a stratified per-object budget: 64 intrinsic positives selected
 with deterministic SE(3)/opening farthest-first sampling, 32 intrinsic
 failures, and 32 certified scene-level hard negatives. Evaluation instead uses
 the complete width-compatible positive library after object-frame SE(3) NMS;
-it is never truncated to the training budget. A stale certification cache is
-ignored when its conversion version differs from the object library.
+it is never truncated to the training budget. Version 2 binds every scene
+certification cache to the exact certifier protocol and the state's
+`object_present & object_active` mask. A cache is ignored when its conversion
+version, certifier version, scene/state identity, or physical-active mask does
+not match. Legacy v1 caches must be regenerated into the configured v2
+directory.
+
+Quota-sampled training labels explicitly set `label_set_complete = false`, even
+when the underlying full cache is complete. Unmatched queries remain ignored;
+only predictions geometrically associated with explicit certified negatives
+receive negative quality supervision.
 
 Existing PICK_REMOVE sequences are retained. Their old grasp labels are
 associated with the new library by exact ACRONYM source index, then by

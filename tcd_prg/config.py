@@ -21,7 +21,7 @@ class DatasetConfig:
     step_labels_subdir: str = "task_training_labels_steps1_6_v1"
     action_labels_subdir: str = "task_positive_multistep_sequences"
     global_grasp_library_subdir: str = "generic_grasp_library_v1"
-    global_grasp_certification_subdir: str = "global_grasp_scene_certification_v1"
+    global_grasp_certification_subdir: str = "global_grasp_scene_certification_v2"
     pick_remove_global_association_subdir: str = "pick_remove_global_grasp_association_v1"
     scene_points: int = 16_384
     target_points: int = 4_096

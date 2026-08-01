@@ -52,8 +52,16 @@ class TCDPRGObjective(nn.Module):
         self.region = TaskRegionLoss(
             region_config.focal_alpha, region_config.focal_gamma, region_config.dice_weight
         )
-        self.task_grasp = GraspProposalLoss()
-        self.global_grasp = GlobalGraspLoss()
+        self.task_grasp = GraspProposalLoss(
+            negative_translation_m=model_config.grasp_nms_translation_m,
+            negative_rotation_deg=model_config.grasp_nms_rotation_deg,
+            negative_width_m=model_config.grasp_nms_width_m,
+        )
+        self.global_grasp = GlobalGraspLoss(
+            negative_translation_m=model_config.global_grasp_nms_translation_m,
+            negative_rotation_deg=model_config.global_grasp_nms_rotation_deg,
+            negative_width_m=model_config.global_grasp_nms_width_m,
+        )
         self.graph = DependencyGraphLoss()
         self.push = PushLoss()
         self.verify = GraspVerifierLoss()

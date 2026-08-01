@@ -120,6 +120,22 @@ def _pack_grasp_set(
     return packed
 
 
+def _attach_negative_grasp_set(
+    labels: dict[str, Tensor], pose: Tensor, width: Tensor, valid: Tensor,
+    object_index: Tensor | None = None,
+) -> None:
+    """Attach explicit known negatives without turning other queries negative."""
+
+    labels["negative_translation_world"] = torch.nan_to_num(pose[..., :3])
+    labels["negative_rotation_matrix"] = quaternion_xyzw_to_matrix(
+        torch.nan_to_num(pose[..., 3:], nan=0.0)
+    )
+    labels["negative_width_m"] = torch.nan_to_num(width)
+    labels["negative_valid"] = valid
+    if object_index is not None:
+        labels["negative_object_index"] = object_index
+
+
 def build_grasp_proposal_labels(
     batch: dict[str, Tensor], config: ModelConfig
 ) -> dict[str, Tensor]:
@@ -140,13 +156,25 @@ def build_grasp_proposal_labels(
         overall_valid, torch.nan_to_num(overall),
         torch.nan_to_num(parameters.get("grasp_confidence", torch.ones_like(width)), nan=1.0),
     ).clamp(0.0, 1.0)
-    evaluated = batch["evaluation_status"] != int(CandidateStatus.UNKNOWN_UNTESTED)
-    exhaustive = candidate.any(-1) & ~(candidate & ~evaluated).any(-1)
+    known_negative = (
+        candidate
+        & (batch["evaluation_status"] == int(CandidateStatus.NEGATIVE))
+        & torch.isfinite(pose).all(-1)
+        & torch.isfinite(width)
+        & (width >= config.min_grasp_width_m)
+        & (width <= config.max_grasp_width_m)
+    )
+    label_set_complete = batch.get(
+        "task_grasp_label_set_complete",
+        torch.zeros(pose.shape[0], dtype=torch.bool, device=pose.device),
+    ).bool()
     labels = _pack_grasp_set(
         pose, width, valid, quality, torch.ones_like(candidate), config.task_grasp_candidates
     )
-    labels["sample_valid"] = valid.any(-1) | exhaustive
-    labels["unmatched_quality_valid"] = exhaustive
+    _attach_negative_grasp_set(labels, pose, width, known_negative)
+    labels["label_set_complete"] = label_set_complete
+    labels["sample_valid"] = valid.any(-1) | known_negative.any(-1) | label_set_complete
+    labels["unmatched_quality_valid"] = label_set_complete
     return labels
 
 
@@ -167,14 +195,29 @@ def build_global_grasp_labels(
         & (width >= config.min_grasp_width_m) & (width <= config.max_grasp_width_m)
     )
     quality = positive.float()
+    known_negative = (
+        source["valid_mask"] & (source["scene_executable"] == 0)
+        & torch.isfinite(pose).all(-1) & torch.isfinite(width)
+        & (width >= config.min_grasp_width_m) & (width <= config.max_grasp_width_m)
+    )
     labels = _pack_grasp_set(
         pose, width, valid, quality, certified, config.global_grasp_candidates,
         object_index=source["object_index"],
     )
-    labels["sample_valid"] = batch.get(
+    _attach_negative_grasp_set(
+        labels, pose, width, known_negative, object_index=source["object_index"]
+    )
+    representative = batch.get(
         "global_loss_sample_valid", torch.ones(pose.shape[0], dtype=torch.bool, device=pose.device)
-    ) & (source["valid_mask"] & certified).any(-1)
-    labels["unmatched_quality_valid"] = labels["sample_valid"]
+    )
+    label_set_complete = source.get(
+        "label_set_complete", torch.zeros_like(representative)
+    ).bool() & ~(source["valid_mask"] & ~certified).any(-1)
+    labels["label_set_complete"] = label_set_complete
+    labels["sample_valid"] = representative & (
+        valid.any(-1) | known_negative.any(-1) | label_set_complete
+    )
+    labels["unmatched_quality_valid"] = representative & label_set_complete
     return labels
 
 
