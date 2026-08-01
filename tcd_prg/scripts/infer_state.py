@@ -77,10 +77,21 @@ def main() -> None:
     valid_count = (int(tensor_candidates["valid"].sum())
                    if isinstance(tensor_candidates, dict) and "valid" in tensor_candidates
                    else len(candidates.get("candidates", [])) if isinstance(candidates, dict) else 0)
+    survival_keys = (
+        "task_grasp_query_count", "task_grasp_after_nms_count",
+        "task_grasp_after_verifier_count", "task_grasp_after_certifier_count",
+        "verified_unique_grasp_count",
+    )
+    task_grasp_survival = {
+        key: int(tensor_candidates[key][0])
+        for key in survival_keys
+        if isinstance(tensor_candidates, dict) and key in tensor_candidates
+    }
     payload = {
         "scene_id": args.scene_id, "state_id": args.state_id,
         "task_index": args.task_index, "selected_action": serializable(action),
         "valid_candidate_count": valid_count,
+        "task_grasp_survival": task_grasp_survival,
         "certification_reasons": (candidates.get("certification_reasons", [])
                                   if isinstance(candidates, dict) else []),
         "final_certification": final_certification,

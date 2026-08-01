@@ -37,6 +37,17 @@ def parallel_jaw_rotation_distance(first: Tensor, second: Tensor) -> Tensor:
     return torch.minimum(angle(relative), angle(swapped))
 
 
+def parallel_jaw_rotation_chordal_loss(first: Tensor, second: Tensor) -> Tensor:
+    """Smooth squared chordal loss with 180-degree jaw-swap symmetry."""
+
+    jaw_swap = torch.diag(torch.tensor(
+        [-1.0, -1.0, 1.0], dtype=first.dtype, device=first.device
+    ))
+    direct = (first - second).square().sum(dim=(-2, -1)) / 8.0
+    swapped = (first - second @ jaw_swap).square().sum(dim=(-2, -1)) / 8.0
+    return torch.minimum(direct, swapped)
+
+
 def normalize_quaternion_xyzw(q: Tensor, eps: float = 1e-8) -> Tensor:
     """Normalize xyzw quaternions and choose a deterministic sign (w >= 0)."""
 

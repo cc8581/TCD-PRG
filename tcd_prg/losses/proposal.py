@@ -8,7 +8,10 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from torch import Tensor, nn
 
-from tcd_prg.geometry.se3 import parallel_jaw_rotation_distance
+from tcd_prg.geometry.se3 import (
+    parallel_jaw_rotation_chordal_loss,
+    parallel_jaw_rotation_distance,
+)
 
 
 class CompleteGraspSetLoss(nn.Module):
@@ -17,9 +20,12 @@ class CompleteGraspSetLoss(nn.Module):
     def __init__(
         self, translation_weight: float = 1.0, rotation_weight: float = 1.0,
         width_weight: float = 0.5, quality_weight: float = 1.0,
+        object_weight: float = 1.0,
     ) -> None:
         super().__init__()
-        self.weights = (translation_weight, rotation_weight, width_weight, quality_weight)
+        self.weights = (
+            translation_weight, rotation_weight, width_weight, quality_weight, object_weight
+        )
 
     def forward(self, output: dict[str, Tensor], labels: dict[str, Tensor]) -> dict[str, Tensor]:
         prediction_t = output["translation_world"]
@@ -30,7 +36,10 @@ class CompleteGraspSetLoss(nn.Module):
         matched_prediction: list[Tensor] = []
         matched_target: list[Tensor] = []
         quality_target = torch.zeros_like(quality_logit)
-        quality_valid = sample_valid[:, None].expand_as(quality_logit).clone()
+        unmatched_quality_valid = labels.get("unmatched_quality_valid", sample_valid).bool()
+        quality_valid = unmatched_quality_valid[:, None].expand_as(quality_logit).clone()
+        object_logits = output.get("object_logits")
+        object_target = labels.get("object_index")
         for row in range(prediction_t.shape[0]):
             targets = torch.nonzero(labels["target_valid"][row], as_tuple=False).flatten()
             if not bool(sample_valid[row]) or not len(targets):
@@ -48,6 +57,9 @@ class CompleteGraspSetLoss(nn.Module):
             ) / 0.02
             confidence_cost = -F.logsigmoid(quality_logit[row])[:, None]
             cost = translation_cost + rotation_cost + 0.5 * width_cost + confidence_cost
+            if object_logits is not None and object_target is not None:
+                object_cost = -F.log_softmax(object_logits[row], -1)[:, object_target[row, targets]]
+                cost = cost + object_cost
             pred_np, target_np = linear_sum_assignment(
                 np.asarray(cost.detach().float().cpu())
             )
@@ -60,6 +72,7 @@ class CompleteGraspSetLoss(nn.Module):
                 torch.full_like(target_index, row), target_index,
             ), -1))
             quality_target[row, pred_index] = labels["quality_target"][row, target_index]
+            quality_valid[row, pred_index] = labels["quality_valid"][row, target_index]
         if matched_prediction:
             prediction_index = torch.cat(matched_prediction)
             target_index = torch.cat(matched_target)
@@ -68,28 +81,38 @@ class CompleteGraspSetLoss(nn.Module):
             translation = F.smooth_l1_loss(
                 prediction_t[pr, pq], labels["translation_world"][tr, tq], beta=0.01
             )
-            rotation = parallel_jaw_rotation_distance(
+            rotation = parallel_jaw_rotation_chordal_loss(
                 prediction_r[pr, pq], labels["rotation_matrix"][tr, tq]
             ).mean()
             width = F.smooth_l1_loss(
                 prediction_w[pr, pq], labels["width_m"][tr, tq], beta=0.005
             )
+            if object_logits is not None and object_target is not None:
+                object_assignment = F.cross_entropy(
+                    object_logits[pr, pq], object_target[tr, tq]
+                )
+            else:
+                object_assignment = translation.new_zeros(())
         else:
             zero = prediction_t.sum() * 0.0
-            translation = rotation = width = zero
+            translation = rotation = width = object_assignment = zero
         safe_quality_target = torch.where(quality_valid, quality_target, torch.zeros_like(quality_target))
         quality_raw = F.binary_cross_entropy_with_logits(
             quality_logit, safe_quality_target, reduction="none"
         )
         quality = (quality_raw * quality_valid).sum() / quality_valid.sum().clamp_min(1)
-        wt, wr, ww, wq = self.weights
-        total = wt * translation + wr * rotation + ww * width + wq * quality
+        wt, wr, ww, wq, wo = self.weights
+        total = (
+            wt * translation + wr * rotation + ww * width + wq * quality
+            + wo * object_assignment
+        )
         return {
             "loss": total,
             "grasp_translation": translation,
             "grasp_rotation": rotation,
             "grasp_width": width,
             "grasp_quality": quality,
+            "grasp_object": object_assignment,
         }
 
 

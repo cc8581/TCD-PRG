@@ -39,7 +39,8 @@ class _CompleteGraspSetHead(nn.Module):
         self.quality = nn.Linear(dim, 1)
 
     def _decode(
-        self, memory_input: Tensor, xyz: Tensor, point_domain: Tensor, context: Tensor
+        self, memory_input: Tensor, xyz: Tensor, point_domain: Tensor, context: Tensor,
+        object_index: Tensor | None = None, object_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
         b = xyz.shape[0]
         memory = self.memory(memory_input)
@@ -59,7 +60,7 @@ class _CompleteGraspSetHead(nn.Module):
         translation = anchor + 0.10 * torch.tanh(self.translation_offset(decoded))
         rotation_6d = self.rotation_6d(decoded)
         rotation = rotation_6d_to_matrix(rotation_6d)
-        return {
+        output = {
             "translation_world": translation,
             "rotation_matrix": rotation,
             "rotation_6d": rotation_6d,
@@ -67,6 +68,27 @@ class _CompleteGraspSetHead(nn.Module):
             "quality_logit": self.quality(decoded).squeeze(-1),
             "attention_point_index": weights.argmax(-1),
         }
+        if object_index is not None:
+            if object_mask is None:
+                raise ValueError("object_mask is required with object_index")
+            object_count = object_mask.shape[1]
+            valid_object_point = (
+                point_domain & (object_index >= 0) & (object_index < object_count)
+            )
+            safe_object = object_index.clamp(0, object_count - 1)
+            object_mass = weights.new_zeros((b, weights.shape[1], object_count))
+            object_mass.scatter_add_(
+                2,
+                safe_object[:, None].expand(-1, weights.shape[1], -1),
+                weights * valid_object_point[:, None],
+            )
+            visible_count = torch.zeros_like(object_mask, dtype=torch.long)
+            visible_count.scatter_add_(1, safe_object, valid_object_point.long())
+            valid_object = object_mask & (visible_count > 0)
+            output["object_logits"] = torch.log(object_mass.clamp_min(1e-8)).masked_fill(
+                ~valid_object[:, None], -30.0
+            )
+        return output
 
     @staticmethod
     def decode_width(width_raw: Tensor, min_width_m: float, max_width_m: float) -> Tensor:
@@ -128,6 +150,7 @@ class GlobalGraspProposalHead(_CompleteGraspSetHead):
         global_scene_token: Tensor,
         instance_id: Tensor,
         point_domain: Tensor,
+        object_mask: Tensor,
     ) -> dict[str, Tensor]:
         b, n, _ = point_features.shape
         if self.input_mode == "instance_assisted":
@@ -141,6 +164,9 @@ class GlobalGraspProposalHead(_CompleteGraspSetHead):
             global_scene_token[:, None].expand(-1, n, -1),
         ), -1)
         context = torch.cat((global_scene_token, global_scene_token, global_scene_token), -1)
-        output = self._decode(memory, xyz, point_domain, context)
+        output = self._decode(
+            memory, xyz, point_domain, context,
+            object_index=instance_id, object_mask=object_mask,
+        )
         output["point_domain"] = point_domain
         return output

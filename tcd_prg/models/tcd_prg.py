@@ -99,7 +99,14 @@ class TCDPRGModel(nn.Module):
                 delta = batch["xyz"][row, points] - query
                 point = points[(delta * delta).sum(-1).argmin()]
                 if is_push:
-                    evidence[row, candidate, 0] = result["push"]["utility_delta"][row, point]
+                    direction = parameters["push_direction_world"][row, candidate]
+                    angle = torch.atan2(direction[1], direction[0]).remainder(2 * torch.pi)
+                    direction_bin = torch.floor(
+                        angle * self.config.num_direction_bins / (2 * torch.pi)
+                    ).long().remainder(self.config.num_direction_bins)
+                    evidence[row, candidate, 0] = result["push"]["utility_delta"][
+                        row, point, direction_bin
+                    ]
                     evidence[row, candidate, 1] = torch.sigmoid(
                         result["push"]["contact_logits"][row, point]
                     )
@@ -226,6 +233,7 @@ class TCDPRGModel(nn.Module):
             encoded.scene_global_token,
             batch["instance_id"],
             global_mask,
+            object_present,
         )
         global_grasp["width_m"] = self.global_grasp.decode_width(
             global_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m

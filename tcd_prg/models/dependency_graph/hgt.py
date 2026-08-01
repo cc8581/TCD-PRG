@@ -79,10 +79,7 @@ def derive_dependency_masks(
 
     physical = torch.sigmoid(physical_edge_logits) >= threshold
     direct = (torch.sigmoid(task_edge_logits) >= threshold).any(-1) & object_mask
-    if target_object is not None:
-        row = torch.arange(object_mask.shape[0], device=object_mask.device)
-        target_neighborhood = physical[row, :, target_object][:, :, (0, 1, 4)].any(-1)
-        direct |= target_neighborhood & object_mask
+    del target_object
     prerequisite = physical[..., 2] | physical[..., 3].transpose(1, 2)
     prerequisite &= object_mask[:, :, None] & object_mask[:, None, :]
     dependency = direct.clone()

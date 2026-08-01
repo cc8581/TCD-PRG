@@ -44,11 +44,13 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
         "translation_world": torch.zeros(1, 2, 3),
         "rotation_matrix": torch.eye(3).expand(1, 2, 3, 3),
         "width_m": torch.ones(1, 2) * 0.05, "quality_logit": torch.zeros(1, 2),
+        "attention_point_index": torch.zeros(1, 2, dtype=torch.long),
+        "object_logits": torch.zeros(1, 2, 1),
     }
     push = {
         "object_logits": torch.zeros(1, 1), "contact_logits": torch.zeros(1, 4),
         "direction_logits": torch.zeros(1, 4, 16), "direction_residual": torch.zeros(1, 4, 2),
-        "utility_delta": torch.zeros(1, 4),
+        "utility_delta": torch.zeros(1, 4, 16),
     }
     encoded = SimpleNamespace(object_tokens=torch.zeros(1, 1, 8), task_token=torch.zeros(1, 8))
 
@@ -131,13 +133,15 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
         "rotation_matrix": torch.eye(3).expand(1, 4, 3, 3),
         "width_m": torch.full((1, 4), 0.05),
         "quality_logit": torch.arange(4).float()[None],
+        "attention_point_index": torch.tensor([[0, 2, 4, 6]]),
+        "object_logits": torch.eye(4)[None] * 20.0,
     }
     push = {
         "object_logits": torch.tensor([[0.0, 1.0, 2.0, 3.0]]),
         "contact_logits": torch.arange(8).float()[None],
         "direction_logits": torch.zeros(1, 8, 16),
         "direction_residual": torch.zeros(1, 8, 2),
-        "utility_delta": torch.zeros(1, 8),
+        "utility_delta": torch.zeros(1, 8, 16),
     }
     graph = SimpleNamespace(
         derived_actionable_mask=torch.tensor([[False, True, False, False]]),

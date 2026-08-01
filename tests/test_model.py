@@ -73,6 +73,16 @@ def test_dependency_closure_returns_only_topmost_actionable_object() -> None:
     assert actionable.tolist() == [[False, False, True]]
 
 
+def test_physical_neighborhood_does_not_create_direct_task_blocker() -> None:
+    physical = torch.full((1, 2, 2, 5), -20.0)
+    physical[0, 1, 0, 0] = 20.0
+    task = torch.full((1, 2, 3), -20.0)
+    direct, _, _, _ = derive_dependency_masks(
+        physical, task, torch.ones(1, 2, dtype=torch.bool), target_object=torch.tensor([0])
+    )
+    assert not direct.any()
+
+
 @pytest.mark.parametrize(
     "ablation",
     [
@@ -118,6 +128,14 @@ def test_policy_heads_match_training_contract(tiny_batch) -> None:
         "translation_world", "rotation_matrix", "rotation_6d", "width_raw",
         "width_m", "quality_logit", "attention_point_index",
     }
+    assert "object_logits" in output["global_grasp"]
+    assert output["push"]["utility_delta"].shape[-1] == _config().num_direction_bins
     assert "approach_logits" not in output["push"]
     assert "risk_logits" not in output["push"]
     assert "pick_remove" not in output
+
+
+def test_default_task_query_capacity_has_certification_margin() -> None:
+    config = ModelConfig()
+    assert config.task_grasp_candidates == 64
+    assert config.task_grasp_candidates >= 3 * config.default_required_grasp_count

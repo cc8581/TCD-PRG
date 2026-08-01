@@ -73,7 +73,7 @@ model:
   min_grasp_width_m: 0.0
   max_grasp_width_m: 0.095
   candidate_topk: 64
-  task_grasp_candidates: 32
+  task_grasp_candidates: 64
   global_grasp_candidates: 64
   pick_remove_candidates: 16
   push_candidates: 16

@@ -43,7 +43,7 @@ def test_global_branch_is_invariant_to_task_and_target(tiny_batch) -> None:
         assert torch.equal(one[key], two[key]), key
 
 
-def test_scene_only_forward_is_strictly_invariant_to_instance_ids(tiny_batch) -> None:
+def test_scene_only_geometry_is_invariant_to_posthoc_instance_assignment(tiny_batch) -> None:
     model = _small_model()
     first = {key: value.clone() for key, value in tiny_batch.items()}
     second = {key: value.clone() for key, value in tiny_batch.items()}
@@ -51,8 +51,12 @@ def test_scene_only_forward_is_strictly_invariant_to_instance_ids(tiny_batch) ->
     with torch.no_grad():
         one = model(first)["global_grasp"]
         two = model(second)["global_grasp"]
-    for key, value in one.items():
-        assert torch.equal(value, two[key]), key
+    for key in (
+        "translation_world", "rotation_matrix", "width_m", "quality_logit",
+        "attention_point_index",
+    ):
+        assert torch.equal(one[key], two[key]), key
+    assert not torch.equal(one["object_logits"], two["object_logits"])
 
 
 def test_complete_global_branch_outputs_fixed_grasp_set(tiny_batch) -> None:
@@ -61,6 +65,7 @@ def test_complete_global_branch_outputs_fixed_grasp_set(tiny_batch) -> None:
     assert output["rotation_matrix"].shape == (1, 6, 3, 3)
     assert output["width_m"].shape == (1, 6)
     assert output["quality_logit"].shape == (1, 6)
+    assert output["object_logits"].shape == (1, 6, 3)
     determinant = torch.det(output["rotation_matrix"])
     assert torch.allclose(determinant, torch.ones_like(determinant), atol=1e-5)
 
@@ -80,6 +85,8 @@ def test_global_prediction_uses_complete_pose_and_se3_nms() -> None:
         "rotation_matrix": rotation,
         "width_m": torch.full((1, 2), 0.05),
         "quality_logit": torch.tensor([[10.0, 9.0]]),
+        "attention_point_index": torch.zeros(1, 2, dtype=torch.long),
+        "object_logits": torch.zeros(1, 2, 1),
     }
     decoded = generator.global_predictions(batch, {"global_grasp": head})[0]
     assert len(decoded["raw_score"]) == 1
@@ -138,7 +145,7 @@ def test_global_evaluator_accepts_parallel_jaw_symmetric_pose() -> None:
         0.05, 1.0, 1.0, 1.0, True, "test",
     )
     assert GlobalGraspEvaluator().evaluate([prediction], _labels(), certified=False, topk=(1,))[
-        "raw_recall@1"
+        "scene_recall@1"
     ] == 1.0
 
 

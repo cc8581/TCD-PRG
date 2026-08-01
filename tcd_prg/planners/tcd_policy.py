@@ -168,6 +168,15 @@ class TCDPRGPolicy(ManipulationPolicy):
             candidates = self.generator.generate(
                 self.model, encoded.device_batch, encoded.output
             )
+            task_query_count = encoded.output["task_grasp"]["quality_logit"].shape[1]
+            task_mask = candidates["type"] == int(ActionType.TASK_GRASP)
+            candidates["task_grasp_query_count"] = torch.full(
+                (candidates["type"].shape[0],), task_query_count,
+                dtype=torch.long, device=self.device,
+            )
+            candidates["task_grasp_after_nms_count"] = (
+                candidates["valid"] & task_mask
+            ).sum(-1)
             if self.previous_action is not None:
                 candidates["previous_action"] = torch.tensor(
                     [self.previous_action], device=self.device
@@ -193,6 +202,9 @@ class TCDPRGPolicy(ManipulationPolicy):
                     encoded.output["verifier"]["overall_logit"]
                 ) >= self.config.model.verifier_validity_threshold
                 candidates["valid"] &= ~grasp | learned_valid
+            candidates["task_grasp_after_verifier_count"] = (
+                candidates["valid"] & task_mask
+            ).sum(-1)
             certification_reasons: list[str] = []
             if self.certifier is not None:
                 valid_indices = [index for index in range(candidates["type"].shape[1])
@@ -214,6 +226,9 @@ class TCDPRGPolicy(ManipulationPolicy):
                     ok, reason = decision_by_index[index]
                     candidates["valid"][0, index] = ok
                     certification_reasons.append(reason)
+            candidates["task_grasp_after_certifier_count"] = (
+                candidates["valid"] & task_mask
+            ).sum(-1)
             # The number of unique verifier/certifier survivors is the hard
             # count gate before TASK_GRASP can enter the router.
             (
@@ -273,7 +288,7 @@ class TCDPRGPolicy(ManipulationPolicy):
             encoded.device_batch, encoded.output, self.config.model.candidate_topk
         )[0]
         predictions: list[GlobalGraspPrediction] = []
-        for index in range(len(decoded["raw_score"])):
+        for index in range(len(decoded["scene_score"])):
             predictions.append(GlobalGraspPrediction(
                 object_index=int(decoded["object"][index]),
                 contact_point_world=decoded["contact_world"][index].detach().cpu().numpy(),
@@ -281,7 +296,7 @@ class TCDPRGPolicy(ManipulationPolicy):
                 width_m=float(decoded["width_m"][index]),
                 raw_score=float(decoded["raw_score"][index]),
                 scene_score=float(decoded["scene_score"][index]),
-                intrinsic_score=float(decoded["intrinsic_score"][index]),
+                intrinsic_score=None,
                 certified=False,
                 source="tcd_prg_global",
             ))

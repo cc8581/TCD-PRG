@@ -38,7 +38,7 @@ def _parallel_jaw_rotation_distance_deg(first: np.ndarray, second: np.ndarray) -
 
 
 class GlobalGraspEvaluator:
-    """Report raw proposal and post-certification metrics separately."""
+    """Evaluate the unified scene-executable grasp quality before/after exact certification."""
 
     def __init__(self, config: GlobalGraspMatchConfig | None = None) -> None:
         self.config = config or GlobalGraspMatchConfig()
@@ -46,8 +46,8 @@ class GlobalGraspEvaluator:
     def _nms(
         self, predictions: list[GlobalGraspPrediction], *, certified: bool
     ) -> list[GlobalGraspPrediction]:
-        score = (lambda item: item.scene_score) if certified else (lambda item: item.raw_score)
-        ranked = sorted(predictions, key=score, reverse=True)
+        del certified
+        ranked = sorted(predictions, key=lambda item: item.scene_score, reverse=True)
         if not self.config.apply_nms:
             return ranked
         selected: list[GlobalGraspPrediction] = []
@@ -103,14 +103,13 @@ class GlobalGraspEvaluator:
         self, predictions: list[GlobalGraspPrediction], labels: GlobalGraspLabels,
         *, certified: bool, topk: tuple[int, ...] = (1, 5, 10, 50),
     ) -> dict[str, float]:
+        positive = labels.valid_mask & (labels.scene_executable == 1)
         if certified:
-            positive = labels.valid_mask & (labels.scene_executable == 1)
             considered_predictions = [item for item in predictions if item.certified]
             prefix = "certified"
         else:
-            positive = labels.valid_mask & labels.intrinsic_stable
             considered_predictions = predictions
-            prefix = "raw"
+            prefix = "scene"
         ranked = self._nms(considered_predictions, certified=certified)
         matched_truth: set[int] = set()
         true_positive = []

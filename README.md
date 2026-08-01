@@ -23,7 +23,7 @@ AG-160-95 total opening in `[0, 0.095]` m; it is not the push distance.
 - Exact-URDF local scene–gripper overall-executability verifier.
 - Predicted-edge heterogeneous dependency graph ending at a `TASK_GRASP` node.
 - PICK_REMOVE reuses global complete grasps. PUSH predicts object, contact,
-  direction and a scalar complete utility change that combines task gains with
+  direction and a direction-conditioned complete utility change that combines task gains with
   instability/workspace/failure costs. Hard feasibility remains certified.
 - TASK_GRASP eligibility counts unique verifier/certifier survivors after
   per-object SE(3) grasp NMS, not raw candidate tensor slots.
@@ -126,7 +126,7 @@ tcd-prg-eval-global --config configs/config.yaml --checkpoint outputs/full/last.
 ```
 
 The global comparison has separate `scene_only` and `instance_assisted` tracks
-and reports raw proposal metrics independently from post-certification metrics.
+and reports unified scene-executable proposal metrics before and after exact certification.
 See [docs/global_grasp_protocol.md](docs/global_grasp_protocol.md).
 
 ## Training

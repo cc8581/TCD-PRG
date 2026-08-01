@@ -3,6 +3,12 @@ import torch
 from tcd_prg.losses.masked import multi_positive_listwise_loss, safe_smooth_l1
 from tcd_prg.config import AblationConfig, LossConfig, ModelConfig
 from tcd_prg.datasets.capabilities import DatasetCapabilities
+from tcd_prg.constants import ActionType, CandidateStatus
+from tcd_prg.losses.labels import (
+    _pack_grasp_set,
+    build_grasp_proposal_labels,
+    build_push_supervision,
+)
 from tcd_prg.losses.objective import TCDPRGObjective
 from tcd_prg.losses.total import MultiTaskLoss
 from tcd_prg.losses.proposal import CompleteGraspSetLoss
@@ -130,4 +136,128 @@ def test_parallel_jaw_symmetric_rotation_has_zero_set_loss() -> None:
         "quality_valid": torch.ones(1, 1, dtype=torch.bool),
         "sample_valid": torch.tensor([True]),
     }
-    assert CompleteGraspSetLoss()(output, labels)["grasp_rotation"] < 1e-7
+    loss = CompleteGraspSetLoss()(output, labels)
+    assert loss["grasp_rotation"] < 1e-7
+    loss["loss"].backward()
+    assert torch.isfinite(output["rotation_matrix"].grad).all()
+
+
+def test_partial_grasp_set_does_not_make_unmatched_queries_negative() -> None:
+    identity = torch.eye(3)
+    output = {
+        "translation_world": torch.tensor(
+            [[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]]], requires_grad=True
+        ),
+        "rotation_matrix": identity.expand(1, 2, 3, 3).clone().requires_grad_(),
+        "width_m": torch.full((1, 2), 0.05, requires_grad=True),
+        "quality_logit": torch.tensor([[0.0, 100.0]], requires_grad=True),
+    }
+    labels = {
+        "translation_world": torch.zeros(1, 2, 3),
+        "rotation_matrix": identity.expand(1, 2, 3, 3).clone(),
+        "width_m": torch.full((1, 2), 0.05),
+        "quality_target": torch.tensor([[1.0, 0.0]]),
+        "target_valid": torch.tensor([[True, False]]),
+        "quality_valid": torch.tensor([[True, False]]),
+        "sample_valid": torch.tensor([True]),
+        "unmatched_quality_valid": torch.tensor([False]),
+    }
+    quality = CompleteGraspSetLoss()(output, labels)["grasp_quality"]
+    assert torch.allclose(quality, torch.log(torch.tensor(2.0)))
+
+
+def test_unknown_task_grasp_marks_label_set_non_exhaustive() -> None:
+    pose = torch.zeros(1, 2, 7)
+    pose[..., 6] = 1.0
+    batch = {
+        "candidate_mask": torch.ones(1, 2, dtype=torch.bool),
+        "action_type": torch.full((1, 2), int(ActionType.TASK_GRASP)),
+        "evaluation_status": torch.tensor([[
+            int(CandidateStatus.POSITIVE), int(CandidateStatus.UNKNOWN_UNTESTED)
+        ]]),
+        "action_improves_state": torch.tensor([[True, False]]),
+        "action_parameters": {
+            "task_grasp_pose_world": pose,
+            "grasp_width_m": torch.full((1, 2), 0.05),
+        },
+    }
+    labels = build_grasp_proposal_labels(batch, ModelConfig(task_grasp_candidates=2))
+    assert labels["sample_valid"].item()
+    assert not labels["unmatched_quality_valid"].item()
+    assert labels["target_valid"].sum().item() == 1
+
+
+def test_global_grasp_packing_balances_objects_before_truncation() -> None:
+    pose = torch.zeros(1, 8, 7)
+    pose[..., 6] = 1.0
+    packed = _pack_grasp_set(
+        pose, torch.full((1, 8), 0.05), torch.ones(1, 8, dtype=torch.bool),
+        torch.ones(1, 8), torch.ones(1, 8, dtype=torch.bool), 4,
+        object_index=torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]]),
+    )
+    assert packed["object_index"].tolist() == [[0, 1, 0, 1]]
+
+
+def test_global_grasp_object_assignment_is_an_internal_set_term() -> None:
+    identity = torch.eye(3)
+    object_logits = torch.tensor(
+        [[[10.0, -10.0], [-10.0, 10.0]]], requires_grad=True
+    )
+    output = {
+        "translation_world": torch.tensor(
+            [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]], requires_grad=True
+        ),
+        "rotation_matrix": identity.expand(1, 2, 3, 3).clone().requires_grad_(),
+        "width_m": torch.full((1, 2), 0.05, requires_grad=True),
+        "quality_logit": torch.full((1, 2), 10.0, requires_grad=True),
+        "object_logits": object_logits,
+    }
+    labels = {
+        "translation_world": output["translation_world"].detach().clone(),
+        "rotation_matrix": output["rotation_matrix"].detach().clone(),
+        "width_m": output["width_m"].detach().clone(),
+        "quality_target": torch.ones(1, 2),
+        "target_valid": torch.ones(1, 2, dtype=torch.bool),
+        "quality_valid": torch.ones(1, 2, dtype=torch.bool),
+        "object_index": torch.tensor([[0, 1]]),
+        "sample_valid": torch.tensor([True]),
+    }
+    loss = CompleteGraspSetLoss()(output, labels)
+    assert loss["grasp_object"] < 1e-6
+    loss["loss"].backward()
+    assert torch.isfinite(object_logits.grad).all()
+
+
+def test_push_utility_uses_ground_truth_direction_and_keeps_failed_transition() -> None:
+    output = {
+        "object_logits": torch.zeros(1, 1),
+        "contact_logits": torch.zeros(1, 1),
+        "direction_logits": torch.zeros(1, 1, 4),
+        "direction_residual": torch.zeros(1, 1, 2),
+        "utility_delta": torch.arange(4.0).reshape(1, 1, 4),
+    }
+    batch = {
+        "xyz": torch.zeros(1, 1, 3),
+        "point_mask": torch.ones(1, 1, dtype=torch.bool),
+        "instance_id": torch.zeros(1, 1, dtype=torch.long),
+        "candidate_mask": torch.ones(1, 1, dtype=torch.bool),
+        "action_type": torch.zeros(1, 1, dtype=torch.long),
+        "acted_object": torch.zeros(1, 1, dtype=torch.long),
+        "object_mask": torch.ones(1, 1, dtype=torch.bool),
+        "object_active": torch.ones(1, 1, dtype=torch.bool),
+        "action_improves_state": torch.zeros(1, 1, dtype=torch.bool),
+        "evaluation_status": torch.ones(1, 1, dtype=torch.long),
+        "potential_delta": torch.zeros(1, 1, 5),
+        "potential_after_valid": torch.zeros(1, 1, dtype=torch.bool),
+        "action_parameters": {
+            "push_contact_world": torch.zeros(1, 1, 3),
+            "push_direction_world": torch.tensor([[[-1.0, 0.0, 0.0]]]),
+            "risk_unstable": torch.ones(1, 1),
+            "risk_out_of_workspace": torch.zeros(1, 1),
+            "risk_other_invalid": torch.zeros(1, 1),
+        },
+    }
+    gathered, labels = build_push_supervision(output, batch, ModelConfig())
+    assert gathered["utility_delta"].item() == 2.0
+    assert labels["utility_delta"].item() == -1.0
+    assert labels["utility_valid"].item()

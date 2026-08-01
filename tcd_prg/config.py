@@ -121,7 +121,7 @@ class ModelConfig:
     max_grasp_width_m: float = 0.095
     min_grasp_width_m: float = 0.0
     candidate_topk: int = 64
-    task_grasp_candidates: int = 32
+    task_grasp_candidates: int = 64
     global_grasp_candidates: int = 64
     pick_remove_candidates: int = 16
     push_candidates: int = 16

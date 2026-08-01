@@ -15,7 +15,7 @@ class PushHead(nn.Module):
         self.contact = nn.Linear(dim, 1)
         self.direction = nn.Linear(dim, direction_bins)
         self.direction_residual = nn.Linear(dim, 2)
-        self.utility = nn.Linear(dim, 1)
+        self.utility = nn.Linear(dim, direction_bins)
 
     def forward(
         self,
@@ -56,5 +56,5 @@ class PushHead(nn.Module):
             "contact_logits": contact,
             "direction_logits": self.direction(x),
             "direction_residual": torch.tanh(self.direction_residual(x)),
-            "utility_delta": self.utility(x).squeeze(-1),
+            "utility_delta": self.utility(x),
         }

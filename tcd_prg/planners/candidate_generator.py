@@ -86,12 +86,12 @@ class DenseCandidateGenerator:
 
     def global_predictions(
         self, batch: dict[str, Tensor], output: dict[str, Any], topk: int | None = None,
-        score_kind: str = "raw",
+        score_kind: str = "scene",
     ) -> list[dict[str, Tensor]]:
         """Return task-free complete grasp queries without task-dependent ranking."""
 
         if score_kind not in {"raw", "scene"}:
-            raise ValueError("score_kind must be raw or scene")
+            raise ValueError("score_kind must be scene (raw is a compatibility alias)")
         del score_kind
         head = output["global_grasp"]
         amount = int(topk or self.config.candidate_topk)
@@ -102,10 +102,9 @@ class DenseCandidateGenerator:
             pose = torch.cat((translation, matrix_to_quaternion_xyzw(rotation)), -1)
             width = head["width_m"][row]
             score = torch.sigmoid(head["quality_logit"][row])
-            point = self._nearest_scene_point(translation, batch["xyz"][row], batch["point_mask"][row])
-            objects = batch["instance_id"][row, point]
-            nms_objects = torch.zeros_like(objects) if self.config.global_grasp_input_mode == "scene_only" else objects
-            selected = self._nms_indices(pose, width, score, nms_objects, amount, global_grasp=True)
+            point = head["attention_point_index"][row]
+            objects = head["object_logits"][row].argmax(-1)
+            selected = self._nms_indices(pose, width, score, objects, amount, global_grasp=True)
             rows.append({
                 "object": objects[selected],
                 "contact_world": translation[selected],
@@ -113,7 +112,6 @@ class DenseCandidateGenerator:
                 "width_m": width[selected],
                 "raw_score": score[selected],
                 "scene_score": score[selected],
-                "intrinsic_score": score[selected],
                 "point_index": point[selected],
                 "mode_index": selected,
             })
@@ -161,10 +159,8 @@ class DenseCandidateGenerator:
                 matrix_to_quaternion_xyzw(global_head["rotation_matrix"][batch_row]),
             ), -1)
             global_score = torch.sigmoid(global_head["quality_logit"][batch_row])
-            global_point = self._nearest_scene_point(
-                global_head["translation_world"][batch_row], xyz, batch["point_mask"][batch_row]
-            )
-            global_object = instance[global_point]
+            global_point = global_head["attention_point_index"][batch_row]
+            global_object = global_head["object_logits"][batch_row].argmax(-1)
             remove_domain = active.clone()
             remove_domain[target_object] = False
             remove_eligible = active & actionable & remove_domain
@@ -279,7 +275,10 @@ class DenseCandidateGenerator:
             ).flatten()
             if len(push_candidates):
                 points = result["point_index"][row, push_candidates]
-                evidence[row, push_candidates, 0] = output["push"]["utility_delta"][row, points]
+                direction_bin = output["push"]["direction_logits"][row, points].argmax(-1)
+                evidence[row, push_candidates, 0] = output["push"]["utility_delta"][
+                    row, points, direction_bin
+                ]
         result["evidence"] = evidence
         return result
 

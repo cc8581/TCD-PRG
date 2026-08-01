@@ -14,8 +14,10 @@ have been computed.
 Two comparison tracks must be reported separately:
 
 - `scene_only`: the global head uses neutral point and global scene features.
-  Instance masks are used only after prediction to assign grasps to objects for
-  evaluation. They do not mask points, rank candidates, or partition NMS.
+  Instance IDs never enter geometric feature encoding. After query decoding,
+  cross-attention mass is aggregated by visible instance to produce each
+  query's object distribution; that assignment participates in matching and
+  object-wise NMS.
 - `instance_assisted`: every method receives the same external instance masks.
   Methods without native mask support run once per instance crop, then merge
   predictions in world coordinates.
@@ -57,23 +59,22 @@ for global-candidate ranking.
 
 ## Multimodal output
 
-The head predicts four modes per visible contact point by default. Set matching
-is performed before approach, rotation, opening, and confidence losses. Target
-modes are selected with farthest-first pose/opening diversity, so nearby
-ACRONYM candidates do not collapse to several equivalent labels.
+The head predicts a fixed unordered set of complete grasps
+`(translation, SO(3), AG opening, scene quality, object assignment)`. Hungarian
+matching uses translation, jaw-symmetric geodesic angle, opening, quality and
+object cost. Backpropagation uses a smooth squared chordal rotation loss to
+avoid the singular gradient of `acos(1)`. When labels exceed the query budget,
+round-robin object-balanced selection preserves scene-level object coverage.
 
-The anchor is the physical contact side closest to visible geometry. Candidates
-farther than the configured association distance are ignored. Outputs are
-contact heatmap, approach, in-plane rotation, AG total opening, grasp-center
-offset from that visible anchor, intrinsic confidence, and scene-executable
-confidence. Unmatched modes receive explicit no-grasp confidence supervision.
-There is no task compatibility output.
+The model has one unified scene-executable quality. There is no separate
+intrinsic or task-compatibility score. Unmatched query quality is supervised as
+no-grasp only when the corresponding label set is declared complete.
 
 ## Evaluation
 
-Raw proposal metrics rank by contact times intrinsic confidence. Certified
-metrics rank by contact times intrinsic times scene-executable confidence.
-Reports include Recall@K, AP, translation/rotation/opening error, matched-object
+Scene proposal metrics and post-certification metrics both rank the unified
+scene-executable quality; the latter additionally filters predictions through
+the exact certifier. Reports include Recall@K, AP, translation/rotation/opening error, matched-object
 coverage, unique-match ratio, NMS candidate count, nearest-neighbour SE(3)
 distances, approach coverage, and grasp clusters per object. Certified metrics
 are reported separately: collision-free
