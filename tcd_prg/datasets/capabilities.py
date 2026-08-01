@@ -24,7 +24,6 @@ class DatasetCapabilities:
             "global_grasp": self.has_global_grasps,
             "verify": self.has_task_grasps,
             "graph": self.has_relation_graph,
-            "remove": self.has_pick_remove_actions,
             "push": self.has_push_actions,
             "policy": self.has_sequences and (self.has_push_actions or self.has_pick_remove_actions),
         }

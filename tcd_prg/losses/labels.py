@@ -8,7 +8,7 @@ import torch
 from torch import Tensor
 
 from tcd_prg.config import ModelConfig
-from tcd_prg.constants import ActionType, CandidateStatus
+from tcd_prg.constants import ActionType
 from tcd_prg.geometry.se3 import quaternion_xyzw_to_matrix
 
 
@@ -51,274 +51,94 @@ def _nearest_point_indices(
     return indices, valid
 
 
-def _rotation_bins(rotation: Tensor, bins: int) -> Tensor:
-    """Quantize the x-axis rotation around the canonical +Z approach axis."""
+def _pack_grasp_set(
+    pose: Tensor, width: Tensor, valid: Tensor, quality: Tensor, quality_valid: Tensor,
+    queries: int,
+) -> dict[str, Tensor]:
+    """Pack an unordered positive grasp set without averaging valid modes."""
 
-    approach = torch.nn.functional.normalize(rotation[..., :, 2], dim=-1)
-    x_axis = torch.nn.functional.normalize(rotation[..., :, 0], dim=-1)
-    reference_z = torch.tensor([0.0, 0.0, 1.0], device=rotation.device).expand_as(approach)
-    reference_y = torch.tensor([0.0, 1.0, 0.0], device=rotation.device).expand_as(approach)
-    reference = torch.where((approach[..., 2].abs() > 0.9).unsqueeze(-1), reference_y, reference_z)
-    tangent_x = torch.nn.functional.normalize(torch.cross(reference, approach, dim=-1), dim=-1)
-    tangent_y = torch.cross(approach, tangent_x, dim=-1)
-    angle = torch.atan2((x_axis * tangent_y).sum(-1), (x_axis * tangent_x).sum(-1))
-    return torch.floor((angle + math.pi) * bins / (2 * math.pi)).long().remainder(bins)
-
-
-def _visible_contact_anchors(
-    xyz: Tensor, point_mask: Tensor, instance_id: Tensor, contacts: Tensor,
-    acted_object: Tensor, candidate_valid: Tensor,
-) -> tuple[Tensor, Tensor]:
-    """Choose the labelled finger contact closest to the visible object surface."""
-
-    anchors = contacts[..., 0, :].clone()
-    valid = candidate_valid.clone()
-    for row in range(xyz.shape[0]):
-        for candidate in torch.nonzero(candidate_valid[row], as_tuple=False).flatten().tolist():
-            points = torch.nonzero(
-                point_mask[row] & (instance_id[row] == acted_object[row, candidate]),
-                as_tuple=False,
-            ).flatten()
-            if not len(points) or not torch.isfinite(contacts[row, candidate]).all():
-                valid[row, candidate] = False
-                continue
-            distance = torch.cdist(contacts[row, candidate], xyz[row, points])
-            side = distance.min(-1).values.argmin()
-            anchors[row, candidate] = contacts[row, candidate, side]
-    return anchors, valid
+    b = pose.shape[0]
+    translation = pose.new_full((b, queries, 3), float("nan"))
+    rotation = pose.new_full((b, queries, 3, 3), float("nan"))
+    width_target = pose.new_full((b, queries), float("nan"))
+    quality_target = pose.new_zeros((b, queries))
+    target_valid = torch.zeros((b, queries), dtype=torch.bool, device=pose.device)
+    target_quality_valid = torch.zeros_like(target_valid)
+    matrices = quaternion_xyzw_to_matrix(torch.nan_to_num(pose[..., 3:], nan=0.0))
+    for row in range(b):
+        selected = torch.nonzero(valid[row], as_tuple=False).flatten()
+        if len(selected) > queries:
+            selected = selected[quality[row, selected].argsort(descending=True, stable=True)[:queries]]
+        count = len(selected)
+        if not count:
+            continue
+        translation[row, :count] = pose[row, selected, :3]
+        rotation[row, :count] = matrices[row, selected]
+        width_target[row, :count] = width[row, selected]
+        quality_target[row, :count] = quality[row, selected]
+        target_valid[row, :count] = True
+        target_quality_valid[row, :count] = quality_valid[row, selected]
+    return {
+        "translation_world": translation,
+        "rotation_matrix": rotation,
+        "width_m": width_target,
+        "quality_target": quality_target,
+        "target_valid": target_valid,
+        "quality_valid": target_quality_valid,
+    }
 
 
 def build_grasp_proposal_labels(
-    batch: dict[str, Tensor], config: ModelConfig, generic_remove: bool = False
+    batch: dict[str, Tensor], config: ModelConfig
 ) -> dict[str, Tensor]:
-    xyz = batch["xyz"]
-    if generic_remove:
-        point_domain = batch["point_mask"] & batch["object_active"].gather(
-            1, batch["instance_id"].clamp(0, batch["object_active"].shape[1] - 1)
-        )
-        action_kind = int(ActionType.PICK_REMOVE)
-        pose_key = "removal_grasp_pose_world"
-    else:
-        point_domain = batch["target_mask"] & batch["point_mask"]
-        action_kind = int(ActionType.TASK_GRASP)
-        pose_key = "task_grasp_pose_world"
-    batch_size, point_count = xyz.shape[:2]
+    """Build the complete task-grasp set from final executable grasps."""
+
     parameters = batch["action_parameters"]
-    candidate = batch["candidate_mask"] & (batch["action_type"] == action_kind)
-    geometry_positive = parameters.get(
-        "proposal_geometry_valid", torch.ones_like(candidate)
-    ).bool()
-    pose = parameters[pose_key]
-    rotation = parameters["grasp_rotation_matrix_world"]
-    candidate &= (
-        torch.isfinite(pose).all(-1)
-        & torch.isfinite(rotation).all(-1).all(-1)
-        & torch.isfinite(parameters["grasp_width_m"])
+    candidate = batch["candidate_mask"] & (batch["action_type"] == int(ActionType.TASK_GRASP))
+    pose = parameters["task_grasp_pose_world"]
+    width = parameters["grasp_width_m"]
+    overall_valid = parameters.get("verifier_overall_valid", torch.zeros_like(candidate)).bool()
+    overall = parameters.get("verifier_overall_target", torch.zeros_like(width)).float()
+    successful = torch.where(overall_valid, overall > 0.5, batch["action_improves_state"])
+    valid = (
+        candidate & successful & torch.isfinite(pose).all(-1) & torch.isfinite(width)
+        & (width >= config.min_grasp_width_m) & (width <= config.max_grasp_width_m)
     )
-    contact_anchors, candidate = _visible_contact_anchors(
-        xyz, point_domain, batch["instance_id"], parameters["grasp_contact_points_world"],
-        batch["acted_object"], candidate,
+    quality = torch.where(
+        overall_valid, torch.nan_to_num(overall),
+        torch.nan_to_num(parameters.get("grasp_confidence", torch.ones_like(width)), nan=1.0),
+    ).clamp(0.0, 1.0)
+    labels = _pack_grasp_set(
+        pose, width, valid, quality, torch.ones_like(candidate), config.task_grasp_candidates
     )
-    point_index, candidate = _nearest_point_indices(
-        xyz, point_domain, batch["instance_id"], contact_anchors,
-        batch["acted_object"], candidate, config.grasp_anchor_association_max_m,
-    )
-    contact_target = torch.zeros((batch_size, point_count), dtype=xyz.dtype, device=xyz.device)
-    proposal_valid = torch.zeros((batch_size, point_count), dtype=torch.bool, device=xyz.device)
-    mode_valid = torch.zeros_like(proposal_valid)
-    approach_target = torch.full((batch_size, point_count, 3), float("nan"), device=xyz.device)
-    rotation_bin = torch.full((batch_size, point_count), -1, dtype=torch.long, device=xyz.device)
-    width_target = torch.full((batch_size, point_count), float("nan"), device=xyz.device)
-    center_offset_target = torch.full((batch_size, point_count, 3), float("nan"), device=xyz.device)
-    confidence_target = torch.zeros((batch_size, point_count), device=xyz.device)
-    candidate_rotation_bin = _rotation_bins(torch.nan_to_num(rotation), config.num_grasp_rotation_bins)
-    selected_confidence = torch.full(
-        (batch_size, point_count), -float("inf"), dtype=xyz.dtype, device=xyz.device
-    )
-    sigma_sq = float(config.contact_heatmap_sigma_m) ** 2
-    support_sq = 9.0 * sigma_sq
-    for row in range(batch_size):
-        for candidate_index in torch.nonzero(candidate[row], as_tuple=False).flatten().tolist():
-            point = int(point_index[row, candidate_index])
-            object_index = int(batch["acted_object"][row, candidate_index])
-            domain = point_domain[row] & (batch["instance_id"][row] == object_index)
-            delta = xyz[row] - contact_anchors[row, candidate_index]
-            distance_sq = (delta * delta).sum(-1)
-            neighborhood = domain & (distance_sq <= support_sq)
-            if not bool(neighborhood.any()):
-                continue
-            proposal_valid[row] |= neighborhood
-            if not bool(geometry_positive[row, candidate_index]):
-                continue
-            heat = torch.exp(-0.5 * distance_sq / sigma_sq) * neighborhood
-            contact_target[row] = torch.maximum(contact_target[row], heat)
-            confidence = torch.nan_to_num(
-                parameters["grasp_confidence"][row, candidate_index], nan=1.0
-            )
-            # A single dense point cannot represent two rotation/width modes.
-            # Select the highest-confidence candidate deterministically instead
-            # of silently overwriting it with iteration order.
-            if confidence <= selected_confidence[row, point]:
-                continue
-            selected_confidence[row, point] = confidence
-            mode_valid[row, point] = True
-            approach_target[row, point] = parameters["grasp_approach_world"][row, candidate_index]
-            rotation_bin[row, point] = candidate_rotation_bin[row, candidate_index]
-            width_target[row, point] = parameters["grasp_width_m"][row, candidate_index]
-            center_offset_target[row, point] = pose[row, candidate_index, :3] - xyz[row, point]
-            confidence_target[row, point] = confidence
-    if generic_remove:
-        compatibility_target = point_domain
-        compatibility_valid = point_domain
-    else:
-        compatibility_target = batch.get("region_target", contact_target).bool()
-        compatibility_valid = batch.get("region_valid", point_domain).bool() & point_domain
-    return {
-        "proposal_valid": proposal_valid,
-        "contact_target": contact_target,
-        "mode_valid": mode_valid,
-        "approach_target": approach_target,
-        "rotation_bin": rotation_bin,
-        "width_target_m": width_target,
-        "center_offset_target_m": center_offset_target,
-        "center_offset_valid": mode_valid & torch.isfinite(center_offset_target).all(-1),
-        "width_valid": torch.isfinite(width_target)
-        & (width_target >= config.min_grasp_width_m)
-        & (width_target <= config.max_grasp_width_m),
-        "confidence_target": confidence_target,
-        "compatibility_target": compatibility_target,
-        "compatibility_valid": compatibility_valid,
-    }
+    labels["sample_valid"] = candidate.any(-1)
+    return labels
 
 
 def build_global_grasp_labels(
     batch: dict[str, Tensor], config: ModelConfig
 ) -> dict[str, Tensor] | None:
-    """Map the task-free candidate set to unordered per-point grasp modes."""
+    """Build task-free sets using only scene-certified executable grasps."""
 
     source = batch.get("global_grasp_labels")
     if source is None:
         return None
-    xyz = batch["xyz"]
-    b, n = xyz.shape[:2]
-    modes = config.global_grasp_modes_per_point
-    contact_target = xyz.new_zeros((b, n))
-    contact_valid = torch.zeros((b, n), dtype=torch.bool, device=xyz.device)
-    matching_valid = torch.zeros((b, n, modes), dtype=torch.bool, device=xyz.device)
-    geometry_valid = torch.zeros_like(matching_valid)
-    approach = xyz.new_full((b, n, modes, 3), float("nan"))
-    rotation_bin = torch.full((b, n, modes), -1, dtype=torch.long, device=xyz.device)
-    width = xyz.new_full((b, n, modes), float("nan"))
-    center_offset = xyz.new_full((b, n, modes, 3), float("nan"))
-    intrinsic = xyz.new_zeros((b, n, modes))
-    intrinsic_valid = torch.zeros_like(matching_valid)
-    scene = xyz.new_zeros((b, n, modes))
-    scene_valid = torch.zeros_like(matching_valid)
-    sample_valid = batch.get(
-        "global_loss_sample_valid",
-        torch.ones((b,), dtype=torch.bool, device=xyz.device),
+    certified = source["scene_executable"] >= 0
+    positive = source["scene_executable"] == 1
+    pose = source["grasp_pose_world"]
+    width = source["width_m"]
+    valid = (
+        source["valid_mask"] & positive & torch.isfinite(pose).all(-1) & torch.isfinite(width)
+        & (width >= config.min_grasp_width_m) & (width <= config.max_grasp_width_m)
     )
-    candidate = (
-        source["valid_mask"]
-        & sample_valid[:, None]
-        & torch.isfinite(source["grasp_pose_world"]).all(-1)
+    quality = positive.float()
+    labels = _pack_grasp_set(
+        pose, width, valid, quality, certified, config.global_grasp_candidates
     )
-    point_index, candidate = _nearest_point_indices(
-        xyz, batch["point_mask"], batch["instance_id"], source["contact_point_world"],
-        source["object_index"], candidate, config.grasp_anchor_association_max_m,
-    )
-    rotation = quaternion_xyzw_to_matrix(torch.nan_to_num(source["grasp_pose_world"][..., 3:]))
-    candidate_rotation_bin = _rotation_bins(rotation, config.num_grasp_rotation_bins)
-    candidate_approach = source["approach_direction_world"]
-    dominant_axis = candidate_approach.abs().argmax(-1)
-    dominant_sign = (candidate_approach.gather(-1, dominant_axis.unsqueeze(-1)).squeeze(-1) >= 0).long()
-    approach_anchor = dominant_axis * 2 + dominant_sign
-    width_anchor = torch.floor(torch.nan_to_num(source["width_m"], nan=0.0) / 0.005).long()
-    mode_anchor = (
-        (approach_anchor * config.num_grasp_rotation_bins + candidate_rotation_bin) * 32
-        + width_anchor.clamp(0, 31)
-    ).detach().cpu().tolist()
-    intrinsic_cpu = source["intrinsic_stable"].detach().cpu().tolist()
-    sigma_sq = float(config.contact_heatmap_sigma_m) ** 2
-    support_sq = 9.0 * sigma_sq
-    for row in range(b):
-        grouped: dict[int, list[int]] = {}
-        for candidate_index in torch.nonzero(candidate[row], as_tuple=False).flatten().tolist():
-            grouped.setdefault(int(point_index[row, candidate_index]), []).append(candidate_index)
-        for point, candidates_at_point in grouped.items():
-            # Anchor-diverse mode coverage avoids collapsing a dense ACRONYM
-            # contact neighbourhood to several nearly identical poses without
-            # per-candidate GPU synchronisation in the label builder.
-            stable = [index for index in candidates_at_point if bool(intrinsic_cpu[row][index])]
-            remaining = stable + [index for index in candidates_at_point if index not in stable]
-            selected: list[int] = []
-            used_anchors: set[int] = set()
-            for index in remaining:
-                anchor = int(mode_anchor[row][index])
-                if anchor not in used_anchors:
-                    selected.append(index)
-                    used_anchors.add(anchor)
-                if len(selected) == modes:
-                    break
-            if len(selected) < modes:
-                selected.extend(index for index in remaining if index not in selected)
-                selected = selected[:modes]
-            written = 0
-            for candidate_index in selected:
-                object_index = int(source["object_index"][row, candidate_index])
-                domain = batch["point_mask"][row] & (batch["instance_id"][row] == object_index)
-                object_points = torch.nonzero(domain, as_tuple=False).flatten()
-                if object_points.numel() == 0:
-                    continue
-                object_distance_sq = (
-                    (xyz[row, object_points] - source["contact_point_world"][row, candidate_index])
-                    ** 2
-                ).sum(-1)
-                near_object_points = object_points[object_distance_sq <= support_sq]
-                if near_object_points.numel() == 0:
-                    continue
-                slot = written
-                written += 1
-                contact_valid[row, near_object_points] = True
-                if bool(intrinsic_cpu[row][candidate_index]):
-                    contact_target[row, near_object_points] = torch.maximum(
-                        contact_target[row, near_object_points],
-                        torch.exp(
-                            -0.5
-                            * object_distance_sq[object_distance_sq <= support_sq]
-                            / sigma_sq
-                        ),
-                    )
-                matching_valid[row, point, slot] = True
-                geometry_valid[row, point, slot] = bool(intrinsic_cpu[row][candidate_index])
-                approach[row, point, slot] = source["approach_direction_world"][row, candidate_index]
-                rotation_bin[row, point, slot] = candidate_rotation_bin[row, candidate_index]
-                width[row, point, slot] = source["width_m"][row, candidate_index]
-                center_offset[row, point, slot] = (
-                    source["grasp_pose_world"][row, candidate_index, :3] - xyz[row, point]
-                )
-                intrinsic[row, point, slot] = source["intrinsic_stable"][row, candidate_index].float()
-                intrinsic_valid[row, point, slot] = True
-                state = int(source["scene_executable"][row, candidate_index])
-                if state >= 0:
-                    scene[row, point, slot] = float(state)
-                    scene_valid[row, point, slot] = True
-    return {
-        "contact_target": contact_target,
-        "contact_valid": contact_valid,
-        "mode_valid": matching_valid,
-        "geometry_valid": geometry_valid,
-        "approach_target": approach,
-        "rotation_bin": rotation_bin,
-        "width_target_m": width,
-        "center_offset_target_m": center_offset,
-        "center_offset_valid": geometry_valid & torch.isfinite(center_offset).all(-1),
-        "width_valid": torch.isfinite(width) & (width >= config.min_grasp_width_m) & (width <= config.max_grasp_width_m),
-        "intrinsic_target": intrinsic,
-        "intrinsic_valid": intrinsic_valid,
-        "scene_target": scene,
-        "scene_valid": scene_valid,
-    }
+    labels["sample_valid"] = batch.get(
+        "global_loss_sample_valid", torch.ones(pose.shape[0], dtype=torch.bool, device=pose.device)
+    ) & (source["valid_mask"] & certified).any(-1)
+    return labels
 
 
 def build_graph_labels(batch: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -329,29 +149,18 @@ def build_graph_labels(batch: dict[str, Tensor]) -> dict[str, Tensor]:
         "physical_edge_valid": pair_valid.expand_as(batch["relation_graph"]),
         "task_edge_target": batch["task_block_graph"],
         "task_edge_valid": object_mask[:, :, None].expand_as(batch["task_block_graph"]),
-        "direct_blocker_target": batch["direct_blocker_target"],
-        "indirect_blocker_target": batch["indirect_blocker_target"],
-        "actionable_target": batch["actionable_blocker_target"],
-        "blocker_valid": object_mask,
-        "topology_target": batch["topology_target"],
-        "topology_edge_valid": batch["topology_edge_valid"],
-        "sequence_topology_valid": batch["sequence_topology_valid"],
     }
 
 
 def build_push_supervision(
-    output: dict[str, Tensor], batch: dict[str, Tensor], use_potential: bool, use_risk: bool
-) -> tuple[dict[str, Tensor], dict[str, Tensor | bool]]:
+    output: dict[str, Tensor], batch: dict[str, Tensor], config: ModelConfig
+) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
     action_type = batch["action_type"]
     parameters = batch["action_parameters"]
     candidate = batch["candidate_mask"] & (action_type == int(ActionType.PUSH))
     point_index, parameter_valid = _nearest_point_indices(
-        batch["xyz"],
-        batch["point_mask"],
-        batch["instance_id"],
-        parameters["push_contact_world"],
-        batch["acted_object"],
-        candidate,
+        batch["xyz"], batch["point_mask"], batch["instance_id"],
+        parameters["push_contact_world"], batch["acted_object"], candidate,
     )
     row = torch.arange(action_type.shape[0], device=action_type.device)[:, None]
     gathered = {
@@ -359,8 +168,7 @@ def build_push_supervision(
         "contact_logits": output["contact_logits"],
         "direction_logits": output["direction_logits"][row, point_index],
         "direction_residual": output["direction_residual"][row, point_index],
-        "potential_delta": output["potential_delta"][row, point_index],
-        "risk_logits": output["risk_logits"][row, point_index],
+        "utility_delta": output["utility_delta"][row, point_index],
     }
     direction = torch.nn.functional.normalize(
         torch.nan_to_num(parameters["push_direction_world"]), dim=-1
@@ -372,39 +180,38 @@ def build_push_supervision(
     center = torch.stack((torch.cos(center_angle), torch.sin(center_angle)), -1)
     contact_target = torch.zeros_like(output["contact_logits"])
     contact_valid = torch.zeros_like(output["contact_logits"], dtype=torch.bool)
-    sigma_sq = float(batch.get("contact_heatmap_sigma_m", 0.008)) ** 2
-    support_sq = 9.0 * sigma_sq
+    sigma_sq = float(config.contact_heatmap_sigma_m) ** 2
     for batch_row in range(action_type.shape[0]):
-        for candidate_index in torch.nonzero(
-            parameter_valid[batch_row], as_tuple=False
-        ).flatten().tolist():
+        for candidate_index in torch.nonzero(parameter_valid[batch_row], as_tuple=False).flatten().tolist():
             object_index = int(batch["acted_object"][batch_row, candidate_index])
-            domain = batch["point_mask"][batch_row] & (
-                batch["instance_id"][batch_row] == object_index
-            )
-            delta = batch["xyz"][batch_row] - parameters["push_contact_world"][
-                batch_row, candidate_index
-            ]
+            domain = batch["point_mask"][batch_row] & (batch["instance_id"][batch_row] == object_index)
+            delta = batch["xyz"][batch_row] - parameters["push_contact_world"][batch_row, candidate_index]
             distance_sq = (delta * delta).sum(-1)
-            neighborhood = domain & (distance_sq <= support_sq)
+            neighborhood = domain & (distance_sq <= 9.0 * sigma_sq)
             contact_valid[batch_row] |= neighborhood
-            heat = torch.exp(-0.5 * distance_sq / sigma_sq) * neighborhood
-            contact_target[batch_row] = torch.maximum(contact_target[batch_row], heat)
-    evaluated = batch["evaluation_status"] != int(CandidateStatus.UNKNOWN_UNTESTED)
+            contact_target[batch_row] = torch.maximum(
+                contact_target[batch_row], torch.exp(-0.5 * distance_sq / sigma_sq) * neighborhood
+            )
     positive = batch["action_improves_state"] & candidate
     object_positive = torch.zeros_like(batch["object_mask"])
     for batch_row in range(action_type.shape[0]):
         objects = batch["acted_object"][batch_row, positive[batch_row]]
         object_positive[batch_row, objects[objects >= 0]] = True
-    risk_target = torch.stack(
-        (
-            parameters["risk_unstable"],
-            parameters["risk_out_of_workspace"],
-            parameters["risk_other_invalid"],
-        ),
-        -1,
+    component_weights = torch.as_tensor(
+        config.push_utility_component_weights,
+        dtype=batch["potential_delta"].dtype,
+        device=batch["potential_delta"].device,
     )
-    labels: dict[str, Tensor | bool] = {
+    utility = (torch.nan_to_num(batch["potential_delta"]) * component_weights).sum(-1)
+    failures = torch.stack((
+        parameters["risk_unstable"], parameters["risk_out_of_workspace"],
+        parameters["risk_other_invalid"],
+    ), -1)
+    penalties = torch.as_tensor(
+        config.push_failure_penalties, dtype=utility.dtype, device=utility.device
+    )
+    utility = utility - (torch.nan_to_num(failures) * penalties).sum(-1)
+    return gathered, {
         "object_positive": object_positive,
         "object_valid_mask": batch["object_mask"] & batch["object_active"],
         "contact_target": contact_target,
@@ -412,58 +219,21 @@ def build_push_supervision(
         "direction_bin": direction_bin,
         "direction_residual": direction[..., :2] - center,
         "direction_valid": parameter_valid,
-        "potential_delta": batch["potential_delta"],
-        "potential_after_valid": candidate & batch["potential_after_valid"],
-        "risk_target": risk_target,
-        "risk_valid": (candidate & evaluated).unsqueeze(-1).expand_as(risk_target),
-        "use_potential": use_potential,
-        "use_risk": use_risk,
-    }
-    return gathered, labels
-
-
-def build_remove_labels(batch: dict[str, Tensor]) -> dict[str, Tensor]:
-    candidate = batch["candidate_mask"] & (batch["action_type"] == int(ActionType.PICK_REMOVE))
-    evaluated = batch["evaluation_status"] != int(CandidateStatus.UNKNOWN_UNTESTED)
-    action_positive = candidate & batch["action_improves_state"]
-    association_valid = batch["action_parameters"].get(
-        "removal_global_match_valid", torch.zeros_like(candidate)
-    ).bool()
-    positive = action_positive & association_valid
-    object_positive = torch.zeros_like(batch["object_mask"])
-    for row in range(candidate.shape[0]):
-        # Object choice remains valid supervision even when a legacy grasp has
-        # no representation in the new global library.
-        objects = batch["acted_object"][row, action_positive[row]]
-        object_positive[row, objects[objects >= 0]] = True
-    return {
-        "object_positive": object_positive,
-        "object_valid_mask": batch["object_mask"] & batch["object_active"],
-        "candidate_positive": positive,
-        # An unmatched successful legacy grasp is UNKNOWN for global-candidate
-        # ranking, never a positive and never a negative.
-        "candidate_valid": candidate & evaluated & (~action_positive | association_valid),
-        "association_valid": association_valid,
+        "utility_delta": utility,
+        "utility_valid": candidate & batch["potential_after_valid"],
     }
 
 
 def build_verifier_labels(batch: dict[str, Tensor]) -> dict[str, Tensor]:
-    """Use only verifier labels that are truly present in the action data.
-
-    Executed actions supervise stability/overall. Initial-state Steps 1--6
-    screens additionally supervise region compatibility, collision/clearance,
-    and coarse FR5 approach feasibility. Every head keeps its own mask.
-    """
+    """Supervise only final certifier executability."""
 
     candidate_valid = batch["verifier_inputs"]["candidate_valid"]
-    parameters = batch["action_parameters"]
-    result = {}
-    for head in ("stability", "task_compatibility", "collision", "clearance", "approach", "overall"):
-        target = parameters[f"verifier_{head}_target"]
-        valid = parameters[f"verifier_{head}_valid"] & candidate_valid
-        result[f"{head}_target"] = torch.nan_to_num(target)
-        result[f"{head}_valid"] = valid & torch.isfinite(target)
-    return result
+    target = batch["action_parameters"]["verifier_overall_target"]
+    valid = batch["action_parameters"]["verifier_overall_valid"] & candidate_valid
+    return {
+        "overall_target": torch.nan_to_num(target),
+        "overall_valid": valid & torch.isfinite(target),
+    }
 
 
 def build_region_labels(batch: dict[str, Tensor]) -> dict[str, Tensor] | None:

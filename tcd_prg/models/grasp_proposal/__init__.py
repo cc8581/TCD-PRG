@@ -1,4 +1,3 @@
 from .head import GlobalGraspProposalHead, TaskGraspProposalHead
-from .graspability import StateGraspabilityHead
 
-__all__ = ["GlobalGraspProposalHead", "StateGraspabilityHead", "TaskGraspProposalHead"]
+__all__ = ["GlobalGraspProposalHead", "TaskGraspProposalHead"]

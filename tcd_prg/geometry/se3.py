@@ -8,6 +8,35 @@ import torch
 from torch import Tensor
 
 
+def rotation_6d_to_matrix(rotation_6d: Tensor, eps: float = 1e-6) -> Tensor:
+    """Convert the continuous Zhou et al. 6D representation to SO(3)."""
+
+    if rotation_6d.shape[-1] != 6:
+        raise ValueError("rotation_6d must end in 6 values")
+    first, second = rotation_6d[..., :3], rotation_6d[..., 3:]
+    x_axis = torch.nn.functional.normalize(first, dim=-1, eps=eps)
+    second = second - (x_axis * second).sum(-1, keepdim=True) * x_axis
+    y_axis = torch.nn.functional.normalize(second, dim=-1, eps=eps)
+    z_axis = torch.cross(x_axis, y_axis, dim=-1)
+    return torch.stack((x_axis, y_axis, z_axis), dim=-1)
+
+
+def parallel_jaw_rotation_distance(first: Tensor, second: Tensor) -> Tensor:
+    """SO(3) geodesic distance with 180-degree jaw-swap symmetry."""
+
+    relative = first.transpose(-1, -2) @ second
+    jaw_swap = torch.diag(torch.tensor(
+        [-1.0, -1.0, 1.0], dtype=first.dtype, device=first.device
+    ))
+    swapped = first.transpose(-1, -2) @ (second @ jaw_swap)
+
+    def angle(matrix: Tensor) -> Tensor:
+        trace = matrix.diagonal(dim1=-2, dim2=-1).sum(-1)
+        return torch.acos(((trace - 1.0) * 0.5).clamp(-1.0, 1.0))
+
+    return torch.minimum(angle(relative), angle(swapped))
+
+
 def normalize_quaternion_xyzw(q: Tensor, eps: float = 1e-8) -> Tensor:
     """Normalize xyzw quaternions and choose a deterministic sign (w >= 0)."""
 
@@ -127,4 +156,3 @@ class SE3:
         if frame != self.source:
             raise ValueError(f"Points are in {frame}, transform expects {self.source}")
         return (self.rotation @ points.unsqueeze(-1)).squeeze(-1) + self.translation
-

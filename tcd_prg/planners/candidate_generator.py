@@ -1,4 +1,4 @@
-"""Decode dense TCD-PRG heads into heterogeneous executable candidates."""
+"""Filter complete grasp sets and decode heterogeneous executable candidates."""
 
 from __future__ import annotations
 
@@ -10,32 +10,18 @@ from torch import Tensor
 
 from tcd_prg.config import ModelConfig
 from tcd_prg.constants import ActionType, PUSH_DISTANCE_M
-from tcd_prg.geometry.se3 import matrix_to_quaternion_xyzw
 from tcd_prg.geometry.grasp_nms import task_grasp_nms
-
-
-def _rotation_from_approach(approach: Tensor, rotation_bin: Tensor, bins: int) -> Tensor:
-    z = torch.nn.functional.normalize(approach, dim=-1)
-    world_z = torch.tensor([0.0, 0.0, 1.0], dtype=z.dtype, device=z.device).expand_as(z)
-    world_y = torch.tensor([0.0, 1.0, 0.0], dtype=z.dtype, device=z.device).expand_as(z)
-    reference = torch.where((z[..., 2].abs() > 0.9).unsqueeze(-1), world_y, world_z)
-    x0 = torch.nn.functional.normalize(torch.cross(reference, z, dim=-1), dim=-1)
-    y0 = torch.cross(z, x0, dim=-1)
-    angle = (rotation_bin.float() + 0.5) * (2.0 * math.pi / bins) - math.pi
-    x = torch.cos(angle).unsqueeze(-1) * x0 + torch.sin(angle).unsqueeze(-1) * y0
-    y = torch.cross(z, x, dim=-1)
-    return torch.stack((x, y, z), dim=-1)
+from tcd_prg.geometry.se3 import matrix_to_quaternion_xyzw
 
 
 class DenseCandidateGenerator:
-    """Generate task grasp, global-grasp-based removal, and push candidates."""
+    """Apply quality filtering, Top-K and SE(3) NMS to complete grasps."""
 
     def __init__(self, config: ModelConfig) -> None:
         self.config = config
 
     @staticmethod
-    def _top_per_object(score: Tensor, instance_id: Tensor, object_ids: Tensor,
-                        total: int) -> Tensor:
+    def _top_per_object(score: Tensor, instance_id: Tensor, object_ids: Tensor, total: int) -> Tensor:
         if not len(object_ids) or total <= 0:
             return torch.empty(0, dtype=torch.long, device=score.device)
         per_object = max(1, math.ceil(total / len(object_ids)))
@@ -49,14 +35,17 @@ class DenseCandidateGenerator:
         candidates = torch.cat(selected)
         return candidates[score[candidates].topk(min(total, len(candidates))).indices]
 
+    @staticmethod
+    def _nearest_scene_point(
+        translation: Tensor, xyz: Tensor, point_mask: Tensor
+    ) -> Tensor:
+        points = torch.nonzero(point_mask, as_tuple=False).flatten()
+        if not len(points):
+            return torch.zeros(len(translation), dtype=torch.long, device=translation.device)
+        distance = torch.cdist(translation, xyz[points])
+        return points[distance.argmin(-1)]
+
     def _with_graph_fallback(self, eligible: Tensor, domain: Tensor, score: Tensor) -> Tensor:
-        """Keep graph actionability hard, plus a bounded recovery frontier.
-
-        Published labels omit some task edges even for successful sequences.
-        One high-scoring non-graph object is therefore retained so a missing
-        predicted edge cannot make the closed-loop policy irrecoverable.
-        """
-
         amount = self.config.graph_candidate_fallback_objects
         fallback_domain = domain & ~eligible
         if amount and fallback_domain.any():
@@ -66,214 +55,154 @@ class DenseCandidateGenerator:
             eligible[selected] = True
         return eligible
 
+    def _nms_indices(
+        self, pose: Tensor, width: Tensor, score: Tensor, objects: Tensor,
+        amount: int, *, global_grasp: bool,
+    ) -> Tensor:
+        if not len(score):
+            return torch.empty(0, dtype=torch.long, device=score.device)
+        if global_grasp:
+            thresholds = (
+                self.config.global_grasp_nms_translation_m,
+                self.config.global_grasp_nms_rotation_deg,
+                self.config.global_grasp_nms_width_m,
+                self.config.global_grasp_nms_approach_deg,
+            )
+        else:
+            thresholds = (
+                self.config.grasp_nms_translation_m,
+                self.config.grasp_nms_rotation_deg,
+                self.config.grasp_nms_width_m,
+                self.config.grasp_nms_approach_deg,
+            )
+        keep = task_grasp_nms(
+            pose[None], width[None], score[None], objects[None],
+            torch.ones((1, len(score)), dtype=torch.bool, device=score.device),
+            translation_threshold_m=thresholds[0], rotation_threshold_deg=thresholds[1],
+            width_threshold_m=thresholds[2], approach_threshold_deg=thresholds[3],
+        )[0]
+        selected = torch.nonzero(keep, as_tuple=False).flatten()
+        return selected[score[selected].argsort(descending=True, stable=True)[:amount]]
+
     def global_predictions(
         self, batch: dict[str, Tensor], output: dict[str, Any], topk: int | None = None,
         score_kind: str = "raw",
     ) -> list[dict[str, Tensor]]:
-        """Decode task-free grasps for every physically present visible object.
+        """Return task-free complete grasp queries without task-dependent ranking."""
 
-        This path deliberately does not inspect target, actionable, graph, task,
-        or router tensors. It is therefore suitable for standalone comparison.
-        """
-
-        head = output["global_grasp"]
-        rows: list[dict[str, Tensor]] = []
         if score_kind not in {"raw", "scene"}:
             raise ValueError("score_kind must be raw or scene")
+        del score_kind
+        head = output["global_grasp"]
         amount = int(topk or self.config.candidate_topk)
+        rows = []
         for row in range(batch["xyz"].shape[0]):
-            xyz = batch["xyz"][row]
-            instance = batch["instance_id"][row]
-            present = batch.get("object_present", batch["object_mask"])[row]
-            valid_instance = (instance >= 0) & (instance < present.shape[0])
-            if self.config.global_grasp_input_mode == "scene_only":
-                domain = batch["point_mask"][row]
-            else:
-                domain = (
-                    batch["point_mask"][row] & valid_instance
-                    & present[instance.clamp(0, present.shape[0] - 1)]
-                )
-            raw_score = (
-                torch.sigmoid(head["contact_logits"][row, :, None])
-                * torch.sigmoid(head["intrinsic_confidence_logit"][row])
-            ).masked_fill(~domain[:, None], -1.0)
-            scene_score = raw_score * torch.sigmoid(head["scene_confidence_logit"][row])
-            ranking_score = raw_score if score_kind == "raw" else scene_score
-            count = min(amount * 8, int(domain.sum()) * ranking_score.shape[1])
-            flat = ranking_score.flatten().topk(count).indices if count else torch.empty(
-                0, dtype=torch.long, device=xyz.device
-            )
-            point = torch.div(flat, ranking_score.shape[1], rounding_mode="floor")
-            mode = flat.remainder(ranking_score.shape[1])
-            rotation_bin = head["rotation_logits"][row, point, mode].argmax(-1)
-            rotation = _rotation_from_approach(
-                head["approach_direction"][row, point, mode], rotation_bin,
-                self.config.num_grasp_rotation_bins,
-            )
-            pose_world = torch.cat((
-                xyz[point] + head["center_offset_m"][row, point, mode],
-                matrix_to_quaternion_xyzw(rotation),
-            ), -1)
-            object_index = instance[point]
-            # Strict scene-only comparison may annotate selected grasps after
-            # decoding, but instance IDs must not influence ranking or NMS.
-            nms_object_index = (
-                torch.zeros_like(object_index)
-                if self.config.global_grasp_input_mode == "scene_only"
-                else object_index
-            )
-            width_m = head["width_m"][row, point, mode]
-            ranked_score = ranking_score[point, mode]
-            if len(point):
-                keep = task_grasp_nms(
-                    pose_world[None], width_m[None], ranked_score[None], nms_object_index[None],
-                    torch.ones((1, len(point)), dtype=torch.bool, device=point.device),
-                    translation_threshold_m=self.config.global_grasp_nms_translation_m,
-                    rotation_threshold_deg=self.config.global_grasp_nms_rotation_deg,
-                    width_threshold_m=self.config.global_grasp_nms_width_m,
-                    approach_threshold_deg=self.config.global_grasp_nms_approach_deg,
-                )[0]
-                if self.config.global_grasp_input_mode != "scene_only":
-                    keep |= object_index < 0
-                selected = torch.nonzero(keep, as_tuple=False).flatten()
-                selected = selected[
-                    ranked_score[selected].argsort(descending=True, stable=True)
-                ][:amount]
-                point, mode, rotation = point[selected], mode[selected], rotation[selected]
-                pose_world, object_index, width_m = (
-                    pose_world[selected], object_index[selected], width_m[selected]
-                )
+            translation = head["translation_world"][row]
+            rotation = head["rotation_matrix"][row]
+            pose = torch.cat((translation, matrix_to_quaternion_xyzw(rotation)), -1)
+            width = head["width_m"][row]
+            score = torch.sigmoid(head["quality_logit"][row])
+            point = self._nearest_scene_point(translation, batch["xyz"][row], batch["point_mask"][row])
+            objects = batch["instance_id"][row, point]
+            nms_objects = torch.zeros_like(objects) if self.config.global_grasp_input_mode == "scene_only" else objects
+            selected = self._nms_indices(pose, width, score, nms_objects, amount, global_grasp=True)
             rows.append({
-                "object": object_index,
-                "contact_world": xyz[point],
-                "pose_world": pose_world,
-                "width_m": width_m,
-                "raw_score": raw_score[point, mode],
-                "scene_score": scene_score[point, mode],
-                "intrinsic_score": torch.sigmoid(
-                    head["intrinsic_confidence_logit"][row, point, mode]
-                ),
-                "point_index": point,
-                "mode_index": mode,
+                "object": objects[selected],
+                "contact_world": translation[selected],
+                "pose_world": pose[selected],
+                "width_m": width[selected],
+                "raw_score": score[selected],
+                "scene_score": score[selected],
+                "intrinsic_score": score[selected],
+                "point_index": point[selected],
+                "mode_index": selected,
             })
         return rows
 
     def generate(self, model: Any, batch: dict[str, Tensor], output: dict[str, Any]) -> dict[str, Tensor]:
-        """Return padded tensors and learned candidate tokens for one encoded batch."""
-
         rows: list[dict[str, Tensor]] = []
         encoded = output["encoded"]
         for batch_row in range(batch["xyz"].shape[0]):
             xyz, instance = batch["xyz"][batch_row], batch["instance_id"][batch_row]
             active = batch["object_mask"][batch_row] & batch["object_active"][batch_row]
-            if output["graph"] is not None:
-                actionable = output["graph"].derived_actionable_mask[batch_row]
-            else:
-                # No-graph ablation intentionally falls back to all active
-                # objects; the full method always uses the derived hard mask.
-                actionable = active
+            actionable = output["graph"].derived_actionable_mask[batch_row] if output["graph"] is not None else active
             target_object = int(batch["target_object"][batch_row])
-            type_parts, object_parts, contact_parts, direction_parts, point_index_parts = [], [], [], [], []
+            type_parts, object_parts, contact_parts, direction_parts, point_parts = [], [], [], [], []
             pose_parts, destination_parts, width_parts, score_parts = [], [], [], []
 
-            task_head = output["task_grasp"]
-            task_score = (
-                torch.sigmoid(task_head["contact_logits"][batch_row])
-                * torch.sigmoid(task_head["proposal_confidence_logit"][batch_row])
-                * torch.sigmoid(task_head["task_compatibility_logit"][batch_row])
-            ).masked_fill(~batch["target_mask"][batch_row], -1.0)
-            task_count = min(self.config.task_grasp_candidates, int(batch["target_mask"][batch_row].sum()))
-            if task_count:
-                index = task_score.topk(task_count).indices
-                rotation_bin = task_head["rotation_logits"][batch_row, index].argmax(-1)
-                rotation = _rotation_from_approach(
-                    task_head["approach_direction"][batch_row, index], rotation_bin,
-                    self.config.num_grasp_rotation_bins,
-                )
-                pose = torch.cat((
-                    xyz[index] + task_head["center_offset_m"][batch_row, index],
-                    matrix_to_quaternion_xyzw(rotation),
-                ), -1)
-                type_parts.append(torch.full_like(index, int(ActionType.TASK_GRASP)))
-                object_parts.append(torch.full_like(index, target_object))
-                contact_parts.append(torch.full((len(index), 3), float("nan"), device=xyz.device))
-                direction_parts.append(torch.full((len(index), 3), float("nan"), device=xyz.device))
-                pose_parts.append(pose)
-                destination_parts.append(torch.full((len(index), 3), float("nan"), device=xyz.device))
-                width_parts.append(task_head["width_m"][batch_row, index])
-                score_parts.append(task_score[index])
-                point_index_parts.append(index)
+            task = output["task_grasp"]
+            task_pose = torch.cat((
+                task["translation_world"][batch_row],
+                matrix_to_quaternion_xyzw(task["rotation_matrix"][batch_row]),
+            ), -1)
+            task_score = torch.sigmoid(task["quality_logit"][batch_row])
+            task_objects = torch.full_like(task_score, target_object, dtype=torch.long)
+            selected = self._nms_indices(
+                task_pose, task["width_m"][batch_row], task_score, task_objects,
+                self.config.task_grasp_candidates, global_grasp=False,
+            )
+            if not bool(active[target_object] & batch["target_mask"][batch_row].any()):
+                selected = selected[:0]
+            if len(selected):
+                points = task["attention_point_index"][batch_row, selected]
+                type_parts.append(torch.full_like(selected, int(ActionType.TASK_GRASP)))
+                object_parts.append(task_objects[selected])
+                contact_parts.append(torch.full((len(selected), 3), float("nan"), device=xyz.device))
+                direction_parts.append(torch.full((len(selected), 3), float("nan"), device=xyz.device))
+                pose_parts.append(task_pose[selected])
+                destination_parts.append(torch.full((len(selected), 3), float("nan"), device=xyz.device))
+                width_parts.append(task["width_m"][batch_row, selected])
+                score_parts.append(task_score[selected])
+                point_parts.append(points)
 
-            global_grasp = output["global_grasp"]
-            global_raw_score = (
-                torch.sigmoid(global_grasp["contact_logits"][batch_row, :, None])
-                * torch.sigmoid(global_grasp["intrinsic_confidence_logit"][batch_row])
+            global_head = output["global_grasp"]
+            global_pose = torch.cat((
+                global_head["translation_world"][batch_row],
+                matrix_to_quaternion_xyzw(global_head["rotation_matrix"][batch_row]),
+            ), -1)
+            global_score = torch.sigmoid(global_head["quality_logit"][batch_row])
+            global_point = self._nearest_scene_point(
+                global_head["translation_world"][batch_row], xyz, batch["point_mask"][batch_row]
             )
-            global_score = global_raw_score * torch.sigmoid(
-                global_grasp["scene_confidence_logit"][batch_row]
-            )
+            global_object = instance[global_point]
             remove_domain = active.clone()
             remove_domain[target_object] = False
             remove_eligible = active & actionable & remove_domain
+            per_object_score = global_score.new_full(active.shape, -1.0)
+            for object_index in torch.nonzero(active, as_tuple=False).flatten().tolist():
+                mask = global_object == object_index
+                if mask.any():
+                    per_object_score[object_index] = global_score[mask].max()
             if output["graph"] is not None:
-                remove_eligible = self._with_graph_fallback(
-                    remove_eligible, remove_domain,
-                    output["pick_remove"]["object_logits"][batch_row],
+                remove_eligible = self._with_graph_fallback(remove_eligible, remove_domain, per_object_score)
+            valid_remove = remove_eligible[global_object.clamp(0, len(active) - 1)] & (global_object >= 0)
+            candidates = torch.nonzero(valid_remove, as_tuple=False).flatten()
+            if len(candidates):
+                local = self._nms_indices(
+                    global_pose[candidates], global_head["width_m"][batch_row, candidates],
+                    global_score[candidates], global_object[candidates],
+                    self.config.pick_remove_candidates, global_grasp=True,
                 )
-            remove_objects = torch.nonzero(remove_eligible, as_tuple=False).flatten()
-            if output["graph"] is not None and len(remove_objects):
-                priority = output["graph"].actionable_blocker_logits[batch_row, remove_objects]
-                remove_objects = remove_objects[priority.argsort(descending=True)]
-            # Select point-mode pairs only after the dependency graph has
-            # restricted objects; the global head itself predicts all present objects.
-            flat_score = global_score.flatten()
-            flat_instance = instance[:, None].expand(-1, global_score.shape[1]).reshape(-1)
-            remove_flat = self._top_per_object(
-                flat_score, flat_instance, remove_objects[:4], self.config.pick_remove_candidates
-            )
-            if len(remove_flat):
-                remove_index = torch.div(remove_flat, global_score.shape[1], rounding_mode="floor")
-                remove_mode = remove_flat.remainder(global_score.shape[1])
-                rotation_bin = global_grasp["rotation_logits"][
-                    batch_row, remove_index, remove_mode
-                ].argmax(-1)
-                rotation = _rotation_from_approach(
-                    global_grasp["approach_direction"][batch_row, remove_index, remove_mode], rotation_bin,
-                    self.config.num_grasp_rotation_bins,
-                )
-                pose = torch.cat((
-                    xyz[remove_index] + global_grasp["center_offset_m"][
-                        batch_row, remove_index, remove_mode
-                    ],
-                    matrix_to_quaternion_xyzw(rotation),
-                ), -1)
-                type_parts.append(torch.full_like(remove_index, int(ActionType.PICK_REMOVE)))
-                object_parts.append(instance[remove_index])
-                contact_parts.append(torch.full((len(remove_index), 3), float("nan"), device=xyz.device))
-                direction_parts.append(torch.full((len(remove_index), 3), float("nan"), device=xyz.device))
-                pose_parts.append(pose)
-                destination_parts.append(torch.full((len(remove_index), 3), float("nan"), device=xyz.device))
-                width_parts.append(global_grasp["width_m"][batch_row, remove_index, remove_mode])
-                score_parts.append(global_score[remove_index, remove_mode])
-                point_index_parts.append(remove_index)
+                selected = candidates[local]
+                type_parts.append(torch.full_like(selected, int(ActionType.PICK_REMOVE)))
+                object_parts.append(global_object[selected])
+                contact_parts.append(torch.full((len(selected), 3), float("nan"), device=xyz.device))
+                direction_parts.append(torch.full((len(selected), 3), float("nan"), device=xyz.device))
+                pose_parts.append(global_pose[selected])
+                destination_parts.append(torch.full((len(selected), 3), float("nan"), device=xyz.device))
+                width_parts.append(global_head["width_m"][batch_row, selected])
+                score_parts.append(global_score[selected])
+                point_parts.append(global_point[selected])
 
             push = output["push"]
-            # Target self-push is an explicit recovery primitive in the current
-            # dataset, including successful actions whose target is not on the
-            # graph frontier. The configurable override records that semantics
-            # directly instead of implying graph gating.
             push_eligible = active & actionable
             if output["graph"] is not None:
                 if self.config.allow_target_push_recovery:
                     push_eligible[target_object] = active[target_object]
-                push_eligible = self._with_graph_fallback(
-                    push_eligible, active, push["object_logits"][batch_row]
-                )
+                push_eligible = self._with_graph_fallback(push_eligible, active, push["object_logits"][batch_row])
             push_objects = torch.nonzero(push_eligible, as_tuple=False).flatten()
             if len(push_objects):
-                push_objects = push_objects[
-                    push["object_logits"][batch_row, push_objects].argsort(descending=True)
-                ][:4]
+                push_objects = push_objects[push["object_logits"][batch_row, push_objects].argsort(descending=True)[:4]]
             push_index = self._top_per_object(
                 torch.sigmoid(push["contact_logits"][batch_row]), instance,
                 push_objects, self.config.push_candidates,
@@ -282,9 +211,7 @@ class DenseCandidateGenerator:
                 direction_bin = push["direction_logits"][batch_row, push_index].argmax(-1)
                 angle = (direction_bin.float() + 0.5) * 2.0 * math.pi / self.config.num_direction_bins
                 center = torch.stack((torch.cos(angle), torch.sin(angle)), -1)
-                planar = torch.nn.functional.normalize(
-                    center + push["direction_residual"][batch_row, push_index], dim=-1
-                )
+                planar = torch.nn.functional.normalize(center + push["direction_residual"][batch_row, push_index], dim=-1)
                 direction = torch.cat((planar, torch.zeros(len(planar), 1, device=xyz.device)), -1)
                 type_parts.append(torch.full_like(push_index, int(ActionType.PUSH)))
                 object_parts.append(instance[push_index])
@@ -294,46 +221,36 @@ class DenseCandidateGenerator:
                 destination_parts.append(torch.full((len(push_index), 3), float("nan"), device=xyz.device))
                 width_parts.append(torch.full((len(push_index),), float("nan"), device=xyz.device))
                 score_parts.append(torch.sigmoid(push["contact_logits"][batch_row, push_index]))
-                point_index_parts.append(push_index)
+                point_parts.append(push_index)
 
-            if type_parts:
-                row = {
-                    "type": torch.cat(type_parts), "object": torch.cat(object_parts),
-                    "contact_world": torch.cat(contact_parts),
-                    "direction_world": torch.cat(direction_parts),
-                    "pose_world": torch.cat(pose_parts),
-                    "destination_world": torch.cat(destination_parts),
-                    "width_m": torch.cat(width_parts),
-                    "proposal_score": torch.cat(score_parts),
-                    "point_index": torch.cat(point_index_parts),
-                }
-            else:
-                # Keep a single padded slot so downstream Transformer modules do
-                # not receive a zero-length sequence.  Its valid mask remains false.
-                row = {
-                    "type": torch.empty(0, dtype=torch.long, device=xyz.device),
-                    "object": torch.empty(0, dtype=torch.long, device=xyz.device),
-                    "contact_world": xyz.new_empty((0, 3)),
-                    "direction_world": xyz.new_empty((0, 3)),
-                    "pose_world": xyz.new_empty((0, 7)),
-                    "destination_world": xyz.new_empty((0, 3)),
-                    "width_m": xyz.new_empty((0,)),
-                    "proposal_score": xyz.new_empty((0,)),
-                    "point_index": torch.empty(0, dtype=torch.long, device=xyz.device),
-                }
-            rows.append(row)
+            def joined(parts: list[Tensor], shape: tuple[int, ...], dtype: torch.dtype, fill: float = float("nan")) -> Tensor:
+                return torch.cat(parts) if parts else torch.full(shape, fill, dtype=dtype, device=xyz.device)
+
+            rows.append({
+                "type": joined(type_parts, (0,), torch.long, -1),
+                "object": joined(object_parts, (0,), torch.long, -1),
+                "contact_world": joined(contact_parts, (0, 3), xyz.dtype),
+                "direction_world": joined(direction_parts, (0, 3), xyz.dtype),
+                "pose_world": joined(pose_parts, (0, 7), xyz.dtype),
+                "destination_world": joined(destination_parts, (0, 3), xyz.dtype),
+                "width_m": joined(width_parts, (0,), xyz.dtype),
+                "proposal_score": joined(score_parts, (0,), xyz.dtype, -1.0),
+                "point_index": joined(point_parts, (0,), torch.long, -1),
+            })
+
         max_candidates = max(1, max(len(row["type"]) for row in rows))
+        fill = {"type": -1, "object": -1, "point_index": -1, "width_m": float("nan"),
+                "proposal_score": -1.0, "contact_world": float("nan"),
+                "direction_world": float("nan"), "pose_world": float("nan"),
+                "destination_world": float("nan")}
         result: dict[str, Tensor] = {}
-        fill = {"type": -1, "object": -1, "point_index": -1,
-                "width_m": float("nan"), "proposal_score": -1.0,
-                "contact_world": float("nan"), "direction_world": float("nan"),
-                "pose_world": float("nan"), "destination_world": float("nan")}
         for key in rows[0]:
-            tail = rows[0][key].shape[1:]
-            value = torch.full((len(rows), max_candidates) + tail, fill[key],
-                               dtype=rows[0][key].dtype, device=rows[0][key].device)
+            value = torch.full(
+                (len(rows), max_candidates) + rows[0][key].shape[1:], fill[key],
+                dtype=rows[0][key].dtype, device=rows[0][key].device,
+            )
             for row_index, row in enumerate(rows):
-                value[row_index, : len(row[key])] = row[key]
+                value[row_index, :len(row[key])] = row[key]
             result[key] = value
         result["valid"] = result["type"] >= 0
         result["push_distance_m"] = torch.where(
@@ -349,31 +266,25 @@ class DenseCandidateGenerator:
             torch.isfinite(result["width_m"]),
         ), -1)
         result["tokens"] = model.candidate_encoder(
-            encoded.object_tokens, result["type"], result["object"],
-            result["contact_world"], result["direction_world"], result["pose_world"],
-            result["destination_world"], flags, encoded.task_token,
+            encoded.object_tokens, result["type"], result["object"], result["contact_world"],
+            result["direction_world"], result["pose_world"], result["destination_world"],
+            flags, encoded.task_token,
         )
-        evidence = torch.zeros(
-            result["type"].shape + (22,), device=result["type"].device
-        )
+        evidence = torch.zeros(result["type"].shape + (7,), device=result["type"].device)
+        evidence[..., 1] = torch.where(result["valid"], result["proposal_score"], 0.0)
         for row in range(result["type"].shape[0]):
-            valid = torch.nonzero(result["valid"][row], as_tuple=False).flatten()
-            for candidate in valid.tolist():
-                point = int(result["point_index"][row, candidate])
-                kind = int(result["type"][row, candidate])
-                evidence[row, candidate, 15] = result["proposal_score"][row, candidate]
-                if kind == int(ActionType.PUSH):
-                    evidence[row, candidate, 7:12] = output["push"]["potential_delta"][row, point]
-                    evidence[row, candidate, 12:15] = torch.sigmoid(
-                        output["push"]["risk_logits"][row, point]
-                    )
+            push_candidates = torch.nonzero(
+                result["valid"][row] & (result["type"][row] == int(ActionType.PUSH)),
+                as_tuple=False,
+            ).flatten()
+            if len(push_candidates):
+                points = result["point_index"][row, push_candidates]
+                evidence[row, push_candidates, 0] = output["push"]["utility_delta"][row, points]
         result["evidence"] = evidence
         return result
 
     @staticmethod
     def verifier_batch(base_batch: dict[str, Tensor], candidates: dict[str, Tensor]) -> dict[str, Any]:
-        """Create the minimal CPU batch contract consumed by verifier preprocessing."""
-
         kind = candidates["type"].cpu()
         pose = candidates["pose_world"].cpu()
         nan_pose = torch.full_like(pose, float("nan"))

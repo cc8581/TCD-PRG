@@ -12,9 +12,8 @@ from tcd_prg.config import AblationConfig, BackboneConfig, GraphConfig, ModelCon
 from .backbones import TaskConditionedPointTransformer
 from .common import ActionCandidateEncoder
 from .dependency_graph import TaskConditionedDependencyGraph
-from .grasp_proposal import GlobalGraspProposalHead, StateGraspabilityHead, TaskGraspProposalHead
+from .grasp_proposal import GlobalGraspProposalHead, TaskGraspProposalHead
 from .grasp_verifier import GripperSceneTaskVerifier
-from .pick_remove import PickRemoveHead
 from .policy import FlatCandidateClassifier, MaskedHierarchicalCandidateRouter, fixed_priority_output
 from .push import PushHead
 from .region import TaskRegionHead
@@ -44,19 +43,16 @@ class TCDPRGModel(nn.Module):
             activation_checkpointing=c.activation_checkpointing,
         )
         self.region_head = TaskRegionHead(c.feature_dim)
-        self.task_grasp = TaskGraspProposalHead(c.feature_dim, c.num_grasp_rotation_bins)
+        self.task_grasp = TaskGraspProposalHead(c.feature_dim, c.task_grasp_candidates)
         self.global_grasp = GlobalGraspProposalHead(
-            c.feature_dim, c.num_grasp_rotation_bins, c.global_grasp_modes_per_point,
-            c.global_grasp_input_mode,
+            c.feature_dim, c.global_grasp_candidates, c.global_grasp_input_mode,
         )
-        self.state_graspability = StateGraspabilityHead(c.feature_dim)
         self.verifier = GripperSceneTaskVerifier(c.feature_dim, c.feature_dim)
         self.graph = TaskConditionedDependencyGraph(
             c.feature_dim, physical_relations=len(graph_config.physical_relations),
             task_relations=len(graph_config.task_relations), layers=graph_config.layers,
             heads=graph_config.heads, edge_threshold=c.graph_edge_threshold,
         )
-        self.pick_remove = PickRemoveHead(c.feature_dim)
         self.push = PushHead(c.feature_dim, c.num_direction_bins)
         self.router = MaskedHierarchicalCandidateRouter(
             c.feature_dim, layers=router_config.layers, heads=router_config.heads
@@ -66,7 +62,7 @@ class TCDPRGModel(nn.Module):
         )
         self.candidate_encoder = ActionCandidateEncoder(c.feature_dim)
         self.candidate_evidence = nn.Sequential(
-            nn.Linear(22, c.feature_dim), nn.GELU(), nn.Linear(c.feature_dim, c.feature_dim)
+            nn.Linear(7, c.feature_dim), nn.GELU(), nn.Linear(c.feature_dim, c.feature_dim)
         )
 
     def _candidate_evidence_from_batch(
@@ -76,7 +72,7 @@ class TCDPRGModel(nn.Module):
         """Gather proposal/PUSH evidence for labelled training candidates."""
 
         b, k = kind.shape
-        evidence = torch.zeros((b, k, 22), device=kind.device)
+        evidence = torch.zeros((b, k, 7), device=kind.device)
         parameters = batch["action_parameters"]
         for row in range(b):
             for candidate in torch.nonzero(batch["candidate_mask"][row], as_tuple=False).flatten().tolist():
@@ -103,40 +99,16 @@ class TCDPRGModel(nn.Module):
                 delta = batch["xyz"][row, points] - query
                 point = points[(delta * delta).sum(-1).argmin()]
                 if is_push:
-                    evidence[row, candidate, 7:12] = result["push"]["potential_delta"][row, point]
-                    evidence[row, candidate, 12:15] = torch.sigmoid(
-                        result["push"]["risk_logits"][row, point]
-                    )
-                    evidence[row, candidate, 15] = torch.sigmoid(
+                    evidence[row, candidate, 0] = result["push"]["utility_delta"][row, point]
+                    evidence[row, candidate, 1] = torch.sigmoid(
                         result["push"]["contact_logits"][row, point]
                     )
                 else:
-                    if int(kind[row, candidate]) == 1:
-                        global_head = result["global_grasp"]
-                        predicted_center = (
-                            batch["xyz"][row, point]
-                            + global_head["center_offset_m"][row, point]
-                        )
-                        center_cost = torch.linalg.vector_norm(
-                            predicted_center - pose[row, candidate, :3], dim=-1
-                        ) / 0.02
-                        approach_target = parameters["grasp_approach_world"][row, candidate]
-                        approach_cost = 1.0 - (
-                            global_head["approach_direction"][row, point] * approach_target
-                        ).sum(-1).clamp(-1.0, 1.0)
-                        width_cost = torch.abs(
-                            global_head["width_m"][row, point]
-                            - parameters["grasp_width_m"][row, candidate]
-                        ) / 0.005
-                        mode = (center_cost + approach_cost + width_cost).argmin()
-                        evidence[row, candidate, 15] = (
-                            torch.sigmoid(global_head["intrinsic_confidence_logit"][row, point, mode])
-                            * torch.sigmoid(global_head["scene_confidence_logit"][row, point, mode])
-                        )
-                    else:
-                        evidence[row, candidate, 15] = torch.sigmoid(
-                            result["task_grasp"]["proposal_confidence_logit"][row, point]
-                        )
+                    head = result["global_grasp"] if is_remove else result["task_grasp"]
+                    nearest = torch.linalg.vector_norm(
+                        head["translation_world"][row] - pose[row, candidate, :3], dim=-1
+                    ).argmin()
+                    evidence[row, candidate, 1] = torch.sigmoid(head["quality_logit"][row, nearest])
         return evidence
 
     def verify_cached(
@@ -174,51 +146,17 @@ class TCDPRGModel(nn.Module):
         """Route externally generated candidates using the already encoded scene."""
 
         encoded = result["encoded"]
-        graph_context = (
-            result["graph"].node_features[:, :-1]
-            if result["graph"] is not None
-            else encoded.object_tokens
-        )
-        remove_candidates = candidate_inputs["valid"] & (candidate_inputs["type"] == 1)
-        preliminary_remove = self.pick_remove(
-            encoded.object_tokens,
-            encoded.object_mask & batch["object_active"],
-            encoded.task_token,
-            graph_context,
-            candidate_inputs["tokens"],
-            candidate_inputs["object"],
-            remove_candidates,
-        )
         evidence = candidate_inputs.get("evidence")
         if evidence is None:
             evidence = torch.zeros(
-                candidate_inputs["tokens"].shape[:2] + (22,),
+                candidate_inputs["tokens"].shape[:2] + (7,),
                 device=candidate_inputs["tokens"].device,
             )
         else:
             evidence = evidence.clone()
-        if "candidate_logits" in preliminary_remove:
-            evidence[..., 15] = torch.where(
-                remove_candidates,
-                torch.sigmoid(preliminary_remove["candidate_logits"]),
-                evidence[..., 15],
-            )
         if result.get("verifier") is not None:
-            verifier_evidence = torch.stack(
-                [torch.sigmoid(result["verifier"][f"{name}_logit"])
-                 for name in self.verifier.HEADS], -1
-            )
-            evidence[..., 16:22] = verifier_evidence
+            evidence[..., 2] = torch.sigmoid(result["verifier"]["overall_logit"])
         routed_tokens = candidate_inputs["tokens"] + self.candidate_evidence(evidence)
-        result["pick_remove"] = self.pick_remove(
-            encoded.object_tokens,
-            encoded.object_mask & batch["object_active"],
-            encoded.task_token,
-            graph_context,
-            routed_tokens,
-            candidate_inputs["object"],
-            remove_candidates,
-        )
         router_args = (
             encoded.task_token,
             encoded.global_scene_token,
@@ -260,6 +198,7 @@ class TCDPRGModel(nn.Module):
         )
         task_grasp = self.task_grasp(
             encoded.point_features,
+            batch["xyz"],
             encoded.target_token,
             encoded.task_token,
             region["region_probability"],
@@ -282,6 +221,7 @@ class TCDPRGModel(nn.Module):
             )
         global_grasp = self.global_grasp(
             encoded.scene_point_features,
+            batch["xyz"],
             encoded.scene_object_tokens,
             encoded.scene_global_token,
             batch["instance_id"],
@@ -289,9 +229,6 @@ class TCDPRGModel(nn.Module):
         )
         global_grasp["width_m"] = self.global_grasp.decode_width(
             global_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m
-        )
-        state_graspability = self.state_graspability(
-            encoded.global_scene_token, encoded.target_token, encoded.task_token
         )
         if self.ablation.use_dependency_graph:
             graph = self.graph(
@@ -318,21 +255,13 @@ class TCDPRGModel(nn.Module):
             graph_context,
             batch["remaining_steps"],
         )
-        remove = self.pick_remove(
-            encoded.object_tokens,
-            encoded.object_mask & batch["object_active"],
-            encoded.task_token,
-            graph_context,
-        )
         result: dict[str, Any] = {
             "encoded": encoded,
             "region": region,
             "task_grasp": task_grasp,
             "global_grasp": global_grasp,
-            "state_graspability": state_graspability,
             "graph": graph,
             "push": push,
-            "pick_remove": remove,
             "verifier": None,
         }
         verifier_inputs = batch.get("verifier_inputs")
@@ -343,7 +272,6 @@ class TCDPRGModel(nn.Module):
             kind = batch["action_type"]
             push = kind == 0
             remove_mask = kind == 1
-            task_grasp_mask = kind == 2
             pose = torch.where(
                 remove_mask.unsqueeze(-1), parameters["removal_grasp_pose_world"],
                 parameters["task_grasp_pose_world"]

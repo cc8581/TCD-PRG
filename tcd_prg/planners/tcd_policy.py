@@ -21,16 +21,6 @@ from tcd_prg.models.policy.router import MaskedHierarchicalCandidateRouter
 from .candidate_generator import DenseCandidateGenerator
 
 
-def predicted_state_graspability_gate(
-    output: dict[str, Tensor], required_count: Tensor, probability_threshold: float
-) -> Tensor:
-    """Deployment gate using predictions rather than HDF5 state truth."""
-
-    return (
-        torch.sigmoid(output["graspable_logit"]) >= probability_threshold
-    ) & (output["verified_count_prediction"] >= required_count.float())
-
-
 def apply_verified_candidate_count_gate(
     candidate_type: Tensor,
     candidate_object: Tensor,
@@ -178,14 +168,6 @@ class TCDPRGPolicy(ManipulationPolicy):
             candidates = self.generator.generate(
                 self.model, encoded.device_batch, encoded.output
             )
-            task = candidates["type"] == int(ActionType.TASK_GRASP)
-            state_output = encoded.output["state_graspability"]
-            learned_state_valid = predicted_state_graspability_gate(
-                state_output,
-                encoded.device_batch["required_grasp_count"],
-                self.config.model.state_graspability_threshold,
-            )
-            candidates["valid"] &= ~task | learned_state_valid[:, None]
             if self.previous_action is not None:
                 candidates["previous_action"] = torch.tensor(
                     [self.previous_action], device=self.device
@@ -210,10 +192,7 @@ class TCDPRGPolicy(ManipulationPolicy):
                 learned_valid = torch.sigmoid(
                     encoded.output["verifier"]["overall_logit"]
                 ) >= self.config.model.verifier_validity_threshold
-                task_valid = torch.sigmoid(
-                    encoded.output["verifier"]["task_compatibility_logit"]
-                ) >= self.config.model.verifier_validity_threshold
-                candidates["valid"] &= ~grasp | (learned_valid & (~task | task_valid))
+                candidates["valid"] &= ~grasp | learned_valid
             certification_reasons: list[str] = []
             if self.certifier is not None:
                 valid_indices = [index for index in range(candidates["type"].shape[1])
@@ -235,10 +214,8 @@ class TCDPRGPolicy(ManipulationPolicy):
                     ok, reason = decision_by_index[index]
                     candidates["valid"][0, index] = ok
                     certification_reasons.append(reason)
-            # State graspability is a count criterion, not an existential one.
-            # The learned gate replaces HDF5 truth at deployment; the number of
-            # surviving verifier/certifier candidates provides a deterministic
-            # second gate before TASK_GRASP can enter the router.
+            # The number of unique verifier/certifier survivors is the hard
+            # count gate before TASK_GRASP can enter the router.
             (
                 candidates["valid"], verified_count, unique_task_mask
             ) = apply_verified_candidate_count_gate(
@@ -250,12 +227,6 @@ class TCDPRGPolicy(ManipulationPolicy):
                 width_threshold_m=self.config.model.grasp_nms_width_m,
                 approach_threshold_deg=self.config.model.grasp_nms_approach_deg,
             )
-            candidates["state_graspability_probability"] = torch.sigmoid(
-                state_output["graspable_logit"]
-            )
-            candidates["predicted_verified_grasp_count"] = state_output[
-                "verified_count_prediction"
-            ]
             candidates["verified_unique_grasp_count"] = verified_count
             # Compatibility alias now has unique-grasp semantics.
             candidates["verified_candidate_count"] = verified_count

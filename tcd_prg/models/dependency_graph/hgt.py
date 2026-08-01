@@ -55,10 +55,6 @@ class DependencyGraphOutput:
     node_features: Tensor
     physical_edge_logits: Tensor
     task_edge_logits: Tensor
-    direct_blocker_logits: Tensor
-    indirect_blocker_logits: Tensor
-    actionable_blocker_logits: Tensor
-    topology_order_logits: Tensor
     derived_direct_mask: Tensor
     derived_indirect_mask: Tensor
     derived_dependency_mask: Tensor
@@ -119,10 +115,6 @@ class TaskConditionedDependencyGraph(nn.Module):
             EdgeAwareHGTLayer(dim, physical_relations + 2 * task_relations + 1, heads)
             for _ in range(layers)
         )
-        self.direct = nn.Linear(dim, 1)
-        self.indirect = nn.Linear(dim, 1)
-        self.actionable = nn.Linear(dim, 1)
-        self.order_score = nn.Linear(dim, 1)
 
     @staticmethod
     def _pairs(nodes: Tensor) -> Tensor:
@@ -184,14 +176,6 @@ class TaskConditionedDependencyGraph(nn.Module):
         edge_mask = node_mask[:, :, None] & node_mask[:, None, :]
         for layer in self.layers:
             nodes = layer(nodes, node_mask, relation_weight, edge_mask)
-        objects = nodes[:, :-1]
-        direct = self.direct(objects).squeeze(-1).masked_fill(~object_mask, -30.0)
-        indirect = self.indirect(objects).squeeze(-1).masked_fill(~object_mask, -30.0)
-        if not use_indirect_reasoning:
-            indirect = torch.full_like(indirect, -30.0)
-        actionable = self.actionable(objects).squeeze(-1).masked_fill(~object_mask, -30.0)
-        order_score = self.order_score(objects).squeeze(-1)
-        topology_order = order_score[:, :, None] - order_score[:, None, :]
         derived = derive_dependency_masks(
             physical_logits, task_logits, object_mask,
             target_object=target_object,
@@ -199,6 +183,5 @@ class TaskConditionedDependencyGraph(nn.Module):
             use_indirect_reasoning=use_indirect_reasoning,
         )
         return DependencyGraphOutput(
-            nodes, physical_logits, task_logits, direct, indirect, actionable, topology_order,
-            *derived,
+            nodes, physical_logits, task_logits, *derived,
         )

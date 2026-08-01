@@ -276,7 +276,7 @@ class Trainer:
         path.parent.mkdir(parents=True, exist_ok=True)
         source = self.model.module if hasattr(self.model, "module") else self.model
         payload = {
-            "schema_version": 5,
+            "schema_version": 6,
             "model": source.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler else None,
@@ -295,11 +295,11 @@ class Trainer:
     def load_checkpoint(self, path: str | Path) -> None:
         payload = torch.load(path, map_location=self.device, weights_only=False)
         schema_version = int(payload.get("schema_version", 1))
-        if schema_version != 5:
+        if schema_version != 6:
             raise RuntimeError(
                 "Unsupported TCD-PRG checkpoint schema "
-                f"{schema_version}; this code expects schema 5. The center-offset and task-free "
-                "backbone, task adapter, and multimodal global-grasp head changed. Load the "
+                f"{schema_version}; this code expects schema 6. Complete query-based task/global "
+                "grasp sets and the eleven-objective training contract changed. Load the "
                 "original GAPG encoder through the pretrained-backbone option, "
                 "or start a new TCD-PRG run instead of resuming this checkpoint."
             )

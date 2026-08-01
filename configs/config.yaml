@@ -69,12 +69,12 @@ model:
   num_task_regions: 64
   num_relation_types: 8
   num_direction_bins: 16
-  num_grasp_rotation_bins: 12
   contact_heatmap_sigma_m: 0.008
   min_grasp_width_m: 0.0
   max_grasp_width_m: 0.095
   candidate_topk: 64
   task_grasp_candidates: 32
+  global_grasp_candidates: 64
   pick_remove_candidates: 16
   push_candidates: 16
   activation_checkpointing: true
@@ -84,7 +84,6 @@ model:
   verifier_candidate_micro_batch: 16
   verifier_validity_threshold: 0.5
   graph_edge_threshold: 0.5
-  state_graspability_threshold: 0.5
   default_required_grasp_count: 20
   max_required_grasp_count: 20
   grasp_nms_translation_m: 0.010
@@ -94,12 +93,12 @@ model:
   graph_candidate_fallback_objects: 1
   allow_target_push_recovery: true
   global_grasp_input_mode: scene_only
-  global_grasp_modes_per_point: 4
-  grasp_anchor_association_max_m: 0.02
   global_grasp_nms_translation_m: 0.01
   global_grasp_nms_rotation_deg: 15.0
   global_grasp_nms_width_m: 0.005
   global_grasp_nms_approach_deg: 15.0
+  push_utility_component_weights: [0.05, 1.0, -1.0, -0.25, 1.0]
+  push_failure_penalties: [1.0, 2.0, 1.0]
 
 grasp_verifier:
   local_scene_points: 512
@@ -129,58 +128,20 @@ router:
 
 losses:
   region: 1.0
-  proposal: 1.0
+  task_grasp: 1.0
   global_grasp: 1.0
-  verify: 1.0
-  graph: 1.0
-  remove: 1.0
-  push: 1.0
-  policy: 1.0
-  potential: 1.0
+  physical_edge: 1.0
+  task_edge: 1.0
+  verify_overall: 1.0
+  push_object: 1.0
+  push_contact: 1.0
+  push_direction: 1.0
+  push_potential: 1.0
+  policy_candidate: 1.0
   internal:
     region_focal: 1.0
     region_dice: 1.0
     region_visibility: 0.2
-    task_proposal_contact: 1.0
-    task_proposal_approach: 1.0
-    task_proposal_rotation: 1.0
-    task_proposal_width: 1.0
-    task_proposal_center_offset: 1.0
-    task_proposal_confidence: 0.25
-    task_proposal_task_compatibility: 1.0
-    global_contact: 1.0
-    global_approach: 1.0
-    global_rotation: 1.0
-    global_width: 1.0
-    global_center_offset: 1.0
-    global_scene_confidence: 0.25
-    global_intrinsic_confidence: 0.1
-    proposal_state_graspable: 1.0
-    proposal_verified_count: 0.5
-    verify_stability: 0.5
-    verify_task_compatibility: 1.0
-    verify_collision: 1.0
-    verify_clearance: 0.25
-    verify_approach: 1.0
-    verify_overall: 0.5
-    graph_physical_edge: 1.0
-    graph_task_edge: 1.0
-    graph_direct_blocker: 0.25
-    graph_indirect_blocker: 0.25
-    graph_actionable: 1.0
-    graph_topology_order: 0.1
-    push_object: 1.0
-    push_contact: 1.0
-    push_direction_bin: 1.0
-    push_direction_residual: 1.0
-    push_risk: 0.5
-    push_potential: 1.0
-    remove_object: 1.0
-    remove_candidate: 1.0
-    policy_type: 0.2
-    policy_object: 0.2
-    policy_candidate: 1.0
-    policy_remaining_steps: 0.1
 
 sampling:
   positive_grasps: 8
@@ -227,15 +188,17 @@ training:
   ddp_backend: auto
   ddp_find_unused_parameters: true
   validation_family_weights:
-    policy: 1.0
-    verify: 0.5
-    graph: 0.5
-    proposal: 0.25
+    policy_candidate: 1.0
+    verify_overall: 0.5
+    physical_edge: 0.25
+    task_edge: 0.25
+    task_grasp: 0.25
     global_grasp: 0.25
     region: 0.1
-    push: 0.25
-    remove: 0.25
-    potential: 0.1
+    push_object: 0.1
+    push_contact: 0.05
+    push_direction: 0.05
+    push_potential: 0.1
 
 evaluation:
   max_preparation_actions: 5
@@ -255,7 +218,6 @@ ablation:
   use_indirect_dependency_reasoning: true
   use_gripper_scene_verifier: true
   use_push_potential: true
-  use_push_risk: true
   router_type: hierarchical
 
 logging:

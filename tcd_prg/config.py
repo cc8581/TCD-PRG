@@ -115,14 +115,14 @@ class ModelConfig:
     num_task_regions: int = 64
     num_relation_types: int = 8
     num_direction_bins: int = 16
-    num_grasp_rotation_bins: int = 12
-    # Grasp translation is the dataset's canonical contact midpoint.  Legacy
-    # Panda-frame depth is intentionally not part of the AG policy output.
+    # Complete grasp queries predict translation, continuous SO(3), width and
+    # scene/task-conditioned execution quality directly.
     contact_heatmap_sigma_m: float = 0.008
     max_grasp_width_m: float = 0.095
     min_grasp_width_m: float = 0.0
     candidate_topk: int = 64
     task_grasp_candidates: int = 32
+    global_grasp_candidates: int = 64
     pick_remove_candidates: int = 16
     push_candidates: int = 16
     activation_checkpointing: bool = True
@@ -132,7 +132,6 @@ class ModelConfig:
     verifier_candidate_micro_batch: int = 16
     verifier_validity_threshold: float = 0.5
     graph_edge_threshold: float = 0.5
-    state_graspability_threshold: float = 0.5
     default_required_grasp_count: int = 20
     max_required_grasp_count: int = 20
     grasp_nms_translation_m: float = 0.010
@@ -145,12 +144,12 @@ class ModelConfig:
     # learned graph frontier inside candidate generation.
     allow_target_push_recovery: bool = True
     global_grasp_input_mode: str = "scene_only"
-    global_grasp_modes_per_point: int = 4
-    grasp_anchor_association_max_m: float = 0.02
     global_grasp_nms_translation_m: float = 0.01
     global_grasp_nms_rotation_deg: float = 15.0
     global_grasp_nms_width_m: float = 0.005
     global_grasp_nms_approach_deg: float = 15.0
+    push_utility_component_weights: tuple[float, ...] = (0.05, 1.0, -1.0, -0.25, 1.0)
+    push_failure_penalties: tuple[float, ...] = (1.0, 2.0, 1.0)
 
 
 @dataclass(slots=True)
@@ -160,7 +159,6 @@ class AblationConfig:
     use_indirect_dependency_reasoning: bool = True
     use_gripper_scene_verifier: bool = True
     use_push_potential: bool = True
-    use_push_risk: bool = True
     router_type: str = "hierarchical"
 
 
@@ -190,15 +188,17 @@ class TrainingConfig:
     ddp_backend: str = "auto"
     ddp_find_unused_parameters: bool = True
     validation_family_weights: dict[str, float] = field(default_factory=lambda: {
-        "policy": 1.0,
-        "verify": 0.5,
-        "graph": 0.5,
-        "proposal": 0.25,
+        "policy_candidate": 1.0,
+        "verify_overall": 0.5,
+        "physical_edge": 0.25,
+        "task_edge": 0.25,
+        "task_grasp": 0.25,
         "global_grasp": 0.25,
         "region": 0.1,
-        "push": 0.25,
-        "remove": 0.25,
-        "potential": 0.1,
+        "push_object": 0.1,
+        "push_contact": 0.05,
+        "push_direction": 0.05,
+        "push_potential": 0.1,
     })
 
 
@@ -250,64 +250,30 @@ class RouterConfig:
 @dataclass(slots=True)
 class LossConfig:
     region: float = 1.0
-    proposal: float = 1.0
-    verify: float = 1.0
-    graph: float = 1.0
-    remove: float = 1.0
-    push: float = 1.0
-    policy: float = 1.0
-    potential: float = 1.0
+    task_grasp: float = 1.0
     global_grasp: float = 1.0
+    physical_edge: float = 1.0
+    task_edge: float = 1.0
+    verify_overall: float = 1.0
+    push_object: float = 1.0
+    push_contact: float = 1.0
+    push_direction: float = 1.0
+    push_potential: float = 1.0
+    policy_candidate: float = 1.0
     internal: dict[str, float] = field(default_factory=lambda: {
         "region_focal": 1.0,
         "region_dice": 1.0,
         "region_visibility": 0.2,
-        "task_proposal_contact": 1.0,
-        "task_proposal_approach": 1.0,
-        "task_proposal_rotation": 1.0,
-        "task_proposal_width": 1.0,
-        "task_proposal_center_offset": 1.0,
-        "task_proposal_confidence": 0.25,
-        "task_proposal_task_compatibility": 1.0,
-        "proposal_state_graspable": 1.0,
-        "proposal_verified_count": 0.5,
-        "global_contact": 1.0,
-        "global_approach": 1.0,
-        "global_rotation": 1.0,
-        "global_width": 1.0,
-        "global_center_offset": 1.0,
-        "global_scene_confidence": 0.25,
-        "global_intrinsic_confidence": 0.1,
-        "verify_stability": 0.5,
-        "verify_task_compatibility": 1.0,
-        "verify_collision": 1.0,
-        "verify_clearance": 0.25,
-        "verify_approach": 1.0,
-        "verify_overall": 0.5,
-        "graph_physical_edge": 1.0,
-        "graph_task_edge": 1.0,
-        "graph_direct_blocker": 0.25,
-        "graph_indirect_blocker": 0.25,
-        "graph_actionable": 1.0,
-        "graph_topology_order": 0.1,
-        "push_object": 1.0,
-        "push_contact": 1.0,
-        "push_direction_bin": 1.0,
-        "push_direction_residual": 1.0,
-        "push_risk": 0.5,
-        "push_potential": 1.0,
-        "remove_object": 1.0,
-        "remove_candidate": 1.0,
-        "policy_type": 0.2,
-        "policy_object": 0.2,
-        "policy_candidate": 1.0,
-        "policy_remaining_steps": 0.1,
     })
 
     def family_weights(self) -> dict[str, float]:
         return {
             name: float(getattr(self, name))
-            for name in ("region", "proposal", "global_grasp", "verify", "graph", "remove", "push", "policy", "potential")
+            for name in (
+                "region", "task_grasp", "global_grasp", "physical_edge", "task_edge",
+                "verify_overall", "push_object", "push_contact", "push_direction",
+                "push_potential", "policy_candidate",
+            )
         }
 
 
@@ -419,9 +385,8 @@ class TCDPRGConfig:
             self.model.global_grasp_nms_rotation_deg,
             self.model.global_grasp_nms_width_m,
             self.model.global_grasp_nms_approach_deg,
-            self.model.grasp_anchor_association_max_m,
         ) <= 0:
-            raise ValueError("Global grasp NMS/association thresholds must be positive")
+            raise ValueError("Global grasp NMS thresholds must be positive")
         if self.model.graph_candidate_fallback_objects < 0:
             raise ValueError("graph_candidate_fallback_objects cannot be negative")
         if self.model.global_grasp_input_mode not in {"scene_only", "instance_assisted"}:
@@ -434,8 +399,12 @@ class TCDPRGConfig:
             raise ValueError("Global grasp stratum sizes cannot be negative")
         if self.sampling.global_positive_grasps_per_object == 0:
             raise ValueError("Global grasp training requires positive samples")
-        if not 2 <= self.model.global_grasp_modes_per_point <= 8:
-            raise ValueError("global_grasp_modes_per_point must be in [2,8]")
+        if self.model.global_grasp_candidates <= 0:
+            raise ValueError("global_grasp_candidates must be positive")
+        if len(self.model.push_utility_component_weights) != 5:
+            raise ValueError("push_utility_component_weights must match the five dataset components")
+        if len(self.model.push_failure_penalties) != 3:
+            raise ValueError("push_failure_penalties must cover unstable/workspace/other failures")
         if self.ablation.router_type not in {
             "hierarchical",
             "fixed_priority",

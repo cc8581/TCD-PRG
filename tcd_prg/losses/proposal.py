@@ -1,58 +1,96 @@
-"""Task-conditioned grasp proposal supervision."""
+"""Hungarian set loss for complete 6D grasp candidates."""
 
+from __future__ import annotations
+
+import numpy as np
 import torch
+import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
 from torch import Tensor, nn
 
-from .masked import masked_mean, safe_bce_with_logits, safe_cross_entropy, safe_smooth_l1
+from tcd_prg.geometry.se3 import parallel_jaw_rotation_distance
 
 
-class GraspProposalLoss(nn.Module):
+class CompleteGraspSetLoss(nn.Module):
+    """One module objective with internal pose, width and quality terms."""
+
+    def __init__(
+        self, translation_weight: float = 1.0, rotation_weight: float = 1.0,
+        width_weight: float = 0.5, quality_weight: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.weights = (translation_weight, rotation_weight, width_weight, quality_weight)
+
     def forward(self, output: dict[str, Tensor], labels: dict[str, Tensor]) -> dict[str, Tensor]:
-        valid = labels["proposal_valid"].bool()
-        contact = safe_bce_with_logits(output["contact_logits"], labels["contact_target"].float(), valid)
-        positive = labels["mode_valid"].bool()
-        approach_target = torch.nn.functional.normalize(
-            torch.nan_to_num(labels["approach_target"].float()), dim=-1, eps=1e-6
+        prediction_t = output["translation_world"]
+        prediction_r = output["rotation_matrix"]
+        prediction_w = output["width_m"]
+        quality_logit = output["quality_logit"]
+        sample_valid = labels["sample_valid"].bool()
+        matched_prediction: list[Tensor] = []
+        matched_target: list[Tensor] = []
+        quality_target = torch.zeros_like(quality_logit)
+        quality_valid = sample_valid[:, None].expand_as(quality_logit).clone()
+        for row in range(prediction_t.shape[0]):
+            targets = torch.nonzero(labels["target_valid"][row], as_tuple=False).flatten()
+            if not bool(sample_valid[row]) or not len(targets):
+                continue
+            translation_cost = torch.cdist(
+                prediction_t[row], labels["translation_world"][row, targets], p=1
+            ) / 0.02
+            pred_rotation = prediction_r[row, :, None].expand(-1, len(targets), -1, -1)
+            target_rotation = labels["rotation_matrix"][row, targets][None].expand(
+                prediction_r.shape[1], -1, -1, -1
+            )
+            rotation_cost = parallel_jaw_rotation_distance(pred_rotation, target_rotation)
+            width_cost = torch.abs(
+                prediction_w[row, :, None] - labels["width_m"][row, targets][None]
+            ) / 0.02
+            confidence_cost = -F.logsigmoid(quality_logit[row])[:, None]
+            cost = translation_cost + rotation_cost + 0.5 * width_cost + confidence_cost
+            pred_np, target_np = linear_sum_assignment(
+                np.asarray(cost.detach().float().cpu())
+            )
+            pred_index = torch.as_tensor(pred_np, dtype=torch.long, device=prediction_t.device)
+            target_index = targets[torch.as_tensor(target_np, dtype=torch.long, device=targets.device)]
+            matched_prediction.append(torch.stack((
+                torch.full_like(pred_index, row), pred_index,
+            ), -1))
+            matched_target.append(torch.stack((
+                torch.full_like(target_index, row), target_index,
+            ), -1))
+            quality_target[row, pred_index] = labels["quality_target"][row, target_index]
+        if matched_prediction:
+            prediction_index = torch.cat(matched_prediction)
+            target_index = torch.cat(matched_target)
+            pr, pq = prediction_index.unbind(-1)
+            tr, tq = target_index.unbind(-1)
+            translation = F.smooth_l1_loss(
+                prediction_t[pr, pq], labels["translation_world"][tr, tq], beta=0.01
+            )
+            rotation = parallel_jaw_rotation_distance(
+                prediction_r[pr, pq], labels["rotation_matrix"][tr, tq]
+            ).mean()
+            width = F.smooth_l1_loss(
+                prediction_w[pr, pq], labels["width_m"][tr, tq], beta=0.005
+            )
+        else:
+            zero = prediction_t.sum() * 0.0
+            translation = rotation = width = zero
+        safe_quality_target = torch.where(quality_valid, quality_target, torch.zeros_like(quality_target))
+        quality_raw = F.binary_cross_entropy_with_logits(
+            quality_logit, safe_quality_target, reduction="none"
         )
-        cosine = 1 - (output["approach_direction"] * approach_target).sum(-1)
-        approach = masked_mean(cosine, positive & torch.isfinite(labels["approach_target"]).all(-1))
-        rotation = safe_cross_entropy(output["rotation_logits"], labels["rotation_bin"], positive)
-        width = safe_smooth_l1(output["width_m"], labels["width_target_m"], positive & labels["width_valid"])
-        center_offset = safe_smooth_l1(
-            output["center_offset_m"], labels["center_offset_target_m"],
-            labels["center_offset_valid"].unsqueeze(-1).expand_as(output["center_offset_m"]),
-        )
-        confidence = safe_bce_with_logits(
-            output["proposal_confidence_logit"], labels["confidence_target"].float(), valid
-        )
-        compatibility = safe_bce_with_logits(
-            output["task_compatibility_logit"],
-            labels["compatibility_target"].float(),
-            labels.get("compatibility_valid", valid),
-        )
+        quality = (quality_raw * quality_valid).sum() / quality_valid.sum().clamp_min(1)
+        wt, wr, ww, wq = self.weights
+        total = wt * translation + wr * rotation + ww * width + wq * quality
         return {
-            "proposal_contact": contact,
-            "proposal_approach": approach,
-            "proposal_rotation": rotation,
-            "proposal_width": width,
-            "proposal_center_offset": center_offset,
-            "proposal_confidence": confidence,
-            "proposal_task_compatibility": compatibility,
+            "loss": total,
+            "grasp_translation": translation,
+            "grasp_rotation": rotation,
+            "grasp_width": width,
+            "grasp_quality": quality,
         }
 
 
-class StateGraspabilityLoss(nn.Module):
-    """Binary adaptive gate plus calibrated reliable-candidate count."""
-
-    def forward(self, output: dict[str, Tensor], labels: dict[str, Tensor]) -> dict[str, Tensor]:
-        valid = torch.ones_like(labels["graspable_target"], dtype=torch.bool)
-        return {
-            "proposal_state_graspable": safe_bce_with_logits(
-                output["graspable_logit"], labels["graspable_target"].float(), valid
-            ),
-            "proposal_verified_count": safe_smooth_l1(
-                output["verified_count_log_prediction"],
-                torch.log1p(labels["verified_count_target"].float()),
-                valid,
-            ),
-        }
+GraspProposalLoss = CompleteGraspSetLoss

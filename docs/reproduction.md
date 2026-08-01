@@ -38,7 +38,7 @@ cache or deterministic-seed test fails.
 Use the same data snapshot, train/val/test scene split, seed, candidate sampler,
 motion constraints and evaluator for every experiment. Override only the
 documented switch. The six supported comparisons are task region off,
-dependency graph off, indirect reasoning off, verifier off, PUSH potential/risk
+dependency graph off, indirect reasoning off, verifier off, PUSH potential
 off, and hierarchical router versus fixed/flat routing.
 
 ## 5. Evaluation

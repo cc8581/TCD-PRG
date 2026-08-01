@@ -20,17 +20,13 @@ REQUIRED_METRICS = (
     "task_grasp_recall_at_1", "task_grasp_recall_at_5", "task_grasp_recall_at_10",
     "correct_region_contact_rate_at_10", "wrong_region_grasp_rate_at_10",
     "verifier_overall_auroc", "verifier_overall_f1",
-    "verifier_collision_auroc", "collision_prediction_accuracy",
-    "state_graspability_accuracy", "physical_edge_f1", "task_blocking_edge_f1",
+    "physical_edge_f1", "task_blocking_edge_f1",
     "direct_blocker_recall_at_3", "indirect_blocker_f1",
     "actionable_blocker_accuracy", "push_acted_object_top1",
     "push_contact_distance_error_m", "push_direction_angle_error_deg",
     "push_candidate_ndcg",
-    "potential_delta_mae", "push_unstable_auroc", "push_out_of_workspace_auroc",
-    "remove_acted_object_top1", "remove_grasp_recall_at_5",
-    "remove_candidate_ndcg", "action_type_accuracy",
+    "push_utility_delta_mae", "action_type_accuracy",
     "acted_object_accuracy", "successful_action_set_recall", "candidate_ndcg",
-    "remaining_steps_mae",
 )
 
 

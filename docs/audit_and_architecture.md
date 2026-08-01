@@ -22,13 +22,12 @@ Python 3.8 worker.
 |---|---|---|---|---|---|---|
 | Shared encoder | PointNet++ concepts | `models/backbones/task_point_transformer.py` | `[B,N,3]` XYZ/RGB/masks/task | point/object/target/global/task tokens | joint downstream gradients | exactly one scene pass |
 | Functional region | none | `models/region/head.py` | target point features + task | point probability, visibility | focal BCE + Dice + visibility | constrains task grasp |
-| Task grasp proposal | external GraspNet concepts | `models/grasp_proposal/head.py` | shared points + target/task/region | canonical contact frame, approach, rotation, AG total opening, confidence, compatibility | masked classification/regression | dense TASK_GRASP candidates |
-| Generic removal grasp | GraspNet concepts | same head under generic condition | active object points | removal grasp fields | PICK_REMOVE grasp labels | candidate proposals |
-| Grasp verifier | `Space_GraspFusion` concept | `models/grasp_verifier/` | local scene + exact AG cloud + task context | six validity heads | explicit per-head valid masks | learned filtering/ranking |
-| Dependency graph | none | `models/dependency_graph/hgt.py` | object/task tokens and predicted edges | physical/task edges, blockers, topology | edge/blocker/order losses | direct/indirect dependency context |
-| PICK_REMOVE | none | `models/pick_remove/head.py` | object/graph/candidate tokens | object pointer, removal-grasp rank | masked pointer/listwise | reliable removal macro selection |
-| PUSH | `Push_model` concept | `models/push/head.py` | point/object/task/graph/geometry/steps | object, contact, direction, low-weight potential and risks | independently masked heads | fixed 0.15 m action; approach is execution-layer geometry |
-| Router | fixed grasp→push rule | `models/policy/router.py` | heterogeneous candidates + evidence | type/object/candidate scores, steps | multi-positive listwise | legal hierarchical selection |
+| Task grasp set | external GraspNet/DETR concepts | `models/grasp_proposal/head.py` | shared points + target/task/region | K complete poses, openings and qualities | symmetric SO(3) Hungarian set loss | TASK_GRASP candidates |
+| Global grasp set | GraspNet/DETR concepts | same module, neutral scene features | task-free scene points | K complete poses, openings and scene qualities | scene-certified Hungarian set loss | PICK_REMOVE candidates |
+| Grasp verifier | `Space_GraspFusion` concept | `models/grasp_verifier/` | local scene + exact AG cloud + task context | overall executability | final-certifier BCE | learned filtering/ranking |
+| Dependency graph | none | `models/dependency_graph/hgt.py` | object/task tokens and predicted edges | physical/task edges and derived masks | two edge losses | dependency context/frontier |
+| PUSH | `Push_model` concept | `models/push/head.py` | point/object/task/graph/geometry/steps | object, contact, direction, utility delta | four module objectives | fixed 0.15 m action; hard feasibility is certified |
+| Router | fixed grasp→push rule | `models/policy/router.py` | heterogeneous candidates + evidence | candidate score | multi-positive listwise | legal candidate selection |
 | Closed loop | `grasp_push_eval.py` loop | `planners/closed_loop.py` | policy, observations, executor | H=5 result and trace | evaluated through replay/simulation | reobserve and replan |
 | Exact safety | PyBullet execution environment | `execution/pybullet_certifier.py` + worker | candidate + full state + FR5/AG URDF | valid/reason | deterministic, not learned | final mask before execution |
 
@@ -45,20 +44,19 @@ controlled by `model.allow_target_push_recovery`; disabling it restores strict
 `active & actionable` target eligibility. Non-graph recovery for other objects
 remains bounded by `graph_candidate_fallback_objects`.
 
-Within each loss family, only currently supervised child terms enter a weighted
-mean. The family subtotal is then multiplied once by its top-level family
-weight. Detached child terms remain available for diagnostics without being
-added to the optimization objective a second time.
+The final objective exposes eleven paper-level modules. Translation, symmetric
+SO(3), width, quality and assignment remain internal diagnostics of each grasp
+set loss rather than separate weighted tasks.
 
 ## Reuse, extension and replacement
 
 Directly reused for the GAPG baseline: original grasp/push network definitions,
 preprocessing utilities and their checkpoints. Reused conceptually in the full
-method: GraspNet-style discrete grasp parameterization and local gripper–scene
+method: complete continuous grasp-set prediction and local gripper–scene
 evaluation. Extended: three-view input wrapper, task conditioning, shared
 features and closed-loop evaluation. Newly implemented: the unified adapter,
-functional region head, heterogeneous task graph, PICK_REMOVE, multi-head PUSH,
-hierarchical set router, exact AG geometry, cache pipeline, capability-aware
+functional region head, heterogeneous task graph, utility-aware PUSH,
+candidate router, exact AG geometry, cache pipeline, capability-aware
 losses and unified metrics. Replaced in the full method: GAPG's fixed action rule
 and per-candidate scene feature recomputation.
 

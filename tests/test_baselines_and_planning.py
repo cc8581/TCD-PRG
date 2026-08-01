@@ -2,17 +2,16 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 
 from tcd_prg.baselines import GAPGPolicyWrapper, OneShotSequencePolicy
 from tcd_prg.config import ModelConfig
 from tcd_prg.constants import ActionType
+from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.planners import ClosedLoopPlanner, DenseCandidateGenerator
 from tcd_prg.planners.tcd_policy import (
     apply_verified_candidate_count_gate,
-    predicted_state_graspability_gate,
 )
 
 
@@ -30,27 +29,26 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
     generator = DenseCandidateGenerator(config)
     batch = {
         "xyz": torch.zeros(1, 4, 3), "instance_id": torch.zeros(1, 4, dtype=torch.long),
+        "point_mask": torch.ones(1, 4, dtype=torch.bool),
         "object_mask": torch.zeros(1, 1, dtype=torch.bool),
         "object_active": torch.zeros(1, 1, dtype=torch.bool),
         "target_object": torch.tensor([0]), "target_mask": torch.zeros(1, 4, dtype=torch.bool),
     }
     point_head = {
-        "contact_logits": torch.zeros(1, 4), "proposal_confidence_logit": torch.zeros(1, 4),
-        "task_compatibility_logit": torch.zeros(1, 4), "rotation_logits": torch.zeros(1, 4, 12),
-        "approach_direction": torch.ones(1, 4, 3), "width_m": torch.ones(1, 4) * 0.05,
+        "translation_world": torch.zeros(1, 2, 3),
+        "rotation_matrix": torch.eye(3).expand(1, 2, 3, 3),
+        "width_m": torch.ones(1, 2) * 0.05, "quality_logit": torch.zeros(1, 2),
+        "attention_point_index": torch.zeros(1, 2, dtype=torch.long),
     }
     global_head = {
-        "contact_logits": torch.zeros(1, 4),
-        "scene_confidence_logit": torch.zeros(1, 4, 4),
-        "intrinsic_confidence_logit": torch.zeros(1, 4, 4),
-        "rotation_logits": torch.zeros(1, 4, 4, 12),
-        "approach_direction": torch.ones(1, 4, 4, 3),
-        "width_m": torch.ones(1, 4, 4) * 0.05,
+        "translation_world": torch.zeros(1, 2, 3),
+        "rotation_matrix": torch.eye(3).expand(1, 2, 3, 3),
+        "width_m": torch.ones(1, 2) * 0.05, "quality_logit": torch.zeros(1, 2),
     }
     push = {
         "object_logits": torch.zeros(1, 1), "contact_logits": torch.zeros(1, 4),
         "direction_logits": torch.zeros(1, 4, 16), "direction_residual": torch.zeros(1, 4, 2),
-        "potential_delta": torch.zeros(1, 4, 5), "risk_logits": torch.zeros(1, 4, 3),
+        "utility_delta": torch.zeros(1, 4),
     }
     encoded = SimpleNamespace(object_tokens=torch.zeros(1, 1, 8), task_token=torch.zeros(1, 8))
 
@@ -68,6 +66,45 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
     assert "push_approach_mode" not in result
 
 
+def test_offline_evaluator_accepts_overall_only_verifier(monkeypatch) -> None:
+    sample = SimpleNamespace(
+        observation=SimpleNamespace(
+            scene_id=0, state_id=0, task_index=0, target_object=0,
+            object_category_id=torch.tensor([0]), task_region_id=0,
+        ),
+        state_labels=SimpleNamespace(sequence_depth=0, target_visible_ratio=1.0),
+    )
+    batch = {
+        "xyz": torch.zeros(1, 1, 3), "samples": [sample],
+        "candidate_mask": torch.zeros(1, 1, dtype=torch.bool),
+        "evaluation_status": torch.zeros(1, 1, dtype=torch.long),
+        "policy_success_mask": torch.zeros(1, 1, dtype=torch.bool),
+        "action_type": torch.zeros(1, 1, dtype=torch.long),
+        "acted_object": torch.zeros(1, 1, dtype=torch.long),
+    }
+    output = {
+        "graph": None,
+        "verifier": {"overall_logit": torch.zeros(1, 1)},
+        "push": {"object_logits": torch.zeros(1, 1)},
+    }
+    monkeypatch.setattr(
+        "tcd_prg.evaluators.offline.build_verifier_labels",
+        lambda _: {
+            "overall_valid": torch.ones(1, 1, dtype=torch.bool),
+            "overall_target": torch.ones(1, 1),
+        },
+    )
+    monkeypatch.setattr(
+        "tcd_prg.evaluators.offline.build_push_supervision",
+        lambda *_: ({}, {
+            "direction_valid": torch.zeros(1, 1, dtype=torch.bool),
+            "utility_valid": torch.zeros(1, 1, dtype=torch.bool),
+        }),
+    )
+
+    OfflineModelEvaluator(ModelConfig(), bootstrap_samples=1).update(batch, output)
+
+
 def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
     config = ModelConfig(
         feature_dim=8, task_dim=4, task_grasp_candidates=1,
@@ -78,38 +115,32 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
     instance = torch.tensor([[0, 0, 1, 1, 2, 2, 3, 3]])
     batch = {
         "xyz": torch.randn(1, 8, 3), "instance_id": instance,
+        "point_mask": torch.ones(1, 8, dtype=torch.bool),
         "object_mask": torch.ones(1, 4, dtype=torch.bool),
         "object_active": torch.ones(1, 4, dtype=torch.bool),
         "target_object": torch.tensor([0]), "target_mask": instance == 0,
     }
     point_head = {
-        "contact_logits": torch.arange(8).float()[None],
-        "proposal_confidence_logit": torch.zeros(1, 8),
-        "task_compatibility_logit": torch.zeros(1, 8),
-        "rotation_logits": torch.zeros(1, 8, 12),
-        "approach_direction": torch.nn.functional.normalize(torch.ones(1, 8, 3), dim=-1),
-        "width_m": torch.full((1, 8), 0.05),
-        "center_offset_m": torch.tensor([0.01, -0.02, 0.03]).expand(1, 8, 3),
+        "translation_world": batch["xyz"][:, :1] + torch.tensor([0.01, -0.02, 0.03]),
+        "rotation_matrix": torch.eye(3).expand(1, 1, 3, 3),
+        "width_m": torch.full((1, 1), 0.05), "quality_logit": torch.zeros(1, 1),
+        "attention_point_index": torch.zeros(1, 1, dtype=torch.long),
     }
     global_head = {
-        "contact_logits": torch.arange(8).float()[None],
-        "scene_confidence_logit": torch.zeros(1, 8, 4),
-        "intrinsic_confidence_logit": torch.zeros(1, 8, 4),
-        "rotation_logits": torch.zeros(1, 8, 4, 12),
-        "approach_direction": torch.nn.functional.normalize(torch.ones(1, 8, 4, 3), dim=-1),
-        "width_m": torch.full((1, 8, 4), 0.05),
-        "center_offset_m": torch.zeros(1, 8, 4, 3),
+        "translation_world": batch["xyz"][:, ::2],
+        "rotation_matrix": torch.eye(3).expand(1, 4, 3, 3),
+        "width_m": torch.full((1, 4), 0.05),
+        "quality_logit": torch.arange(4).float()[None],
     }
     push = {
         "object_logits": torch.tensor([[0.0, 1.0, 2.0, 3.0]]),
         "contact_logits": torch.arange(8).float()[None],
         "direction_logits": torch.zeros(1, 8, 16),
         "direction_residual": torch.zeros(1, 8, 2),
-        "potential_delta": torch.zeros(1, 8, 5), "risk_logits": torch.zeros(1, 8, 3),
+        "utility_delta": torch.zeros(1, 8),
     }
     graph = SimpleNamespace(
         derived_actionable_mask=torch.tensor([[False, True, False, False]]),
-        actionable_blocker_logits=torch.zeros(1, 4),
     )
     encoded = SimpleNamespace(object_tokens=torch.zeros(1, 4, 8), task_token=torch.zeros(1, 8))
 
@@ -120,7 +151,7 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
 
     result = generator.generate(Model(), batch, {
         "encoded": encoded, "task_grasp": point_head, "global_grasp": global_head,
-        "push": push, "pick_remove": {"object_logits": push["object_logits"]}, "graph": graph,
+        "push": push, "graph": graph,
     })
     task_row = torch.nonzero(
         result["valid"][0] & (result["type"][0] == int(ActionType.TASK_GRASP)),
@@ -141,7 +172,7 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
     config.allow_target_push_recovery = False
     without_target_recovery = DenseCandidateGenerator(config).generate(Model(), batch, {
         "encoded": encoded, "task_grasp": point_head, "global_grasp": global_head,
-        "push": push, "pick_remove": {"object_logits": push["object_logits"]}, "graph": graph,
+        "push": push, "graph": graph,
     })
     push_rows = without_target_recovery["valid"][0] & (
         without_target_recovery["type"][0] == int(ActionType.PUSH)
@@ -149,12 +180,7 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
     assert 0 not in set(without_target_recovery["object"][0, push_rows].tolist())
 
 
-def test_adaptive_task_grasp_gate_requires_state_and_candidate_counts() -> None:
-    state = {
-        "graspable_logit": torch.tensor([20.0]),
-        "verified_count_prediction": torch.tensor([20.0]),
-    }
-    assert predicted_state_graspability_gate(state, torch.tensor([20]), 0.5).item()
+def test_adaptive_task_grasp_gate_requires_unique_certified_candidate_counts() -> None:
     kinds = torch.tensor([[2, 2, 2, 1]])
     objects = torch.tensor([[0, 0, 0, 1]])
     poses = torch.tensor([[[

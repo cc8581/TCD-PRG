@@ -1,4 +1,4 @@
-"""Joint local-scene/AG-gripper/task multi-head grasp verifier."""
+"""Joint local-scene/AG-gripper/task overall grasp verifier."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ class GripperSceneTaskVerifier(nn.Module):
     ``[B,K,L,C]``; output heads ``[B,K]``.
     """
 
-    HEADS = ("stability", "task_compatibility", "collision", "clearance", "approach", "overall")
+    HEADS = ("overall",)
 
     def __init__(self, scene_feature_dim: int = 256, hidden_dim: int = 256) -> None:
         super().__init__()
@@ -22,7 +22,7 @@ class GripperSceneTaskVerifier(nn.Module):
         )
         self.gripper_encoder = nn.Sequential(nn.Linear(4, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim))
         self.fusion = nn.Sequential(nn.Linear(4 * hidden_dim, 2 * hidden_dim), nn.GELU(), nn.Linear(2 * hidden_dim, hidden_dim))
-        self.heads = nn.ModuleDict({name: nn.Linear(hidden_dim, 1) for name in self.HEADS})
+        self.overall = nn.Linear(hidden_dim, 1)
 
     def forward(
         self,
@@ -62,4 +62,4 @@ class GripperSceneTaskVerifier(nn.Module):
         gripper_max = torch.where(gripper_valid.any(2, keepdim=True), gripper_max, 0.0)
         task = task_token[:, None].expand(-1, scene_max.shape[1], -1)
         fused = self.fusion(torch.cat((scene_max, scene_mean, gripper_max, task), -1))
-        return {f"{name}_logit": head(fused).squeeze(-1) for name, head in self.heads.items()}
+        return {"overall_logit": self.overall(fused).squeeze(-1)}

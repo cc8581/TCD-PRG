@@ -1,4 +1,4 @@
-"""End-to-end supervised objective for one action-state group batch."""
+"""End-to-end objective exposing exactly eleven paper-level loss modules."""
 
 from __future__ import annotations
 
@@ -11,34 +11,36 @@ from tcd_prg.config import AblationConfig, LossConfig, ModelConfig, RegionHeadCo
 from tcd_prg.constants import CandidateStatus
 from tcd_prg.datasets.capabilities import DatasetCapabilities
 
-from .actions import PickRemoveLoss, PushLoss
+from .actions import PushLoss
+from .global_grasp import GlobalGraspLoss
 from .graph import DependencyGraphLoss
 from .labels import (
-    build_graph_labels,
     build_global_grasp_labels,
+    build_graph_labels,
     build_grasp_proposal_labels,
     build_push_supervision,
     build_region_labels,
-    build_remove_labels,
     build_verifier_labels,
 )
 from .policy import HierarchicalSetPolicyLoss
-from .proposal import GraspProposalLoss, StateGraspabilityLoss
-from .global_grasp import GlobalGraspLoss
+from .proposal import GraspProposalLoss
 from .region import TaskRegionLoss
-from .verifier import GraspVerifierLoss
 from .total import MultiTaskLoss
+from .verifier import GraspVerifierLoss
 
 
 class TCDPRGObjective(nn.Module):
-    """Construct labels lazily and aggregate only capability-valid losses."""
+    """Construct labels lazily and combine the eleven module objectives."""
+
+    MODULE_OBJECTIVES = (
+        "region", "task_grasp", "global_grasp", "physical_edge", "task_edge",
+        "verify_overall", "push_object", "push_contact", "push_direction",
+        "push_potential", "policy_candidate",
+    )
 
     def __init__(
-        self,
-        capabilities: DatasetCapabilities,
-        model_config: ModelConfig,
-        ablation: AblationConfig,
-        loss_config: LossConfig | None = None,
+        self, capabilities: DatasetCapabilities, model_config: ModelConfig,
+        ablation: AblationConfig, loss_config: LossConfig | None = None,
         region_config: RegionHeadConfig | None = None,
     ) -> None:
         super().__init__()
@@ -50,91 +52,44 @@ class TCDPRGObjective(nn.Module):
         self.region = TaskRegionLoss(
             region_config.focal_alpha, region_config.focal_gamma, region_config.dice_weight
         )
-        self.proposal = GraspProposalLoss()
+        self.task_grasp = GraspProposalLoss()
         self.global_grasp = GlobalGraspLoss()
-        self.state_graspability = StateGraspabilityLoss()
         self.graph = DependencyGraphLoss()
         self.push = PushLoss()
-        self.remove = PickRemoveLoss()
         self.verify = GraspVerifierLoss()
         self.policy = HierarchicalSetPolicyLoss()
         self.total = MultiTaskLoss(capabilities, ablation, loss_config.family_weights())
 
     @staticmethod
     def _listwise_active(positive: Tensor, valid: Tensor) -> Tensor:
-        valid = valid.bool()
-        positive = positive.bool() & valid
+        positive = positive.bool() & valid.bool()
         return (valid.any(-1) & positive.any(-1)).any()
 
     def _subtotal(
         self, values: dict[str, Tensor], active: dict[str, Tensor | bool]
     ) -> dict[str, Tensor]:
-        """Return a weighted mean over child losses with valid supervision.
-
-        A zero-valued but valid loss remains active. An unavailable child loss
-        contributes neither its value nor its configured weight to the family
-        denominator, preventing large families from dominating merely because
-        they expose more heads.
-        """
-
         if values.keys() != active.keys():
-            missing = values.keys() - active.keys()
-            extra = active.keys() - values.keys()
-            raise KeyError(f"Loss activity mismatch: missing={missing}, extra={extra}")
-        reference = next(iter(values.values()), None)
-        if reference is None:
-            raise ValueError("Cannot construct an empty loss family")
+            raise KeyError("Loss activity keys do not match loss values")
+        reference = next(iter(values.values()))
         numerator = reference.new_zeros(())
-        active_weight = reference.new_zeros(())
+        denominator = reference.new_zeros(())
         for name, value in values.items():
             flag = torch.as_tensor(active[name], dtype=torch.bool, device=value.device).any()
-            flag_float = flag.to(value.dtype)
             weight = float(self.internal_weights.get(name, 1.0))
-            numerator = numerator + weight * value * flag_float
-            active_weight = active_weight + weight * flag_float
-        total = numerator / active_weight.clamp_min(torch.finfo(reference.dtype).eps)
-        return {"loss": total, **values}
-
-    @staticmethod
-    def _proposal_activity(labels: dict[str, Tensor], prefix: str) -> dict[str, Tensor]:
-        proposal = labels["proposal_valid"].bool()
-        mode = labels["mode_valid"].bool()
-        compatibility = labels.get("compatibility_valid", proposal).bool()
-        return {
-            f"{prefix}_proposal_contact": proposal.any(),
-            f"{prefix}_proposal_approach": (
-                mode & torch.isfinite(labels["approach_target"]).all(-1)
-            ).any(),
-            f"{prefix}_proposal_rotation": (mode & (labels["rotation_bin"] >= 0)).any(),
-            f"{prefix}_proposal_width": (
-                mode & labels["width_valid"].bool() & torch.isfinite(labels["width_target_m"])
-            ).any(),
-            f"{prefix}_proposal_center_offset": labels["center_offset_valid"].any(),
-            f"{prefix}_proposal_confidence": proposal.any(),
-            f"{prefix}_proposal_task_compatibility": (
-                compatibility & torch.isfinite(labels["compatibility_target"])
-            ).any(),
-        }
+            numerator = numerator + weight * value * flag.to(value.dtype)
+            denominator = denominator + weight * flag.to(value.dtype)
+        return {"loss": numerator / denominator.clamp_min(torch.finfo(reference.dtype).eps), **values}
 
     def forward(self, model: nn.Module, batch: dict[str, Any]) -> tuple[Tensor, dict[str, Tensor]]:
-        exceeds_declared_maximum = (
-            batch["required_grasp_count"] > self.model_config.max_required_grasp_count
-        ).any()
-        if bool(exceeds_declared_maximum):
-            maximum = int(batch["required_grasp_count"].max())
-            raise ValueError(
-                f"Batch required_grasp_count={maximum} exceeds declared "
-                f"max_required_grasp_count={self.model_config.max_required_grasp_count}"
-            )
         if bool((batch["required_grasp_count"] > self.model_config.task_grasp_candidates).any()):
             maximum = int(batch["required_grasp_count"].max())
             raise ValueError(
                 f"Batch requires {maximum} unique grasps but task_grasp_candidates="
                 f"{self.model_config.task_grasp_candidates}"
             )
-        batch["contact_heatmap_sigma_m"] = self.model_config.contact_heatmap_sigma_m
         output = model(batch)
         families: dict[str, dict[str, Tensor]] = {}
+
         region_labels = build_region_labels(batch)
         if region_labels is not None and self.total.enabled("region"):
             region_losses = self.region(output["region"], region_labels)
@@ -143,150 +98,50 @@ class TCDPRGObjective(nn.Module):
                 "region_dice": region_labels["region_valid"].any(),
                 "region_visibility": region_labels["visibility_valid"].any(),
             })
-        if self.total.enabled("proposal"):
+
+        if self.total.enabled("task_grasp"):
             task_labels = build_grasp_proposal_labels(batch, self.model_config)
-            task_losses = self.proposal(
-                output["task_grasp"], task_labels
-            )
-            state_losses = self.state_graspability(
-                output["state_graspability"],
-                {
-                    "graspable_target": (
-                        batch["verified_positive_grasp_count"] >= batch["required_grasp_count"]
-                    ),
-                    "verified_count_target": batch["verified_positive_grasp_count"],
-                },
-            )
-            proposal_losses = {
-                **{f"task_{key}": value for key, value in task_losses.items()},
-                **state_losses,
-            }
-            proposal_active = {
-                **self._proposal_activity(task_labels, "task"),
-                "proposal_state_graspable": torch.ones(
-                    (), dtype=torch.bool, device=batch["xyz"].device
-                ),
-                "proposal_verified_count": torch.ones(
-                    (), dtype=torch.bool, device=batch["xyz"].device
-                ),
-            }
-            families["proposal"] = self._subtotal(proposal_losses, proposal_active)
+            if task_labels["sample_valid"].any():
+                families["task_grasp"] = self.task_grasp(output["task_grasp"], task_labels)
+
         if self.total.enabled("global_grasp"):
             global_labels = build_global_grasp_labels(batch, self.model_config)
-            if global_labels is not None and global_labels["intrinsic_valid"].any():
-                global_losses = self.global_grasp(output["global_grasp"], global_labels)
-                families["global_grasp"] = self._subtotal(global_losses, {
-                    "global_contact": global_labels["contact_valid"].any(),
-                    "global_approach": global_labels["geometry_valid"].any(),
-                    "global_rotation": global_labels["geometry_valid"].any(),
-                    "global_width": (global_labels["geometry_valid"] & global_labels["width_valid"]).any(),
-                    "global_center_offset": global_labels["center_offset_valid"].any(),
-                    "global_scene_confidence": global_labels["scene_valid"].any(),
-                    "global_intrinsic_confidence": global_labels["intrinsic_valid"].any(),
-                })
-        if output["verifier"] is not None and self.total.enabled("verify"):
-            verifier_labels = build_verifier_labels(batch)
-            verifier_losses = self.verify(output["verifier"], verifier_labels)
-            families["verify"] = self._subtotal(verifier_losses, {
-                f"verify_{head}": verifier_labels[f"{head}_valid"].any()
-                for head in self.verify.HEADS
-            })
-        if output["graph"] is not None and self.total.enabled("graph"):
+            if global_labels is not None and global_labels["sample_valid"].any():
+                families["global_grasp"] = self.global_grasp(output["global_grasp"], global_labels)
+
+        if output["graph"] is not None and self.total.enabled("physical_edge"):
             graph_labels = build_graph_labels(batch)
             graph_losses = self.graph(output["graph"], graph_labels)
-            families["graph"] = self._subtotal(graph_losses, {
-                "graph_physical_edge": graph_labels["physical_edge_valid"].any(),
-                "graph_task_edge": graph_labels["task_edge_valid"].any(),
-                "graph_direct_blocker": graph_labels["blocker_valid"].any(),
-                "graph_indirect_blocker": graph_labels["blocker_valid"].any(),
-                "graph_actionable": graph_labels["blocker_valid"].any(),
-                "graph_topology_order": (
-                    graph_labels["topology_edge_valid"]
-                    & graph_labels["sequence_topology_valid"][:, None, None]
-                ).any(),
-            })
-        if self.total.enabled("push"):
+            families["physical_edge"] = {"loss": graph_losses["physical_edge"]}
+            families["task_edge"] = {"loss": graph_losses["task_edge"]}
+
+        if output["verifier"] is not None and self.total.enabled("verify_overall"):
+            verifier_labels = build_verifier_labels(batch)
+            families["verify_overall"] = {
+                "loss": self.verify(output["verifier"], verifier_labels)
+            }
+
+        if self.total.enabled("push_object"):
             push_output, push_labels = build_push_supervision(
-                output["push"],
-                batch,
-                self.ablation.use_push_potential,
-                self.ablation.use_push_risk,
+                output["push"], batch, self.model_config
             )
-            push_losses = self.push(push_output, push_labels)  # type: ignore[arg-type]
-            push_active = {
-                "push_object": self._listwise_active(
-                    push_labels["object_positive"], push_labels["object_valid_mask"]
-                ),
-                "push_contact": push_labels["contact_valid"].any(),
-                "push_direction_bin": push_labels["direction_valid"].any(),
-                "push_direction_residual": push_labels["direction_valid"].any(),
+            push_losses = self.push(push_output, push_labels)
+            families["push_object"] = {"loss": push_losses["push_object"]}
+            families["push_contact"] = {"loss": push_losses["push_contact"]}
+            families["push_direction"] = {
+                "loss": push_losses["push_direction"],
+                "push_direction_bin_diagnostic": push_losses["push_direction_bin_diagnostic"],
+                "push_direction_residual_diagnostic": push_losses["push_direction_residual_diagnostic"],
             }
-            if "push_risk" in push_losses:
-                push_active["push_risk"] = push_labels["risk_valid"].any()
-            if "push_potential" in push_losses:
-                push_active["push_potential"] = push_labels["potential_after_valid"].any()
-            potential = {
-                key: value for key, value in push_losses.items() if key == "push_potential"
-            }
-            main_push = {
-                key: value for key, value in push_losses.items() if key != "push_potential"
-            }
-            families["push"] = self._subtotal(
-                main_push, {key: push_active[key] for key in main_push}
-            )
-            if potential:
-                families["potential"] = self._subtotal(
-                    potential, {"push_potential": push_active["push_potential"]}
-                )
-        if self.total.enabled("remove"):
-            remove_labels = build_remove_labels(batch)
-            remove_losses = self.remove(output["pick_remove"], remove_labels)
-            remove_active = {
-                "remove_object": self._listwise_active(
-                    remove_labels["object_positive"], remove_labels["object_valid_mask"]
-                )
-            }
-            if "remove_candidate" in remove_losses:
-                remove_active["remove_candidate"] = self._listwise_active(
-                    remove_labels["candidate_positive"], remove_labels["candidate_valid"]
-                )
-            families["remove"] = self._subtotal(remove_losses, remove_active)
+            if self.total.enabled("push_potential"):
+                families["push_potential"] = {"loss": push_losses["push_potential"]}
+
         if (
-            "router" in output
-            and self.total.enabled("policy")
+            "router" in output and self.total.enabled("policy_candidate")
             and self.ablation.router_type != "fixed_priority"
         ):
             evaluated = batch["evaluation_status"] != int(CandidateStatus.UNKNOWN_UNTESTED)
-            policy_losses = self.policy(
-                output["router"],
-                batch["action_type"],
-                batch["acted_object"],
-                batch["policy_success_mask"],
-                evaluated,
-                batch["remaining_steps_target"],
-                batch["remaining_steps_valid"],
-            )
-            policy_candidate_valid = output["router"].candidate_valid_mask & evaluated
-            type_positive = torch.stack([
-                (
-                    batch["policy_success_mask"]
-                    & (batch["action_type"] == kind)
-                ).any(-1)
-                for kind in range(3)
-            ], -1)
-            policy_active = {
-                "policy_candidate": self._listwise_active(
-                    batch["policy_success_mask"], policy_candidate_valid
-                ),
-                "policy_type": self._listwise_active(
-                    type_positive, output["router"].type_valid_mask
-                ),
-                "policy_object": batch["policy_success_mask"].any(),
+            families["policy_candidate"] = {
+                "loss": self.policy(output["router"], batch["policy_success_mask"], evaluated)
             }
-            if "policy_remaining_steps" in policy_losses:
-                policy_active["policy_remaining_steps"] = (
-                    batch["remaining_steps_valid"]
-                    & torch.isfinite(batch["remaining_steps_target"])
-                ).any()
-            families["policy"] = self._subtotal(policy_losses, policy_active)
         return self.total(families)

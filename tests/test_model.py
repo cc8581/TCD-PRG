@@ -80,7 +80,7 @@ def test_dependency_closure_returns_only_topmost_actionable_object() -> None:
         AblationConfig(use_dependency_graph=False),
         AblationConfig(use_indirect_dependency_reasoning=False),
         AblationConfig(use_gripper_scene_verifier=False),
-        AblationConfig(use_push_potential=False, use_push_risk=False),
+        AblationConfig(use_push_potential=False),
         AblationConfig(router_type="fixed_priority"),
         AblationConfig(router_type="flat_candidate_classifier"),
     ],
@@ -114,7 +114,10 @@ def test_network_features_do_not_depend_on_simulation_object_pose(tiny_batch) ->
 
 def test_policy_heads_match_training_contract(tiny_batch) -> None:
     output = TCDPRGModel(_config()).eval()(tiny_batch)
-    assert "depth_logits" not in output["task_grasp"]
+    assert set(output["task_grasp"]) == {
+        "translation_world", "rotation_matrix", "rotation_6d", "width_raw",
+        "width_m", "quality_logit", "attention_point_index",
+    }
     assert "approach_logits" not in output["push"]
-    assert "outcome_logits" not in output["push"]
-    assert "outcome_logits" not in output["pick_remove"]
+    assert "risk_logits" not in output["push"]
+    assert "pick_remove" not in output

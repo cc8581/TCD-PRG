@@ -9,9 +9,7 @@ import torch
 
 from tcd_prg.constants import ActionType, CandidateStatus
 from tcd_prg.losses.labels import (
-    build_grasp_proposal_labels,
     build_push_supervision,
-    build_remove_labels,
     build_verifier_labels,
 )
 from tcd_prg.models.policy.router import MaskedHierarchicalCandidateRouter
@@ -82,19 +80,19 @@ class OfflineModelEvaluator:
                     np.broadcast_to(object_valid[:, None], task_target.shape),
                 )
                 record["direct_blocker_f1"] = binary_f1(
-                    self._numpy(output["graph"].direct_blocker_logits[row]) >= 0,
+                    self._numpy(output["graph"].derived_direct_mask[row]),
                     self._numpy(batch["direct_blocker_target"][row]).astype(bool), object_valid,
                 )
                 record["indirect_blocker_f1"] = binary_f1(
-                    self._numpy(output["graph"].indirect_blocker_logits[row]) >= 0,
+                    self._numpy(output["graph"].derived_indirect_mask[row]),
                     self._numpy(batch["indirect_blocker_target"][row]).astype(bool), object_valid,
                 )
                 record["actionable_blocker_accuracy"] = float(np.mean(
-                    (self._numpy(output["graph"].actionable_blocker_logits[row]) >= 0)[object_valid]
+                    self._numpy(output["graph"].derived_actionable_mask[row])[object_valid]
                     == self._numpy(batch["actionable_blocker_target"][row]).astype(bool)[object_valid]
                 )) if object_valid.any() else float("nan")
                 direct_target = self._numpy(batch["direct_blocker_target"][row]).astype(bool)
-                direct_score = self._numpy(output["graph"].direct_blocker_logits[row])
+                direct_score = self._numpy(output["graph"].task_edge_logits[row]).max(-1)
                 valid_indices = np.flatnonzero(object_valid)
                 ranked = valid_indices[np.argsort(-direct_score[valid_indices])]
                 positives = set(np.flatnonzero(direct_target & object_valid).tolist())
@@ -138,45 +136,9 @@ class OfflineModelEvaluator:
                     self._numpy(output["router"].candidate_logits[row]), success.astype(float),
                     candidate_valid & evaluated,
                 )
-                if bool(batch["remaining_steps_valid"][row]):
-                    record["remaining_steps_mae"] = abs(
-                        float(output["router"].remaining_steps_prediction[row])
-                        - float(batch["remaining_steps_target"][row])
-                    )
-            proposal = build_grasp_proposal_labels(batch, self.model_config, generic_remove=False)
-            proposal_valid = self._numpy(proposal["proposal_valid"][row]).astype(bool)
-            contact_target = self._numpy(proposal["contact_target"][row]).astype(bool)
-            proposal_score = self._numpy(
-                output["task_grasp"]["contact_logits"][row]
-                + output["task_grasp"]["proposal_confidence_logit"][row]
-                + output["task_grasp"]["task_compatibility_logit"][row]
-            )
-            proposal_indices = np.flatnonzero(proposal_valid)
-            if contact_target.any() and len(proposal_indices):
-                order = proposal_indices[np.argsort(-proposal_score[proposal_indices])]
-                for k in (1, 5, 10):
-                    record[f"task_grasp_recall_at_{k}"] = float(contact_target[order[:k]].any())
-                if "region_target" in batch:
-                    region = self._numpy(batch["region_target"][row]).astype(bool)
-                    top = order[: min(10, len(order))]
-                    record["correct_region_contact_rate_at_10"] = float(np.mean(region[top]))
-                    record["wrong_region_grasp_rate_at_10"] = float(np.mean(~region[top]))
-            graspable = (
-                sample.state_labels.verified_positive_grasp_count
-                >= sample.state_labels.required_grasp_count
-            )
-            state_prediction = output["state_graspability"]
-            predicted_direct = bool(
-                self._numpy(torch.sigmoid(state_prediction["graspable_logit"][row])) >= 0.5
-                and self._numpy(state_prediction["verified_count_prediction"][row])
-                >= float(batch["required_grasp_count"][row])
-            )
-            record["state_graspability_accuracy"] = float(predicted_direct == graspable)
-            record["direct_grasp_false_positive"] = float(predicted_direct and not graspable)
             if output["verifier"] is not None:
                 verifier_labels = build_verifier_labels(batch)
-                for head in ("stability", "task_compatibility", "collision", "clearance",
-                             "approach", "overall"):
+                for head in ("overall",):
                     valid_head = self._numpy(verifier_labels[f"{head}_valid"][row]).astype(bool)
                     if valid_head.any():
                         target_head = self._numpy(
@@ -189,11 +151,6 @@ class OfflineModelEvaluator:
                         record[f"verifier_{head}_auroc"] = binary_auroc(
                             score_head, target_head, valid_head
                         )
-                record["collision_prediction_accuracy"] = self._masked_accuracy(
-                    self._numpy(output["verifier"]["collision_logit"][row]) >= 0,
-                    self._numpy(verifier_labels["collision_target"][row]).astype(bool),
-                    self._numpy(verifier_labels["collision_valid"][row]).astype(bool),
-                )
             positive_push_objects = set(acted_object[success & (action_type == int(ActionType.PUSH))])
             if "router" in output:
                 push_candidates = candidate_valid & evaluated & (
@@ -207,7 +164,7 @@ class OfflineModelEvaluator:
                 predicted = int(output["push"]["object_logits"][row].argmax())
                 record["push_acted_object_top1"] = float(predicted in positive_push_objects)
             push_prediction, push_labels = build_push_supervision(
-                output["push"], batch, use_potential=True, use_risk=True
+                output["push"], batch, self.model_config
             )
             push_parameter_valid = self._numpy(push_labels["direction_valid"][row]).astype(bool)
             if push_parameter_valid.any():
@@ -231,37 +188,13 @@ class OfflineModelEvaluator:
                     record["push_contact_distance_error_m"] = float(
                         np.linalg.norm(valid_contacts - point[None], axis=1).min()
                     )
-            potential_valid = self._numpy(push_labels["potential_after_valid"][row]).astype(bool)
+            potential_valid = self._numpy(push_labels["utility_valid"][row]).astype(bool)
             if potential_valid.any():
                 error = np.abs(
-                    self._numpy(push_prediction["potential_delta"][row])
-                    - self._numpy(push_labels["potential_delta"][row])
+                    self._numpy(push_prediction["utility_delta"][row])
+                    - self._numpy(push_labels["utility_delta"][row])
                 )
-                record["potential_delta_mae"] = float(np.mean(error[potential_valid]))
-            risk_valid = self._numpy(push_labels["risk_valid"][row]).astype(bool)
-            risk_target = self._numpy(push_labels["risk_target"][row]).astype(bool)
-            risk_score = self._numpy(push_prediction["risk_logits"][row])
-            for risk_index, risk_name in enumerate(("unstable", "out_of_workspace", "other_invalid")):
-                record[f"push_{risk_name}_auroc"] = binary_auroc(
-                    risk_score[:, risk_index], risk_target[:, risk_index], risk_valid[:, risk_index]
-                )
-            positive_remove_objects = set(
-                acted_object[success & (action_type == int(ActionType.PICK_REMOVE))]
-            )
-            if positive_remove_objects:
-                predicted = int(output["pick_remove"]["object_logits"][row].argmax())
-                record["remove_acted_object_top1"] = float(predicted in positive_remove_objects)
-            remove_labels = build_remove_labels(batch)
-            if "candidate_logits" in output["pick_remove"]:
-                remove_valid = self._numpy(remove_labels["candidate_valid"][row]).astype(bool)
-                remove_positive = self._numpy(remove_labels["candidate_positive"][row]).astype(float)
-                remove_score = self._numpy(output["pick_remove"]["candidate_logits"][row])
-                record["remove_candidate_ndcg"] = ndcg(
-                    remove_score, remove_positive, remove_valid
-                )
-                record["remove_grasp_recall_at_5"] = self._recall_at_k(
-                    remove_score, remove_positive.astype(bool), remove_valid, 5
-                )
+                record["push_utility_delta_mae"] = float(np.mean(error[potential_valid]))
             if "_inference_time_s_per_sample" in output:
                 record["planning_time_s"] = float(output["_inference_time_s_per_sample"])
             self.evaluator.add(**record)

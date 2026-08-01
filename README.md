@@ -17,23 +17,22 @@ AG-160-95 total opening in `[0, 0.095]` m; it is not the push distance.
 - A single expensive task-free scene geometry backbone pass, followed by a
   lightweight task-conditioning adapter for task-specific heads.
 - Target-only functional-region segmentation and visibility prediction.
-- Separate task-region and multimodal global task-free grasp heads. The global
-  branch predicts four pose/opening modes per point by default; PICK_REMOVE
-  filters and reranks its candidates instead of owning a grasp generator.
-- Exact-URDF local scene–gripper multi-head verifier.
+- Separate query-based task and global grasp heads. Each directly predicts an
+  unordered set of complete `(translation, SO(3), width, quality)` grasps;
+  Hungarian matching preserves multiple valid modes without pose averaging.
+- Exact-URDF local scene–gripper overall-executability verifier.
 - Predicted-edge heterogeneous dependency graph ending at a `TASK_GRASP` node.
-- PICK_REMOVE object/removal-grasp ranking and PUSH object/contact/direction
-  prediction, with low-weight potential/risk auxiliaries. PUSH approach,
-  fixed-distance execution, removal transport and placement stay non-learning.
-- State graspability uses the adaptive required count and counts unique
-  verifier/certifier survivors after per-object SE(3) grasp NMS, not raw
-  candidate tensor slots.
+- PICK_REMOVE reuses global complete grasps. PUSH predicts object, contact,
+  direction and a scalar complete utility change that combines task gains with
+  instability/workspace/failure costs. Hard feasibility remains certified.
+- TASK_GRASP eligibility counts unique verifier/certifier survivors after
+  per-object SE(3) grasp NMS, not raw candidate tensor slots.
 - The generated data contains successful target self-push transitions. This is
   an explicit configurable recovery primitive (`allow_target_push_recovery`),
   while all other PUSH/PICK_REMOVE objects use the graph frontier plus the
   bounded recovery fallback.
-- Masked hierarchical, flat, and fixed-priority routing with multi-positive
-  listwise supervision; UNKNOWN candidates never become negatives.
+- Candidate-only policy routing with multi-positive listwise supervision;
+  UNKNOWN candidates never become negatives.
 - Deterministic three-PRO-S state reconstruction, free-space-aware LRU cache,
   Windows-safe external PyBullet workers, and FR5/AG execution interfaces.
 - AMP, accumulation, activation checkpointing, EMA, resume, freeze/unfreeze,
@@ -161,9 +160,10 @@ uniformly sampled action rows. Logs include optimizer steps, samples/states/
 candidate groups seen and effective epochs. `loss_routing.json` records losses
 automatically disabled by dataset capabilities or ablations.
 
-Each loss family is an internally weighted mean over only the child losses that
-have valid supervision in the current batch. Child losses remain individually
-logged, but family size alone cannot amplify shared-backbone gradients.
+The paper-level objective has exactly eleven modules: region, task grasp,
+global grasp, physical edge, task edge, verifier overall, four PUSH objectives,
+and policy candidate. Pose matching diagnostics remain internal to the two
+grasp-set objectives and are not independently weighted task families.
 
 ## Evaluation and inference
 
