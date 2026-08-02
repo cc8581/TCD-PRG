@@ -146,16 +146,29 @@ def test_trainer_prints_concise_summary_and_saves_every_step_metric(
     Trainer(model, optimizer, config, loss_step).train(batches)
     terminal = capsys.readouterr().out
     assert "[train-start]" in terminal
-    assert "[train 0000001/0000001]" in terminal
+    assert "Train [geometry] [0000001/0000001]" in terminal
+    assert "eta: 0:00:00" in terminal
+    assert "loss:" in terminal
+    assert "lr:" in terminal
+    assert "grad:" in terminal
+    assert "time:" in terminal
+    assert "data:" in terminal
+    assert "  losses:" not in terminal
+    assert "  generated:" not in terminal
     assert "[train-done]" in terminal
     records = [
         json.loads(line)
         for line in (tmp_path / "train_metrics.jsonl").read_text().splitlines()
     ]
     assert len(records) == 1
+    assert records[0]["schema_version"] == 3
+    assert records[0]["training_stage"] == "geometry"
     assert records[0]["micro_batches"] == 2
     assert records[0]["window_samples"] == 4
     assert records[0]["diagnostic"] == pytest.approx(2.0)
+    assert records[0]["eta_seconds"] == pytest.approx(0.0)
+    assert records[0]["data_seconds"] >= 0.0
+    assert records[0]["max_memory_mb"] == pytest.approx(0.0)
     events = [
         json.loads(line)["event"]
         for line in (tmp_path / "training_events.jsonl").read_text().splitlines()
@@ -191,16 +204,71 @@ def test_validation_metrics_and_checkpoint_events_are_persisted(tmp_path, capsys
         (tmp_path / "validation_metrics.jsonl").read_text().strip()
     )
     assert validation["validation_score"] == pytest.approx(0.5)
+    assert validation["schema_version"] == 2
+    assert validation["training_stage"] == "policy_teacher"
     assert validation["metrics"]["loss_policy_candidate"] == pytest.approx(0.3)
     assert validation["improved"]
     assert (tmp_path / "best.pt").is_file()
-    assert "[valid 0000001]" in capsys.readouterr().out
+    terminal = capsys.readouterr().out
+    assert "Val [policy_teacher] [0000001]" in terminal
+    assert "score: 0.500000" in terminal
+    assert "policy: 0.3000" in terminal
+    assert "items: 4" in terminal
+    assert "improved: yes" in terminal
     events = [
         json.loads(line)["event"]
         for line in (tmp_path / "training_events.jsonl").read_text().splitlines()
     ]
     assert "checkpoint_saved" in events
     assert "validation_completed" in events
+
+
+def test_terminal_summary_averages_interval_and_shows_generated_coverage(
+    tmp_path, capsys
+) -> None:
+    config = TCDPRGConfig(
+        training=TrainingConfig(
+            device="cpu", amp=False, max_optimizer_steps=3,
+            gradient_accumulation_steps=1,
+            generated_policy_candidate_cache="generated-cache",
+            generated_policy_candidate_ratio=1.0,
+        ),
+        logging=LoggingConfig(backend="none", log_interval=3),
+        output_dir=str(tmp_path),
+    )
+    model = torch.nn.Linear(3, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    batches = [
+        {"x": torch.randn(2, 3), "marker": torch.tensor(value)}
+        for value in (1.0, 2.0, 3.0)
+    ]
+
+    def loss_step(module, batch):
+        differentiable = module(batch["x"]).square().mean() * 0.0
+        loss = differentiable + batch["marker"]
+        return loss, {
+            "loss_total": loss,
+            "loss_policy_candidate": loss,
+            "generated_states": loss.new_tensor(4.0),
+            "generated_states_with_positive": loss.new_tensor(3.0),
+            "generated_effective_policy_rows": loss.new_tensor(2.0),
+            "generated_known_candidates": loss.new_tensor(10.0),
+            "generated_unknown_candidates": loss.new_tensor(5.0),
+            "generated_conflict_candidates": loss.new_tensor(1.0),
+        }
+
+    Trainer(model, optimizer, config, loss_step).train(batches)
+    terminal = capsys.readouterr().out
+    summaries = [line for line in terminal.splitlines() if line.startswith("Train ")]
+    assert len(summaries) == 2
+    assert "Train [policy_generated] [0000003/0000003]" in summaries[-1]
+    assert "loss: 2.5000" in summaries[-1]
+    assert "policy: 2.5000" in summaries[-1]
+    assert "pos_cov: 75.0%" in summaries[-1]
+    assert "eff_rows: 4/8" in summaries[-1]
+    assert "known" not in summaries[-1]
+    assert "unknown" not in summaries[-1]
+    assert "conflict" not in summaries[-1]
 
 
 def test_ten_batch_overfit_smoke(tiny_batch) -> None:

@@ -247,11 +247,16 @@ def main() -> None:
         validate=validate if validation_loader is not None else None,
         groups_per_effective_epoch=len(train_dataset),
     )
-    trainer.save_checkpoint(f"{config.output_dir}/last.pt")
+    final_checkpoint = os.path.join(config.output_dir, "last.pt")
+    trainer.save_checkpoint(final_checkpoint)
     if world_size > 1:
         torch.distributed.barrier()
     if rank == 0:
-        print(asdict(state))
+        print(
+            f"Saved final checkpoint: {os.path.abspath(final_checkpoint)} "
+            f"(step {state.optimizer_steps:07d})",
+            flush=True,
+        )
     if world_size > 1:
         torch.distributed.destroy_process_group()
 
