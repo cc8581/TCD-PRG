@@ -83,7 +83,9 @@ class CompleteGraspSetLoss(nn.Module):
             matched_target.append(torch.stack((
                 torch.full_like(target_index, row), target_index,
             ), -1))
-            quality_target[row, pred_index] = labels["quality_target"][row, target_index]
+            quality_target[row, pred_index] = labels["quality_target"][
+                row, target_index
+            ].to(quality_target.dtype)
             quality_valid[row, pred_index] = labels["quality_valid"][row, target_index]
             matched_query[row, pred_index] = True
         negative_valid = labels.get("negative_valid")

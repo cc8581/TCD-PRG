@@ -24,12 +24,35 @@ from tcd_prg.runtime import UnifiedBatchCollator, create_adapter, create_gripper
 from tcd_prg.trainers import Trainer
 
 
+def preflight_observation_cache(adapter, *named_datasets: tuple[str, object]) -> int:
+    """Verify every snapshotted state/task observation before model allocation."""
+
+    checked: set[tuple[int, int, int]] = set()
+    for split, dataset in named_datasets:
+        if dataset is None:
+            continue
+        for unit in dataset.units:
+            key = (unit.scene_id, unit.state_id, unit.task_index)
+            if key in checked:
+                continue
+            if not adapter.observation_available(*key):
+                scene_id, state_id, task_index = key
+                raise RuntimeError(
+                    "Cache-only training preflight failed before model initialization: "
+                    f"missing split={split} scene={scene_id} state={state_id} "
+                    f"task={task_index} after {len(checked)} cached observations. "
+                    "Formal training never renders observations synchronously. "
+                    "Run tcd-prg-prefetch for the same config, then relaunch training."
+                )
+            checked.add(key)
+    return len(checked)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--resume")
     parser.add_argument("--initialize", help="Load model/EMA weights without optimizer state")
-    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("overrides", nargs="*")
     return parser.parse_args()
 
@@ -37,6 +60,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_config(args.config, args.overrides)
+    if config.observation.provider != "cached":
+        raise ValueError(
+            "Formal training requires observation.provider=cached; generate observations "
+            "offline with tcd-prg-prefetch"
+        )
     if args.resume and args.initialize:
         raise ValueError("--resume and --initialize are mutually exclusive")
     if config.training.generated_policy_candidate_ratio > 0:
@@ -93,11 +121,25 @@ def main() -> None:
     train_dataset = ActionStateGroupDataset(
         adapter, split="train", max_groups=config.training.max_train_groups
     )
-    validation_dataset = ActionStateGroupDataset(
-        adapter, split="val", max_groups=config.training.max_validation_groups
+    validation_dataset = (
+        ActionStateGroupDataset(
+            adapter, split="val", max_groups=config.training.max_validation_groups
+        )
+        if config.training.validation_interval > 0
+        else None
     )
     if not len(train_dataset):
         raise RuntimeError("The completed-file snapshot contains no training groups")
+    cached_observations = preflight_observation_cache(
+        adapter,
+        ("train", train_dataset),
+        ("val", validation_dataset),
+    )
+    if rank == 0:
+        print(
+            f"[cache-preflight] observations={cached_observations} status=ready",
+            flush=True,
+        )
     gripper = (
         create_gripper_provider(config, allow_generate=False)
         if config.ablation.use_gripper_scene_verifier
@@ -130,7 +172,7 @@ def main() -> None:
         pin_memory=config.training.pin_memory,
         persistent_workers=config.training.num_workers > 0,
         collate_fn=collator,
-    ) if len(validation_dataset) else None
+    ) if validation_dataset is not None and len(validation_dataset) else None
     model = TCDPRGModel(
         config.model, config.ablation, config.graph, config.router, config.backbone
     )
@@ -198,16 +240,6 @@ def main() -> None:
     )
     if args.resume:
         trainer.load_checkpoint(args.resume)
-    if args.dry_run:
-        raw = next(iter(train_loader))
-        batch = trainer._move(raw, trainer.device)
-        loss, terms = objective(trainer.model, batch)
-        loss.backward()
-        print({"loss": float(loss.detach()), "terms": len(terms), "batch": len(raw["samples"])})
-        if world_size > 1:
-            torch.distributed.destroy_process_group()
-        return
-
     def validate(module: torch.nn.Module) -> dict[str, object]:
         if validation_loader is None:
             return {

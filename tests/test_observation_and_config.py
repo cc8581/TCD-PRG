@@ -6,10 +6,10 @@ import re
 import numpy as np
 import pytest
 
-from tcd_prg.config import ModelConfig, TCDPRGConfig, load_config
+from tcd_prg.config import ModelConfig, TCDPRGConfig, TrainingConfig, load_config
 from tcd_prg.paths import PROJECT_ROOT
 from tcd_prg.observation.base import ObservationRequest
-from tcd_prg.observation.cached import request_hash
+from tcd_prg.observation.cached import CachedObservationProvider, request_hash
 
 
 def _request(**changes) -> ObservationRequest:
@@ -34,6 +34,13 @@ def test_observation_cache_hash_binds_geometry_camera_seed_and_sampling() -> Non
         _request(point_count=1024), _request(renderer_version="v2"),
     )
     assert len({base, *(request_hash(item) for item in variants)}) == len(variants) + 1
+
+
+def test_cache_availability_is_read_only(tmp_path) -> None:
+    provider = CachedObservationProvider(tmp_path)
+    request = _request()
+    assert not provider.is_available(request)
+    assert list(tmp_path.rglob("*.npz")) == []
 
 
 def test_every_shipped_yaml_passes_strict_schema() -> None:
@@ -78,3 +85,9 @@ def test_task_grasp_candidate_capacity_covers_maximum_required_count() -> None:
     ))
     with pytest.raises(ValueError, match="task_grasp_candidates"):
         config.validate()
+
+
+def test_train_only_bootstrap_allows_zero_validation_interval() -> None:
+    TCDPRGConfig(training=TrainingConfig(validation_interval=0)).validate()
+    with pytest.raises(ValueError, match="validation_interval"):
+        TCDPRGConfig(training=TrainingConfig(validation_interval=-1)).validate()

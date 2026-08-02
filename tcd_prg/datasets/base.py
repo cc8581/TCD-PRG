@@ -23,6 +23,11 @@ class DatasetAdapter(ABC):
     def load_observation(self, scene_id: int, state_id: int, task_index: int) -> SceneObservation:
         pass
 
+    def observation_available(self, scene_id: int, state_id: int, task_index: int) -> bool:
+        """Return whether an observation can be loaded without generating data."""
+
+        return True
+
     @abstractmethod
     def load_state_labels(self, scene_id: int, state_id: int) -> StateLabels:
         pass

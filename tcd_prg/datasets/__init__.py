@@ -39,7 +39,6 @@ __all__ = [
     "TaskOrientedClutterAdapter",
     "load_candidate_batch",
     "match_generated_candidates",
-    "split_units_by_scene",
 ]
 
 
@@ -53,14 +52,12 @@ def __getattr__(name: str) -> Any:
         "DistributedEvaluationSampler",
         "DistributedWeightedStateSampler",
         "StateGroupUnit",
-        "split_units_by_scene",
     }:
         from .torch_dataset import (
             ActionStateGroupDataset,
             DistributedEvaluationSampler,
             DistributedWeightedStateSampler,
             StateGroupUnit,
-            split_units_by_scene,
         )
 
         return {
@@ -68,6 +65,5 @@ def __getattr__(name: str) -> Any:
             "DistributedEvaluationSampler": DistributedEvaluationSampler,
             "DistributedWeightedStateSampler": DistributedWeightedStateSampler,
             "StateGroupUnit": StateGroupUnit,
-            "split_units_by_scene": split_units_by_scene,
         }[name]
     raise AttributeError(name)

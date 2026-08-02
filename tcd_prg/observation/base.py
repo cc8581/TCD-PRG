@@ -33,6 +33,11 @@ class PointObservation:
 
 
 class ObservationProvider(ABC):
+    def is_available(self, request: ObservationRequest) -> bool:
+        """Return whether ``get`` can serve the request without new rendering."""
+
+        return True
+
     @abstractmethod
     def get(self, request: ObservationRequest) -> PointObservation:
         pass

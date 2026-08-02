@@ -24,11 +24,8 @@ class DatasetConfig:
     global_grasp_certification_subdir: str = "global_grasp_scene_certification_v2"
     pick_remove_global_association_subdir: str = "pick_remove_global_grasp_association_v1"
     scene_points: int = 16_384
+    # Reduced target-only point budget used by the standalone resource profiler.
     target_points: int = 4_096
-    include_rgb: bool = True
-    allowed_camera_types: tuple[str, ...] = ("mecheye_pro_s",)
-    oracle_camera_types: tuple[str, ...] = ("oracle",)
-    temporary_snapshot: bool = True
 
 
 @dataclass(slots=True)
@@ -43,7 +40,6 @@ class ObservationConfig:
     runtime_mesh_root: str = "runtime/cache/meshes"
     gripper_worker_script: str = "scripts/sample_gripper_worker_py38.py"
     gripper_cache_dir: str = "runtime/cache/grippers"
-    allow_render_on_cache_miss: bool = False
     certification_worker_script: str = "scripts/certify_actions_worker_py38.py"
     render_temporary_root: str = "runtime/tmp/render_requests"
     certification_temporary_root: str = "runtime/tmp/certification"
@@ -51,7 +47,6 @@ class ObservationConfig:
 
 @dataclass(slots=True)
 class CacheConfig:
-    enabled: bool = True
     directory: str = "runtime/cache/observations"
     max_gb: float = 15.0
     min_free_gb: float = 20.0
@@ -61,7 +56,6 @@ class CacheConfig:
 
 @dataclass(slots=True)
 class BackboneConfig:
-    name: str = "task_conditioned_point_transformer"
     pretrained_checkpoint: str | None = None
     freeze: bool = False
     attention_points: int = 1_024
@@ -77,25 +71,8 @@ class RegionHeadConfig:
 
 
 @dataclass(slots=True)
-class GraspProposalConfig:
-    task_conditioned: bool = True
-    predict_width: bool = True
-    recall_k: tuple[int, ...] = (1, 5, 10)
-
-
-@dataclass(slots=True)
-class PickRemoveConfig:
-    enabled: bool = True
-    macro_action: bool = True
-    deactivate_after_success: bool = True
-
-
-@dataclass(slots=True)
 class PlannerConfig:
-    reobserve_after_action: bool = True
-    exact_certification: bool = True
     max_preparation_actions: int = MAX_PREPARATION_ACTIONS
-    reject_and_rerank: bool = True
 
 
 @dataclass(slots=True)
@@ -130,8 +107,6 @@ class ModelConfig:
     push_directions_per_contact: int = 2
     max_push_candidates: int = 32
     activation_checkpointing: bool = True
-    verifier_local_scene_points: int = 512
-    verifier_gripper_points: int = 512
     verifier_local_radius_m: float = 0.25
     verifier_candidate_micro_batch: int = 16
     verifier_validity_threshold: float = 0.5
@@ -187,8 +162,9 @@ class TrainingConfig:
     amp_dtype: str = "float16"
     batch_size: int = 1
     gradient_accumulation_steps: int = 8
-    candidate_micro_batch: int = 16
     max_optimizer_steps: int = 100_000
+    # Set to zero for train-only bootstrap runs while a partial dataset has no
+    # published validation split yet.
     validation_interval: int = 1_000
     checkpoint_interval: int = 1_000
     gradient_clip_norm: float = 1.0
@@ -197,7 +173,6 @@ class TrainingConfig:
     deterministic: bool = True
     num_workers: int = 4
     pin_memory: bool = True
-    validation_fraction: float = 0.1
     max_validation_groups: int = 256
     max_train_groups: int | None = None
     frozen_modules: tuple[str, ...] = ()
@@ -247,7 +222,6 @@ class EvaluationConfig:
 class GraspVerifierConfig:
     local_scene_points: int = 512
     gripper_points: int = 512
-    candidate_micro_batch: int = 16
 
 
 @dataclass(slots=True)
@@ -318,7 +292,6 @@ class SamplingConfig:
 
 @dataclass(slots=True)
 class OptimizerConfig:
-    name: str = "adamw"
     learning_rate: float = 1e-4
     backbone_learning_rate: float = 2e-5
     weight_decay: float = 0.01
@@ -326,7 +299,6 @@ class OptimizerConfig:
 
 @dataclass(slots=True)
 class SchedulerConfig:
-    name: str = "cosine"
     warmup_steps: int = 2_000
 
 
@@ -336,14 +308,6 @@ class LoggingConfig:
     # Terminal summaries are concise; JSONL and TensorBoard metrics are always
     # written for every successful optimizer step.
     log_interval: int = 20
-    save_resolved_config: bool = True
-    save_git_commit: bool = True
-
-
-@dataclass(slots=True)
-class ReproducibilityConfig:
-    deterministic: bool = True
-    cudnn_benchmark: bool = False
 
 
 @dataclass(slots=True)
@@ -353,7 +317,6 @@ class TCDPRGConfig:
     cache: CacheConfig = field(default_factory=CacheConfig)
     backbone: BackboneConfig = field(default_factory=BackboneConfig)
     region_head: RegionHeadConfig = field(default_factory=RegionHeadConfig)
-    grasp_proposal: GraspProposalConfig = field(default_factory=GraspProposalConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     ablation: AblationConfig = field(default_factory=AblationConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -361,14 +324,12 @@ class TCDPRGConfig:
     grasp_verifier: GraspVerifierConfig = field(default_factory=GraspVerifierConfig)
     graph: GraphConfig = field(default_factory=GraphConfig)
     push: PushConfig = field(default_factory=PushConfig)
-    pick_remove: PickRemoveConfig = field(default_factory=PickRemoveConfig)
     router: RouterConfig = field(default_factory=RouterConfig)
     losses: LossConfig = field(default_factory=LossConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
-    reproducibility: ReproducibilityConfig = field(default_factory=ReproducibilityConfig)
     planner: PlannerConfig = field(default_factory=PlannerConfig)
     baseline: BaselineConfig = field(default_factory=BaselineConfig)
     push_distance_m: float = PUSH_DISTANCE_M
@@ -442,6 +403,8 @@ class TCDPRGConfig:
             raise ValueError("PUSH contact and final candidate budgets must be positive")
         if not 0.0 <= self.training.generated_policy_candidate_ratio <= 1.0:
             raise ValueError("generated_policy_candidate_ratio must be in [0,1]")
+        if self.training.validation_interval < 0:
+            raise ValueError("validation_interval must be non-negative")
         if not 0.0 <= self.training.generated_policy_min_positive_coverage <= 1.0:
             raise ValueError("generated_policy_min_positive_coverage must be in [0,1]")
         if not 0.0 <= self.training.generated_policy_min_effective_coverage <= 1.0:
@@ -489,8 +452,6 @@ class TCDPRGConfig:
             raise ValueError("Only deterministic LRU cache eviction is supported")
         if self.cache.max_gb <= 0 or self.cache.min_free_gb <= 0:
             raise ValueError("cache max_gb and min_free_gb must be positive")
-        if self.pick_remove.macro_action and not self.pick_remove.deactivate_after_success:
-            raise ValueError("PICK_REMOVE macro action must leave the object inactive")
 
 
 def load_config(path: str | Path, overrides: list[str] | None = None) -> TCDPRGConfig:

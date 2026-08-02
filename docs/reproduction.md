@@ -24,7 +24,7 @@ the GPU loop. Prewarm exact AG geometry for all observed valid widths.
 Set `TCD_DATASET_ROOT` and run `pytest -q`. Before a large job run:
 
 1. one real batch forward;
-2. one real batch backward (`--dry-run`);
+2. launch the formal cache-only training command and stop it after startup verification;
 3. ten-batch overfit test;
 4. one cached state inference;
 5. one labelled multi-step replay;

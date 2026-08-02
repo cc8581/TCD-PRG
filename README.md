@@ -132,8 +132,8 @@ See [docs/global_grasp_protocol.md](docs/global_grasp_protocol.md).
 ## Training
 
 ```powershell
-# One real batch forward/backward
-tcd-prg-train --config configs/config.yaml --dry-run
+# Formal cache-only training (stop the process after startup verification when testing)
+tcd-prg-train --config configs/config.yaml
 
 # Full method
 tcd-prg-train --config configs/config.yaml output_dir=outputs/full

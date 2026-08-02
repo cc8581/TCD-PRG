@@ -7,7 +7,6 @@ action_state_group)``.  No action row is exposed as an independent sample.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import islice
 
@@ -95,25 +94,6 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
     @property
     def stratum_counts(self) -> dict[str, int]:
         return dict(Counter(unit.stratum for unit in self.units))
-
-
-def split_units_by_scene(
-    units: Sequence[StateGroupUnit],
-    validation_fraction: float = 0.1,
-    seed: int = 2026,
-) -> tuple[list[int], list[int]]:
-    """Return train/validation indices with scene-disjoint deterministic splitting."""
-
-    if not 0.0 < validation_fraction < 1.0:
-        raise ValueError("validation_fraction must be in (0,1)")
-    scene_ids = sorted({unit.scene_id for unit in units})
-    generator = torch.Generator().manual_seed(seed)
-    order = torch.randperm(len(scene_ids), generator=generator).tolist()
-    validation_count = max(1, round(len(scene_ids) * validation_fraction))
-    validation_scenes = {scene_ids[index] for index in order[:validation_count]}
-    train_indices = [index for index, unit in enumerate(units) if unit.scene_id not in validation_scenes]
-    validation_indices = [index for index, unit in enumerate(units) if unit.scene_id in validation_scenes]
-    return train_indices, validation_indices
 
 
 class DistributedWeightedStateSampler(Sampler[int]):

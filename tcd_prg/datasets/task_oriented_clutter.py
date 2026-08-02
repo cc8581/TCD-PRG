@@ -137,6 +137,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         observation_provider: ObservationProvider | None = None,
         point_count: int = 16_384,
         renderer_version: str = "tcd_prg_pybullet_v1",
+        camera_profile: str = "mecheye_pro_s_three_view",
         functional_region_root: str | Path | None = None,
         verifier_wrong_region_negatives: int = 8,
         verifier_collision_negatives: int = 8,
@@ -178,6 +179,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         self.relation_names = ("near", "contact", "support", "press", "occlude")
         self.point_count = point_count
         self.renderer_version = renderer_version
+        self.camera_profile = camera_profile
         self.verifier_sampling = (
             int(verifier_wrong_region_negatives), int(verifier_collision_negatives),
             int(verifier_approach_negatives), int(sampling_seed),
@@ -382,19 +384,15 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 category_keys = tuple(str(x) for x in raw_scene["object_category_key"][: len(object_pose)])
                 model_ids = tuple(str(x) for x in raw_scene["object_model_id"][: len(object_pose)])
                 object_scales = raw_scene["object_scale"][: len(object_pose)].astype(np.float32)
-            request = ObservationRequest(
+            request = self._make_observation_request(
                 scene_id=scene_id,
                 state_id=state_id,
                 object_pose=object_pose,
-                object_active=active,
-                object_present=np.ones(len(object_pose), dtype=bool),
-                object_asset_ids=h5_names,
-                object_model_ids=model_ids,
+                active=active,
+                h5_names=h5_names,
+                model_ids=model_ids,
                 object_scales=object_scales,
                 render_seed=int(states["observation_render_seed"][state_id]),
-                camera_profile="mecheye_pro_s_three_view",
-                point_count=self.point_count,
-                renderer_version=self.renderer_version,
             )
             object_count = len(object_pose)
             object_category_id = catalog["object_category_id"][:].astype(np.int64)
@@ -450,6 +448,61 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         )
         observation.validate()
         return observation
+
+    def _make_observation_request(
+        self,
+        *,
+        scene_id: int,
+        state_id: int,
+        object_pose: np.ndarray,
+        active: np.ndarray,
+        h5_names: tuple[str, ...],
+        model_ids: tuple[str, ...],
+        object_scales: np.ndarray,
+        render_seed: int,
+    ) -> ObservationRequest:
+        return ObservationRequest(
+            scene_id=scene_id,
+            state_id=state_id,
+            object_pose=object_pose,
+            object_active=active,
+            object_present=np.ones(len(object_pose), dtype=bool),
+            object_asset_ids=h5_names,
+            object_model_ids=model_ids,
+            object_scales=object_scales,
+            render_seed=render_seed,
+            camera_profile=self.camera_profile,
+            point_count=self.point_count,
+            renderer_version=self.renderer_version,
+        )
+
+    def observation_available(self, scene_id: int, state_id: int, task_index: int) -> bool:
+        """Check the exact content-addressed request without loading point arrays."""
+
+        with h5py.File(self._h5_path(scene_id), "r", swmr=True) as handle:
+            scene = self._scene_group(handle, scene_id)
+            states = scene["states"]
+            object_pose = states["object_pose"][state_id].astype(np.float32)
+            active = self._object_active(scene, state_id, task_index)
+            render_seed = int(states["observation_render_seed"][state_id])
+        with np.load(
+            self.scene_root / f"scene_{scene_id:04d}" / "scene.npz", allow_pickle=False
+        ) as raw_scene:
+            count = len(object_pose)
+            h5_names = tuple(str(x) for x in raw_scene["object_h5_name"][:count])
+            model_ids = tuple(str(x) for x in raw_scene["object_model_id"][:count])
+            object_scales = raw_scene["object_scale"][:count].astype(np.float32)
+        request = self._make_observation_request(
+            scene_id=scene_id,
+            state_id=state_id,
+            object_pose=object_pose,
+            active=active,
+            h5_names=h5_names,
+            model_ids=model_ids,
+            object_scales=object_scales,
+            render_seed=render_seed,
+        )
+        return self.observation_provider.is_available(request)
 
     def load_global_grasps(
         self, scene_id: int, state_id: int, observation: SceneObservation,

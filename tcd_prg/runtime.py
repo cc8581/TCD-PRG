@@ -39,10 +39,9 @@ def create_observation_provider(config: TCDPRGConfig, allow_render: bool = False
         return external_provider()
     if config.observation.provider != "cached":
         raise ValueError(f"Unknown observation provider {config.observation.provider}")
-    fallback = (
-        external_provider()
-        if allow_render or config.observation.allow_render_on_cache_miss else None
-    )
+    # Rendering is an explicit caller capability. Formal training passes
+    # allow_render=False, while the offline prefetch command passes True.
+    fallback = external_provider() if allow_render else None
     return CachedObservationProvider(
         config.cache.directory,
         fallback,
@@ -59,6 +58,7 @@ def create_adapter(config: TCDPRGConfig, allow_render: bool = False):
         observation_provider=create_observation_provider(config, allow_render),
         point_count=config.dataset.scene_points,
         renderer_version=config.observation.renderer_version,
+        camera_profile=config.observation.camera_profile,
         functional_region_root=config.dataset.functional_region_root,
         verifier_wrong_region_negatives=config.sampling.wrong_region_grasps,
         verifier_collision_negatives=config.sampling.collision_or_approach_negative_grasps,

@@ -47,6 +47,9 @@ class CachedObservationProvider(ObservationProvider):
     def _path(self, key: str) -> Path:
         return self.cache_dir / key[:2] / f"{key}.npz"
 
+    def is_available(self, request: ObservationRequest) -> bool:
+        return self._path(request_hash(request)).is_file() or self.fallback is not None
+
     def get(self, request: ObservationRequest) -> PointObservation:
         key = request_hash(request)
         path = self._path(key)

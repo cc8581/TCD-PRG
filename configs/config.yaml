@@ -15,10 +15,6 @@ dataset:
   pick_remove_global_association_subdir: pick_remove_global_grasp_association_v1
   scene_points: 16384
   target_points: 4096
-  include_rgb: true
-  allowed_camera_types: [mech_eye_pro_s]
-  oracle_camera_types: [oracle]
-  temporary_snapshot: true
 
 observation:
   provider: cached
@@ -31,13 +27,11 @@ observation:
   runtime_mesh_root: runtime/cache/meshes
   gripper_worker_script: scripts/sample_gripper_worker_py38.py
   gripper_cache_dir: runtime/cache/grippers
-  allow_render_on_cache_miss: false
   certification_worker_script: scripts/certify_actions_worker_py38.py
   render_temporary_root: runtime/tmp/render_requests
   certification_temporary_root: runtime/tmp/certification
 
 cache:
-  enabled: true
   directory: runtime/cache/observations
   max_gb: 15
   min_free_gb: 20
@@ -45,7 +39,6 @@ cache:
   prefetch_workers: 4
 
 backbone:
-  name: task_conditioned_point_transformer
   pretrained_checkpoint: null
   freeze: false
   attention_points: 1024
@@ -56,11 +49,6 @@ region_head:
   focal_gamma: 2.0
   dice_weight: 1.0
   visibility_threshold: 0.5
-
-grasp_proposal:
-  task_conditioned: true
-  predict_width: true
-  recall_k: [1, 5, 10]
 
 model:
   feature_dim: 256
@@ -80,8 +68,6 @@ model:
   push_directions_per_contact: 2
   max_push_candidates: 32
   activation_checkpointing: true
-  verifier_local_scene_points: 512
-  verifier_gripper_points: 512
   verifier_local_radius_m: 0.25
   verifier_candidate_micro_batch: 16
   verifier_validity_threshold: 0.5
@@ -115,7 +101,6 @@ model:
 grasp_verifier:
   local_scene_points: 512
   gripper_points: 512
-  candidate_micro_batch: 16
 
 graph:
   physical_relations: [near, contact, support, press, occlude]
@@ -126,11 +111,6 @@ graph:
 push:
   distance_m: 0.15
   direction_bins: 16
-
-pick_remove:
-  enabled: true
-  macro_action: true
-  deactivate_after_success: true
 
 router:
   type: hierarchical
@@ -166,13 +146,11 @@ sampling:
   unit: action_state_group
 
 optimizer:
-  name: adamw
   learning_rate: 0.0001
   backbone_learning_rate: 0.00002
   weight_decay: 0.01
 
 scheduler:
-  name: cosine
   warmup_steps: 2000
 
 training:
@@ -182,8 +160,8 @@ training:
   amp_dtype: float16
   batch_size: 1
   gradient_accumulation_steps: 8
-  candidate_micro_batch: 16
   max_optimizer_steps: 100000
+  # Set to 0 only for train-only bootstrap runs before val scenes are published.
   validation_interval: 1000
   checkpoint_interval: 1000
   gradient_clip_norm: 1.0
@@ -192,7 +170,6 @@ training:
   deterministic: true
   num_workers: 4
   pin_memory: true
-  validation_fraction: 0.1
   max_validation_groups: 256
   max_train_groups: null
   frozen_modules: []
@@ -241,18 +218,9 @@ logging:
   backend: tensorboard
   # Terminal summaries only; train_metrics.jsonl records every optimizer step.
   log_interval: 20
-  save_resolved_config: true
-  save_git_commit: true
-
-reproducibility:
-  deterministic: true
-  cudnn_benchmark: false
 
 planner:
-  reobserve_after_action: true
-  exact_certification: true
   max_preparation_actions: 5
-  reject_and_rerank: true
 
 baseline:
   type: tcd_prg
