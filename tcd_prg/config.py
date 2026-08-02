@@ -333,6 +333,8 @@ class SchedulerConfig:
 @dataclass(slots=True)
 class LoggingConfig:
     backend: str = "tensorboard"
+    # Terminal summaries are concise; JSONL and TensorBoard metrics are always
+    # written for every successful optimizer step.
     log_interval: int = 20
     save_resolved_config: bool = True
     save_git_commit: bool = True
@@ -375,6 +377,8 @@ class TCDPRGConfig:
     name: str = "tcd-prg"
 
     def validate(self) -> None:
+        if self.logging.log_interval <= 0:
+            raise ValueError("logging.log_interval must be positive")
         if abs(self.push_distance_m - PUSH_DISTANCE_M) > 1e-7:
             raise ValueError("The main TCD-PRG primitive requires push_distance_m == 0.15")
         if abs(self.push.distance_m - PUSH_DISTANCE_M) > 1e-7:

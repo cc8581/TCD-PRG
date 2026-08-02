@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-import time
 import subprocess
-from contextlib import nullcontext
+import time
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,15 @@ class TrainerState:
 
 
 class Trainer:
+    COUNT_TERMS = {
+        "generated_states",
+        "generated_states_with_positive",
+        "generated_effective_policy_rows",
+        "generated_known_candidates",
+        "generated_unknown_candidates",
+        "generated_conflict_candidates",
+    }
+
     def __init__(
         self,
         model: nn.Module,
@@ -58,12 +68,14 @@ class Trainer:
         self.state = TrainerState()
         self.output_dir = Path(output_dir or config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_path = self.output_dir / "train_metrics.jsonl"
+        self.validation_metrics_path = self.output_dir / "validation_metrics.jsonl"
+        self.events_path = self.output_dir / "training_events.jsonl"
         self.scaler = torch.cuda.amp.GradScaler(enabled=config.training.amp and self.device.type == "cuda")
         source_model = self.model.module if hasattr(self.model, "module") else self.model
         self.ema = ModelEMA(source_model, config.training.ema_decay) if config.training.ema_decay else None
         if self.is_primary:
             self._save_run_metadata()
-        self.metrics_path = self.output_dir / "train_metrics.jsonl"
         self.tensorboard = None
         if self.is_primary and config.logging.backend == "tensorboard":
             try:
@@ -74,6 +86,82 @@ class Trainer:
                 raise RuntimeError(
                     "logging.backend=tensorboard requires the tensorboard package"
                 ) from error
+
+    @staticmethod
+    def _timestamp() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(record), ensure_ascii=False) + "\n")
+
+    def _write_event(self, event: str, **values: Any) -> None:
+        if self.is_primary:
+            self._append_jsonl(self.events_path, {
+                "timestamp_utc": self._timestamp(),
+                "event": event,
+                "optimizer_step": self.state.optimizer_steps,
+                **values,
+            })
+
+    @classmethod
+    def _aggregate_window_terms(
+        cls, sums: Mapping[str, Tensor], counts: Mapping[str, int]
+    ) -> dict[str, float]:
+        return {
+            key: float(value.cpu())
+            if key in cls.COUNT_TERMS
+            else float((value / counts[key]).cpu())
+            for key, value in sums.items()
+        }
+
+    def _print_train_summary(self, record: Mapping[str, Any]) -> None:
+        step = int(record["optimizer_step"])
+        maximum = self.config.training.max_optimizer_steps
+        status = (
+            f"[train {step:07d}/{maximum:07d}] "
+            f"epoch={float(record['effective_epochs']):.3f} "
+            f"loss={float(record['loss_total']):.5f} "
+            f"lr={max(record['learning_rates']):.3e} "
+            f"grad={float(record['gradient_norm']):.3f} "
+            f"samples/s={float(record['samples_per_second']):.1f} "
+            f"amp_skip={int(record['amp_skipped_steps'])}"
+        )
+        print(status, flush=True)
+        names = (
+            ("region", "loss_region"),
+            ("task_g", "loss_task_grasp"),
+            ("global_g", "loss_global_grasp"),
+            ("graph_p", "loss_physical_edge"),
+            ("graph_t", "loss_task_edge"),
+            ("verify", "loss_verify_overall"),
+            ("push_o", "loss_push_object"),
+            ("push_c", "loss_push_contact"),
+            ("push_d", "loss_push_direction"),
+            ("push_u", "loss_push_potential"),
+            ("policy", "loss_policy_candidate"),
+        )
+        losses = [
+            f"{label}={float(record[key]):.4f}"
+            for label, key in names if key in record
+        ]
+        if losses:
+            print("  losses: " + " ".join(losses), flush=True)
+        generated = float(record.get("generated_states", 0.0))
+        if generated:
+            positive = float(record.get("generated_states_with_positive", 0.0))
+            effective = float(record.get("generated_effective_policy_rows", 0.0))
+            known = float(record.get("generated_known_candidates", 0.0))
+            unknown = float(record.get("generated_unknown_candidates", 0.0))
+            conflicts = float(record.get("generated_conflict_candidates", 0.0))
+            print(
+                "  generated: "
+                f"positive={positive / generated:.1%} "
+                f"effective={effective / generated:.1%} "
+                f"known={known:.0f} unknown={unknown:.0f} conflicts={conflicts:.0f}",
+                flush=True,
+            )
 
     def _set_frozen_modules(self, frozen: bool) -> None:
         source = self.model.module if hasattr(self.model, "module") else self.model
@@ -104,7 +192,14 @@ class Trainer:
         except (OSError, subprocess.CalledProcessError):
             commit = "uncommitted"
         (self.output_dir / "run_metadata.json").write_text(
-            json.dumps({"git_commit": commit, "torch": torch.__version__}, indent=2), encoding="utf-8"
+            json.dumps({
+                "git_commit": commit,
+                "torch": torch.__version__,
+                "train_metrics_schema_version": 2,
+                "validation_metrics_schema_version": 1,
+                "training_events_schema_version": 1,
+            }, indent=2),
+            encoding="utf-8",
         )
 
     @staticmethod
@@ -117,10 +212,19 @@ class Trainer:
             return type(value)(Trainer._move(v, device) for v in value)
         return value
 
+    @staticmethod
+    def _batch_size(batch: Mapping[str, Any]) -> int:
+        if "xyz" in batch and isinstance(batch["xyz"], Tensor):
+            return int(batch["xyz"].shape[0])
+        for value in batch.values():
+            if isinstance(value, Tensor) and value.ndim:
+                return int(value.shape[0])
+        return 1
+
     def train(
         self,
         loader: Iterable[Mapping[str, Any]],
-        validate: Callable[[nn.Module], float | tuple[float, int]] | None = None,
+        validate: Callable[[nn.Module], Any] | None = None,
         groups_per_effective_epoch: int | None = None,
     ) -> TrainerState:
         accumulation = self.config.training.gradient_accumulation_steps
@@ -133,7 +237,25 @@ class Trainer:
         self._apply_frozen_module_modes()
         micro_step, saw_batch, stop = 0, False, False
         started = time.time()
+        last_optimizer_time = started
+        window_term_sums: dict[str, Tensor] = {}
+        window_term_counts: dict[str, int] = {}
+        window_micro_batches = 0
+        window_samples = 0
         epoch = 0
+        self._write_event(
+            "training_started",
+            max_optimizer_steps=self.config.training.max_optimizer_steps,
+            gradient_accumulation_steps=accumulation,
+        )
+        if self.is_primary:
+            print(
+                f"[train-start] output={self.output_dir.resolve()} "
+                f"steps={self.state.optimizer_steps}->{self.config.training.max_optimizer_steps} "
+                f"accumulation={accumulation} "
+                f"terminal_interval={self.config.logging.log_interval}",
+                flush=True,
+            )
         while self.state.optimizer_steps < self.config.training.max_optimizer_steps and not stop:
             sampler = getattr(loader, "sampler", None)
             if sampler is not None and hasattr(sampler, "set_epoch"):
@@ -171,7 +293,7 @@ class Trainer:
                     self.state.generated_states_seen += int(generated_counts[0])
                     self.state.generated_positive_states_seen += int(generated_counts[1])
                     self.state.effective_policy_rows_seen += int(generated_counts[2])
-                batch_size = int(batch["xyz"].shape[0]) if "xyz" in batch else 1
+                batch_size = self._batch_size(batch)
                 global_batch_size = batch_size * (
                     torch.distributed.get_world_size()
                     if torch.distributed.is_initialized() else 1
@@ -179,6 +301,16 @@ class Trainer:
                 self.state.samples_seen += global_batch_size
                 self.state.states_seen += global_batch_size
                 self.state.candidate_groups_seen += global_batch_size
+                window_micro_batches += 1
+                window_samples += global_batch_size
+                window_values = dict(terms)
+                window_values.setdefault("loss_total", loss.detach())
+                for key, value in window_values.items():
+                    detached = value.detach().float()
+                    window_term_sums[key] = window_term_sums.get(
+                        key, torch.zeros_like(detached)
+                    ) + detached
+                    window_term_counts[key] = window_term_counts.get(key, 0) + 1
                 if not synchronize:
                     continue
                 self.scaler.unscale_(self.optimizer)
@@ -196,6 +328,25 @@ class Trainer:
                 # EMA, counters and checkpoints must remain unchanged.
                 if self.scaler.is_enabled() and current_scale < previous_scale:
                     self.state.amp_skipped_steps += 1
+                    skipped_terms = self._aggregate_window_terms(
+                        window_term_sums, window_term_counts
+                    )
+                    self._write_event(
+                        "amp_step_skipped",
+                        previous_amp_scale=previous_scale,
+                        current_amp_scale=current_scale,
+                        gradient_norm=float(gradient_norm),
+                        micro_batches=window_micro_batches,
+                        samples=window_samples,
+                        metrics=skipped_terms,
+                    )
+                    if self.is_primary:
+                        print(
+                            f"[amp-skip step={self.state.optimizer_steps:07d}] "
+                            f"scale={previous_scale:.0f}->{current_scale:.0f} "
+                            f"grad={float(gradient_norm):.3f}",
+                            flush=True,
+                        )
                     if self.tensorboard is not None:
                         self.tensorboard.add_scalar(
                             "amp/skipped_steps", self.state.amp_skipped_steps,
@@ -204,6 +355,11 @@ class Trainer:
                         self.tensorboard.add_scalar(
                             "amp/scale", current_scale, self.state.optimizer_steps
                         )
+                    window_term_sums.clear()
+                    window_term_counts.clear()
+                    window_micro_batches = 0
+                    window_samples = 0
+                    last_optimizer_time = time.time()
                     continue
                 self.state.optimizer_steps += 1
                 if (
@@ -223,8 +379,15 @@ class Trainer:
                         self.state.candidate_groups_seen / groups_per_effective_epoch
                     )
                 step = self.state.optimizer_steps
-                if self.is_primary and (step % self.config.logging.log_interval == 0 or step == 1):
+                now = time.time()
+                step_seconds = max(now - last_optimizer_time, 1e-12)
+                aggregated_terms = self._aggregate_window_terms(
+                    window_term_sums, window_term_counts
+                )
+                if self.is_primary:
                     record = {
+                        "schema_version": 2,
+                        "timestamp_utc": self._timestamp(),
                         "optimizer_step": step,
                         "amp_skipped_steps": self.state.amp_skipped_steps,
                         "amp_scale": current_scale,
@@ -236,47 +399,146 @@ class Trainer:
                         "effective_policy_rows_seen": self.state.effective_policy_rows_seen,
                         "effective_epochs": self.state.effective_epochs,
                         "gradient_norm": float(gradient_norm),
-                        "elapsed_seconds": time.time() - started,
+                        "elapsed_seconds": now - started,
+                        "optimizer_step_seconds": step_seconds,
+                        "samples_per_second": window_samples / step_seconds,
+                        "micro_batches": window_micro_batches,
+                        "window_samples": window_samples,
+                        "metric_scope": "rank0",
                         "learning_rates": [group["lr"] for group in self.optimizer.param_groups],
-                        **{key: float(value.detach()) for key, value in terms.items()},
+                        **aggregated_terms,
                     }
-                    with self.metrics_path.open("a", encoding="utf-8") as handle:
-                        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    self._append_jsonl(self.metrics_path, record)
                     if self.tensorboard is not None:
                         for key, value in record.items():
                             if isinstance(value, (int, float)):
                                 self.tensorboard.add_scalar(key, value, step)
                         for index, rate in enumerate(record["learning_rates"]):
                             self.tensorboard.add_scalar(f"learning_rate/group_{index}", rate, step)
+                    if step % self.config.logging.log_interval == 0 or step == 1:
+                        self._print_train_summary(record)
+                window_term_sums.clear()
+                window_term_counts.clear()
+                window_micro_batches = 0
+                window_samples = 0
+                last_optimizer_time = now
                 if step % self.config.training.checkpoint_interval == 0:
                     self.save_checkpoint(self.output_dir / f"step_{step:08d}.pt")
                 if validate and step % self.config.training.validation_interval == 0:
                     validation = validate(self.ema.model if self.ema else self.model)
                     self.model.train()
                     self._apply_frozen_module_modes()
-                    if torch.distributed.is_initialized():
+                    validation_items = 1
+                    validation_details: dict[str, float] = {}
+                    if isinstance(validation, Mapping):
+                        summaries: list[Mapping[str, Any]] = [validation]
+                        if torch.distributed.is_initialized():
+                            gathered: list[Mapping[str, Any] | None] = [
+                                None for _ in range(torch.distributed.get_world_size())
+                            ]
+                            torch.distributed.all_gather_object(gathered, validation)
+                            summaries = [item for item in gathered if item is not None]
+                        score_sum = sum(float(item["score_sum"]) for item in summaries)
+                        validation_items = sum(
+                            int(item["score_count"]) for item in summaries
+                        )
+                        score = score_sum / max(1, validation_items)
+                        metric_sums: dict[str, float] = {}
+                        metric_counts: dict[str, int] = {}
+                        for item in summaries:
+                            for key, value in item.get("metric_sums", {}).items():
+                                metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
+                            for key, value in item.get("metric_counts", {}).items():
+                                metric_counts[key] = metric_counts.get(key, 0) + int(value)
+                        validation_details = {
+                            key: value / max(1, metric_counts.get(key, 0))
+                            for key, value in metric_sums.items()
+                        }
+                    elif torch.distributed.is_initialized():
                         if isinstance(validation, tuple):
                             value = torch.tensor(validation, dtype=torch.float64, device=self.device)
                             torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
                             score = float(value[0] / value[1].clamp_min(1))
+                            validation_items = int(value[1])
                         else:
                             value = torch.tensor(float(validation), device=self.device)
                             torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
                             score = float(value / torch.distributed.get_world_size())
                     elif isinstance(validation, tuple):
                         score = float(validation[0] / max(1, validation[1]))
+                        validation_items = int(validation[1])
                     else:
                         score = float(validation)
-                    if score < self.state.best_validation:
+                    previous_best = self.state.best_validation
+                    improved = score < previous_best
+                    if improved:
                         self.state.best_validation = score
                         self.state.validation_without_improvement = 0
                         self.save_checkpoint(self.output_dir / "best.pt")
                     else:
                         self.state.validation_without_improvement += 1
+                    if self.is_primary:
+                        validation_record = {
+                            "schema_version": 1,
+                            "timestamp_utc": self._timestamp(),
+                            "optimizer_step": step,
+                            "validation_score": score,
+                            "best_validation": self.state.best_validation,
+                            "improved": improved,
+                            "validation_items": validation_items,
+                            "validation_without_improvement": (
+                                self.state.validation_without_improvement
+                            ),
+                            "early_stopping_patience": (
+                                self.config.training.early_stopping_patience
+                            ),
+                            "metrics": validation_details,
+                        }
+                        self._append_jsonl(
+                            self.validation_metrics_path, validation_record
+                        )
+                        if self.tensorboard is not None:
+                            self.tensorboard.add_scalar(
+                                "validation/score", score, step
+                            )
+                            self.tensorboard.add_scalar(
+                                "validation/best", self.state.best_validation, step
+                            )
+                            for key, value in validation_details.items():
+                                self.tensorboard.add_scalar(
+                                    f"validation/{key}", value, step
+                                )
+                        print(
+                            f"[valid {step:07d}] score={score:.6f} "
+                            f"best={self.state.best_validation:.6f} "
+                            f"improved={'yes' if improved else 'no'} "
+                            f"patience={self.state.validation_without_improvement}/"
+                            f"{self.config.training.early_stopping_patience}",
+                            flush=True,
+                        )
+                    self._write_event(
+                        "validation_completed",
+                        validation_score=score,
+                        best_validation=self.state.best_validation,
+                        improved=improved,
+                        validation_items=validation_items,
+                        metrics=validation_details,
+                    )
                     if (
                         self.state.validation_without_improvement
                         >= self.config.training.early_stopping_patience
                     ):
+                        self._write_event(
+                            "early_stopping",
+                            best_validation=self.state.best_validation,
+                            validation_score=score,
+                        )
+                        if self.is_primary:
+                            print(
+                                f"[early-stop] step={step:07d} "
+                                f"best={self.state.best_validation:.6f}",
+                                flush=True,
+                            )
                         stop = True
                         break
                 if step >= self.config.training.max_optimizer_steps:
@@ -287,6 +549,18 @@ class Trainer:
         if self.tensorboard is not None:
             self.tensorboard.flush()
             self.tensorboard.close()
+        self._write_event(
+            "training_completed",
+            best_validation=self.state.best_validation,
+            stopped_early=stop and self.state.optimizer_steps < self.config.training.max_optimizer_steps,
+        )
+        if self.is_primary:
+            print(
+                f"[train-done] step={self.state.optimizer_steps:07d} "
+                f"best={self.state.best_validation:.6f} "
+                f"elapsed={time.time() - started:.1f}s",
+                flush=True,
+            )
         return self.state
 
     def save_checkpoint(self, path: str | Path) -> None:
@@ -324,6 +598,11 @@ class Trainer:
         temporary = path.with_suffix(path.suffix + ".tmp")
         torch.save(payload, temporary)
         temporary.replace(path)
+        self._write_event(
+            "checkpoint_saved",
+            path=str(path.resolve()),
+            schema_version=payload["schema_version"],
+        )
 
     def load_checkpoint(self, path: str | Path) -> None:
         payload = torch.load(path, map_location=self.device, weights_only=False)

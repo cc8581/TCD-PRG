@@ -174,6 +174,15 @@ uniformly sampled action rows. Logs include optimizer steps, samples/states/
 candidate groups seen and effective epochs. `loss_routing.json` records losses
 automatically disabled by dataset capabilities or ablations.
 
+The terminal prints a concise live summary at `logging.log_interval`: total and
+paper-level module losses, learning rate, gradient norm, throughput, AMP skips,
+effective epoch, and generated-candidate coverage when applicable. Detailed
+metrics are not downsampled: every successful optimizer step is appended to
+`train_metrics.jsonl`, including all loss diagnostics averaged across the full
+gradient-accumulation window. `validation_metrics.jsonl` stores every validation
+score plus all averaged validation terms, while `training_events.jsonl` records
+start/end, AMP-skipped windows, checkpoints, validation, and early stopping.
+
 Generated policy caches are tied to the upstream checkpoint SHA-256 and the
 full candidate code/config/asset signature. Matching is tri-state: candidates
 near successful sequence actions are positive, candidates near explicitly

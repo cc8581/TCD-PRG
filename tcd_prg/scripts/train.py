@@ -208,11 +208,16 @@ def main() -> None:
             torch.distributed.destroy_process_group()
         return
 
-    def validate(module: torch.nn.Module) -> tuple[float, int]:
+    def validate(module: torch.nn.Module) -> dict[str, object]:
         if validation_loader is None:
-            return float("inf"), 1
+            return {
+                "score_sum": float("inf"), "score_count": 1,
+                "metric_sums": {}, "metric_counts": {},
+            }
         module.eval()
         total, count = 0.0, 0
+        metric_sums: dict[str, float] = {}
+        metric_counts: dict[str, int] = {}
         with torch.no_grad():
             for raw in validation_loader:
                 batch = trainer._move(raw, trainer.device)
@@ -224,10 +229,18 @@ def main() -> None:
                 )
                 total += score
                 count += 1
+                for key, value in terms.items():
+                    metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
+                    metric_counts[key] = metric_counts.get(key, 0) + 1
                 if count >= config.training.max_validation_groups:
                     break
         module.train()
-        return total, count
+        return {
+            "score_sum": total,
+            "score_count": count,
+            "metric_sums": metric_sums,
+            "metric_counts": metric_counts,
+        }
 
     state = trainer.train(
         train_loader,

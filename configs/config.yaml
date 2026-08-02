@@ -239,6 +239,7 @@ ablation:
 
 logging:
   backend: tensorboard
+  # Terminal summaries only; train_metrics.jsonl records every optimizer step.
   log_interval: 20
   save_resolved_config: true
   save_git_commit: true

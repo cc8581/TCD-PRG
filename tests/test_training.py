@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 
 from tcd_prg.config import (
-    AblationConfig, BackboneConfig, GraphConfig, LossConfig, ModelConfig,
+    AblationConfig, BackboneConfig, GraphConfig, LoggingConfig, LossConfig, ModelConfig,
     RegionHeadConfig, RouterConfig, TCDPRGConfig, TrainingConfig,
 )
 from tcd_prg.datasets import TaskOrientedClutterAdapter
@@ -115,8 +117,90 @@ def test_amp_overflow_does_not_advance_optimizer_step(tmp_path) -> None:
     state = trainer.train([batch], groups_per_effective_epoch=1)
     assert state.optimizer_steps == 1
     assert state.amp_skipped_steps == 1
-    assert state.samples_seen == 2
+    assert state.samples_seen == 4
     assert optimizer.state
+
+
+def test_trainer_prints_concise_summary_and_saves_every_step_metric(
+    tmp_path, capsys
+) -> None:
+    config = TCDPRGConfig(
+        training=TrainingConfig(
+            device="cpu", amp=False, max_optimizer_steps=1,
+            gradient_accumulation_steps=2,
+        ),
+        logging=LoggingConfig(backend="none", log_interval=1),
+        output_dir=str(tmp_path),
+    )
+    model = torch.nn.Linear(3, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    batches = [
+        {"x": torch.randn(2, 3), "marker": torch.tensor(value)}
+        for value in (1.0, 3.0)
+    ]
+
+    def loss_step(module, batch):
+        loss = module(batch["x"]).square().mean()
+        return loss, {"loss_total": loss, "diagnostic": batch["marker"]}
+
+    Trainer(model, optimizer, config, loss_step).train(batches)
+    terminal = capsys.readouterr().out
+    assert "[train-start]" in terminal
+    assert "[train 0000001/0000001]" in terminal
+    assert "[train-done]" in terminal
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "train_metrics.jsonl").read_text().splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0]["micro_batches"] == 2
+    assert records[0]["window_samples"] == 4
+    assert records[0]["diagnostic"] == pytest.approx(2.0)
+    events = [
+        json.loads(line)["event"]
+        for line in (tmp_path / "training_events.jsonl").read_text().splitlines()
+    ]
+    assert events == ["training_started", "training_completed"]
+
+
+def test_validation_metrics_and_checkpoint_events_are_persisted(tmp_path, capsys) -> None:
+    config = TCDPRGConfig(
+        training=TrainingConfig(
+            device="cpu", amp=False, max_optimizer_steps=1,
+            gradient_accumulation_steps=1, validation_interval=1,
+        ),
+        logging=LoggingConfig(backend="none", log_interval=10),
+        output_dir=str(tmp_path),
+    )
+    model = torch.nn.Linear(3, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    batch = {"x": torch.randn(2, 3)}
+
+    def loss_step(module, current):
+        loss = module(current["x"]).square().mean()
+        return loss, {"loss_total": loss}
+
+    trainer = Trainer(model, optimizer, config, loss_step)
+    trainer.train([batch], validate=lambda module: {
+        "score_sum": 2.0,
+        "score_count": 4,
+        "metric_sums": {"loss_policy_candidate": 1.2},
+        "metric_counts": {"loss_policy_candidate": 4},
+    })
+    validation = json.loads(
+        (tmp_path / "validation_metrics.jsonl").read_text().strip()
+    )
+    assert validation["validation_score"] == pytest.approx(0.5)
+    assert validation["metrics"]["loss_policy_candidate"] == pytest.approx(0.3)
+    assert validation["improved"]
+    assert (tmp_path / "best.pt").is_file()
+    assert "[valid 0000001]" in capsys.readouterr().out
+    events = [
+        json.loads(line)["event"]
+        for line in (tmp_path / "training_events.jsonl").read_text().splitlines()
+    ]
+    assert "checkpoint_saved" in events
+    assert "validation_completed" in events
 
 
 def test_ten_batch_overfit_smoke(tiny_batch) -> None:
