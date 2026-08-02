@@ -1,4 +1,4 @@
-"""Batch exact FR5/AG-160-95 IK, approach-path and collision certification."""
+"""Batch exact FR5/AG-160-95 grasp IK, approach-path and collision certification."""
 
 from __future__ import print_function
 
@@ -173,12 +173,10 @@ class Certifier(object):
 
     def certify(self, kind, acted, pose, width, contact, direction):
         if int(kind) == 0:
-            self.set_gripper(self.robot, 1.0, use_motor=False)
-            waypoints = self.push_waypoints(contact, direction)
-        else:
-            closure = (0.095 - min(0.095, max(0.0, float(width)))) / 0.095
-            self.set_gripper(self.robot, closure, use_motor=False)
-            waypoints = self.grasp_waypoints(pose)
+            return False, "push_motion_planning_is_executor_owned"
+        closure = (0.095 - min(0.095, max(0.0, float(width)))) / 0.095
+        self.set_gripper(self.robot, closure, use_motor=False)
+        waypoints = self.grasp_waypoints(pose)
         previous = self.home
         for waypoint_index, waypoint in enumerate(waypoints):
             solution, reason = self.solve(waypoint, previous)

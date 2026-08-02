@@ -33,6 +33,15 @@ def test_multiple_correct_action_set_loss() -> None:
     loss.backward()
 
 
+def test_positive_only_policy_row_has_no_effective_loss_or_gradient() -> None:
+    logits = torch.tensor([[1.0, 2.0]], requires_grad=True)
+    positive = torch.tensor([[True, True]])
+    loss = multi_positive_listwise_loss(logits, positive, torch.ones_like(positive))
+    assert loss == 0
+    loss.backward()
+    assert torch.equal(logits.grad, torch.zeros_like(logits))
+
+
 def test_unknown_candidate_excluded_from_listwise_denominator() -> None:
     logits = torch.tensor([[0.0, 1.0, 100.0]])
     positive = torch.tensor([[False, True, False]])

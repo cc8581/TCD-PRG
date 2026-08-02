@@ -73,7 +73,7 @@ class TCDPRGObjective(nn.Module):
     @staticmethod
     def _listwise_active(positive: Tensor, valid: Tensor) -> Tensor:
         positive = positive.bool() & valid.bool()
-        return (valid.any(-1) & positive.any(-1)).any()
+        return (positive.any(-1) & (valid & ~positive).any(-1)).any()
 
     def _subtotal(
         self, values: dict[str, Tensor], active: dict[str, Tensor | bool]
@@ -97,7 +97,15 @@ class TCDPRGObjective(nn.Module):
                 f"Batch requires {maximum} unique grasps but task_grasp_candidates="
                 f"{self.model_config.task_grasp_candidates}"
             )
-        output = model(batch)
+        generated_only = (
+            self.generated_policy_candidate_ratio == 1.0
+            and self.total.enabled("policy_candidate")
+            and not any(
+                self.total.enabled(name)
+                for name in self.MODULE_OBJECTIVES if name != "policy_candidate"
+            )
+        )
+        output = model(batch, forward_mode="generated_policy" if generated_only else "full")
         families: dict[str, dict[str, Tensor]] = {}
 
         region_labels = build_region_labels(batch)
@@ -177,4 +185,28 @@ class TCDPRGObjective(nn.Module):
                     "Generated policy training is enabled but the batch has no generated candidates"
                 )
             families["policy_candidate"] = {"loss": policy_loss}
-        return self.total(families)
+        total, terms = self.total(families)
+        generated = batch.get("generated_policy_candidates")
+        if generated is not None:
+            valid = generated["valid"]
+            positive = valid & generated["policy_success"]
+            negative = valid & (
+                generated["label_status"] == int(CandidateStatus.NEGATIVE)
+            )
+            positive_rows = positive.any(-1)
+            negative_rows = negative.any(-1)
+            terms.update({
+                "generated_states": valid.new_tensor(valid.shape[0], dtype=torch.float32),
+                "generated_states_with_positive": positive_rows.sum().float(),
+                "generated_effective_policy_rows": (
+                    positive_rows & negative_rows
+                ).sum().float(),
+                "generated_known_candidates": (positive | negative).sum().float(),
+                "generated_unknown_candidates": (
+                    valid & ~positive & ~negative
+                ).sum().float(),
+                "generated_conflict_candidates": generated.get(
+                    "match_conflict", torch.zeros_like(valid)
+                ).sum().float(),
+            })
+        return total, terms

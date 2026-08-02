@@ -15,6 +15,17 @@ def test_float32_push_distance_is_semantically_exact_015m() -> None:
     assert np.isclose(stored, PUSH_DISTANCE_M, atol=1e-6, rtol=0.0)
 
 
+def test_exact_certifier_defers_push_motion_planning_to_executor() -> None:
+    certifier = object.__new__(ExternalFR5AG16095Certifier)
+    certifier.observation = SimpleNamespace()
+    result = certifier.certify({
+        "action_type": int(ActionType.PUSH),
+        "acted_object": 0,
+        "push_distance_m": PUSH_DISTANCE_M,
+    })
+    assert result == (False, "push_requires_executor_motion_planner")
+
+
 def test_exact_certifier_excludes_inactive_objects_from_request(tmp_path, monkeypatch) -> None:
     scene_dir = tmp_path / "scene_0000"
     scene_dir.mkdir()

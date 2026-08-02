@@ -214,7 +214,7 @@ class TCDPRGModel(nn.Module):
             ),
         }
 
-    def forward(self, batch: dict[str, Tensor], candidate_inputs: dict[str, Tensor] | None = None) -> dict[str, Any]:
+    def _encode_scene(self, batch: dict[str, Tensor]) -> tuple[Any, Tensor]:
         object_present = batch.get("object_present", batch["object_mask"])
         physical_active = object_present & batch["object_active"]
         encoded = self.encoder(
@@ -229,6 +229,34 @@ class TCDPRGModel(nn.Module):
             use_task_region_condition=self.ablation.use_task_region_condition,
             target_object=batch["target_object"],
         )
+        return encoded, physical_active
+
+    def forward_generated_policy(self, batch: dict[str, Tensor]) -> dict[str, Any]:
+        """Router-only stage: shared encoder plus cached generated candidates."""
+
+        generated = batch.get("generated_policy_candidates")
+        if generated is None:
+            raise RuntimeError("Generated-policy forward requires cached generated candidates")
+        encoder_frozen = not any(parameter.requires_grad for parameter in self.encoder.parameters())
+        if encoder_frozen:
+            with torch.no_grad():
+                encoded, _ = self._encode_scene(batch)
+        else:
+            encoded, _ = self._encode_scene(batch)
+        result: dict[str, Any] = {"encoded": encoded, "verifier": None}
+        generated_inputs = self._external_candidate_inputs(encoded, generated)
+        result["generated_router"] = self.route_cached(batch, result, generated_inputs)
+        return result
+
+    def forward(
+        self, batch: dict[str, Tensor], candidate_inputs: dict[str, Tensor] | None = None,
+        *, forward_mode: str = "full",
+    ) -> dict[str, Any]:
+        if forward_mode == "generated_policy":
+            return self.forward_generated_policy(batch)
+        if forward_mode != "full":
+            raise ValueError(f"Unsupported forward_mode={forward_mode}")
+        encoded, physical_active = self._encode_scene(batch)
         region = self.region_head(
             encoded.point_features, encoded.target_token, encoded.task_token, batch["target_mask"]
         )

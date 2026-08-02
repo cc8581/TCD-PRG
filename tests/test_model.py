@@ -5,6 +5,7 @@ import torch
 
 from tcd_prg.config import AblationConfig, ModelConfig
 from tcd_prg.models import TCDPRGModel
+from tcd_prg.models.common import ActionCandidateEncoder
 from tcd_prg.models.grasp_verifier import GripperSceneTaskVerifier
 from tcd_prg.models.policy import MaskedHierarchicalCandidateRouter
 from tcd_prg.models.dependency_graph.hgt import derive_dependency_masks
@@ -131,6 +132,32 @@ def test_model_routes_cached_generated_candidates_without_teacher_axis(tiny_batc
     output = model(batch)
     assert output["generated_router"].candidate_logits.shape == (1, 2)
     assert torch.isfinite(output["generated_router"].candidate_logits).all()
+
+    class ForbiddenHead(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            raise AssertionError("full geometry head ran during generated-policy forward")
+
+    model.region_head = ForbiddenHead()
+    fast = model(batch, forward_mode="generated_policy")
+    assert fast["generated_router"].candidate_logits.shape == (1, 2)
+
+
+def test_candidate_encoder_does_not_consume_pick_remove_destination() -> None:
+    encoder = ActionCandidateEncoder(8).eval()
+    object_tokens = torch.randn(1, 2, 8)
+    common = {
+        "object_tokens": object_tokens,
+        "action_type": torch.tensor([[1]]),
+        "acted_object": torch.tensor([[0]]),
+        "contact_world": torch.full((1, 1, 3), float("nan")),
+        "direction_world": torch.full((1, 1, 3), float("nan")),
+        "pose_world": torch.tensor([[[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]]]),
+        "parameter_valid": torch.ones(1, 1, 5, dtype=torch.bool),
+        "task_token": torch.randn(1, 8),
+    }
+    first = encoder(destination_world=torch.zeros(1, 1, 3), **common)
+    second = encoder(destination_world=torch.full((1, 1, 3), 100.0), **common)
+    assert torch.equal(first, second)
 
 
 def test_network_features_do_not_depend_on_simulation_object_pose(tiny_batch) -> None:

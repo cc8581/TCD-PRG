@@ -84,6 +84,50 @@ class DenseCandidateGenerator:
         selected = torch.nonzero(keep, as_tuple=False).flatten()
         return selected[score[selected].argsort(descending=True, stable=True)[:amount]]
 
+    def apply_push_nms(
+        self, candidates: dict[str, Tensor], router_logits: Tensor
+    ) -> Tensor:
+        """Deduplicate same-object PUSH actions using router evidence order."""
+
+        keep = candidates["valid"].clone()
+        cosine_threshold = math.cos(math.radians(self.config.push_nms_direction_deg))
+        for row in range(keep.shape[0]):
+            push = torch.nonzero(
+                keep[row] & (candidates["type"][row] == int(ActionType.PUSH)),
+                as_tuple=False,
+            ).flatten()
+            ordered = push[router_logits[row, push].argsort(descending=True, stable=True)]
+            accepted: list[int] = []
+            for index in ordered.tolist():
+                duplicate = False
+                for prior in accepted:
+                    same_object = bool(
+                        candidates["object"][row, index] == candidates["object"][row, prior]
+                    )
+                    contact_distance = torch.linalg.vector_norm(
+                        candidates["contact_world"][row, index]
+                        - candidates["contact_world"][row, prior]
+                    )
+                    first = torch.nn.functional.normalize(
+                        candidates["direction_world"][row, index, :2], dim=-1
+                    )
+                    second = torch.nn.functional.normalize(
+                        candidates["direction_world"][row, prior, :2], dim=-1
+                    )
+                    similar_direction = bool((first * second).sum() >= cosine_threshold)
+                    if (
+                        same_object
+                        and bool(contact_distance < self.config.push_nms_contact_m)
+                        and similar_direction
+                    ):
+                        duplicate = True
+                        break
+                if duplicate:
+                    keep[row, index] = False
+                else:
+                    accepted.append(index)
+        return keep
+
     def global_predictions(
         self, batch: dict[str, Tensor], output: dict[str, Any], topk: int | None = None,
         score_kind: str = "scene",
@@ -123,7 +167,19 @@ class DenseCandidateGenerator:
         for batch_row in range(batch["xyz"].shape[0]):
             xyz, instance = batch["xyz"][batch_row], batch["instance_id"][batch_row]
             active = batch["object_mask"][batch_row] & batch["object_active"][batch_row]
-            actionable = output["graph"].derived_actionable_mask[batch_row] if output["graph"] is not None else active
+            graph_output = output["graph"]
+            if graph_output is None or self.config.graph_candidate_mode == "none":
+                actionable = active
+                graph_prior = active.to(xyz.dtype)
+            elif self.config.graph_candidate_mode == "hard":
+                actionable = graph_output.derived_actionable_mask[batch_row]
+                graph_prior = actionable.to(xyz.dtype)
+            else:
+                actionable = active
+                graph_prior = getattr(
+                    graph_output, "dependency_prior",
+                    graph_output.derived_actionable_mask.to(xyz.dtype),
+                )[batch_row]
             target_object = int(batch["target_object"][batch_row])
             type_parts, object_parts, contact_parts, direction_parts, point_parts = [], [], [], [], []
             pose_parts, destination_parts, width_parts, score_parts = [], [], [], []
@@ -172,14 +228,19 @@ class DenseCandidateGenerator:
                 mask = global_object == object_index
                 if mask.any():
                     per_object_score[object_index] = global_score[mask].max()
-            if output["graph"] is not None:
+            if graph_output is not None and self.config.graph_candidate_mode == "hard":
                 remove_eligible = self._with_graph_fallback(remove_eligible, remove_domain, per_object_score)
             valid_remove = remove_eligible[global_object.clamp(0, len(active) - 1)] & (global_object >= 0)
             candidates = torch.nonzero(valid_remove, as_tuple=False).flatten()
             if len(candidates):
+                candidate_score = global_score[candidates]
+                if self.config.graph_candidate_mode == "soft":
+                    candidate_score = candidate_score * (
+                        0.25 + 0.75 * graph_prior[global_object[candidates]]
+                    )
                 local = self._nms_indices(
                     global_pose[candidates], global_head["width_m"][batch_row, candidates],
-                    global_score[candidates], global_object[candidates],
+                    candidate_score, global_object[candidates],
                     self.config.pick_remove_candidates, global_grasp=True,
                 )
                 selected = candidates[local]
@@ -197,13 +258,18 @@ class DenseCandidateGenerator:
 
             push = output["push"]
             push_eligible = active & actionable
-            if output["graph"] is not None:
+            if graph_output is not None and self.config.graph_candidate_mode == "hard":
                 if self.config.allow_target_push_recovery:
                     push_eligible[target_object] = active[target_object]
                 push_eligible = self._with_graph_fallback(push_eligible, active, push["object_logits"][batch_row])
             push_objects = torch.nonzero(push_eligible, as_tuple=False).flatten()
             if len(push_objects):
-                push_objects = push_objects[push["object_logits"][batch_row, push_objects].argsort(descending=True)[:4]]
+                object_score = torch.sigmoid(push["object_logits"][batch_row, push_objects])
+                if self.config.graph_candidate_mode == "soft":
+                    object_score = object_score * (0.25 + 0.75 * graph_prior[push_objects])
+                push_objects = push_objects[object_score.argsort(descending=True)[
+                    :self.config.graph_candidate_topk_objects
+                ]]
             push_index = self._top_per_object(
                 torch.sigmoid(push["contact_logits"][batch_row]), instance,
                 push_objects, self.config.push_candidates,
@@ -317,6 +383,16 @@ class DenseCandidateGenerator:
                 evidence[row, push_candidates, 3] = result["direction_score"][
                     row, push_candidates
                 ]
+        if output["graph"] is not None and self.config.graph_candidate_mode == "soft":
+            for row in range(result["type"].shape[0]):
+                prior = getattr(
+                    output["graph"], "dependency_prior",
+                    output["graph"].derived_actionable_mask.to(evidence.dtype),
+                )[row]
+                safe_object = result["object"][row].clamp(0, len(prior) - 1)
+                evidence[row, :, 4] = torch.where(
+                    result["valid"][row], prior[safe_object], 0.0
+                )
         result["evidence"] = evidence
         return result
 

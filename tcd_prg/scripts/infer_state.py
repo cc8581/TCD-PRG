@@ -62,17 +62,35 @@ def main() -> None:
         model.load_state_dict(checkpoint.get("ema") or checkpoint["model"])
         gripper = (create_gripper_provider(config, args.allow_gripper_generate)
                    if config.ablation.use_gripper_scene_verifier else None)
-        base_policy = TCDPRGPolicy(model, config, gripper, certifier)
+        # Candidate generation/routing stays robot-agnostic.  The selected
+        # action is certified below, with rejection followed by reranking.
+        base_policy = TCDPRGPolicy(model, config, gripper, certifier=None)
         policy = create_baseline(config, base_policy)
     encoded = policy.encode_observation(observation)
     candidates = policy.generate_candidates(encoded)
-    action = policy.select_action(candidates)
     final_certification = None
-    if config.baseline.type == "original_gapg_wrapper" and certifier is not None and action is not None:
+    action = policy.select_action(candidates)
+    if certifier is not None:
         certifier.set_observation(observation)
-        final_certification = certifier.certify(action)
-        if not final_certification[0]:
-            action = None
+        while action is not None:
+            final_certification = certifier.certify(action)
+            if final_certification[0]:
+                break
+            tensor_group = candidates.get("candidates") if isinstance(candidates, dict) else None
+            index = action.get("candidate_index") if isinstance(action, dict) else None
+            if not isinstance(tensor_group, dict) or index is None or "valid" not in tensor_group:
+                action = None
+                break
+            tensor_group["valid"][0, int(index)] = False
+            encoded_state = candidates.get("encoded")
+            routed_model = getattr(policy, "model", None)
+            if encoded_state is None or routed_model is None:
+                action = None
+                break
+            candidates["router"] = routed_model.route_cached(
+                encoded_state.device_batch, encoded_state.output, tensor_group
+            )
+            action = policy.select_action(candidates)
     tensor_candidates = candidates.get("candidates") if isinstance(candidates, dict) else None
     valid_count = (int(tensor_candidates["valid"].sum())
                    if isinstance(tensor_candidates, dict) and "valid" in tensor_candidates

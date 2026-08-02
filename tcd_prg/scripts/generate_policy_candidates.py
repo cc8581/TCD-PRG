@@ -18,7 +18,7 @@ from tcd_prg.datasets.policy_candidates import (
 )
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.planners import TCDPRGPolicy
-from tcd_prg.runtime import create_action_certifier, create_adapter, create_gripper_provider
+from tcd_prg.runtime import create_adapter, create_gripper_provider
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,7 +28,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="train", choices=("train", "val", "test"))
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-groups", type=int)
-    parser.add_argument("--skip-exact-certification", action="store_true")
     parser.add_argument("overrides", nargs="*")
     return parser.parse_args()
 
@@ -53,25 +52,27 @@ def main() -> None:
         create_gripper_provider(config, allow_generate=False)
         if config.ablation.use_gripper_scene_verifier else None
     )
-    exact = config.planner.exact_certification and not args.skip_exact_certification
-    certifier = create_action_certifier(config) if exact else None
-    policy = TCDPRGPolicy(model, config, gripper, certifier)
+    # Generated caches preserve the generator's full open-world proposal set.
+    # Robot approach/path certification belongs to the final executor, while
+    # action outcomes come from teacher transitions or dedicated rollouts.
+    policy = TCDPRGPolicy(model, config, gripper, certifier=None)
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    manifest = cache_manifest(args.checkpoint, config.model, exact_certification=exact)
+    manifest = cache_manifest(args.checkpoint, config, certification_scope="none")
     manifest_path = output / "manifest.json"
     if manifest_path.is_file():
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
         for key in (
             "format", "checkpoint_sha256", "generator_signature",
-            "exact_certification", "certifier_version",
+            "certification_scope", "label_version",
         ):
             if existing.get(key) != manifest[key]:
                 raise ValueError(
                     f"Existing generated policy cache has incompatible {key}"
                 )
         manifest["splits"] = existing.get("splits", {})
-    positive = negative = unknown = written = 0
+    positive = negative = unknown = conflict = written = 0
+    groups_positive = groups_negative = effective_rows = 0
     with torch.no_grad():
         for index in range(len(dataset)):
             sample = dataset[index]
@@ -79,7 +80,6 @@ def main() -> None:
                 config.planner.max_preparation_actions,
                 int(sample.state_labels.sequence_depth),
             )
-            policy.previous_action = None
             encoded = policy.encode_observation(sample.observation)
             group = policy.generate_candidates(encoded)
             candidates = group["candidates"]
@@ -90,15 +90,33 @@ def main() -> None:
             teacher = collate_unified([sample])
             labels = match_generated_candidates(candidates, teacher, 0, config.model)
             save_candidate_entry(output, sample, candidates, labels)
-            positive += int(labels["policy_success"].sum())
-            negative += int((labels["label_status"] == 0).sum())
-            unknown += int((labels["label_status"] < 0).sum())
+            valid = candidates["valid"][0].cpu()
+            positive_mask = valid & (labels["label_status"] == 1)
+            negative_mask = valid & (labels["label_status"] == 0)
+            unknown_mask = valid & (labels["label_status"] < 0)
+            conflict_mask = valid & labels["match_conflict"]
+            has_positive = bool(positive_mask.any())
+            has_negative = bool(negative_mask.any())
+            positive += int(positive_mask.sum())
+            negative += int(negative_mask.sum())
+            unknown += int(unknown_mask.sum())
+            conflict += int(conflict_mask.sum())
+            groups_positive += int(has_positive)
+            groups_negative += int(has_negative)
+            effective_rows += int(has_positive and has_negative)
             written += 1
     manifest["splits"][args.split] = {
         "entries": written,
         "known_positive_candidates": positive,
         "known_negative_candidates": negative,
         "unknown_candidates": unknown,
+        "conflict_unknown_candidates": conflict,
+        "unmatched_unknown_candidates": unknown - conflict,
+        "groups_with_known_positive": groups_positive,
+        "groups_with_known_negative": groups_negative,
+        "effective_policy_rows": effective_rows,
+        "generated_positive_coverage": groups_positive / max(1, written),
+        "effective_policy_row_coverage": effective_rows / max(1, written),
     }
     manifest["entries"] = len(tuple(output.glob("*.npz")))
     temporary = output / "manifest.work.json"

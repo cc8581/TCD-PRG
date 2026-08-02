@@ -45,7 +45,10 @@ def multi_positive_listwise_loss(logits: Tensor, positive: Tensor, valid: Tensor
     positive_logits = logits.masked_fill(~positive, -torch.inf)
     log_all = torch.logsumexp(masked_logits, dim=-1)
     log_positive = torch.logsumexp(positive_logits, dim=-1)
-    row_valid = valid.any(-1) & positive.any(-1)
+    # A positive-only row has numerator == denominator and exactly zero
+    # gradient.  Count/train only rows containing a known positive and at
+    # least one known negative competitor.
+    negative = valid & ~positive
+    row_valid = positive.any(-1) & negative.any(-1)
     loss = -(log_positive - log_all)
     return masked_mean(loss, row_valid)
-

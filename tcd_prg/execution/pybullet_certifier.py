@@ -15,6 +15,7 @@ from tcd_prg.paths import project_path, resolve_executable
 
 
 class ExternalFR5AG16095Certifier:
+    """Exact grasp-pose certifier; PUSH motion planning is executor-owned."""
     def __init__(self, python_executable: str | Path, worker_script: str | Path,
                  robot_root: str | Path, runtime_mesh_root: str | Path,
                  scene_root: str | Path,
@@ -37,6 +38,22 @@ class ExternalFR5AG16095Certifier:
         if self.observation is None:
             raise RuntimeError("set_observation must be called before certification")
         observation = self.observation
+        action_type_all = np.asarray([item["action_type"] for item in actions], np.int8)
+        distances = np.asarray(
+            [item.get("push_distance_m", np.nan) for item in actions], dtype=np.float64
+        )
+        if np.any((action_type_all == int(ActionType.PUSH)) &
+                  (~np.isclose(distances, PUSH_DISTANCE_M, atol=1e-6, rtol=0.0))):
+            raise ValueError("Formal PUSH actions require exactly 0.15 m")
+        grasp_indices = np.flatnonzero(action_type_all != int(ActionType.PUSH)).tolist()
+        decisions: list[tuple[bool, str]] = [
+            (False, "push_requires_executor_motion_planner")
+            if kind == int(ActionType.PUSH) else (False, "unprocessed")
+            for kind in action_type_all
+        ]
+        if not grasp_indices:
+            return decisions
+        grasp_actions = [actions[index] for index in grasp_indices]
         metadata = observation.metadata
         model_ids = np.asarray(metadata["object_model_id"])
         scales = np.asarray(metadata["object_scale"], np.float32)
@@ -45,25 +62,15 @@ class ExternalFR5AG16095Certifier:
             support_present = scene["thin_support_block_present"]
             support_pose = scene["thin_support_block_pose"]
             support_size = scene["thin_support_block_size"]
-        count = len(actions)
-        action_type = np.asarray([item["action_type"] for item in actions], np.int8)
-        distances = np.asarray(
-            [item.get("push_distance_m", np.nan) for item in actions], dtype=np.float64
-        )
-        if np.any((action_type == int(ActionType.PUSH)) &
-                  (~np.isclose(distances, PUSH_DISTANCE_M, atol=1e-6, rtol=0.0))):
-            raise ValueError("Formal PUSH certification requires exactly 0.15 m")
+        count = len(grasp_actions)
+        action_type = np.asarray([item["action_type"] for item in grasp_actions], np.int8)
         pose = np.full((count, 7), np.nan, np.float32)
         width = np.full(count, np.nan, np.float32)
         contact = np.full((count, 3), np.nan, np.float32)
         direction = np.full((count, 3), np.nan, np.float32)
-        for index, item in enumerate(actions):
-            if int(item["action_type"]) == int(ActionType.PUSH):
-                contact[index] = item["push_contact_world"]
-                direction[index] = item["push_direction_world"]
-            else:
-                pose[index] = item["grasp_pose_world"]
-                width[index] = item["grasp_width_m"]
+        for index, item in enumerate(grasp_actions):
+            pose[index] = item["grasp_pose_world"]
+            width[index] = item["grasp_width_m"]
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as directory:
             request, output = Path(directory) / "request.npz", Path(directory) / "result.npz"
             np.savez_compressed(
@@ -72,7 +79,9 @@ class ExternalFR5AG16095Certifier:
                 object_present=observation.physical_active,
                 support_present=support_present, support_pose=support_pose, support_size=support_size,
                 action_type=action_type,
-                acted_object=np.asarray([item["acted_object"] for item in actions], np.int16),
+                acted_object=np.asarray(
+                    [item["acted_object"] for item in grasp_actions], np.int16
+                ),
                 pose_world=pose, width_m=width, contact_world=contact,
                 direction_world=direction,
             )
@@ -85,7 +94,13 @@ class ExternalFR5AG16095Certifier:
             if completed.returncode != 0:
                 raise RuntimeError("FR5 certification worker failed\n" + completed.stdout + completed.stderr)
             with np.load(output, allow_pickle=False) as result:
-                return list(zip(result["success"].astype(bool).tolist(), result["reasons"].astype(str).tolist()))
+                grasp_decisions = list(zip(
+                    result["success"].astype(bool).tolist(),
+                    result["reasons"].astype(str).tolist(),
+                ))
+        for index, decision in zip(grasp_indices, grasp_decisions, strict=True):
+            decisions[index] = decision
+        return decisions
 
     def certify(self, action: dict[str, Any]) -> tuple[bool, str]:
         return self.certify_many([action])[0]

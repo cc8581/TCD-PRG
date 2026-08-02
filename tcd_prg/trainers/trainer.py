@@ -27,6 +27,9 @@ class TrainerState:
     samples_seen: int = 0
     states_seen: int = 0
     candidate_groups_seen: int = 0
+    generated_states_seen: int = 0
+    generated_positive_states_seen: int = 0
+    effective_policy_rows_seen: int = 0
     effective_epochs: float = 0.0
     best_validation: float = float("inf")
     validation_without_improvement: int = 0
@@ -81,6 +84,15 @@ class Trainer:
             if any(name == prefix or name.startswith(prefix + ".") for prefix in prefixes):
                 parameter.requires_grad_(not frozen)
 
+    def _apply_frozen_module_modes(self) -> None:
+        """Keep frozen upstream modules deterministic during router-only stages."""
+
+        source = self.model.module if hasattr(self.model, "module") else self.model
+        for prefix in self.config.training.frozen_modules:
+            module = source.get_submodule(prefix)
+            if not any(parameter.requires_grad for parameter in module.parameters()):
+                module.eval()
+
     def _save_run_metadata(self) -> None:
         import yaml
 
@@ -118,6 +130,7 @@ class Trainer:
         )
         self.optimizer.zero_grad(set_to_none=True)
         self.model.train()
+        self._apply_frozen_module_modes()
         micro_step, saw_batch, stop = 0, False, False
         started = time.time()
         epoch = 0
@@ -145,6 +158,19 @@ class Trainer:
                         loss, terms = self.loss_step(self.model, batch)
                         scaled_loss = loss / accumulation
                     self.scaler.scale(scaled_loss).backward()
+                if "generated_states" in terms:
+                    generated_counts = torch.stack([
+                        terms["generated_states"],
+                        terms["generated_states_with_positive"],
+                        terms["generated_effective_policy_rows"],
+                    ]).detach().to(dtype=torch.long)
+                    if torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(
+                            generated_counts, op=torch.distributed.ReduceOp.SUM
+                        )
+                    self.state.generated_states_seen += int(generated_counts[0])
+                    self.state.generated_positive_states_seen += int(generated_counts[1])
+                    self.state.effective_policy_rows_seen += int(generated_counts[2])
                 batch_size = int(batch["xyz"].shape[0]) if "xyz" in batch else 1
                 global_batch_size = batch_size * (
                     torch.distributed.get_world_size()
@@ -185,6 +211,8 @@ class Trainer:
                     and self.state.optimizer_steps >= self.config.training.unfreeze_at_optimizer_step
                 ):
                     self._set_frozen_modules(False)
+                    self.model.train()
+                    self._apply_frozen_module_modes()
                 if self.ema is not None:
                     source = self.model.module if hasattr(self.model, "module") else self.model
                     self.ema.update(source)
@@ -203,6 +231,9 @@ class Trainer:
                         "samples_seen": self.state.samples_seen,
                         "states_seen": self.state.states_seen,
                         "candidate_groups_seen": self.state.candidate_groups_seen,
+                        "generated_states_seen": self.state.generated_states_seen,
+                        "generated_positive_states_seen": self.state.generated_positive_states_seen,
+                        "effective_policy_rows_seen": self.state.effective_policy_rows_seen,
                         "effective_epochs": self.state.effective_epochs,
                         "gradient_norm": float(gradient_norm),
                         "elapsed_seconds": time.time() - started,
@@ -221,6 +252,8 @@ class Trainer:
                     self.save_checkpoint(self.output_dir / f"step_{step:08d}.pt")
                 if validate and step % self.config.training.validation_interval == 0:
                     validation = validate(self.ema.model if self.ema else self.model)
+                    self.model.train()
+                    self._apply_frozen_module_modes()
                     if torch.distributed.is_initialized():
                         if isinstance(validation, tuple):
                             value = torch.tensor(validation, dtype=torch.float64, device=self.device)

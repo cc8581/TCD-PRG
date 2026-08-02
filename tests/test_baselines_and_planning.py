@@ -168,6 +168,7 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
         feature_dim=8, task_dim=4, task_grasp_candidates=1,
         pick_remove_candidates=8, push_candidates=8,
         graph_candidate_fallback_objects=1,
+        graph_candidate_mode="hard",
     )
     generator = DenseCandidateGenerator(config)
     instance = torch.tensor([[0, 0, 1, 1, 2, 2, 3, 3]])
@@ -238,6 +239,21 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
         without_target_recovery["type"][0] == int(ActionType.PUSH)
     )
     assert 0 not in set(without_target_recovery["object"][0, push_rows].tolist())
+
+
+def test_push_action_nms_uses_router_order_for_near_duplicate_actions() -> None:
+    generator = DenseCandidateGenerator(ModelConfig(
+        push_nms_contact_m=0.02, push_nms_direction_deg=10.0
+    ))
+    candidates = {
+        "valid": torch.ones(1, 3, dtype=torch.bool),
+        "type": torch.full((1, 3), int(ActionType.PUSH)),
+        "object": torch.tensor([[0, 0, 1]]),
+        "contact_world": torch.tensor([[[0.0, 0.0, 0.0], [0.01, 0.0, 0.0], [0.0, 0.0, 0.0]]]),
+        "direction_world": torch.tensor([[[1.0, 0.0, 0.0], [0.99, 0.01, 0.0], [1.0, 0.0, 0.0]]]),
+    }
+    keep = generator.apply_push_nms(candidates, torch.tensor([[0.2, 0.9, 0.1]]))
+    assert keep.tolist() == [[False, True, True]]
 
 
 def test_adaptive_task_grasp_gate_requires_unique_certified_candidate_counts() -> None:

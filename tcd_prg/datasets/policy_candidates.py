@@ -12,17 +12,21 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from tcd_prg.config import ModelConfig
+from tcd_prg.config import ModelConfig, TCDPRGConfig
 from tcd_prg.constants import ActionType, CandidateStatus
 from tcd_prg.geometry.se3 import parallel_jaw_rotation_distance, quaternion_xyzw_to_matrix
+from tcd_prg.paths import project_path
 
-POLICY_CANDIDATE_CACHE_FORMAT = "tcd_prg_generated_policy_candidates_v1"
-POLICY_CANDIDATE_CERTIFIER_VERSION = "fr5_ag16095_exact_candidate_v1_physical_active"
+POLICY_CANDIDATE_CACHE_FORMAT = "tcd_prg_generated_policy_candidates_v2_open_world"
+POLICY_CANDIDATE_LABEL_VERSION = "conflict_unknown_effective_rows_v1"
 
 RAW_FIELDS = (
     "type", "object", "contact_world", "direction_world", "pose_world",
     "destination_world", "width_m", "proposal_score", "point_index",
     "direction_bin", "direction_score", "evidence", "valid",
+)
+LABEL_FIELDS = (
+    "label_status", "policy_success", "matched_teacher_index", "match_conflict",
 )
 
 
@@ -34,21 +38,55 @@ def checkpoint_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def generator_signature(config: ModelConfig) -> str:
-    relevant = {
-        "num_direction_bins", "task_grasp_candidates", "pick_remove_candidates",
-        "push_candidates", "push_directions_per_contact", "max_push_candidates",
-        "grasp_nms_translation_m", "grasp_nms_rotation_deg", "grasp_nms_width_m",
-        "grasp_nms_approach_deg", "global_grasp_nms_translation_m",
-        "global_grasp_nms_rotation_deg", "global_grasp_nms_width_m",
-        "global_grasp_nms_approach_deg", "graph_candidate_fallback_objects",
-        "allow_target_push_recovery", "verifier_validity_threshold",
-        "policy_push_match_contact_m", "policy_push_match_direction_deg",
-        "policy_grasp_match_translation_m", "policy_grasp_match_rotation_deg",
-        "policy_grasp_match_width_m",
+def _path_sha256(path: str | Path) -> str:
+    """Hash a file/tree by relative names and contents; missing is explicit."""
+
+    resolved = project_path(path)
+    if not resolved.exists():
+        return f"missing:{resolved.as_posix()}"
+    if resolved.is_file():
+        return checkpoint_sha256(resolved)
+    digest = hashlib.sha256()
+    for child in sorted(item for item in resolved.rglob("*") if item.is_file()):
+        digest.update(child.relative_to(resolved).as_posix().encode("utf-8"))
+        with child.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def generator_signature(config: TCDPRGConfig) -> str:
+    """Bind cached candidates to generator code, config, and consumed assets."""
+
+    code_files = (
+        "tcd_prg/planners/candidate_generator.py",
+        "tcd_prg/planners/tcd_policy.py",
+        "tcd_prg/models/tcd_prg.py",
+        "tcd_prg/models/dependency_graph/hgt.py",
+        "tcd_prg/datasets/policy_candidates.py",
+        "tcd_prg/datasets/task_oriented_clutter.py",
+        "tcd_prg/datasets/collate.py",
+        "tcd_prg/rendering/pybullet_renderer.py",
+    )
+    fields: dict[str, Any] = {
+        "model": asdict(config.model),
+        "ablation": asdict(config.ablation),
+        "graph": asdict(config.graph),
+        "backbone": asdict(config.backbone),
+        "observation": asdict(config.observation),
+        "dataset": {
+            key: value for key, value in asdict(config.dataset).items()
+            if key not in {"root", "acronym_root", "functional_region_root"}
+        },
+        "push_distance_m": config.push_distance_m,
+        "label_version": POLICY_CANDIDATE_LABEL_VERSION,
+        "code": {path: _path_sha256(path) for path in code_files},
     }
-    fields = {key: value for key, value in asdict(config).items() if key in relevant}
-    payload = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+    if config.ablation.use_gripper_scene_verifier:
+        fields["gripper_geometry"] = _path_sha256(config.observation.gripper_cache_dir)
+        fields["gripper_worker"] = _path_sha256(config.observation.gripper_worker_script)
+        fields["robot_urdf"] = _path_sha256(config.dataset.fr5_ag_urdf)
+    payload = json.dumps(fields, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -62,22 +100,62 @@ def sample_cache_key(sample: Any) -> str:
     )
 
 
+def sample_source_signature(sample: Any) -> str:
+    """Bind an entry to the exact observation and teacher action outcomes."""
+
+    digest = hashlib.sha256()
+    observation = sample.observation
+    candidates = sample.candidates
+    arrays = (
+        observation.xyz, observation.rgb, observation.instance_id,
+        observation.target_mask, observation.object_pose,
+        observation.object_present, observation.object_active,
+        candidates.candidate_action_ids, candidates.action_type,
+        candidates.acted_object, candidates.evaluation_status,
+        candidates.success_mask, candidates.potential_delta,
+    )
+    for value in arrays:
+        array = np.ascontiguousarray(value)
+        digest.update(str(array.dtype).encode("ascii"))
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(array.tobytes())
+    for key, value in sorted(candidates.action_parameters.items()):
+        array = np.ascontiguousarray(value)
+        digest.update(key.encode("utf-8"))
+        digest.update(str(array.dtype).encode("ascii"))
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(array.tobytes())
+    for sequence in sample.sequences:
+        for value in (
+            sequence.state_ids, sequence.transition_ids,
+            sequence.policy_action_ids, sequence.terminal_action_ids,
+        ):
+            array = np.ascontiguousarray(value)
+            digest.update(str(array.dtype).encode("ascii"))
+            digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+            digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
 def cache_manifest(
-    checkpoint: str | Path, config: ModelConfig, *, exact_certification: bool
+    checkpoint: str | Path, config: TCDPRGConfig, *, certification_scope: str = "none"
 ) -> dict[str, Any]:
+    if certification_scope != "none":
+        raise ValueError(
+            "Generated policy caches must not pre-filter candidates with robot approach "
+            "certification; label generated actions from observed outcomes/rollouts instead"
+        )
     return {
         "format": POLICY_CANDIDATE_CACHE_FORMAT,
         "checkpoint_sha256": checkpoint_sha256(checkpoint),
         "generator_signature": generator_signature(config),
-        "exact_certification": bool(exact_certification),
-        "certifier_version": (
-            POLICY_CANDIDATE_CERTIFIER_VERSION if exact_certification else "disabled"
-        ),
+        "certification_scope": certification_scope,
+        "label_version": POLICY_CANDIDATE_LABEL_VERSION,
     }
 
 
 def validate_cache_manifest(
-    directory: str | Path, config: ModelConfig, expected_checkpoint_sha256: str = ""
+    directory: str | Path, config: TCDPRGConfig, expected_checkpoint_sha256: str = ""
 ) -> dict[str, Any]:
     path = Path(directory) / "manifest.json"
     if not path.is_file():
@@ -85,12 +163,10 @@ def validate_cache_manifest(
     manifest = json.loads(path.read_text(encoding="utf-8"))
     if manifest.get("format") != POLICY_CANDIDATE_CACHE_FORMAT:
         raise ValueError("Generated policy candidate cache format is incompatible")
-    expected_certifier = (
-        POLICY_CANDIDATE_CERTIFIER_VERSION
-        if manifest.get("exact_certification") else "disabled"
-    )
-    if manifest.get("certifier_version") != expected_certifier:
-        raise ValueError("Generated policy candidate certifier version is incompatible")
+    if manifest.get("certification_scope") != "none":
+        raise ValueError("Generated policy cache has an unsupported certification scope")
+    if manifest.get("label_version") != POLICY_CANDIDATE_LABEL_VERSION:
+        raise ValueError("Generated policy candidate label semantics are incompatible")
     if manifest.get("generator_signature") != generator_signature(config):
         raise ValueError(
             "Generated policy candidate cache uses a different generator/matching config"
@@ -101,6 +177,36 @@ def validate_cache_manifest(
     ):
         raise ValueError("Generated policy candidate cache checkpoint SHA-256 mismatch")
     return manifest
+
+
+def validate_generated_policy_coverage(
+    manifest: dict[str, Any], split: str, *, minimum_positive: float,
+    minimum_effective: float,
+) -> dict[str, float]:
+    """Fail fast before pure generated-policy training on a nearly empty subset."""
+
+    statistics = manifest.get("splits", {}).get(split)
+    if not statistics:
+        raise ValueError(f"Generated policy cache has no coverage statistics for split={split}")
+    groups = int(statistics.get("entries", 0))
+    positive = int(statistics.get("groups_with_known_positive", 0))
+    effective = int(statistics.get("effective_policy_rows", 0))
+    positive_coverage = positive / max(1, groups)
+    effective_coverage = effective / max(1, groups)
+    if positive_coverage < minimum_positive:
+        raise ValueError(
+            f"Generated positive coverage {positive_coverage:.4f} is below required "
+            f"{minimum_positive:.4f}"
+        )
+    if effective_coverage < minimum_effective:
+        raise ValueError(
+            f"Effective generated policy-row coverage {effective_coverage:.4f} is below "
+            f"required {minimum_effective:.4f}"
+        )
+    return {
+        "positive_coverage": positive_coverage,
+        "effective_coverage": effective_coverage,
+    }
 
 
 def _teacher_pose(batch: dict[str, Any], row: int) -> Tensor:
@@ -123,6 +229,7 @@ def match_generated_candidates(
     status = torch.full((count,), int(CandidateStatus.UNKNOWN_UNTESTED), dtype=torch.int8)
     successful = torch.zeros(count, dtype=torch.bool)
     matched = torch.full((count,), -1, dtype=torch.long)
+    conflict = torch.zeros(count, dtype=torch.bool)
     teacher_type = batch["action_type"][row].cpu()
     teacher_object = batch["acted_object"][row].cpu()
     teacher_success = batch["policy_success_mask"][row].cpu()
@@ -200,6 +307,13 @@ def match_generated_candidates(
             continue
         match_cost = cost[compatible]
         positive_mask = teacher_success[matches]
+        negative_mask = teacher_negative[matches]
+        if positive_mask.any() and negative_mask.any():
+            # Geometrically indistinguishable teacher actions disagree about
+            # outcome.  Without repeated-trial success probabilities this is
+            # irreducible UNKNOWN, never a forced binary target.
+            conflict[index] = True
+            continue
         if positive_mask.any():
             positive = matches[positive_mask]
             chosen = positive[match_cost[positive_mask].argmin()]
@@ -213,6 +327,7 @@ def match_generated_candidates(
         "label_status": status,
         "policy_success": successful,
         "matched_teacher_index": matched,
+        "match_conflict": conflict,
     }
 
 
@@ -224,22 +339,28 @@ def save_candidate_entry(
     path = output / f"{sample_cache_key(sample)}.npz"
     arrays = {key: candidates[key][0].detach().cpu().numpy() for key in RAW_FIELDS}
     arrays.update({key: value.cpu().numpy() for key, value in labels.items()})
+    arrays["source_signature"] = np.asarray(sample_source_signature(sample))
     np.savez_compressed(path, **arrays)
     return path
 
 
 def load_candidate_batch(
-    samples: list[Any], directory: str | Path, config: ModelConfig,
-    expected_checkpoint_sha256: str = "",
+    samples: list[Any], directory: str | Path, config: TCDPRGConfig,
+    expected_checkpoint_sha256: str = "", *, validate_manifest: bool = True,
 ) -> dict[str, Tensor]:
-    validate_cache_manifest(directory, config, expected_checkpoint_sha256)
+    if validate_manifest:
+        validate_cache_manifest(directory, config, expected_checkpoint_sha256)
     entries: list[dict[str, np.ndarray]] = []
-    keys = (*RAW_FIELDS, "label_status", "policy_success", "matched_teacher_index")
+    keys = (*RAW_FIELDS, *LABEL_FIELDS)
     for sample in samples:
         path = Path(directory) / f"{sample_cache_key(sample)}.npz"
         if not path.is_file():
             raise FileNotFoundError(f"Generated policy candidate cache entry is missing: {path}")
         with np.load(path, allow_pickle=False) as source:
+            if str(source["source_signature"].item()) != sample_source_signature(sample):
+                raise ValueError(
+                    f"Generated policy candidate source data changed for {path.name}"
+                )
             entries.append({key: source[key] for key in keys})
     maximum = max(len(entry["type"]) for entry in entries)
     result: dict[str, Tensor] = {}
@@ -247,6 +368,7 @@ def load_candidate_batch(
         "type": -1, "object": -1, "point_index": -1, "direction_bin": -1,
         "matched_teacher_index": -1,
         "label_status": int(CandidateStatus.UNKNOWN_UNTESTED),
+        "match_conflict": False,
         "valid": False, "policy_success": False, "proposal_score": -1.0,
     }
     for key in keys:
@@ -263,4 +385,5 @@ def load_candidate_batch(
     result["label_status"] = result["label_status"].to(torch.int8)
     result["valid"] = result["valid"].bool()
     result["policy_success"] = result["policy_success"].bool()
+    result["match_conflict"] = result["match_conflict"].bool()
     return result

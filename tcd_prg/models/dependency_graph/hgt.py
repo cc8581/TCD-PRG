@@ -59,6 +59,7 @@ class DependencyGraphOutput:
     derived_indirect_mask: Tensor
     derived_dependency_mask: Tensor
     derived_actionable_mask: Tensor
+    dependency_prior: Tensor
 
 
 def derive_dependency_masks(
@@ -94,6 +95,28 @@ def derive_dependency_masks(
     has_active_prerequisite = (prerequisite & dependency[:, None, :]).any(-1)
     actionable = dependency & ~has_active_prerequisite & object_mask
     return direct, indirect, dependency, actionable
+
+
+def derive_dependency_prior(
+    physical_edge_logits: Tensor, task_edge_logits: Tensor, object_mask: Tensor,
+) -> Tensor:
+    """Continuous max-product analogue of the deterministic dependency closure."""
+
+    physical = torch.sigmoid(physical_edge_logits)
+    direct = torch.sigmoid(task_edge_logits).amax(-1) * object_mask
+    prerequisite = torch.maximum(physical[..., 2], physical[..., 3].transpose(1, 2))
+    prerequisite = prerequisite * (
+        object_mask[:, :, None] & object_mask[:, None, :]
+    ).to(prerequisite.dtype)
+    dependency = direct
+    for _ in range(object_mask.shape[1]):
+        expanded = (dependency[:, :, None] * prerequisite).amax(1)
+        updated = torch.maximum(dependency, expanded) * object_mask
+        if torch.allclose(updated, dependency):
+            break
+        dependency = updated
+    blocker = (prerequisite * dependency[:, None, :]).amax(-1)
+    return dependency * (1.0 - blocker).clamp_min(0.0) * object_mask
 
 
 class TaskConditionedDependencyGraph(nn.Module):
@@ -179,6 +202,9 @@ class TaskConditionedDependencyGraph(nn.Module):
             threshold=self.edge_threshold,
             use_indirect_reasoning=use_indirect_reasoning,
         )
+        dependency_prior = derive_dependency_prior(
+            physical_logits, task_logits, object_mask
+        )
         return DependencyGraphOutput(
-            nodes, physical_logits, task_logits, *derived,
+            nodes, physical_logits, task_logits, *derived, dependency_prior,
         )

@@ -156,6 +156,14 @@ class OfflineModelEvaluator:
                 record["generated_candidate_positive_coverage"] = float(
                     generated_success[known_valid].any()
                 )
+                known_negative = known_valid & ~generated_success
+                record["generated_effective_policy_row"] = float(
+                    generated_success[known_valid].any() and known_negative.any()
+                )
+                if "match_conflict" in generated:
+                    record["generated_conflict_unknown_count"] = float(
+                        self._numpy(generated["match_conflict"][row]).sum()
+                    )
                 if generated_valid.any():
                     generated_selected = int(
                         np.flatnonzero(generated_valid)[

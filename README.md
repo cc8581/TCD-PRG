@@ -175,11 +175,20 @@ candidate groups seen and effective epochs. `loss_routing.json` records losses
 automatically disabled by dataset capabilities or ablations.
 
 Generated policy caches are tied to the upstream checkpoint SHA-256 and the
-candidate-generation/matching configuration. Matching is tri-state: candidates
+full candidate code/config/asset signature. Matching is tri-state: candidates
 near successful sequence actions are positive, candidates near explicitly
 evaluated unsuccessful actions are negative, and unmatched candidates remain
-UNKNOWN and are excluded from policy loss. Generate both train and validation
+UNKNOWN and are excluded from policy loss. A candidate matching both a positive
+and negative teacher is also UNKNOWN. Cache manifests report state-level positive
+coverage and positive-plus-negative effective rows; pure generated training fails
+fast below the configured coverage thresholds. Generate both train and validation
 splits into the same cache directory before starting a generated-candidate stage.
+
+Generated caches deliberately do not run robot approach certification. Learned
+Verifier and soft graph scores are Router evidence; only physical inactivity and
+malformed actions are hard masks by default. The pure generated stage skips the
+frozen geometry/action heads and executes only the shared encoder, cached candidate
+encoder/evidence, and Router.
 
 The paper-level objective has exactly eleven modules: region, task grasp,
 global grasp, physical edge, task edge, verifier overall, four PUSH objectives,
@@ -198,10 +207,11 @@ tcd-prg-infer --config configs/config.yaml --checkpoint outputs/full/best.pt `
 tcd-prg-replay --config configs/config.yaml --scene-id 0 --task-index 0
 ```
 
-Formal inference applies learned ranking first and then exact collision, FR5 IK
-and approach-path certification. A rejection is masked and the next ranked
-candidate is tried without rerunning the scene backbone. Actual robot transport
-and safe placement remain behind the `RobotClient` interface.
+Formal inference applies learned ranking first. Grasp candidates then receive
+exact collision, FR5 IK and approach-path certification; a rejection is masked
+and the next ranked candidate is tried without rerunning the scene backbone.
+PUSH approach/path selection and PICK_REMOVE transport/safe placement remain
+executor-owned engineering operations behind the `RobotClient` interface.
 
 ## Reproducibility and documentation
 

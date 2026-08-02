@@ -135,7 +135,13 @@ class ModelConfig:
     verifier_local_radius_m: float = 0.25
     verifier_candidate_micro_batch: int = 16
     verifier_validity_threshold: float = 0.5
+    # The learned verifier predicts task-conditioned action outcome and is
+    # therefore evidence for the router, not deterministic geometry.  Keep a
+    # hard gate only as an explicit ablation.
+    verifier_hard_gate: bool = False
     graph_edge_threshold: float = 0.5
+    graph_candidate_mode: str = "soft"
+    graph_candidate_topk_objects: int = 4
     default_required_grasp_count: int = 20
     max_required_grasp_count: int = 20
     grasp_nms_translation_m: float = 0.010
@@ -157,6 +163,8 @@ class ModelConfig:
     policy_grasp_match_translation_m: float = 0.020
     policy_grasp_match_rotation_deg: float = 20.0
     policy_grasp_match_width_m: float = 0.010
+    push_nms_contact_m: float = 0.015
+    push_nms_direction_deg: float = 15.0
     push_utility_component_weights: tuple[float, ...] = (0.05, 1.0, -1.0, -0.25, 1.0)
     push_failure_penalties: tuple[float, ...] = (1.0, 2.0, 1.0)
 
@@ -201,6 +209,11 @@ class TrainingConfig:
     generated_policy_candidate_cache: str = ""
     generated_policy_candidate_ratio: float = 0.0
     generated_policy_checkpoint_sha256: str = ""
+    # Pure generated-candidate training is refused when the cache contains too
+    # few informative state rows.  These thresholds are intentionally explicit
+    # so experiments can set them from a cache-coverage audit.
+    generated_policy_min_positive_coverage: float = 0.05
+    generated_policy_min_effective_coverage: float = 0.01
     validation_family_weights: dict[str, float] = field(default_factory=lambda: {
         "policy_candidate": 1.0,
         "verify_overall": 0.5,
@@ -411,6 +424,12 @@ class TCDPRGConfig:
             raise ValueError("Generated policy matching thresholds must be positive")
         if self.model.graph_candidate_fallback_objects < 0:
             raise ValueError("graph_candidate_fallback_objects cannot be negative")
+        if self.model.graph_candidate_mode not in {"hard", "soft", "none"}:
+            raise ValueError("graph_candidate_mode must be hard, soft, or none")
+        if self.model.graph_candidate_topk_objects <= 0:
+            raise ValueError("graph_candidate_topk_objects must be positive")
+        if min(self.model.push_nms_contact_m, self.model.push_nms_direction_deg) <= 0:
+            raise ValueError("PUSH NMS thresholds must be positive")
         if not 1 <= self.model.push_directions_per_contact <= self.model.num_direction_bins:
             raise ValueError(
                 "push_directions_per_contact must be in [1,num_direction_bins]"
@@ -419,6 +438,17 @@ class TCDPRGConfig:
             raise ValueError("PUSH contact and final candidate budgets must be positive")
         if not 0.0 <= self.training.generated_policy_candidate_ratio <= 1.0:
             raise ValueError("generated_policy_candidate_ratio must be in [0,1]")
+        if not 0.0 <= self.training.generated_policy_min_positive_coverage <= 1.0:
+            raise ValueError("generated_policy_min_positive_coverage must be in [0,1]")
+        if not 0.0 <= self.training.generated_policy_min_effective_coverage <= 1.0:
+            raise ValueError("generated_policy_min_effective_coverage must be in [0,1]")
+        if self.training.generated_policy_candidate_ratio == 1.0 and (
+            self.training.generated_policy_min_positive_coverage <= 0
+            or self.training.generated_policy_min_effective_coverage <= 0
+        ):
+            raise ValueError(
+                "Pure generated policy training requires positive non-zero coverage thresholds"
+            )
         if (
             self.training.generated_policy_candidate_ratio > 0
             and not self.training.generated_policy_candidate_cache

@@ -84,7 +84,6 @@ class TCDPRGPolicy(ManipulationPolicy):
         self.gripper_provider = gripper_provider
         self.certifier = certifier
         self.preparation_actions = 0
-        self.previous_action: int | None = None
 
     def _batch(self, observation: SceneObservation) -> dict[str, Tensor]:
         observation.validate()
@@ -128,8 +127,6 @@ class TCDPRGPolicy(ManipulationPolicy):
         return cpu
 
     def encode_observation(self, observation: SceneObservation) -> EncodedPolicyState:
-        if self.certifier is not None and hasattr(self.certifier, "set_observation"):
-            self.certifier.set_observation(observation)  # type: ignore[attr-defined]
         cpu = self._batch(observation)
         device = {key: value.to(self.device) for key, value in cpu.items()}
         with torch.no_grad():
@@ -177,10 +174,6 @@ class TCDPRGPolicy(ManipulationPolicy):
             candidates["task_grasp_after_nms_count"] = (
                 candidates["valid"] & task_mask
             ).sum(-1)
-            if self.previous_action is not None:
-                candidates["previous_action"] = torch.tensor(
-                    [self.previous_action], device=self.device
-                )
             if self.config.ablation.use_gripper_scene_verifier:
                 if self.gripper_provider is None:
                     raise RuntimeError("Verifier-enabled inference requires AG geometry provider")
@@ -201,31 +194,11 @@ class TCDPRGPolicy(ManipulationPolicy):
                 learned_valid = torch.sigmoid(
                     encoded.output["verifier"]["overall_logit"]
                 ) >= self.config.model.verifier_validity_threshold
-                candidates["valid"] &= ~grasp | learned_valid
+                if self.config.model.verifier_hard_gate:
+                    candidates["valid"] &= ~grasp | learned_valid
             candidates["task_grasp_after_verifier_count"] = (
                 candidates["valid"] & task_mask
             ).sum(-1)
-            certification_reasons: list[str] = []
-            if self.certifier is not None:
-                valid_indices = [index for index in range(candidates["type"].shape[1])
-                                 if bool(candidates["valid"][0, index])]
-                actions = [self._action(candidates, index) for index in valid_indices]
-                if actions:
-                    decisions = (
-                        self.certifier.certify_many(actions)  # type: ignore[attr-defined]
-                        if hasattr(self.certifier, "certify_many")
-                        else [self.certifier.certify(action) for action in actions]
-                    )
-                else:
-                    decisions = []
-                decision_by_index = dict(zip(valid_indices, decisions, strict=True))
-                for index in range(candidates["type"].shape[1]):
-                    if index not in decision_by_index:
-                        certification_reasons.append("masked_by_model")
-                        continue
-                    ok, reason = decision_by_index[index]
-                    candidates["valid"][0, index] = ok
-                    certification_reasons.append(reason)
             candidates["task_grasp_after_certifier_count"] = (
                 candidates["valid"] & task_mask
             ).sum(-1)
@@ -249,11 +222,20 @@ class TCDPRGPolicy(ManipulationPolicy):
             router = self.model.route_cached(
                 encoded.device_batch, encoded.output, candidates
             )
+            nms_valid = self.generator.apply_push_nms(candidates, router.candidate_logits)
+            candidates["push_after_nms_count"] = (
+                nms_valid & (candidates["type"] == int(ActionType.PUSH))
+            ).sum(-1)
+            if not torch.equal(nms_valid, candidates["valid"]):
+                candidates["valid"] = nms_valid
+                router = self.model.route_cached(
+                    encoded.device_batch, encoded.output, candidates
+                )
         return {
             "encoded": encoded,
             "candidates": candidates,
             "router": router,
-            "certification_reasons": certification_reasons,
+            "certification_reasons": [],
         }
 
     def select_action(self, candidates: dict[str, Any]) -> dict[str, Any] | None:
@@ -304,10 +286,9 @@ class TCDPRGPolicy(ManipulationPolicy):
 
     def reset(self) -> None:
         self.preparation_actions = 0
-        self.previous_action = None
 
     def update_after_action(self, action: Any, observation: SceneObservation) -> None:
         if isinstance(action, dict) and "action_type" in action:
-            self.previous_action = int(action["action_type"])
-            if self.previous_action != int(ActionType.TASK_GRASP):
+            action_type = int(action["action_type"])
+            if action_type != int(ActionType.TASK_GRASP):
                 self.preparation_actions += 1

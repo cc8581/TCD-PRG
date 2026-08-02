@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +108,7 @@ class UnifiedBatchCollator:
 
     config: TCDPRGConfig
     gripper_provider: ExactAG16095GeometryProvider | None = None
+    _candidate_manifest_validated: bool = field(default=False, init=False)
 
     def __call__(self, samples: list[Any]) -> dict[str, Any]:
         batch = collate_unified(samples)
@@ -115,10 +116,17 @@ class UnifiedBatchCollator:
             batch["generated_policy_candidates"] = load_candidate_batch(
                 samples,
                 self.config.training.generated_policy_candidate_cache,
-                self.config.model,
+                self.config,
                 self.config.training.generated_policy_checkpoint_sha256,
+                validate_manifest=not self._candidate_manifest_validated,
             )
-        if self.config.ablation.use_gripper_scene_verifier:
+            self._candidate_manifest_validated = True
+        pure_generated_policy = (
+            self.config.training.generated_policy_candidate_ratio == 1.0
+            and self.config.losses.policy_candidate > 0
+            and self.config.losses.verify_overall == 0
+        )
+        if self.config.ablation.use_gripper_scene_verifier and not pure_generated_policy:
             if self.gripper_provider is None:
                 raise RuntimeError("The verifier is enabled but no gripper provider was configured")
             batch["verifier_inputs"] = build_verifier_inputs(

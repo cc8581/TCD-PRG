@@ -36,6 +36,8 @@ class MultiTaskLoss(nn.Module):
         self.weights.update(weights or {})
 
     def enabled(self, family: str) -> bool:
+        if float(self.weights[family]) == 0.0:
+            return False
         requirement = {
             "region": "region",
             "task_grasp": "proposal",

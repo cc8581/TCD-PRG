@@ -13,7 +13,11 @@ from torch.utils.data import DataLoader
 
 from tcd_prg.config import load_config
 from tcd_prg.datasets import ActionStateGroupDataset, DistributedEvaluationSampler
-from tcd_prg.datasets.policy_candidates import checkpoint_sha256
+from tcd_prg.datasets.policy_candidates import (
+    checkpoint_sha256,
+    validate_cache_manifest,
+    validate_generated_policy_coverage,
+)
 from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter, create_gripper_provider
@@ -47,6 +51,19 @@ def main() -> None:
                 "Generated policy training requires --initialize or an explicit "
                 "training.generated_policy_checkpoint_sha256"
             )
+        manifest = validate_cache_manifest(
+            config.training.generated_policy_candidate_cache,
+            config,
+            config.training.generated_policy_checkpoint_sha256,
+        )
+        if config.training.generated_policy_candidate_ratio == 1.0:
+            coverage = validate_generated_policy_coverage(
+                manifest,
+                "train",
+                minimum_positive=config.training.generated_policy_min_positive_coverage,
+                minimum_effective=config.training.generated_policy_min_effective_coverage,
+            )
+            print({"generated_policy_preflight": coverage})
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))

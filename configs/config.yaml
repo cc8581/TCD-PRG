@@ -85,7 +85,10 @@ model:
   verifier_local_radius_m: 0.25
   verifier_candidate_micro_batch: 16
   verifier_validity_threshold: 0.5
+  verifier_hard_gate: false
   graph_edge_threshold: 0.5
+  graph_candidate_mode: soft
+  graph_candidate_topk_objects: 4
   default_required_grasp_count: 20
   max_required_grasp_count: 20
   grasp_nms_translation_m: 0.010
@@ -104,6 +107,8 @@ model:
   policy_grasp_match_translation_m: 0.020
   policy_grasp_match_rotation_deg: 20.0
   policy_grasp_match_width_m: 0.010
+  push_nms_contact_m: 0.015
+  push_nms_direction_deg: 15.0
   push_utility_component_weights: [0.05, 1.0, -1.0, -0.25, 1.0]
   push_failure_penalties: [1.0, 2.0, 1.0]
 
@@ -197,6 +202,8 @@ training:
   generated_policy_candidate_cache: ""
   generated_policy_candidate_ratio: 0.0
   generated_policy_checkpoint_sha256: ""
+  generated_policy_min_positive_coverage: 0.05
+  generated_policy_min_effective_coverage: 0.01
   validation_family_weights:
     policy_candidate: 1.0
     verify_overall: 0.5

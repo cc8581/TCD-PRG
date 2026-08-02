@@ -32,6 +32,12 @@ class ActionCandidateEncoder(nn.Module):
     ) -> Tensor:
         row = torch.arange(object_tokens.shape[0], device=object_tokens.device)[:, None]
         selected_object = object_tokens[row, acted_object.clamp(0, object_tokens.shape[1] - 1)]
+        # PICK_REMOVE is a learned grasp/remove macro.  Transport destination
+        # is chosen by the executor and is unavailable to generated candidates;
+        # never let teacher candidates leak it into router tokens.
+        destination_world = torch.zeros_like(destination_world)
+        parameter_valid = parameter_valid.clone()
+        parameter_valid[..., 3] = False
         numeric = torch.cat((contact_world, direction_world, pose_world, destination_world, parameter_valid.float()), -1)
         numeric = torch.nan_to_num(numeric)
         geometry = self.geometry(numeric)
@@ -39,4 +45,3 @@ class ActionCandidateEncoder(nn.Module):
         return self.fusion(
             torch.cat((selected_object, self.type_embedding(action_type.clamp(0, 2)), geometry, task), -1)
         )
-

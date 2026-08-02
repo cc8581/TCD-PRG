@@ -39,10 +39,11 @@ class MaskedHierarchicalCandidateRouter(nn.Module):
         safe_type = candidate_type.clamp(0, self.action_types - 1)
         safe_object = candidate_object.clamp(0, object_tokens.shape[1] - 1)
         row = torch.arange(b, device=candidate_tokens.device)[:, None]
-        previous = (
-            self.action_embedding(previous_action.clamp(0, self.action_types))
-            if previous_action is not None else torch.zeros_like(task_token)
-        )
+        # Sequence-history supervision is not available for cached generated
+        # state groups.  Keep this context neutral until a history-keyed cache
+        # and labels exist, so deployment cannot introduce an unseen feature.
+        del previous_action
+        previous = torch.zeros_like(task_token)
         remaining = self.remaining_embedding(remaining_steps.clamp(0, 5))
         enriched = candidate_tokens + self.action_embedding(safe_type) + object_tokens[row, safe_object]
         padding = ~candidate_valid

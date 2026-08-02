@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from tcd_prg.config import ModelConfig
+from tcd_prg.config import ModelConfig, TCDPRGConfig
 from tcd_prg.constants import ActionType, CandidateStatus
 from tcd_prg.datasets.policy_candidates import (
     RAW_FIELDS,
@@ -15,6 +15,7 @@ from tcd_prg.datasets.policy_candidates import (
     load_candidate_batch,
     match_generated_candidates,
     save_candidate_entry,
+    validate_generated_policy_coverage,
 )
 
 
@@ -65,6 +66,17 @@ def test_generated_policy_matching_keeps_unmatched_candidates_unknown() -> None:
     ]
     assert labels["policy_success"].tolist() == [True, False, False]
     assert labels["matched_teacher_index"].tolist() == [0, 1, -1]
+    assert not labels["match_conflict"].any()
+
+
+def test_generated_policy_matching_keeps_positive_negative_conflict_unknown() -> None:
+    teacher = _teacher()
+    teacher["action_parameters"]["push_contact_world"][0, 1] = torch.tensor([0.0, 0.0, 0.0])
+    teacher["action_parameters"]["push_direction_world"][0, 1] = torch.tensor([1.0, 0.0, 0.0])
+    labels = match_generated_candidates(_generated(), teacher, 0, ModelConfig())
+    assert labels["label_status"][0] == int(CandidateStatus.UNKNOWN_UNTESTED)
+    assert labels["match_conflict"][0]
+    assert labels["matched_teacher_index"][0] == -1
 
 
 def test_local_positive_outside_successful_sequence_is_not_a_policy_negative() -> None:
@@ -81,15 +93,30 @@ def test_local_positive_outside_successful_sequence_is_not_a_policy_negative() -
 def test_generated_policy_cache_is_checkpoint_and_config_versioned(tmp_path) -> None:
     checkpoint = tmp_path / "upstream.pt"
     checkpoint.write_bytes(b"checkpoint")
-    config = ModelConfig()
-    manifest = cache_manifest(checkpoint, config, exact_certification=True)
+    config = TCDPRGConfig(model=ModelConfig())
+    manifest = cache_manifest(checkpoint, config)
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     sample = SimpleNamespace(
-        observation=SimpleNamespace(scene_id=1, state_id=2, task_index=3),
-        candidates=SimpleNamespace(candidate_action_ids=np.asarray([7, 8], dtype=np.int64)),
+        observation=SimpleNamespace(
+            scene_id=1, state_id=2, task_index=3,
+            xyz=np.zeros((2, 3), np.float32), rgb=np.zeros((2, 3), np.float32),
+            instance_id=np.zeros(2, np.int64), target_mask=np.ones(2, bool),
+            object_pose=np.zeros((1, 7), np.float32),
+            object_present=np.ones(1, bool), object_active=np.ones(1, bool),
+        ),
+        candidates=SimpleNamespace(
+            candidate_action_ids=np.asarray([7, 8], dtype=np.int64),
+            action_type=np.asarray([0, 0], np.int8),
+            acted_object=np.asarray([0, 0], np.int16),
+            evaluation_status=np.asarray([1, 0], np.int8),
+            success_mask=np.asarray([True, False]),
+            potential_delta=np.zeros((2, 5), np.float32),
+            action_parameters={},
+        ),
+        sequences=(),
     )
     generated = _generated()
-    labels = match_generated_candidates(generated, _teacher(), 0, config)
+    labels = match_generated_candidates(generated, _teacher(), 0, config.model)
     assert set(RAW_FIELDS).issubset(generated)
     save_candidate_entry(tmp_path, sample, generated, labels)
     batch = load_candidate_batch(
@@ -99,3 +126,15 @@ def test_generated_policy_cache_is_checkpoint_and_config_versioned(tmp_path) -> 
     assert batch["valid"].all()
     with pytest.raises(ValueError, match="checkpoint SHA-256 mismatch"):
         load_candidate_batch([sample], tmp_path, config, "0" * 64)
+
+
+def test_generated_policy_coverage_rejects_uninformative_pure_stage() -> None:
+    manifest = {"splits": {"train": {
+        "entries": 100,
+        "groups_with_known_positive": 4,
+        "effective_policy_rows": 1,
+    }}}
+    with pytest.raises(ValueError, match="positive coverage"):
+        validate_generated_policy_coverage(
+            manifest, "train", minimum_positive=0.05, minimum_effective=0.01
+        )
