@@ -18,6 +18,7 @@ from tcd_prg.observation import (
 )
 from tcd_prg.paths import project_path
 
+
 def create_observation_provider(config: TCDPRGConfig, allow_render: bool = False):
     scene_root = Path(config.dataset.root) / config.dataset.scene_subdir
     if config.observation.provider == "saved":
@@ -73,6 +74,7 @@ def create_adapter(config: TCDPRGConfig, allow_render: bool = False):
         global_positive_grasps_per_object=config.sampling.global_positive_grasps_per_object,
         global_intrinsic_negative_grasps_per_object=config.sampling.global_intrinsic_negative_grasps_per_object,
         global_scene_negative_grasps_per_object=config.sampling.global_scene_negative_grasps_per_object,
+        index_cache_dir=config.cache.index_directory,
     )
 
 

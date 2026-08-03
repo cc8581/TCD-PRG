@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import replace
@@ -10,6 +13,7 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+from tqdm.auto import tqdm
 
 from tcd_prg.constants import (
     GLOBAL_GRASP_CERTIFICATION_FORMAT,
@@ -34,6 +38,25 @@ from .types import (
     SequenceLabels,
     StateLabels,
 )
+
+ACTION_GROUP_INDEX_CACHE_VERSION = "tcd_prg_action_group_strata_v1"
+ACTION_GROUP_STRATA = (
+    "direct_grasp",
+    "pick_remove",
+    "push",
+    "push_failure",
+    "unresolved_or_unknown",
+)
+
+
+def _show_index_progress() -> bool:
+    """Only rank zero owns terminal progress in distributed training."""
+
+    try:
+        import torch
+    except ImportError:
+        return True
+    return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
 
 
 def _decode_strings(values: np.ndarray) -> tuple[str, ...]:
@@ -153,6 +176,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         global_positive_grasps_per_object: int = 64,
         global_intrinsic_negative_grasps_per_object: int = 32,
         global_scene_negative_grasps_per_object: int = 32,
+        index_cache_dir: str | Path = "runtime/cache/dataset_indexes",
     ) -> None:
         self.root = Path(root)
         self.scene_root = self.root / scene_subdir
@@ -161,6 +185,11 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         self.global_grasp_root = self.root / global_grasp_library_subdir
         self.global_grasp_certification_root = self.root / global_grasp_certification_subdir
         self.pick_remove_global_association_root = self.root / pick_remove_global_association_subdir
+        self.training_index_path = self.action_root / "training_index.h5"
+        self.index_cache_dir = Path(index_cache_dir)
+        self.index_cache_dir.mkdir(parents=True, exist_ok=True)
+        self._action_group_index: np.ndarray | None = None
+        self._reported_strata_cache = False
         self.global_sampling = (
             int(global_positive_grasps_per_object),
             int(global_intrinsic_negative_grasps_per_object),
@@ -253,21 +282,196 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             raise FileNotFoundError(f"No completed action HDF5 for scene {scene_id}") from error
 
     def iter_action_groups(self, split: str | None = None) -> Iterable[tuple[int, int, int, int]]:
-        for scene_id in self._scene_ids:
+        # 生成器发布的全局 training_index 是权威索引，避免每次训练重开 10,000 个 HDF5。
+        if self.training_index_path.is_file():
+            rows = self._load_action_group_index()
             if split is not None:
-                with np.load(self.scene_root / f"scene_{scene_id:04d}" / "scene.npz", allow_pickle=False) as data:
+                split_code = {"train": 0, "val": 1, "test": 2}.get(split)
+                if split_code is None:
+                    raise ValueError(f"Unsupported split: {split}")
+                rows = rows[rows[:, 5] == split_code]
+            yield from (
+                (int(row[1]), int(row[4]), int(row[3]), int(row[2]))
+                for row in rows
+            )
+            return
+
+        # 兼容没有全局索引的旧数据集；首次扫描会明确显示当前场景进度。
+        for scene_id in tqdm(
+            self._scene_ids,
+            desc="scan action-group index",
+            unit="scene",
+            disable=not _show_index_progress(),
+        ):
+            if split is not None:
+                scene_file = self.scene_root / f"scene_{scene_id:04d}" / "scene.npz"
+                with np.load(scene_file, allow_pickle=False) as data:
                     if str(data["split"].item()) != split:
                         continue
             with h5py.File(self._h5_path(scene_id), "r", swmr=True) as handle:
                 group = self._scene_group(handle, scene_id)["action_state_groups"]
                 states = group["from_state"][:]
                 tasks = group["task_index"][:]
-            yield from ((scene_id, int(s), int(t), i) for i, (s, t) in enumerate(zip(states, tasks, strict=True)))
+            yield from (
+                (scene_id, int(state), int(task), index)
+                for index, (state, task) in enumerate(zip(states, tasks, strict=True))
+            )
+
+    def _load_action_group_index(self) -> np.ndarray:
+        if self._action_group_index is None:
+            with h5py.File(self.training_index_path, "r", swmr=True) as handle:
+                if handle.attrs.get("format") != "task_conditioned_action_training_index_v2":
+                    raise ValueError(
+                        f"Unsupported training index format: {self.training_index_path}"
+                    )
+                rows = handle["action_state_group"][:]
+            if rows.ndim != 2 or rows.shape[1] < 7:
+                raise ValueError("action_state_group index must be [N,>=7]")
+            self._action_group_index = rows.astype(np.int32, copy=False)
+            if _show_index_progress():
+                print(
+                    f"[dataset-index] source=training_index.h5 groups={len(rows)}",
+                    flush=True,
+                )
+        return self._action_group_index
+
+    def _strata_cache_path(self) -> Path:
+        stat = self.training_index_path.stat()
+        with h5py.File(self.training_index_path, "r", swmr=True) as handle:
+            signature = str(handle.attrs.get("generation_signature", ""))
+        payload = "|".join((
+            ACTION_GROUP_INDEX_CACHE_VERSION,
+            str(self.action_root.resolve()),
+            signature,
+            str(stat.st_size),
+            str(stat.st_mtime_ns),
+        ))
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return self.index_cache_dir / f"action_group_strata_{digest}.npz"
+
+    @staticmethod
+    def _load_strata_cache(path: Path, expected_rows: int) -> np.ndarray | None:
+        if not path.is_file():
+            return None
+        try:
+            with np.load(path, allow_pickle=False) as cached:
+                if str(cached["version"].item()) != ACTION_GROUP_INDEX_CACHE_VERSION:
+                    return None
+                codes = cached["strata"].astype(np.int8, copy=False)
+            return codes if codes.shape == (expected_rows,) else None
+        except (OSError, KeyError, ValueError):
+            return None
+
+    def _build_strata_cache(self, path: Path, rows: np.ndarray) -> np.ndarray:
+        codes = np.full(len(rows), ACTION_GROUP_STRATA.index("unresolved_or_unknown"), np.int8)
+        scene_column = rows[:, 1]
+        scene_ids, starts = np.unique(scene_column, return_index=True)
+        stops = np.r_[starts[1:], len(rows)]
+        for scene_id, start, stop in tqdm(
+            zip(scene_ids.tolist(), starts.tolist(), stops.tolist(), strict=True),
+            total=len(scene_ids),
+            desc="cache action-group strata",
+            unit="scene",
+            disable=not _show_index_progress(),
+        ):
+            scene_rows = rows[start:stop]
+            if not np.all(scene_rows[:, 1] == scene_id):
+                raise ValueError("training_index.h5 must group action-state rows by scene")
+            with h5py.File(self._h5_path(int(scene_id)), "r", swmr=True) as handle:
+                scene = self._scene_group(handle, int(scene_id))
+                groups = scene["action_state_groups"]
+                offsets = groups["action_offsets"][:]
+                group_action_ids = groups["action_ids"][:]
+                actions = scene["actions"]
+                action_type = actions["action_type"][:]
+                executed = actions["executed"][:]
+                success = actions["success"][:] | actions["potential_improved"][:]
+                for row_index, group_index in enumerate(scene_rows[:, 2], start=start):
+                    group_index = int(group_index)
+                    ids = group_action_ids[
+                        int(offsets[group_index]) : int(offsets[group_index + 1])
+                    ]
+                    evaluated_positive = executed[ids] & success[ids]
+                    positive_types = set(int(x) for x in action_type[ids][evaluated_positive])
+                    if int(ActionType.TASK_GRASP) in positive_types:
+                        stratum = "direct_grasp"
+                    elif int(ActionType.PICK_REMOVE) in positive_types:
+                        stratum = "pick_remove"
+                    elif int(ActionType.PUSH) in positive_types:
+                        stratum = "push"
+                    elif np.any(executed[ids] & (action_type[ids] == int(ActionType.PUSH))):
+                        stratum = "push_failure"
+                    else:
+                        stratum = "unresolved_or_unknown"
+                    codes[row_index] = ACTION_GROUP_STRATA.index(stratum)
+        temporary = path.with_name(f"{path.stem}.{os.getpid()}.tmp.npz")
+        np.savez_compressed(
+            temporary,
+            version=np.asarray(ACTION_GROUP_INDEX_CACHE_VERSION),
+            strata=codes,
+        )
+        os.replace(temporary, path)
+        return codes
+
+    def _load_or_build_strata_cache(self) -> tuple[np.ndarray, np.ndarray]:
+        rows = self._load_action_group_index()
+        path = self._strata_cache_path()
+        cached = self._load_strata_cache(path, len(rows))
+        if cached is not None:
+            if _show_index_progress() and not getattr(self, "_reported_strata_cache", False):
+                print(f"[dataset-index] strata_cache=hit path={path}", flush=True)
+                self._reported_strata_cache = True
+            return rows, cached
+        lock = path.with_suffix(".lock")
+        # 给 rank 0 留出优先创建锁的时间，避免非主进程抢到构建任务却不显示进度。
+        if not _show_index_progress():
+            for _ in range(240):
+                cached = self._load_strata_cache(path, len(rows))
+                if cached is not None:
+                    return rows, cached
+                time.sleep(0.25)
+        while True:
+            try:
+                descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(descriptor)
+                break
+            except FileExistsError:
+                cached = self._load_strata_cache(path, len(rows))
+                if cached is not None:
+                    return rows, cached
+                try:
+                    lock_age = time.time() - lock.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                if lock_age > 6 * 60 * 60:
+                    lock.unlink(missing_ok=True)
+                    continue
+                time.sleep(0.25)
+        try:
+            cached = self._load_strata_cache(path, len(rows))
+            if cached is None:
+                cached = self._build_strata_cache(path, rows)
+                if _show_index_progress():
+                    print(f"[dataset-index] strata_cache=created path={path}", flush=True)
+                    self._reported_strata_cache = True
+            return rows, cached
+        finally:
+            lock.unlink(missing_ok=True)
 
     def action_group_strata(
         self, units: Iterable[tuple[int, int, int, int]] | None = None
     ) -> dict[tuple[int, int, int, int], str]:
         """Classify groups without loading observations or grasp libraries."""
+
+        if self.training_index_path.is_file():
+            rows, codes = self._load_or_build_strata_cache()
+            requested = None if units is None else set(units)
+            result: dict[tuple[int, int, int, int], str] = {}
+            for row, code in zip(rows, codes, strict=True):
+                unit = (int(row[1]), int(row[4]), int(row[3]), int(row[2]))
+                if requested is None or unit in requested:
+                    result[unit] = ACTION_GROUP_STRATA[int(code)]
+            return result
 
         result: dict[tuple[int, int, int, int], str] = {}
         requested = None if units is None else set(units)

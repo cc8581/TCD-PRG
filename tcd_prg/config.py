@@ -49,6 +49,7 @@ class ObservationConfig:
 @dataclass(slots=True)
 class CacheConfig:
     directory: str = "runtime/cache/observations"
+    index_directory: str = "runtime/cache/dataset_indexes"
     max_gb: float = 15.0
     min_free_gb: float = 20.0
     eviction: str = "lru"
@@ -535,6 +536,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> TCDPRGC
         (config.observation, "render_temporary_root"),
         (config.observation, "certification_temporary_root"),
         (config.cache, "directory"),
+        (config.cache, "index_directory"),
         (config.backbone, "source_root"),
         (config.training, "generated_policy_candidate_cache"),
         (config.baseline, "gapg_root"),

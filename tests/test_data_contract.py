@@ -3,9 +3,86 @@ from __future__ import annotations
 import h5py
 import numpy as np
 
-from tcd_prg.constants import ActionType, CandidateStatus, PUSH_DISTANCE_M
+from tcd_prg.constants import PUSH_DISTANCE_M, ActionType, CandidateStatus
 from tcd_prg.datasets import TaskOrientedClutterAdapter
 from tcd_prg.datasets.collate import collate_unified
+from tcd_prg.datasets.task_oriented_clutter import ACTION_GROUP_INDEX_CACHE_VERSION
+
+
+def test_authoritative_training_index_avoids_scene_hdf5_scan(tmp_path) -> None:
+    index = tmp_path / "training_index.h5"
+    rows = np.asarray([
+        [10, 10, 0, 3, 7, 0, 2],
+        [10, 10, 1, 4, 9, 1, 5],
+        [11, 11, 0, 2, 1, 2, 3],
+    ], dtype=np.int32)
+    with h5py.File(index, "w") as handle:
+        handle.attrs["format"] = "task_conditioned_action_training_index_v2"
+        handle.attrs["generation_signature"] = "test-signature"
+        handle.create_dataset("action_state_group", data=rows)
+    adapter = object.__new__(TaskOrientedClutterAdapter)
+    adapter.training_index_path = index
+    adapter._action_group_index = None
+    adapter._scene_ids = ()
+
+    assert list(adapter.iter_action_groups("val")) == [(10, 9, 4, 1)]
+
+
+def test_action_strata_cache_is_reused_without_hdf5_scan(tmp_path) -> None:
+    index = tmp_path / "training_index.h5"
+    rows = np.asarray([
+        [10, 10, 0, 3, 7, 0, 2],
+        [10, 10, 1, 4, 9, 1, 5],
+    ], dtype=np.int32)
+    with h5py.File(index, "w") as handle:
+        handle.attrs["format"] = "task_conditioned_action_training_index_v2"
+        handle.attrs["generation_signature"] = "test-signature"
+        handle.create_dataset("action_state_group", data=rows)
+    adapter = object.__new__(TaskOrientedClutterAdapter)
+    adapter.training_index_path = index
+    adapter.action_root = tmp_path
+    adapter.index_cache_dir = tmp_path / "cache"
+    adapter.index_cache_dir.mkdir()
+    adapter._action_group_index = None
+    cache = adapter._strata_cache_path()
+    np.savez_compressed(
+        cache,
+        version=np.asarray(ACTION_GROUP_INDEX_CACHE_VERSION),
+        strata=np.asarray([0, 2], dtype=np.int8),
+    )
+
+    assert adapter.action_group_strata([(10, 9, 4, 1)]) == {
+        (10, 9, 4, 1): "push"
+    }
+
+
+def test_first_strata_scan_builds_reusable_cache(tmp_path) -> None:
+    rows = np.asarray([
+        [10, 10, 0, 3, 7, 0, 1],
+        [10, 10, 1, 4, 9, 0, 1],
+    ], dtype=np.int32)
+    scene_file = tmp_path / "scene_0010.h5"
+    with h5py.File(scene_file, "w") as handle:
+        scene = handle.create_group("scene_0010")
+        groups = scene.create_group("action_state_groups")
+        groups.create_dataset("action_offsets", data=np.asarray([0, 1, 2]))
+        groups.create_dataset("action_ids", data=np.asarray([0, 1]))
+        actions = scene.create_group("actions")
+        actions.create_dataset(
+            "action_type", data=np.asarray([ActionType.TASK_GRASP, ActionType.PUSH])
+        )
+        actions.create_dataset("executed", data=np.asarray([True, True]))
+        actions.create_dataset("success", data=np.asarray([True, False]))
+        actions.create_dataset("potential_improved", data=np.asarray([False, False]))
+    adapter = object.__new__(TaskOrientedClutterAdapter)
+    adapter._path_by_scene = {10: scene_file}
+    cache = tmp_path / "strata.npz"
+
+    codes = adapter._build_strata_cache(cache, rows)
+
+    assert codes.tolist() == [0, 3]
+    with np.load(cache, allow_pickle=False) as saved:
+        assert saved["strata"].tolist() == [0, 3]
 
 
 def test_real_hdf5_primary_keys_and_shapes(dataset_root) -> None:

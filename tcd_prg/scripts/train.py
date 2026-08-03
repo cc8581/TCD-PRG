@@ -11,6 +11,7 @@ from dataclasses import asdict
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from tcd_prg.config import load_config
 from tcd_prg.datasets import ActionStateGroupDataset, DistributedEvaluationSampler
@@ -32,7 +33,13 @@ def preflight_observation_cache(adapter, *named_datasets: tuple[str, object]) ->
     for split, dataset in named_datasets:
         if dataset is None:
             continue
-        for unit in dataset.units:
+        show_progress = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        for unit in tqdm(
+            dataset.units,
+            desc=f"preflight {split} observations",
+            unit="group",
+            disable=not show_progress,
+        ):
             key = (unit.scene_id, unit.state_id, unit.task_index)
             if key in checked:
                 continue
