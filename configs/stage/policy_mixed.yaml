@@ -1,9 +1,10 @@
-# Stage D: retain generated-candidate robustness while mixing clean teachers.
+# Stage D：以 generated candidates 为主，同时混入干净 teacher candidates 稳定排序。
 defaults:
   - ../config.yaml
   - _self_
 
 training:
+  # 0.8 表示每个 batch 的 Policy loss 为 80% generated + 20% teacher。
   frozen_modules: [encoder, region_head, task_grasp, global_grasp, verifier, graph, push]
   generated_policy_candidate_cache: runtime/cache/policy_candidates
   generated_policy_candidate_ratio: 0.8

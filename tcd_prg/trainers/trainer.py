@@ -23,6 +23,7 @@ from .reproducibility import seed_everything
 
 @dataclass(slots=True)
 class TrainerState:
+    # optimizer_steps 只统计成功更新；samples/states/groups 用于跨阶段核对实际数据覆盖。
     optimizer_steps: int = 0
     amp_skipped_steps: int = 0
     samples_seen: int = 0
@@ -91,6 +92,7 @@ class Trainer:
         self.state = TrainerState()
         self.output_dir = Path(output_dir or config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # JSONL 是逐步完整记录，终端输出只是低频核心摘要，两者职责不同。
         self.metrics_path = self.output_dir / "train_metrics.jsonl"
         self.validation_metrics_path = self.output_dir / "validation_metrics.jsonl"
         self.events_path = self.output_dir / "training_events.jsonl"
@@ -150,6 +152,7 @@ class Trainer:
     ) -> dict[str, float]:
         """Return world-mean metrics and world-sum counters on every rank."""
 
+        # loss/速率在 rank 间取均值，样本和候选数量在 rank 间求和。
         reduced = dict(terms)
         if not torch.distributed.is_initialized() or not reduced:
             return reduced

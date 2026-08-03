@@ -1,6 +1,4 @@
-# Copy this file to configs/local_paths.yaml and edit only the local copy.
-# The local file is ignored by Git, so machine-specific absolute paths never
-# enter source code or shared configuration.
+# 复制为 configs/local_paths.yaml 后只编辑本地副本；该文件被 Git 忽略，绝对路径不会入库。
 dataset_root: data/TaskOrientedClutterSceneDataset
 acronym_root: data/ACRONYM
 functional_region_root: data/manual_function_regions_v1

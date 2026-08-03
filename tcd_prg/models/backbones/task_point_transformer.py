@@ -188,7 +188,7 @@ class TaskFreeSceneGeometryBackbone(nn.Module):
         super().__init__()
         self.attention_points = attention_points
         self.activation_checkpointing = activation_checkpointing
-        # XYZ + RGB + point-valid. Instance membership is intentionally absent.
+        # 中性骨干仅输入 XYZ/RGB/valid，不输入任务或实例身份，防止 Global Grasp 泄漏任务条件。
         self.input_projection = nn.Sequential(nn.Linear(7, dim), nn.LayerNorm(dim), nn.GELU())
         self.blocks = nn.ModuleList(PointTransformerBlock(dim, heads, neighbors) for _ in range(blocks))
         self.context_projection = nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU(), nn.Linear(dim, dim))
@@ -252,6 +252,7 @@ class TaskConditioningAdapter(nn.Module):
         target_mask: Tensor, target_object: Tensor, task_category_id: Tensor,
         task_region_id: Tensor, use_task_region_condition: bool = True,
     ) -> EncoderOutput:
+        # 先完成任务无关场景编码，再以 FiLM 注入类别、功能区域和目标物体条件。
         category = self.category_embedding(task_category_id.clamp(0, self.category_embedding.num_embeddings - 1))
         region = self.region_embedding(task_region_id.clamp(0, self.region_embedding.num_embeddings - 1))
         if not use_task_region_condition:
@@ -305,6 +306,7 @@ class TaskConditionedPointTransformer(nn.Module):
         task_region_id: Tensor, use_task_region_condition: bool = True,
         target_object: Tensor | None = None,
     ) -> EncoderOutput:
+        # scene_backbone 每次 forward 只运行一次，Task/Global/Graph/Push 全部复用其输出。
         scene = self.scene_backbone(xyz, rgb, instance_id, point_mask, object_mask)
         if target_object is None:
             counts = torch.stack([

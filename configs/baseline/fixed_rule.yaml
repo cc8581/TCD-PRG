@@ -1,2 +1,3 @@
+# 使用固定动作类型优先级，不训练策略 Router。
 baseline:
   type: fixed_priority

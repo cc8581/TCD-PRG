@@ -1,2 +1,3 @@
+# 准备阶段只允许 PICK_REMOVE。
 baseline:
   type: pick_remove_only

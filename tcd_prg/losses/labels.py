@@ -57,6 +57,7 @@ def _pack_grasp_set(
 ) -> dict[str, Tensor]:
     """Pack an unordered positive grasp set without averaging valid modes."""
 
+    # 固定 query 容量只用于张量打包；超过容量时按质量并兼顾物体均衡截断。
     b = pose.shape[0]
     translation = pose.new_full((b, queries, 3), float("nan"))
     rotation = pose.new_full((b, queries, 3, 3), float("nan"))
@@ -126,6 +127,7 @@ def _attach_negative_grasp_set(
 ) -> None:
     """Attach explicit known negatives without turning other queries negative."""
 
+    # 显式负抓取保留独立集合，后续仅监督几何邻近的预测 query。
     labels["negative_translation_world"] = torch.nan_to_num(pose[..., :3])
     labels["negative_rotation_matrix"] = quaternion_xyzw_to_matrix(
         torch.nan_to_num(pose[..., 3:], nan=0.0)
@@ -164,6 +166,7 @@ def build_grasp_proposal_labels(
         & (width >= config.min_grasp_width_m)
         & (width <= config.max_grasp_width_m)
     )
+    # 不再通过“已采样候选均已评价”推断完备性，只信任数据生产者的显式字段。
     label_set_complete = batch.get(
         "task_grasp_label_set_complete",
         torch.zeros(pose.shape[0], dtype=torch.bool, device=pose.device),
@@ -186,6 +189,7 @@ def build_global_grasp_labels(
     source = batch.get("global_grasp_labels")
     if source is None:
         return None
+    # scene_executable=-1 是 UNKNOWN；只有 0/1 才属于已认证监督。
     certified = source["scene_executable"] >= 0
     positive = source["scene_executable"] == 1
     pose = source["grasp_pose_world"]
@@ -222,6 +226,7 @@ def build_global_grasp_labels(
 
 
 def build_graph_labels(batch: dict[str, Tensor]) -> dict[str, Tensor]:
+    # 图损失只覆盖当前物理活跃物体之间的边，padding 和已移除物体全部 ignore。
     object_mask = batch["object_mask"] & batch["object_active"]
     pair_valid = object_mask[:, :, None, None] & object_mask[:, None, :, None]
     return {
@@ -254,6 +259,7 @@ def build_push_supervision(
     )
     angle = torch.atan2(direction[..., 1], direction[..., 0]).remainder(2 * math.pi)
     bins = output["direction_logits"].shape[-1]
+    # 执行方向先量化到粗 bin，再在对应 bin 上监督连续残差和方向条件 utility。
     direction_bin = torch.floor(angle * bins / (2 * math.pi)).long().remainder(bins)
     gathered["direction_residual"] = output["direction_residual"][
         row, point_index, direction_bin

@@ -64,6 +64,7 @@ def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
         raise ValueError("Cannot collate an empty batch")
     observations = [x.observation for x in samples]
     candidates = [x.candidates for x in samples]
+    # 所有变长轴都同时生成显式 mask，后续网络不得把 padding 当作真实点或候选。
     xyz, point_mask = _pad([x.xyz for x in observations])
     rgb, _ = _pad([x.rgb for x in observations])
     instance, _ = _pad([x.instance_id for x in observations], -1)
@@ -79,6 +80,7 @@ def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
     status, _ = _pad([x.evaluation_status for x in candidates], -1)
     outcome, _ = _pad([x.outcome_code for x in candidates], -1)
     success, _ = _pad([x.action_improves_state for x in candidates], False)
+    # 一个动作只要出现在任一成功序列中即为已知正策略候选；其余动作仍需看评价状态。
     policy_success_arrays = []
     for sample in samples:
         successful_ids: list[np.ndarray] = []
@@ -116,6 +118,7 @@ def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
     indirect_blocker, _ = _pad([x.state_labels.indirect_blocker_mask for x in samples], False)
     actionable_blocker, _ = _pad([x.state_labels.actionable_blocker_mask for x in samples], False)
     object_count = object_pose.shape[1]
+    # prerequisite_object_order 转成有向先后关系，仅对有明确顺序的物体对监督。
     topology_target = torch.zeros(
         (len(samples), object_count, object_count), dtype=torch.bool
     )

@@ -1,3 +1,3 @@
+# 完全移除依赖图，候选域仅由物理活跃状态决定。
 ablation:
   use_dependency_graph: false
-

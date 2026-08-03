@@ -1,9 +1,10 @@
-# Stage C: train the router only on deployment-path generated candidates.
+# Stage C：冻结全部前级网络，只用部署路径生成候选训练 Router。
 defaults:
   - ../config.yaml
   - _self_
 
 training:
+  # ratio=1 会触发 generated coverage 启动检查，并走精简的 policy-only forward。
   frozen_modules: [encoder, region_head, task_grasp, global_grasp, verifier, graph, push]
   generated_policy_candidate_cache: runtime/cache/policy_candidates
   generated_policy_candidate_ratio: 1.0

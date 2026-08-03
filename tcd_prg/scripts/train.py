@@ -54,8 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--resume")
     parser.add_argument("--initialize", help="Load model/EMA weights without optimizer state")
-    # Explicit values are used by the native-Windows launcher. torchrun uses
-    # its standard process environment, retained only as a compatibility path.
+    # Windows 原生启动器显式传递进程拓扑；torchrun 的环境变量仅作为 Linux 兼容路径。
     parser.add_argument("--world-size", type=int)
     parser.add_argument("--rank", type=int)
     parser.add_argument("--local-rank", "--local_rank", type=int)
@@ -74,6 +73,7 @@ def main() -> None:
         )
     if args.resume and args.initialize:
         raise ValueError("--resume and --initialize are mutually exclusive")
+    # 只要训练使用 generated candidates，就必须校验生成器 checkpoint 和缓存版本签名。
     if config.training.generated_policy_candidate_ratio > 0:
         if args.initialize:
             actual_sha256 = checkpoint_sha256(args.initialize)
@@ -111,6 +111,7 @@ def main() -> None:
         else int(os.environ.get("LOCAL_RANK", "0"))
     )
     use_cuda = torch.cuda.is_available() and config.training.device.startswith("cuda")
+    # Windows CUDA DDP 默认 gloo；Linux CUDA 优先 NCCL。每个 rank 绑定唯一显卡。
     if world_size > 1:
         backend = config.training.ddp_backend
         if backend == "auto":
@@ -146,6 +147,7 @@ def main() -> None:
     )
     if not len(train_dataset):
         raise RuntimeError("The completed-file snapshot contains no training groups")
+    # 创建 DataLoader 前完整预检 cache-only 数据，缺失观测会在训练启动前集中报错。
     cached_observations = preflight_observation_cache(
         adapter,
         ("train", train_dataset),
@@ -211,6 +213,7 @@ def main() -> None:
     backbone_parameters = list(model.encoder.parameters())
     backbone_ids = {id(parameter) for parameter in backbone_parameters}
     other_parameters = [p for p in model.parameters() if id(p) not in backbone_ids]
+    # PTv3 骨干和新建动作头采用两个参数组，骨干学习率更小以保护预训练表示。
     optimizer = torch.optim.AdamW(
         [
             {"params": backbone_parameters, "lr": config.optimizer.backbone_learning_rate},
@@ -220,6 +223,7 @@ def main() -> None:
     )
 
     def learning_rate(step: int) -> float:
+        # 线性 warmup 后按优化器步执行 cosine decay；AMP skip 不会推进此调度器。
         if step < config.scheduler.warmup_steps:
             return max(1e-8, step / max(1, config.scheduler.warmup_steps))
         progress = (step - config.scheduler.warmup_steps) / max(
@@ -235,6 +239,7 @@ def main() -> None:
             device_ids=[local_rank] if use_cuda else None,
             find_unused_parameters=config.training.ddp_find_unused_parameters,
         )
+    # 数据能力与消融开关共同决定实际启用的任务损失，结果写入 loss_routing.json。
     objective = TCDPRGObjective(
         adapter.capabilities, config.model, config.ablation, config.losses,
         config.region_head,

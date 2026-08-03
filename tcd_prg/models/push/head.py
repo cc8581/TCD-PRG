@@ -72,6 +72,7 @@ class PushHead(nn.Module):
         )
         x = self.point(x)
         contact = self.contact(x).squeeze(-1).masked_fill(~point_mask, -30.0)
+        # 每个接触点与全部方向 bin 组成条件 token，各 bin 独立预测分数、残差和 utility。
         direction_tokens = (
             self.direction_context(x)[:, :, None]
             + self.direction_embedding.weight[None, None]

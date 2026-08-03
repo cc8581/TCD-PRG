@@ -58,6 +58,7 @@ def _path_sha256(path: str | Path) -> str:
 def generator_signature(config: TCDPRGConfig) -> str:
     """Bind cached candidates to generator code, config, and consumed assets."""
 
+    # 缓存必须同时绑定候选生成代码、配置和几何资产；任一项变化都会自动失效。
     code_files = (
         "tcd_prg/planners/candidate_generator.py",
         "tcd_prg/planners/tcd_policy.py",
@@ -225,6 +226,7 @@ def match_generated_candidates(
 ) -> dict[str, Tensor]:
     """Match generated actions to known outcomes without inventing negatives."""
 
+    # 默认保持 UNKNOWN，只有与已知教师正/负动作满足同物体和动作几何阈值才赋标签。
     count = candidates["type"].shape[1]
     status = torch.full((count,), int(CandidateStatus.UNKNOWN_UNTESTED), dtype=torch.int8)
     successful = torch.zeros(count, dtype=torch.bool)
@@ -309,9 +311,7 @@ def match_generated_candidates(
         positive_mask = teacher_success[matches]
         negative_mask = teacher_negative[matches]
         if positive_mask.any() and negative_mask.any():
-            # Geometrically indistinguishable teacher actions disagree about
-            # outcome.  Without repeated-trial success probabilities this is
-            # irreducible UNKNOWN, never a forced binary target.
+            # 几何不可区分的教师动作结果冲突时，没有重复试验成功率就只能保持 UNKNOWN。
             conflict[index] = True
             continue
         if positive_mask.any():

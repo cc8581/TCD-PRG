@@ -44,6 +44,7 @@ class ClosedLoopPlanner:
     def run(self) -> PlanResult:
         self.policy.reset()
         actions: list[Any] = []
+        # 每次执行后重新观测和生成候选；H=5 只限制准备动作，不包含最终 Task Grasp。
         for preparation_step in range(self.max_preparation_actions + 1):
             observation = self.observations.observe()
             encoded = self.policy.encode_observation(observation)
@@ -71,6 +72,7 @@ class ClosedLoopPlanner:
             action = self.policy.select_action(candidates)
             if action is None:
                 return None, last_reason
+            # 确定性认证只放在最终执行边界；拒绝后直接尝试同一观测下的次高分候选。
             certified, reason = self.executor.certify(action)
             if certified:
                 return action, None
@@ -84,7 +86,7 @@ class ClosedLoopPlanner:
             if "valid" not in tensor_group or not bool(tensor_group["valid"][0, int(index)]):
                 return None, reason
             tensor_group["valid"][0, int(index)] = False
-            # Recompute the deterministic selection mask without re-encoding.
+            # 仅更新候选有效 mask 并重跑 Router，不重复编码未变化的点云。
             encoded = candidates.get("encoded")
             if encoded is not None and hasattr(self.policy, "model"):
                 candidates["router"] = self.policy.model.route_cached(  # type: ignore[attr-defined]

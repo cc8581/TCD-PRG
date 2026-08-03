@@ -30,6 +30,7 @@ class CameraParameters:
 
 @dataclass(slots=True)
 class SceneObservation:
+    # 点级数组长度为 N，物体级数组长度为 O；object_pose 使用世界系 xyz+xyzw。
     scene_id: int
     state_id: int
     task_index: int
@@ -56,6 +57,7 @@ class SceneObservation:
     def physical_active(self) -> np.ndarray:
         """Objects that physically participate in this observed state."""
 
+        # present 表示场景定义中存在，active 表示尚未被 PICK_REMOVE；两者缺一不可。
         return self.object_present & self.object_active
 
     def validate(self) -> None:
@@ -89,6 +91,7 @@ class SceneObservation:
 
 @dataclass(slots=True)
 class StateLabels:
+    # 图标签、势函数和动作拓扑均描述“当前状态”，不能跨 state_id 复用。
     relation_graph: np.ndarray
     task_block_graph: np.ndarray | None
     blockers: np.ndarray
@@ -116,6 +119,7 @@ class StateLabels:
 
 @dataclass(slots=True)
 class ActionCandidateGroup:
+    # evaluation_status 为三态监督来源；UNKNOWN 候选必须在损失中保持 ignore。
     candidate_action_ids: np.ndarray
     action_type: np.ndarray
     acted_object: np.ndarray
@@ -132,8 +136,7 @@ class ActionCandidateGroup:
     potential_delta: np.ndarray
     success_mask: np.ndarray
     action_parameters: dict[str, np.ndarray]
-    # False for sampled/open-world candidate groups. It may be true only when
-    # the data producer explicitly certified a versioned, complete universe.
+    # 只有版本化候选全集被完整认证时才能为 True；有限采样组必须保持 False。
     label_set_complete: bool = False
 
     @property
@@ -181,6 +184,7 @@ class SequenceLabels:
 
 @dataclass(slots=True)
 class GlobalGraspLabels:
+    # scene_executable: 1=正、0=负、-1=未认证；UNKNOWN 不能当作负样本。
     """Task-free grasps with a visible-surface anchor and contact-centre pose.
 
     ``contact_point_world`` is one physical finger-contact anchor, not the

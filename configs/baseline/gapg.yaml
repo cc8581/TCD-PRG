@@ -1,3 +1,4 @@
+# 原始 GAPG 对照；checkpoint 路径相对项目根目录解析。
 baseline:
   type: original_gapg_wrapper
   gapg_root: third_party/GAPG

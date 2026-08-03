@@ -12,6 +12,7 @@ from .masked import (
 
 class PushLoss(nn.Module):
     def forward(self, output: dict[str, Tensor], labels: dict[str, Tensor]) -> dict[str, Tensor]:
+        # 方向分类负责粗 bin，残差回归负责 bin 内连续修正，两者共同组成方向损失。
         direction_bin = safe_cross_entropy(
             output["direction_logits"], labels["direction_bin"], labels["direction_valid"]
         )
@@ -28,6 +29,7 @@ class PushLoss(nn.Module):
             "push_direction": direction_bin + direction_residual,
             "push_direction_bin_diagnostic": direction_bin,
             "push_direction_residual_diagnostic": direction_residual,
+            # utility_delta 是接触点和方向联合条件化的状态效用变化。
             "push_potential": safe_smooth_l1(
                 output["utility_delta"], labels["utility_delta"], labels["utility_valid"]
             ),

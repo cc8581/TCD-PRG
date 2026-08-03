@@ -13,6 +13,7 @@ def rotation_6d_to_matrix(rotation_6d: Tensor, eps: float = 1e-6) -> Tensor:
 
     if rotation_6d.shape[-1] != 6:
         raise ValueError("rotation_6d must end in 6 values")
+    # Gram-Schmidt 将两个自由向量正交化，第三轴由右手系叉乘得到。
     first, second = rotation_6d[..., :3], rotation_6d[..., 3:]
     x_axis = torch.nn.functional.normalize(first, dim=-1, eps=eps)
     second = second - (x_axis * second).sum(-1, keepdim=True) * x_axis
@@ -25,6 +26,7 @@ def parallel_jaw_rotation_distance(first: Tensor, second: Tensor) -> Tensor:
     """SO(3) geodesic distance with 180-degree jaw-swap symmetry."""
 
     relative = first.transpose(-1, -2) @ second
+    # 平行夹爪绕接近轴旋转 180° 是同一物理抓取，距离取两种表示的最小值。
     jaw_swap = torch.diag(torch.tensor(
         [-1.0, -1.0, 1.0], dtype=first.dtype, device=first.device
     ))

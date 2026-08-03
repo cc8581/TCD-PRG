@@ -198,9 +198,7 @@ class TaskConditionedDependencyGraph(nn.Module):
             dtype=nodes.dtype,
             device=nodes.device,
         )
-        # Graph reasoning always consumes predicted relations. ``relation_graph``
-        # is accepted only for API compatibility and supervision is applied to
-        # ``physical_logits`` outside this module; Oracle edges never enter the policy.
+        # 图推理只消费预测边；relation_graph 仅保留接口兼容，Oracle 标签绝不送入策略网络。
         del relation_graph
         relation_weight[:, :-1, :-1, : self.physical_relations] = torch.sigmoid(
             physical_logits
@@ -211,9 +209,7 @@ class TaskConditionedDependencyGraph(nn.Module):
             self.physical_relations + self.task_relations,
             self.physical_relations + 2 * self.task_relations,
         )
-        # object -> TASK_GRASP is the causal blocking edge.  Reverse context
-        # messages use separate relation parameters and therefore do not
-        # symmetrize the learned edge semantics.
+        # object→TASK_GRASP 表示因果阻塞；反向消息使用独立关系通道，不把有向语义对称化。
         relation_weight[:, -1, :-1, forward] = task_probability
         relation_weight[:, :-1, -1, reverse] = task_probability
         diagonal = torch.arange(total_nodes, device=nodes.device)
@@ -227,6 +223,7 @@ class TaskConditionedDependencyGraph(nn.Module):
             threshold=self.edge_threshold,
             use_indirect_reasoning=use_indirect_reasoning,
         )
+        # 连续 prior 供 soft candidate mode 加权；硬闭包只保留给显式消融和指标。
         dependency_prior = derive_dependency_prior(
             physical_logits, task_logits, object_mask
         )

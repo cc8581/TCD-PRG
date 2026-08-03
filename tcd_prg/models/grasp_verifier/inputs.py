@@ -41,6 +41,7 @@ def build_verifier_inputs(
         (action_type == int(ActionType.TASK_GRASP))
         | (action_type == int(ActionType.PICK_REMOVE))
     )
+    # TASK_GRASP 与 PICK_REMOVE 共用 verifier 坐标协议，PUSH 不进入抓取验证器。
     pose = torch.where(
         (action_type == int(ActionType.PICK_REMOVE)).unsqueeze(-1),
         parameters["removal_grasp_pose_world"],
@@ -85,6 +86,7 @@ def build_verifier_inputs(
             count = len(chosen)
             indices = valid_scene_indices[chosen]
             scene_index[row, candidate, :count] = indices
+            # 场景点和夹爪点统一变换到候选 TCP 坐标系，网络无需学习绝对世界位姿。
             local = batch["xyz"][row, indices] - origin
             scene_xyz_grasp[row, candidate, :count] = (
                 local @ rotation[row, candidate]

@@ -37,6 +37,7 @@ class OfflineModelEvaluator:
         return value.detach().float().cpu().numpy()
 
     def update(self, batch: dict[str, Any], output: dict[str, Any]) -> None:
+        # 指标按 scene/state/task 保存，避免只看全局均值而掩盖困难状态退化。
         batch_size = batch["xyz"].shape[0]
         selected = None
         if "router" in output:
@@ -136,6 +137,7 @@ class OfflineModelEvaluator:
                     self._numpy(output["router"].candidate_logits[row]), success.astype(float),
                     candidate_valid & evaluated,
                 )
+            # generated 指标只在已知三态标签上计算，同时单独报告 UNKNOWN/冲突覆盖情况。
             generated = batch.get("generated_policy_candidates")
             if generated is not None and "generated_router" in output:
                 generated_valid = self._numpy(generated["valid"][row]).astype(bool)

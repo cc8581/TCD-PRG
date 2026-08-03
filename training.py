@@ -146,37 +146,37 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # 下面这些值均可直接覆盖；不传时使用 local_paths.yaml 中的本机配置。
     parser.add_argument(
         "--dataset-root", type=Path, default=defaults["dataset_root"],
-        help="任务场景数据集根目录。",
+        help="Root directory of the task-oriented scene dataset.",
     )
     parser.add_argument(
         "--acronym-root", type=Path, default=defaults["acronym_root"],
-        help="ACRONYM 抓取数据根目录。",
+        help="Root directory of the ACRONYM grasp dataset.",
     )
     parser.add_argument(
         "--functional-region-root",
         type=Path,
         default=defaults["functional_region_root"],
-        help="人工功能区域标注根目录。",
+        help="Root directory of the manual functional-region annotations.",
     )
     parser.add_argument(
         "--pybullet-python", default=defaults["pybullet_python"],
-        help="运行 PyBullet 兼容 worker 的 Python 解释器。",
+        help="Python interpreter used by the PyBullet compatibility workers.",
     )
     parser.add_argument(
-        "--gpus", type=int, default=defaults["gpus"], help="本机训练使用的 GPU 数量。"
+        "--gpus", type=int, default=defaults["gpus"], help="Number of local training GPUs."
     )
     parser.add_argument(
         "--output-dir", type=Path, default=defaults["output_dir"],
-        help="checkpoint、JSONL 指标和 TensorBoard 日志目录。",
+        help="Directory for checkpoints, JSONL metrics, and TensorBoard logs.",
     )
     # resume 恢复优化器/调度器等完整状态；initialize 仅加载模型权重，二者不可同时使用。
     parser.add_argument(
         "--resume", type=Path, default=defaults["resume"],
-        help="恢复完整训练状态的 checkpoint；默认不恢复。",
+        help="Checkpoint used to resume the complete training state.",
     )
     parser.add_argument(
         "--initialize", type=Path, default=defaults["initialize"],
-        help="仅初始化模型权重的 checkpoint；默认不加载。",
+        help="Checkpoint used only to initialize model weights.",
     )
     parser.add_argument(
         "overrides",

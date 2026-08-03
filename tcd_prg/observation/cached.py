@@ -14,6 +14,7 @@ from .base import ObservationProvider, ObservationRequest, PointObservation
 
 
 def request_hash(request: ObservationRequest) -> str:
+    # key 覆盖状态、相机和渲染版本，防止参数变化后误复用旧点云。
     payload = {
         "scene_id": request.scene_id,
         "state_id": request.state_id,
@@ -57,6 +58,7 @@ class CachedObservationProvider(ObservationProvider):
             os.utime(path, None)
             with np.load(path, allow_pickle=False) as data:
                 return PointObservation(data["xyz"], data["rgb"], data["instance_id"], data["source_view"])
+        # 正式 cache-only 训练缺失即失败，不会在 DataLoader worker 中静默启动渲染。
         if self.fallback is None:
             raise ObservationCacheMissError(
                 f"Observation {key} is not cached; run tcd-prg-prefetch before training"
@@ -76,6 +78,7 @@ class CachedObservationProvider(ObservationProvider):
                 f"({self.min_free_bytes} bytes) cannot be maintained"
             )
         path.parent.mkdir(parents=True, exist_ok=True)
+        # 先写进程唯一的临时文件再原子替换，读取方永远只看到完整条目。
         temp = path.with_name(f"{path.stem}.{os.getpid()}.tmp.npz")
         np.savez_compressed(
             temp,

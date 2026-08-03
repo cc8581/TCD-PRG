@@ -66,6 +66,7 @@ def task_grasp_nms(
     ) <= 0:
         raise ValueError("All grasp NMS thresholds must be positive")
 
+    # 只有同一物体且平移、对称旋转、接近轴和开口均接近时才视为重复抓取。
     finite = (
         valid.bool()
         & torch.isfinite(pose_world).all(-1)

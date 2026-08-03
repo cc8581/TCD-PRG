@@ -75,6 +75,7 @@ class _CompleteGraspSetHead(nn.Module):
             padding[all_invalid, 0] = False
             memory[all_invalid, 0] = 0.0
         decoded = decoder(query, memory, padding)
+        # query 对点 memory 的软分配给出抓取锚点，再回归有限范围平移偏移。
         mask_logits = torch.einsum(
             "bqd,bnd->bqn", self.mask_query(decoded), self.mask_memory(memory)
         ) * decoded.shape[-1] ** -0.5
@@ -82,6 +83,7 @@ class _CompleteGraspSetHead(nn.Module):
         weights = torch.softmax(mask_logits, -1)
         anchor = torch.bmm(weights, xyz)
         translation = anchor + 0.10 * torch.tanh(self.translation_offset(decoded))
+        # 6D 连续旋转表示在内部正交化为 SO(3)，避免四元数双覆盖带来的回归不连续。
         rotation_6d = self.rotation_6d(decoded)
         rotation = rotation_6d_to_matrix(rotation_6d)
         output = {
@@ -100,6 +102,7 @@ class _CompleteGraspSetHead(nn.Module):
                 point_domain & (object_index >= 0) & (object_index < object_count)
             )
             safe_object = object_index.clamp(0, object_count - 1)
+            # Global Grasp 的对象分配来自 query 注意力落在各实例点上的概率质量。
             object_mass = weights.new_zeros((b, weights.shape[1], object_count))
             object_mass.scatter_add_(
                 2,
@@ -142,6 +145,7 @@ class TaskGraspProposalHead(_CompleteGraspSetHead):
             task_token[:, None].expand(-1, n, -1),
             region_probability.unsqueeze(-1),
         ), -1)
+        # 功能区域概率只在目标实例内生效，不允许背景或遮挡物点参与 Task Grasp 条件。
         region_weight = region_probability * target_mask
         region_context = (
             point_features * region_weight.unsqueeze(-1)
@@ -179,6 +183,7 @@ class GlobalGraspProposalHead(_CompleteGraspSetHead):
         decoder: M2T2GraspDecoder,
     ) -> dict[str, Tensor]:
         b, n, _ = point_features.shape
+        # scene_only 是主实验轨道；instance_assisted 仅作为显式对照，不共享任务特征。
         if self.input_mode == "instance_assisted":
             row = torch.arange(b, device=point_features.device)[:, None]
             per_point_object = object_tokens[row, instance_id.clamp(0, object_tokens.shape[1] - 1)]

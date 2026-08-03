@@ -1,2 +1,3 @@
+# 准备阶段只允许固定距离 PUSH。
 baseline:
   type: push_only

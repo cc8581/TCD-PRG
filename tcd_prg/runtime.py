@@ -112,6 +112,7 @@ class UnifiedBatchCollator:
 
     def __call__(self, samples: list[Any]) -> dict[str, Any]:
         batch = collate_unified(samples)
+        # generated candidate manifest 每个 worker 只验证一次，单条 entry 仍逐样本校验来源签名。
         if self.config.training.generated_policy_candidate_cache:
             batch["generated_policy_candidates"] = load_candidate_batch(
                 samples,
@@ -121,6 +122,7 @@ class UnifiedBatchCollator:
                 validate_manifest=not self._candidate_manifest_validated,
             )
             self._candidate_manifest_validated = True
+        # 纯 generated-policy 已缓存几何/Verifier 证据，不再构造昂贵的局部夹爪输入。
         pure_generated_policy = (
             self.config.training.generated_policy_candidate_ratio == 1.0
             and self.config.losses.policy_candidate > 0

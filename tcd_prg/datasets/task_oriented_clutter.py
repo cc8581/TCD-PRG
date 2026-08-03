@@ -47,6 +47,7 @@ def _ragged(values: np.ndarray, offsets: np.ndarray, index: int) -> np.ndarray:
 def _se3_diverse_rows(library, rows: np.ndarray, count: int) -> np.ndarray:
     """Deterministic farthest-first object-frame pose/opening sampling."""
 
+    # 以平移、接近轴、夹持轴和开口宽度联合距离做最远点采样，避免只保留单一抓取模式。
     rows = np.asarray(rows, np.int64)
     if count <= 0 or not len(rows):
         return np.empty(0, np.int64)
@@ -184,6 +185,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             int(verifier_wrong_region_negatives), int(verifier_collision_negatives),
             int(verifier_approach_negatives), int(sampling_seed),
         )
+        # 初始化时快照已原子发布的 HDF5，训练期间不会扫描或读取仍在写入的 .work 文件。
         self._h5_paths = tuple(sorted((self.action_root / "scene_labels").glob("scene_*.h5")))
         self._scene_ids = tuple(int(p.stem.split("_")[-1]) for p in self._h5_paths)
         self._path_by_scene = dict(zip(self._scene_ids, self._h5_paths, strict=True))

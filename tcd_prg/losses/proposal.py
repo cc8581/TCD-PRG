@@ -48,6 +48,7 @@ class CompleteGraspSetLoss(nn.Module):
         unmatched_quality_valid = labels.get(
             "unmatched_quality_valid", torch.zeros_like(sample_valid)
         ).bool()
+        # 只有明确完备的标签集才能监督所有 unmatched query；开放世界样本默认 ignore。
         quality_valid = unmatched_quality_valid[:, None].expand_as(quality_logit).clone()
         object_logits = output.get("object_logits")
         object_target = labels.get("object_index")
@@ -72,6 +73,7 @@ class CompleteGraspSetLoss(nn.Module):
             if object_logits is not None and object_target is not None:
                 object_cost = -F.log_softmax(object_logits[row], -1)[:, object_target[row, targets]]
                 cost = cost + object_cost
+            # Hungarian 一对一匹配保持抓取集合的多样性，不依赖候选排列顺序。
             pred_np, target_np = linear_sum_assignment(
                 np.asarray(cost.detach().float().cpu())
             )
@@ -88,6 +90,7 @@ class CompleteGraspSetLoss(nn.Module):
             ].to(quality_target.dtype)
             quality_valid[row, pred_index] = labels["quality_valid"][row, target_index]
             matched_query[row, pred_index] = True
+        # 已认证负样本通过 SE(3)+宽度邻域关联 query，而不是把所有未匹配 query 当负样本。
         negative_valid = labels.get("negative_valid")
         if negative_valid is not None:
             translation_threshold, rotation_threshold, width_threshold = self.negative_thresholds

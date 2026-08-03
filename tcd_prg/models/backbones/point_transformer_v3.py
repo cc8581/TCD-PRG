@@ -23,6 +23,7 @@ from .task_point_transformer import SceneGeometryOutput
 
 
 def _load_official_model(source_root: str | Path) -> type[nn.Module]:
+    # 只做动态加载和接口适配，官方 PTv3 源码由固定 submodule 版本提供，不在本项目重写。
     root = Path(source_root)
     if not root.is_absolute():
         root = project_path(root)
@@ -77,7 +78,7 @@ class PointTransformerV3SceneGeometryBackbone(nn.Module):
             upcast_attention=not enable_flash_attention,
             upcast_softmax=not enable_flash_attention,
         )
-        # The official segmentation decoder returns dec_channels[0] == 64.
+        # 官方分割解码器输出 64 维，再投影到项目统一的 feature_dim。
         self.output_projection = nn.Sequential(nn.Linear(64, dim), nn.LayerNorm(dim))
         self.pool_query = nn.Parameter(torch.empty(dim))
         nn.init.normal_(self.pool_query, std=0.02)
@@ -98,6 +99,7 @@ class PointTransformerV3SceneGeometryBackbone(nn.Module):
             .expand(-1, point_count)
             .reshape(-1)[flat_valid]
         )
+        # 每个 batch 样本独立平移到局部网格，避免不同场景的体素坐标互相影响。
         grid_rows = []
         for row in range(batch_size):
             selected = flat_batch == row
@@ -148,6 +150,7 @@ class PointTransformerV3SceneGeometryBackbone(nn.Module):
             )
         else:
             encoded_features = self.backbone(data).feat
+        # 同体素原始点共享 PTv3 特征，再按 inverse 映射回稠密点顺序供各预测头使用。
         voxel_features = self.output_projection(encoded_features)
         point_features = xyz.new_zeros((*point_mask.shape, voxel_features.shape[-1]))
         point_features.view(-1, voxel_features.shape[-1])[flat_valid] = voxel_features[inverse]

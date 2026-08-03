@@ -86,6 +86,7 @@ class GripperSceneTaskVerifier(nn.Module):
         task = self.task_projection(task_token)[:, None].expand(-1, candidates, -1)
         cls = self.cls_token + self.token_type.weight[0]
         cls = cls[None, None].expand(batch_size, candidates, -1) + task
+        # 每个候选独立拼接 CLS、局部场景点和精确夹爪几何点，不重复运行全局点云骨干。
         tokens = torch.cat((cls[:, :, None], scene_encoded, gripper_encoded), 2)
         padding = torch.cat((
             torch.zeros((batch_size, candidates, 1), dtype=torch.bool, device=tokens.device),

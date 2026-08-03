@@ -127,6 +127,7 @@ class TCDPRGPolicy(ManipulationPolicy):
         return cpu
 
     def encode_observation(self, observation: SceneObservation) -> EncodedPolicyState:
+        # 观测只编码一次；候选生成、Verifier 和 Router 均复用 EncodedPolicyState。
         cpu = self._batch(observation)
         device = {key: value.to(self.device) for key, value in cpu.items()}
         with torch.no_grad():
@@ -202,8 +203,7 @@ class TCDPRGPolicy(ManipulationPolicy):
             candidates["task_grasp_after_certifier_count"] = (
                 candidates["valid"] & task_mask
             ).sum(-1)
-            # The number of unique verifier/certifier survivors is the hard
-            # count gate before TASK_GRASP can enter the router.
+            # Task Grasp 必须在 SE(3) NMS 后仍达到 required_grasp_count，才能进入 Router。
             (
                 candidates["valid"], verified_count, unique_task_mask
             ) = apply_verified_candidate_count_gate(
@@ -216,12 +216,13 @@ class TCDPRGPolicy(ManipulationPolicy):
                 approach_threshold_deg=self.config.model.grasp_nms_approach_deg,
             )
             candidates["verified_unique_grasp_count"] = verified_count
-            # Compatibility alias now has unique-grasp semantics.
+            # 兼容字段也采用“去重后的抓取数”语义，不能用原始 query 数代替。
             candidates["verified_candidate_count"] = verified_count
             candidates["task_grasp_nms_keep"] = unique_task_mask
             router = self.model.route_cached(
                 encoded.device_batch, encoded.output, candidates
             )
+            # PUSH NMS 以 Router 综合证据排序，去除同物体上接触点和方向近似的重复动作。
             nms_valid = self.generator.apply_push_nms(candidates, router.candidate_logits)
             candidates["push_after_nms_count"] = (
                 nms_valid & (candidates["type"] == int(ActionType.PUSH))

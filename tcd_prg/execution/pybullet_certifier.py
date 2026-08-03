@@ -45,6 +45,7 @@ class ExternalFR5AG16095Certifier:
         if np.any((action_type_all == int(ActionType.PUSH)) &
                   (~np.isclose(distances, PUSH_DISTANCE_M, atol=1e-6, rtol=0.0))):
             raise ValueError("Formal PUSH actions require exactly 0.15 m")
+        # PUSH 的接近/运动轨迹属于部署执行器工程，不在离线抓取 certifier 中伪造。
         grasp_indices = np.flatnonzero(action_type_all != int(ActionType.PUSH)).tolist()
         decisions: list[tuple[bool, str]] = [
             (False, "push_requires_executor_motion_planner")
@@ -76,6 +77,7 @@ class ExternalFR5AG16095Certifier:
             np.savez_compressed(
                 request, object_model_ids=model_ids, object_scales=scales,
                 object_pose=observation.object_pose,
+                # 精确碰撞场景只放入当前仍真实存在的物体，避免 PICK_REMOVE 后的幽灵碰撞体。
                 object_present=observation.physical_active,
                 support_present=support_present, support_pose=support_pose, support_size=support_size,
                 action_type=action_type,

@@ -39,12 +39,11 @@ class MaskedHierarchicalCandidateRouter(nn.Module):
         safe_type = candidate_type.clamp(0, self.action_types - 1)
         safe_object = candidate_object.clamp(0, object_tokens.shape[1] - 1)
         row = torch.arange(b, device=candidate_tokens.device)[:, None]
-        # Sequence-history supervision is not available for cached generated
-        # state groups.  Keep this context neutral until a history-keyed cache
-        # and labels exist, so deployment cannot introduce an unseen feature.
+        # generated cache 尚未按动作历史索引，因此训练和部署都将 history 置零，避免分布外特征。
         del previous_action
         previous = torch.zeros_like(task_token)
         remaining = self.remaining_embedding(remaining_steps.clamp(0, 5))
+        # 每个候选融合动作参数、动作类型和作用物体，再在候选集合内部做自注意力比较。
         enriched = candidate_tokens + self.action_embedding(safe_type) + object_tokens[row, safe_object]
         padding = ~candidate_valid
         all_invalid = padding.all(-1)
@@ -61,6 +60,7 @@ class MaskedHierarchicalCandidateRouter(nn.Module):
             remaining[:, None].expand(-1, k, -1),
             previous[:, None].expand(-1, k, -1),
         ), -1)
+        # 无效/padding 候选在最终 logits 上硬屏蔽，不能参与策略选择。
         logits = self.score(context).squeeze(-1).masked_fill(~candidate_valid, -30.0)
         return RouterOutput(logits, candidate_valid)
 

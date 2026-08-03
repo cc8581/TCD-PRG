@@ -18,8 +18,8 @@ class TaskRegionHead(nn.Module):
         context = torch.cat(
             (point_features, target_token[:, None].expand(-1, n, -1), task_token[:, None].expand(-1, n, -1)), -1
         )
+        # 功能区域分割只在目标物体点上定义，其他点直接屏蔽而不是作为负样本监督。
         logits = self.point_logit(self.decoder(context)).squeeze(-1)
         logits = logits.masked_fill(~target_mask, -30.0)
         visibility_logit = self.visibility(torch.cat((target_token, task_token), -1)).squeeze(-1)
         return {"region_logits": logits, "region_probability": torch.sigmoid(logits), "visibility_logit": visibility_logit}
-
