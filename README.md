@@ -101,6 +101,15 @@ Place data under `data/`, or set `TCD_DATASET_ROOT`, `TCD_ACRONYM_ROOT` and
 cache-only and never synchronously invokes PyBullet on the GPU path:
 
 ```powershell
+python scripts/start_training.py
+```
+
+The launcher supplies the Windows RTX 3090 defaults, discovers the completed
+dataset under `G:\cc`, creates a timestamped output directory, and accepts
+ordinary `key=value` overrides. Use `--resume`, `--initialize`, or `--gpus N`
+when required; it always starts formal training and has no dry-run mode.
+
+```powershell
 tcd-prg-audit --config configs/config.yaml --states 100
 tcd-prg-prefetch --config configs/config.yaml --max-groups 1000
 tcd-prg-inspect --config configs/config.yaml --scene-id 0 --group-index 0
