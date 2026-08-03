@@ -63,6 +63,9 @@ def generator_signature(config: TCDPRGConfig) -> str:
         "tcd_prg/planners/candidate_generator.py",
         "tcd_prg/planners/tcd_policy.py",
         "tcd_prg/models/tcd_prg.py",
+        "tcd_prg/models/push/head.py",
+        "tcd_prg/models/grasp_verifier/inputs.py",
+        "tcd_prg/models/grasp_verifier/verifier.py",
         "tcd_prg/models/dependency_graph/hgt.py",
         "tcd_prg/datasets/policy_candidates.py",
         "tcd_prg/datasets/task_oriented_clutter.py",
@@ -74,6 +77,7 @@ def generator_signature(config: TCDPRGConfig) -> str:
         "ablation": asdict(config.ablation),
         "graph": asdict(config.graph),
         "backbone": asdict(config.backbone),
+        "grasp_verifier": asdict(config.grasp_verifier),
         "observation": asdict(config.observation),
         "dataset": {
             key: value for key, value in asdict(config.dataset).items()

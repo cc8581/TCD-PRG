@@ -64,7 +64,7 @@ class BackboneConfig:
     freeze: bool = False
     grid_size_m: float = 0.005
     enable_flash_attention: bool = False
-    patch_size: int = 256
+    patch_size: int = 128
     attention_points: int = 1_024
 
 
@@ -114,10 +114,13 @@ class ModelConfig:
     # push_candidates 是接触点预算；每个点再展开多个方向，最终总量受 max_push_candidates 限制。
     push_directions_per_contact: int = 2
     max_push_candidates: int = 32
+    # 每个活动物体只在高分接触点计算方向和效用；训练时显式补入全部 GT 接触点。
+    push_direction_contact_topk: int = 32
     push_direction_feature_dim: int = 64
     push_direction_transformer_layers: int = 1
     push_direction_transformer_heads: int = 4
-    activation_checkpointing: bool = True
+    # 默认关闭以避免反向传播时重复执行 PTv3；显存不足时再显式开启。
+    activation_checkpointing: bool = False
     verifier_local_radius_m: float = 0.25
     verifier_candidate_micro_batch: int = 16
     verifier_transformer_layers: int = 2
@@ -231,8 +234,9 @@ class EvaluationConfig:
 
 @dataclass(slots=True)
 class GraspVerifierConfig:
-    local_scene_points: int = 512
-    gripper_points: int = 512
+    # Verifier 仅打包有效抓取候选；128+128 个点控制局部自注意力的二次复杂度。
+    local_scene_points: int = 128
+    gripper_points: int = 128
 
 
 @dataclass(slots=True)
@@ -433,6 +437,13 @@ class TCDPRGConfig:
             )
         if self.model.push_candidates <= 0 or self.model.max_push_candidates <= 0:
             raise ValueError("PUSH contact and final candidate budgets must be positive")
+        if self.model.push_direction_contact_topk <= 0:
+            raise ValueError("push_direction_contact_topk must be positive")
+        if min(
+            self.grasp_verifier.local_scene_points,
+            self.grasp_verifier.gripper_points,
+        ) <= 0:
+            raise ValueError("grasp verifier point budgets must be positive")
         if not 0.0 <= self.training.generated_policy_candidate_ratio <= 1.0:
             raise ValueError("generated_policy_candidate_ratio must be in [0,1]")
         if self.training.validation_interval < 0:

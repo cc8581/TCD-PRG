@@ -8,6 +8,7 @@ import torch
 from torch import Tensor, nn
 
 from tcd_prg.config import AblationConfig, BackboneConfig, GraphConfig, ModelConfig, RouterConfig
+from tcd_prg.constants import ActionType
 
 from .backbones import (
     PointTransformerV3SceneGeometryBackbone,
@@ -92,6 +93,7 @@ class TCDPRGModel(nn.Module):
             c.push_direction_feature_dim,
             c.push_direction_transformer_layers,
             c.push_direction_transformer_heads,
+            c.push_direction_contact_topk,
         )
         self.router = MaskedHierarchicalCandidateRouter(
             c.feature_dim, layers=router_config.layers, heads=router_config.heads
@@ -162,28 +164,75 @@ class TCDPRGModel(nn.Module):
         """Verify candidates from cached shared features without a second backbone pass."""
 
         encoded, region = result["encoded"], result["region"]
-        point_index = verifier_inputs["scene_point_index"]
-        batch_rows = torch.arange(point_index.shape[0], device=point_index.device)[:, None, None]
-        verifier_features = encoded.point_features[batch_rows, point_index]
-        verifier_target = batch["target_mask"][batch_rows, point_index]
-        verifier_region = region["region_probability"][batch_rows, point_index]
-        outputs: dict[str, list[Tensor]] = {}
+        candidate_valid = verifier_inputs["candidate_valid"].bool()
+        coordinates = torch.nonzero(candidate_valid, as_tuple=False)
+        batch_size, candidates = candidate_valid.shape
+        outputs = {
+            f"{head}_logit": encoded.point_features.new_full(
+                (batch_size, candidates), -30.0
+            )
+            for head in self.verifier.HEADS
+        }
+        if not coordinates.numel():
+            return outputs
+
+        # 只打包真实抓取候选；PUSH 和 padding 不再进入局部 Transformer。
         micro = self.config.verifier_candidate_micro_batch
-        for start in range(0, point_index.shape[1], micro):
-            stop = min(point_index.shape[1], start + micro)
+        for start in range(0, coordinates.shape[0], micro):
+            selected = coordinates[start:start + micro]
+            rows, candidate_indices = selected[:, 0], selected[:, 1]
+            point_index = verifier_inputs["scene_point_index"][rows, candidate_indices]
+            verifier_features = encoded.point_features[rows[:, None], point_index]
+            verifier_target = batch["target_mask"][rows[:, None], point_index]
+            verifier_region = region["region_probability"][rows[:, None], point_index]
             chunk = self.verifier(
-                verifier_inputs["scene_xyz_grasp"][:, start:stop],
-                verifier_inputs["gripper_xyz_grasp"][:, start:stop],
-                verifier_features[:, start:stop],
-                verifier_target[:, start:stop],
-                verifier_region[:, start:stop],
-                encoded.task_token,
-                verifier_inputs["scene_valid"][:, start:stop],
-                verifier_inputs["gripper_valid"][:, start:stop],
+                verifier_inputs["scene_xyz_grasp"][rows, candidate_indices][:, None],
+                verifier_inputs["gripper_xyz_grasp"][rows, candidate_indices][:, None],
+                verifier_features[:, None],
+                verifier_target[:, None],
+                verifier_region[:, None],
+                encoded.task_token[rows],
+                verifier_inputs["scene_valid"][rows, candidate_indices][:, None],
+                verifier_inputs["gripper_valid"][rows, candidate_indices][:, None],
             )
             for key, value in chunk.items():
-                outputs.setdefault(key, []).append(value)
-        return {key: torch.cat(values, dim=1) for key, values in outputs.items()}
+                outputs[key] = outputs[key].index_put(
+                    (rows, candidate_indices), value.squeeze(1)
+                )
+        return outputs
+
+    @torch.no_grad()
+    def _push_supervision_point_indices(
+        self, batch: dict[str, Tensor]
+    ) -> tuple[Tensor, ...] | None:
+        """Return nearest scene points for every labelled PUSH candidate."""
+
+        required = {"action_parameters", "action_type", "candidate_mask", "acted_object"}
+        if not required.issubset(batch):
+            return None
+        contacts = batch["action_parameters"]["push_contact_world"]
+        forced: list[Tensor] = []
+        for row in range(batch["xyz"].shape[0]):
+            selected: list[Tensor] = []
+            push_candidates = batch["candidate_mask"][row] & (
+                batch["action_type"][row] == int(ActionType.PUSH)
+            ) & torch.isfinite(contacts[row]).all(-1)
+            for candidate in torch.nonzero(push_candidates, as_tuple=False).flatten():
+                object_index = batch["acted_object"][row, candidate]
+                domain = batch["point_mask"][row] & (
+                    batch["instance_id"][row] == object_index
+                )
+                points = torch.nonzero(domain, as_tuple=False).flatten()
+                if points.numel():
+                    distance = batch["xyz"][row, points] - contacts[row, candidate]
+                    selected.append(points[distance.square().sum(-1).argmin()])
+            forced.append(
+                torch.unique(torch.stack(selected))
+                if selected else torch.empty(
+                    0, dtype=torch.long, device=batch["xyz"].device
+                )
+            )
+        return tuple(forced)
 
     def route_cached(
         self, batch: dict[str, Tensor], result: dict[str, Any], candidate_inputs: dict[str, Any]
@@ -360,6 +409,7 @@ class TCDPRGModel(nn.Module):
             encoded.target_token,
             graph_context,
             batch["remaining_steps"],
+            self._push_supervision_point_indices(batch),
         )
         result: dict[str, Any] = {
             "encoded": encoded,

@@ -21,7 +21,7 @@ class GripperGeometryProvider(Protocol):
 def build_verifier_inputs(
     batch: dict[str, Tensor],
     gripper_provider: GripperGeometryProvider,
-    local_scene_points: int = 512,
+    local_scene_points: int = 128,
     local_radius_m: float = 0.25,
 ) -> dict[str, Tensor]:
     """Build candidate-frame verifier tensors without rerunning the backbone.

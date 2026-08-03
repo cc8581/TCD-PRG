@@ -10,6 +10,7 @@ from tcd_prg.models import TCDPRGModel
 from tcd_prg.models.common import ActionCandidateEncoder
 from tcd_prg.models.grasp_verifier import GripperSceneTaskVerifier
 from tcd_prg.models.policy import MaskedHierarchicalCandidateRouter
+from tcd_prg.models.push import PushHead
 from tcd_prg.models.dependency_graph.hgt import derive_dependency_masks
 from tcd_prg.evaluators import OfflineModelEvaluator
 
@@ -35,6 +36,74 @@ def test_point_gripper_joint_input_shapes() -> None:
         torch.randn(1, 32),
     )
     assert all(value.shape == (1, 2) for value in output.values())
+
+
+def test_cached_verifier_only_runs_valid_candidates() -> None:
+    config = _config()
+    config.verifier_candidate_micro_batch = 1
+    model = TCDPRGModel(config).eval()
+    b, k, n, local, gripper = 1, 5, 8, 4, 3
+    candidate_valid = torch.tensor([[True, False, False, True, False]])
+    seen_candidates: list[int] = []
+
+    def record_candidates(_module, inputs) -> None:
+        seen_candidates.append(inputs[0].shape[0] * inputs[0].shape[1])
+
+    handle = model.verifier.register_forward_pre_hook(record_candidates)
+    output = model.verify_cached(
+        {"target_mask": torch.ones(b, n, dtype=torch.bool)},
+        {
+            "encoded": SimpleNamespace(
+                point_features=torch.randn(b, n, config.feature_dim),
+                task_token=torch.randn(b, config.feature_dim),
+            ),
+            "region": {"region_probability": torch.rand(b, n)},
+        },
+        {
+            "candidate_valid": candidate_valid,
+            "scene_point_index": torch.zeros(b, k, local, dtype=torch.long),
+            "scene_xyz_grasp": torch.randn(b, k, local, 3),
+            "scene_valid": torch.ones(b, k, local, dtype=torch.bool),
+            "gripper_xyz_grasp": torch.randn(b, k, gripper, 3),
+            "gripper_valid": torch.ones(b, k, gripper, dtype=torch.bool),
+        },
+    )
+    handle.remove()
+    assert sum(seen_candidates) == int(candidate_valid.sum())
+    assert output["overall_logit"].shape == (b, k)
+    assert torch.equal(
+        output["overall_logit"][~candidate_valid],
+        torch.full((k - int(candidate_valid.sum()),), -30.0),
+    )
+    output["overall_logit"][candidate_valid].sum().backward()
+    assert model.verifier.overall.weight.grad is not None
+
+
+def test_push_direction_sparse_points_include_forced_supervision() -> None:
+    torch.manual_seed(9)
+    b, n, objects, dim = 1, 8, 2, 16
+    head = PushHead(
+        dim=dim, direction_bins=4, direction_dim=8,
+        direction_layers=1, direction_heads=2, direction_contact_topk=2,
+    ).eval()
+    inputs = (
+        torch.randn(b, n, dim), torch.randn(b, n, 3),
+        torch.arange(n)[None] % objects, torch.ones(b, n, dtype=torch.bool),
+        torch.randn(b, objects, dim), torch.ones(b, objects, dtype=torch.bool),
+        torch.randn(b, dim), torch.randn(b, dim), torch.randn(b, objects, dim),
+        torch.tensor([3]),
+    )
+    baseline = head(*inputs)
+    forced_point = torch.nonzero(
+        ~baseline["direction_point_mask"][0], as_tuple=False
+    ).flatten()[:1]
+    output = head(*inputs, forced_direction_points=(forced_point,))
+    assert output["direction_logits"].shape == (b, n, 4)
+    assert output["direction_residual"].shape == (b, n, 4, 2)
+    assert output["direction_point_mask"].sum().item() == 5
+    assert output["direction_point_mask"][0, forced_point].all()
+    assert torch.isfinite(output["direction_logits"][0, forced_point]).all()
+    assert (output["direction_logits"][~output["direction_point_mask"]] == -30.0).all()
 
 
 def test_router_never_selects_invalid_candidate() -> None:

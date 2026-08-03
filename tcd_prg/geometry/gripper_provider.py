@@ -20,7 +20,7 @@ class ExactAG16095GeometryProvider:
     VERSION = "ag16095_collision_surface_v2"
 
     def __init__(self, python_executable: str | Path, worker_script: str | Path,
-                 urdf: str | Path, cache_dir: str | Path, point_count: int = 512,
+                 urdf: str | Path, cache_dir: str | Path, point_count: int = 128,
                  seed: int = 2026, calibration: AG16095Calibration | None = None,
                  allow_generate: bool = True) -> None:
         self.python_executable = resolve_executable(python_executable)
