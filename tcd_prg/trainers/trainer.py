@@ -94,9 +94,15 @@ class Trainer:
         self.metrics_path = self.output_dir / "train_metrics.jsonl"
         self.validation_metrics_path = self.output_dir / "validation_metrics.jsonl"
         self.events_path = self.output_dir / "training_events.jsonl"
-        self.scaler = torch.cuda.amp.GradScaler(enabled=config.training.amp and self.device.type == "cuda")
+        self.scaler = torch.cuda.amp.GradScaler(
+            enabled=config.training.amp and self.device.type == "cuda"
+        )
         source_model = self.model.module if hasattr(self.model, "module") else self.model
-        self.ema = ModelEMA(source_model, config.training.ema_decay) if config.training.ema_decay else None
+        self.ema = (
+            ModelEMA(source_model, config.training.ema_decay)
+            if config.training.ema_decay
+            else None
+        )
         if self.is_primary:
             self._save_run_metadata()
         self.tensorboard = None
@@ -137,6 +143,27 @@ class Trainer:
             if key in cls.COUNT_TERMS
             else float((value / counts[key]).cpu())
             for key, value in sums.items()
+        }
+
+    def _reduce_distributed_terms(
+        self, terms: Mapping[str, float]
+    ) -> dict[str, float]:
+        """Return world-mean metrics and world-sum counters on every rank."""
+
+        reduced = dict(terms)
+        if not torch.distributed.is_initialized() or not reduced:
+            return reduced
+        keys = sorted(reduced)
+        values = torch.tensor(
+            [reduced[key] for key in keys], dtype=torch.float64, device=self.device
+        )
+        torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.SUM)
+        world_size = torch.distributed.get_world_size()
+        return {
+            key: float(values[index])
+            if key in self.COUNT_TERMS
+            else float(values[index] / world_size)
+            for index, key in enumerate(keys)
         }
 
     def _training_stage(self, record: Mapping[str, Any]) -> str:
@@ -269,7 +296,8 @@ class Trainer:
         import yaml
 
         (self.output_dir / "resolved_config.yaml").write_text(
-            yaml.safe_dump(asdict(self.config), sort_keys=False, allow_unicode=True), encoding="utf-8"
+            yaml.safe_dump(asdict(self.config), sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
         )
         try:
             commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -355,7 +383,11 @@ class Trainer:
                 micro_step += 1
                 batch = self._move(raw_batch, self.device)
                 autocast_enabled = self.config.training.amp and self.device.type == "cuda"
-                amp_dtype = torch.bfloat16 if self.config.training.amp_dtype == "bfloat16" else torch.float16
+                amp_dtype = (
+                    torch.bfloat16
+                    if self.config.training.amp_dtype == "bfloat16"
+                    else torch.float16
+                )
                 synchronize = micro_step % accumulation == 0
                 sync_context = (
                     nullcontext()
@@ -418,8 +450,10 @@ class Trainer:
                 # EMA, counters and checkpoints must remain unchanged.
                 if self.scaler.is_enabled() and current_scale < previous_scale:
                     self.state.amp_skipped_steps += 1
-                    skipped_terms = self._aggregate_window_terms(
-                        window_term_sums, window_term_counts
+                    skipped_terms = self._reduce_distributed_terms(
+                        self._aggregate_window_terms(
+                            window_term_sums, window_term_counts
+                        )
                     )
                     self._write_event(
                         "amp_step_skipped",
@@ -456,7 +490,8 @@ class Trainer:
                 self.state.optimizer_steps += 1
                 if (
                     self.config.training.unfreeze_at_optimizer_step is not None
-                    and self.state.optimizer_steps >= self.config.training.unfreeze_at_optimizer_step
+                    and self.state.optimizer_steps
+                    >= self.config.training.unfreeze_at_optimizer_step
                 ):
                     self._set_frozen_modules(False)
                     self.model.train()
@@ -478,8 +513,10 @@ class Trainer:
                 eta_seconds = (
                     (now - started) / max(1, completed_this_run) * remaining_steps
                 )
-                aggregated_terms = self._aggregate_window_terms(
-                    window_term_sums, window_term_counts
+                aggregated_terms = self._reduce_distributed_terms(
+                    self._aggregate_window_terms(
+                        window_term_sums, window_term_counts
+                    )
                 )
                 if self.is_primary:
                     record = {
@@ -507,7 +544,11 @@ class Trainer:
                         ),
                         "micro_batches": window_micro_batches,
                         "window_samples": window_samples,
-                        "metric_scope": "rank0",
+                        "metric_scope": (
+                            "global"
+                            if torch.distributed.is_initialized()
+                            else "local"
+                        ),
                         "learning_rates": [group["lr"] for group in self.optimizer.param_groups],
                         **aggregated_terms,
                     }
@@ -572,7 +613,9 @@ class Trainer:
                         }
                     elif torch.distributed.is_initialized():
                         if isinstance(validation, tuple):
-                            value = torch.tensor(validation, dtype=torch.float64, device=self.device)
+                            value = torch.tensor(
+                                validation, dtype=torch.float64, device=self.device
+                            )
                             torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
                             score = float(value[0] / value[1].clamp_min(1))
                             validation_items = int(value[1])
@@ -670,7 +713,11 @@ class Trainer:
         self._write_event(
             "training_completed",
             best_validation=self.state.best_validation,
-            stopped_early=stop and self.state.optimizer_steps < self.config.training.max_optimizer_steps,
+            stopped_early=(
+                stop
+                and self.state.optimizer_steps
+                < self.config.training.max_optimizer_steps
+            ),
         )
         if self.is_primary:
             print(

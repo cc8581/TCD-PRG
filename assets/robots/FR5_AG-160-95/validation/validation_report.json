@@ -1,5 +1,5 @@
 {
-  "urdf": "D:\\pycharm\\Project\\FR5_AG-160-95\\urdf\\fr5_ag160_95.urdf",
+  "urdf": "assets/robots/FR5_AG-160-95/urdf/fr5_ag160_95.urdf",
   "pybullet_body_id": 0,
   "joint_count": 21,
   "joint_names": [

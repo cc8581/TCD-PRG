@@ -82,8 +82,8 @@ On a Linux CUDA-12 server, install the matching `spconv-cu12x` package and
 FlashAttention, then set `backbone.enable_flash_attention=true`.
 
 Rendering, exact gripper sampling and action certification call an existing
-PyBullet-capable Python environment. No PyBullet reinstall is performed. Set
-`TCD_PYBULLET_PYTHON` to that interpreter; otherwise `python` on `PATH` is used.
+PyBullet-capable Python environment. No PyBullet reinstall is performed. Its
+interpreter is configured in the machine-local path file described below.
 
 External GraspNet source is pinned but not vendored:
 
@@ -96,18 +96,22 @@ datasets, caches and checkpoints.
 
 ## Data preparation
 
-Place data under `data/`, or set `TCD_DATASET_ROOT`, `TCD_ACRONYM_ROOT` and
-`TCD_FUNCTIONAL_REGION_ROOT`. No source edit is required. The training loop is
-cache-only and never synchronously invokes PyBullet on the GPU path:
+Copy `configs/local_paths.example.yaml` to `configs/local_paths.yaml` once and
+set this machine's dataset and PyBullet paths there. The local file is ignored
+by Git; source code and shared configuration contain no machine-specific path.
+Command-line `--dataset-root`, `--acronym-root`, `--functional-region-root` and
+`--pybullet-python` values take precedence. The training loop is cache-only and
+never synchronously invokes PyBullet on the GPU path:
 
 ```powershell
 python scripts/start_training.py
 ```
 
-The launcher supplies the Windows RTX 3090 defaults, discovers the completed
-dataset under `G:\cc`, creates a timestamped output directory, and accepts
-ordinary `key=value` overrides. Use `--resume`, `--initialize`, or `--gpus N`
-when required; it always starts formal training and has no dry-run mode.
+The launcher supplies the Windows RTX 3090 defaults, creates a timestamped
+output directory, and accepts ordinary `key=value` overrides. Its default is
+one optimizer update per batch (no gradient accumulation). Use `--resume`,
+`--initialize`, or `--gpus N` when required; it always starts formal training
+and has no dry-run mode.
 
 ```powershell
 tcd-prg-audit --config configs/config.yaml --states 100
@@ -124,11 +128,14 @@ Build task-unfiltered global grasp supervision and scene certification outside
 the GPU loop (paths remain configurable and are not embedded in checkpoints):
 
 ```powershell
+$DatasetRoot = "E:\datasets\TaskOrientedClutterSceneDataset"
+$AcronymRoot = "E:\datasets\ACRONYM"
+$FunctionalRegionRoot = "E:\datasets\manual_function_regions_v1"
 python tools/build_global_grasp_library.py `
-  --acronym-root $env:TCD_ACRONYM_ROOT `
-  --annotations $env:TCD_FUNCTIONAL_REGION_ROOT `
-  --task-library "$env:TCD_DATASET_ROOT/task_training_labels_steps1_6_v1/grasp_library" `
-  --output "$env:TCD_DATASET_ROOT/generic_grasp_library_v1"
+  --acronym-root $AcronymRoot `
+  --annotations $FunctionalRegionRoot `
+  --task-library "$DatasetRoot/task_training_labels_steps1_6_v1/grasp_library" `
+  --output "$DatasetRoot/generic_grasp_library_v1"
 
 python tools/certify_global_grasps.py --config configs/config.yaml --allow-render
 ```

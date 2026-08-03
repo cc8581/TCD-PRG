@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from pathlib import Path
 import re
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from tcd_prg.config import ModelConfig, TCDPRGConfig, TrainingConfig, load_config
-from tcd_prg.paths import PROJECT_ROOT
 from tcd_prg.observation.base import ObservationRequest
 from tcd_prg.observation.cached import CachedObservationProvider, request_hash
+from tcd_prg.paths import PROJECT_ROOT
 
 
 def _request(**changes) -> ObservationRequest:
@@ -44,7 +44,10 @@ def test_cache_availability_is_read_only(tmp_path) -> None:
 
 
 def test_every_shipped_yaml_passes_strict_schema() -> None:
-    paths = list(Path("configs").rglob("*.yaml"))
+    paths = [
+        path for path in Path("configs").rglob("*.yaml")
+        if not path.name.startswith("local_paths")
+    ]
     assert paths
     for path in paths:
         load_config(path)
@@ -52,7 +55,6 @@ def test_every_shipped_yaml_passes_strict_schema() -> None:
 
 def test_config_paths_are_project_relative_not_cwd_relative(tmp_path, monkeypatch) -> None:
     config_path = PROJECT_ROOT / "configs" / "config.yaml"
-    monkeypatch.setenv("TCD_DATASET_ROOT", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     config = load_config(config_path)
     assert Path(config.output_dir).parent == PROJECT_ROOT / "outputs"
@@ -68,6 +70,8 @@ def test_source_and_config_contain_no_absolute_drive_paths() -> None:
     offenders = []
     for root in roots:
         for path in (PROJECT_ROOT / root).rglob("*"):
+            if path.name.startswith("local_paths"):
+                continue
             if path.suffix.lower() in suffixes:
                 for line_number, line in enumerate(
                     path.read_text(encoding="utf-8").splitlines(), start=1

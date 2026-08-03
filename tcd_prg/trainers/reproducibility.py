@@ -8,7 +8,6 @@ import torch
 
 
 def seed_everything(seed: int, deterministic: bool = True) -> None:
-    os.environ["PYTHONHASHSEED"] = str(seed)
     if deterministic:
         # CUDA >= 10.2 requires one of these workspace layouts for reproducible
         # cuBLAS kernels.  Set it before the first CUDA RNG or tensor operation.

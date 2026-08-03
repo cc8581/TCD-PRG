@@ -5,7 +5,8 @@
 Create the Python 3.10 environment from `environment.yml`; do not install
 PyBullet again on the current workstation. Verify that the configured Python
 3.8 executable can import `torch`, `pybullet`, `trimesh` and `open3d`. Adjust
-dataset, functional-region, ACRONYM and FR5/AG paths in `configs/config.yaml`.
+dataset, functional-region and ACRONYM paths in the ignored
+`configs/local_paths.yaml` file.
 
 Run `scripts/setup_third_party.ps1` (Windows) or `.sh` (Linux) to clone the
 exact GraspNet commits. The setup is idempotent and verifies upstream remotes,
@@ -21,7 +22,7 @@ the GPU loop. Prewarm exact AG geometry for all observed valid widths.
 
 ## 3. Smoke gates
 
-Set `TCD_DATASET_ROOT` and run `pytest -q`. Before a large job run:
+Configure `configs/local_paths.yaml` and run `pytest -q`. Before a large job run:
 
 1. one real batch forward;
 2. launch the formal cache-only training command and stop it after startup verification;

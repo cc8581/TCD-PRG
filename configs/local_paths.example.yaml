@@ -1,0 +1,7 @@
+# Copy this file to configs/local_paths.yaml and edit only the local copy.
+# The local file is ignored by Git, so machine-specific absolute paths never
+# enter source code or shared configuration.
+dataset_root: data/TaskOrientedClutterSceneDataset
+acronym_root: data/ACRONYM
+functional_region_root: data/manual_function_regions_v1
+pybullet_python: python

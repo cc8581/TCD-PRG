@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -21,7 +22,7 @@ def run(rank: int, world_size: int, init_method: str, output_dir: str) -> None:
             device="cpu",
             amp=False,
             max_optimizer_steps=1,
-            gradient_accumulation_steps=2,
+            gradient_accumulation_steps=1,
             checkpoint_interval=1,
             validation_interval=100,
         ),
@@ -40,7 +41,7 @@ def run(rank: int, world_size: int, init_method: str, output_dir: str) -> None:
         {"x": torch.randn(2, 3, generator=generator),
          "xyz": torch.randn(2, 4, 3, generator=generator),
          "y": torch.randn(2, 1, generator=generator)}
-        for _ in range(2)
+        for _ in range(1)
     ]
     trainer = Trainer(model, optimizer, config, loss_step)
     state = trainer.train(loader, groups_per_effective_epoch=4)
@@ -51,8 +52,15 @@ def run(rank: int, world_size: int, init_method: str, output_dir: str) -> None:
             Path(config.output_dir) / "last.pt", map_location="cpu", weights_only=False
         )
         assert state.optimizer_steps == 1
-        assert state.candidate_groups_seen == 8
+        assert state.candidate_groups_seen == 4
         assert len(checkpoint["rng_by_rank"]) == world_size
+        metrics = [
+            json.loads(line)
+            for line in (Path(config.output_dir) / "train_metrics.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert metrics[-1]["metric_scope"] == "global"
     torch.distributed.destroy_process_group()
 
 

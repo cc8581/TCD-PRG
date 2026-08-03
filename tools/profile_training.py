@@ -74,7 +74,7 @@ def main() -> None:
     mode = "full" if args.full else "smoke"
     overrides = [*COMMON_OVERRIDES, f"output_dir={run.as_posix()}", *args.overrides]
     if args.full:
-        overrides.append("training.gradient_accumulation_steps=8")
+        overrides.append("training.gradient_accumulation_steps=1")
     else:
         overrides.extend([
             "dataset.scene_points=2048",

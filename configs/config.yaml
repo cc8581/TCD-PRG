@@ -2,10 +2,10 @@ defaults:
   - _self_
 
 dataset:
-  root: ${oc.env:TCD_DATASET_ROOT,data/TaskOrientedClutterSceneDataset}
-  acronym_root: ${oc.env:TCD_ACRONYM_ROOT,data/ACRONYM}
-  functional_region_root: ${oc.env:TCD_FUNCTIONAL_REGION_ROOT,data/manual_function_regions_v1}
-  fr5_ag_urdf: ${oc.env:TCD_ROBOT_URDF,assets/robots/FR5_AG-160-95/urdf/fr5_ag160_95.urdf}
+  root: data/TaskOrientedClutterSceneDataset
+  acronym_root: data/ACRONYM
+  functional_region_root: data/manual_function_regions_v1
+  fr5_ag_urdf: assets/robots/FR5_AG-160-95/urdf/fr5_ag160_95.urdf
   adapter: task_oriented_clutter
   scene_subdir: task_clutter_scenes_20_categories
   step_labels_subdir: task_training_labels_steps1_6_v1
@@ -22,7 +22,7 @@ observation:
   render_height: 200
   camera_profile: mecheye_pro_s_three_view
   renderer_version: tcd_prg_pybullet_v1
-  pybullet_python: ${oc.env:TCD_PYBULLET_PYTHON,python}
+  pybullet_python: python
   worker_script: scripts/render_observation_worker_py38.py
   runtime_mesh_root: runtime/cache/meshes
   gripper_worker_script: scripts/sample_gripper_worker_py38.py
@@ -174,7 +174,7 @@ training:
   amp: true
   amp_dtype: float16
   batch_size: 1
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 1
   max_optimizer_steps: 100000
   # Set to 0 only for train-only bootstrap runs before val scenes are published.
   validation_interval: 1000

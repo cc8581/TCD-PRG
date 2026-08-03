@@ -9,7 +9,11 @@ from pathlib import Path
 
 import torch.multiprocessing as mp
 
-from ddp_smoke_worker import run
+PROJECT = Path(__file__).resolve().parents[1]
+if str(PROJECT) not in sys.path:
+    sys.path.insert(0, str(PROJECT))
+
+from ddp_smoke_worker import run  # noqa: E402
 
 
 def main() -> None:

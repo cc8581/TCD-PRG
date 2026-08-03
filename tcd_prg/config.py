@@ -173,7 +173,7 @@ class TrainingConfig:
     amp: bool = True
     amp_dtype: str = "float16"
     batch_size: int = 1
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 1
     max_optimizer_steps: int = 100_000
     # Set to zero for train-only bootstrap runs while a partial dataset has no
     # published validation split yet.
@@ -350,6 +350,8 @@ class TCDPRGConfig:
     name: str = "tcd-prg"
 
     def validate(self) -> None:
+        if self.training.gradient_accumulation_steps <= 0:
+            raise ValueError("training.gradient_accumulation_steps must be positive")
         if self.logging.log_interval <= 0:
             raise ValueError("logging.log_interval must be positive")
         if self.backbone.backend not in {"point_transformer_v3", "legacy"}:
@@ -473,7 +475,9 @@ class TCDPRGConfig:
                 "push_direction_transformer_heads"
             )
         if len(self.model.push_utility_component_weights) != 5:
-            raise ValueError("push_utility_component_weights must match the five dataset components")
+            raise ValueError(
+                "push_utility_component_weights must match the five dataset components"
+            )
         if len(self.model.push_failure_penalties) != 3:
             raise ValueError("push_failure_penalties must cover unstable/workspace/other failures")
         if self.ablation.router_type not in {

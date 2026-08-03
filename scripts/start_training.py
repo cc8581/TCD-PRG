@@ -12,6 +12,7 @@ never enables a dry-run and never starts rendering or data generation.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -19,8 +20,10 @@ from datetime import datetime
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parents[1]
+if str(PROJECT) not in sys.path:
+    sys.path.insert(0, str(PROJECT))
 DEFAULT_CONFIG = PROJECT / "configs" / "config.yaml"
-DEFAULT_GAPG_PYTHON = Path(r"D:\Anaconda\envs\gapg\python.exe")
+DEFAULT_PATHS_CONFIG = PROJECT / "configs" / "local_paths.yaml"
 
 # Defaults sized for the current Windows RTX 3090 workstation. Command-line
 # dot-list overrides are applied afterwards and therefore take precedence.
@@ -34,7 +37,7 @@ DEFAULT_OVERRIDES = (
     "training.amp=true",
     "training.amp_dtype=float16",
     "training.batch_size=1",
-    "training.gradient_accumulation_steps=8",
+    "training.gradient_accumulation_steps=1",
     "training.num_workers=4",
     "training.max_optimizer_steps=100000",
     "training.validation_interval=1000",
@@ -45,41 +48,38 @@ DEFAULT_OVERRIDES = (
 )
 
 
-def _discover_data_paths() -> tuple[Path, Path, Path]:
-    configured = os.environ.get("TCD_DATASET_ROOT")
-    if configured:
-        dataset = Path(configured)
-        grasp_root = dataset.parents[1]
-    else:
-        cc_root = Path(r"G:\cc")
-        candidates = []
-        if cc_root.is_dir():
-            candidates = [
-                child
-                for child in cc_root.iterdir()
-                if (child / "self-built-task-oriented-clusster-sense-dataset").is_dir()
-            ]
-        if not candidates:
-            raise FileNotFoundError(
-                "Cannot locate the generated dataset. Set TCD_DATASET_ROOT, "
-                "TCD_ACRONYM_ROOT and TCD_FUNCTIONAL_REGION_ROOT."
-            )
-        grasp_root = candidates[0]
-        dataset = (
-            grasp_root
-            / "self-built-task-oriented-clusster-sense-dataset"
-            / "TaskOrientedClutterSceneDataset"
+def _load_local_paths(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        return {}
+    import yaml
+
+    values = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(values, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in values.items()
+    ):
+        raise ValueError(f"Local path config must be a string mapping: {path}")
+    return values
+
+
+def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, str]:
+    local = _load_local_paths(args.paths_config.resolve())
+    dataset = _project_relative_path(
+        args.dataset_root
+        or local.get(
+            "dataset_root", PROJECT / "data" / "TaskOrientedClutterSceneDataset"
         )
-    source_root = dataset.parent
-    acronym = Path(os.environ.get("TCD_ACRONYM_ROOT", grasp_root / "ACRONYM"))
-    functional_region = Path(
-        os.environ.get(
-            "TCD_FUNCTIONAL_REGION_ROOT",
-            source_root
-            / "Grasp_20_class_object_3D_model"
-            / "data"
-            / "manual_function_regions_v1",
-        )
+    )
+    acronym = _project_relative_path(
+        args.acronym_root
+        or local.get("acronym_root", PROJECT / "data" / "ACRONYM")
+    )
+    functional_region = _project_relative_path(
+        args.functional_region_root
+        or local.get("functional_region_root", PROJECT / "data" / "manual_function_regions_v1")
+    )
+    pybullet_python = str(
+        args.pybullet_python or local.get("pybullet_python", sys.executable)
     )
     for name, path in (
         ("dataset", dataset),
@@ -87,18 +87,21 @@ def _discover_data_paths() -> tuple[Path, Path, Path]:
         ("functional regions", functional_region),
     ):
         if not path.exists():
-            raise FileNotFoundError(f"Configured {name} path does not exist: {path}")
-    return dataset, acronym, functional_region
+            raise FileNotFoundError(
+                f"Configured {name} path does not exist: {path}. "
+                f"Copy configs/local_paths.example.yaml to {args.paths_config} "
+                "and fill in this machine's paths, or pass the matching --*-root option."
+            )
+    return dataset.resolve(), acronym.resolve(), functional_region.resolve(), pybullet_python
 
 
-def _configure_environment() -> tuple[Path, Path, Path]:
-    dataset, acronym, functional_region = _discover_data_paths()
-    os.environ["TCD_DATASET_ROOT"] = str(dataset)
-    os.environ["TCD_ACRONYM_ROOT"] = str(acronym)
-    os.environ["TCD_FUNCTIONAL_REGION_ROOT"] = str(functional_region)
-    if "TCD_PYBULLET_PYTHON" not in os.environ and DEFAULT_GAPG_PYTHON.is_file():
-        os.environ["TCD_PYBULLET_PYTHON"] = str(DEFAULT_GAPG_PYTHON)
-    return dataset, acronym, functional_region
+def _project_relative_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else PROJECT / path
+
+
+def _quoted_override(name: str, value: str | Path) -> str:
+    return f"{name}={json.dumps(str(value), ensure_ascii=False)}"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -106,6 +109,11 @@ def _parse_args() -> argparse.Namespace:
         description="Start formal PTv3 TCD-PRG training with workstation defaults."
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--paths-config", type=Path, default=DEFAULT_PATHS_CONFIG)
+    parser.add_argument("--dataset-root", type=Path)
+    parser.add_argument("--acronym-root", type=Path)
+    parser.add_argument("--functional-region-root", type=Path)
+    parser.add_argument("--pybullet-python")
     parser.add_argument("--gpus", type=int, default=1)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--resume", type=Path)
@@ -123,7 +131,9 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
-def _training_arguments(args: argparse.Namespace) -> list[str]:
+def _training_arguments(
+    args: argparse.Namespace, path_overrides: tuple[str, ...] = ()
+) -> list[str]:
     output = args.output_dir
     if output is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -134,29 +144,52 @@ def _training_arguments(args: argparse.Namespace) -> list[str]:
         arguments.extend(("--resume", str(args.resume.resolve())))
     if args.initialize:
         arguments.extend(("--initialize", str(args.initialize.resolve())))
-    arguments.extend((*DEFAULT_OVERRIDES, f"output_dir={output}", *args.overrides))
+    arguments.extend(
+        (
+            *DEFAULT_OVERRIDES,
+            *path_overrides,
+            _quoted_override("output_dir", output),
+            *args.overrides,
+        )
+    )
     return arguments
 
 
 def main() -> None:
     args = _parse_args()
-    dataset, acronym, functional_region = _configure_environment()
+    if args.gpus > 1:
+        import torch
+
+        available = torch.cuda.device_count()
+        if available < args.gpus:
+            raise RuntimeError(
+                f"Requested {args.gpus} GPUs, but PyTorch detects only {available}. "
+                "Multi-GPU training was not started."
+            )
+    dataset, acronym, functional_region, pybullet_python = _resolve_paths(args)
     ptv3_source = PROJECT / "third_party" / "PointTransformerV3" / "model.py"
     if not ptv3_source.is_file():
         raise FileNotFoundError(
             "Official PTv3 source is missing. Run: git submodule update --init "
             "third_party/PointTransformerV3"
         )
-    training_args = _training_arguments(args)
+    path_overrides = (
+        _quoted_override("dataset.root", dataset),
+        _quoted_override("dataset.acronym_root", acronym),
+        _quoted_override("dataset.functional_region_root", functional_region),
+        _quoted_override("observation.pybullet_python", pybullet_python),
+    )
+    training_args = _training_arguments(args, path_overrides)
     print("TCD-PRG formal training", flush=True)
     print(f"  platform={sys.platform} gpus={args.gpus}", flush=True)
     print(f"  dataset={dataset}", flush=True)
     print(f"  acronym={acronym}", flush=True)
     print(f"  functional_regions={functional_region}", flush=True)
+    print(f"  pybullet_python={pybullet_python}", flush=True)
     print(f"  config={args.config.resolve()}", flush=True)
     print(
         "  backbone=PointTransformerV3 flash=false points=16384 "
-        "batch=1 accumulation=8",
+        "batch=1 accumulation=1",
         flush=True,
     )
     os.chdir(PROJECT)
@@ -185,7 +218,7 @@ def main() -> None:
             "tcd_prg.scripts.train",
             *training_args,
         ]
-    subprocess.run(command, check=True, cwd=PROJECT, env=os.environ.copy())
+    subprocess.run(command, check=True, cwd=PROJECT)
 
 
 if __name__ == "__main__":

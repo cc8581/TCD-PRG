@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import math
 import os
@@ -53,6 +54,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--resume")
     parser.add_argument("--initialize", help="Load model/EMA weights without optimizer state")
+    # Explicit values are used by the native-Windows launcher. torchrun uses
+    # its standard process environment, retained only as a compatibility path.
+    parser.add_argument("--world-size", type=int)
+    parser.add_argument("--rank", type=int)
+    parser.add_argument("--local-rank", "--local_rank", type=int)
+    parser.add_argument("--ddp-init-method")
     parser.add_argument("overrides", nargs="*")
     return parser.parse_args()
 
@@ -92,9 +99,17 @@ def main() -> None:
                 minimum_effective=config.training.generated_policy_min_effective_coverage,
             )
             print({"generated_policy_preflight": coverage})
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = (
+        args.world_size
+        if args.world_size is not None
+        else int(os.environ.get("WORLD_SIZE", "1"))
+    )
+    rank = args.rank if args.rank is not None else int(os.environ.get("RANK", "0"))
+    local_rank = (
+        args.local_rank
+        if args.local_rank is not None
+        else int(os.environ.get("LOCAL_RANK", "0"))
+    )
     use_cuda = torch.cuda.is_available() and config.training.device.startswith("cuda")
     if world_size > 1:
         backend = config.training.ddp_backend
@@ -104,7 +119,7 @@ def main() -> None:
             raise RuntimeError(
                 f"LOCAL_RANK={local_rank}, but only {torch.cuda.device_count()} CUDA devices exist"
             )
-        init_method = os.environ.get("TCD_DDP_INIT_METHOD")
+        init_method = args.ddp_init_method
         if init_method:
             torch.distributed.init_process_group(
                 backend=backend,
@@ -114,6 +129,7 @@ def main() -> None:
             )
         else:
             torch.distributed.init_process_group(backend=backend)
+        atexit.register(_destroy_process_group)
         if use_cuda:
             torch.cuda.set_device(local_rank)
             config.training.device = f"cuda:{local_rank}"
@@ -290,6 +306,14 @@ def main() -> None:
             flush=True,
         )
     if world_size > 1:
+        _destroy_process_group()
+        atexit.unregister(_destroy_process_group)
+
+
+def _destroy_process_group() -> None:
+    """Best-effort DDP cleanup for both normal and exceptional exits."""
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 
 

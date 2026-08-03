@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -9,9 +8,17 @@ import torch
 
 @pytest.fixture
 def dataset_root() -> Path:
-    value = os.environ.get("TCD_DATASET_ROOT")
+    import yaml
+
+    local_paths = Path(__file__).parents[1] / "configs" / "local_paths.yaml"
+    values = (
+        yaml.safe_load(local_paths.read_text(encoding="utf-8"))
+        if local_paths.is_file()
+        else {}
+    )
+    value = values.get("dataset_root") if isinstance(values, dict) else None
     if not value or not Path(value).exists():
-        pytest.skip("Set TCD_DATASET_ROOT for real-data contract tests")
+        pytest.skip("Configure dataset_root in configs/local_paths.yaml")
     return Path(value)
 
 
@@ -29,7 +36,13 @@ def tiny_batch() -> dict[str, torch.Tensor]:
         "point_mask": torch.ones(b, n, dtype=torch.bool),
         "target_mask": instance == 1,
         "target_object": torch.tensor([1]),
-        "object_pose": torch.cat((torch.randn(b, o, 3), torch.tensor([0, 0, 0, 1.0]).repeat(b, o, 1)), -1),
+        "object_pose": torch.cat(
+            (
+                torch.randn(b, o, 3),
+                torch.tensor([0, 0, 0, 1.0]).repeat(b, o, 1),
+            ),
+            -1,
+        ),
         "object_mask": torch.ones(b, o, dtype=torch.bool),
         "object_active": torch.ones(b, o, dtype=torch.bool),
         "task_category_id": torch.tensor([1]),

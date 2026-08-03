@@ -6,5 +6,5 @@ shift || true
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
-torchrun --standalone --nproc-per-node="${gpus}" \
-  -m tcd_prg.scripts.train --config configs/config.yaml "$@"
+python scripts/start_training.py --gpus "${gpus}" \
+  --config configs/config.yaml "$@"

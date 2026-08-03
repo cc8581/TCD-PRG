@@ -4,18 +4,18 @@ All source-configured paths are relative to the repository root. Runtime output,
 render caches and temporary IPC files stay under `outputs/` and `runtime/`.
 The resolved configuration intentionally records absolute paths for provenance.
 
-Large datasets may either be copied into `data/` or mounted elsewhere. Override
-the defaults without editing source files:
+Large datasets may either be copied into `data/` or mounted elsewhere. Copy the
+versioned example into the ignored machine-local configuration, then edit it:
 
 ```powershell
-$env:TCD_DATASET_ROOT = "E:\datasets\TaskOrientedClutterSceneDataset"
-$env:TCD_ACRONYM_ROOT = "E:\datasets\ACRONYM"
-$env:TCD_FUNCTIONAL_REGION_ROOT = "E:\datasets\manual_function_regions_v1"
-$env:TCD_PYBULLET_PYTHON = "D:\Anaconda\envs\gapg\python.exe"
+Copy-Item configs/local_paths.example.yaml configs/local_paths.yaml
+notepad configs/local_paths.yaml
 ```
 
-Linux uses the same variable names. The accurate FR5/AG-160-95 URDF and meshes
-are bundled under `assets/robots/FR5_AG-160-95`.
+The same YAML file is used on Linux. Paths can also be supplied explicitly to
+`scripts/start_training.py`; project dataset paths do not depend on environment
+variables. The accurate FR5/AG-160-95 URDF and meshes are bundled under
+`assets/robots/FR5_AG-160-95`.
 
 Initialize the pinned official PTv3 source once after cloning:
 
@@ -52,6 +52,9 @@ Both launchers accept ordinary dot-list overrides after their GPU-count
 argument. Windows uses Gloo with a repository-local `file://` rendezvous so it
 does not depend on host-name/DNS behavior; Linux CUDA defaults to NCCL through
 `torchrun`. Each process owns one GPU. Validation is sharded
-without padding, training groups are weighted and sharded, gradient accumulation
-uses `no_sync`, and checkpoint files are written only by rank 0 while preserving
-per-rank RNG state.
+without padding, training groups are weighted and sharded, and checkpoint files
+are written only by rank 0 while preserving per-rank RNG state. Gradient
+accumulation remains available as an explicit experiment override, but the
+formal default is 1 and therefore performs no accumulation.
+Training losses are reduced across ranks before rank 0 writes terminal, JSONL
+and TensorBoard metrics; count metrics are summed rather than averaged.
