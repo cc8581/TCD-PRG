@@ -291,9 +291,10 @@ class TaskConditionedPointTransformer(nn.Module):
         self, dim: int = 256, task_dim: int = 128, num_categories: int = 64,
         num_regions: int = 64, blocks: int = 3, heads: int = 4, neighbors: int = 16,
         attention_points: int = 1024, activation_checkpointing: bool = True,
+        scene_backbone: nn.Module | None = None,
     ) -> None:
         super().__init__()
-        self.scene_backbone = TaskFreeSceneGeometryBackbone(
+        self.scene_backbone = scene_backbone or TaskFreeSceneGeometryBackbone(
             dim, blocks, heads, neighbors, attention_points, activation_checkpointing
         )
         self.task_adapter = TaskConditioningAdapter(dim, task_dim, num_categories, num_regions)

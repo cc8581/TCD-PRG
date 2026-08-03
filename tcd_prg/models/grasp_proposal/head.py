@@ -8,11 +8,36 @@ from torch import Tensor, nn
 from tcd_prg.geometry.se3 import rotation_6d_to_matrix
 
 
-def _attention_heads(dim: int) -> int:
-    for heads in (8, 4, 2):
-        if dim % heads == 0:
-            return heads
-    return 1
+class M2T2GraspDecoder(nn.Module):
+    """Shared masked-transformer trunk for task and global grasp queries.
+
+    The architecture follows M2T2's learned-query, cross-attention and
+    feed-forward decoder pattern while using PyTorch's maintained
+    ``TransformerDecoder`` implementation. Semantic heads and query banks stay
+    separate so task conditioning cannot leak into global grasp prediction.
+    """
+
+    def __init__(self, dim: int, layers: int = 3, heads: int = 8) -> None:
+        super().__init__()
+        layer = nn.TransformerDecoderLayer(
+            d_model=dim,
+            nhead=heads,
+            dim_feedforward=4 * dim,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(layer, layers, norm=nn.LayerNorm(dim))
+
+    def forward(
+        self, query: Tensor, memory: Tensor, memory_padding_mask: Tensor
+    ) -> Tensor:
+        return self.decoder(
+            query,
+            memory,
+            memory_key_padding_mask=memory_padding_mask,
+        )
 
 
 class _CompleteGraspSetHead(nn.Module):
@@ -26,13 +51,8 @@ class _CompleteGraspSetHead(nn.Module):
         nn.init.normal_(self.query_embedding, std=0.02)
         self.context = nn.Sequential(nn.Linear(context_dim, dim), nn.GELU(), nn.Linear(dim, dim))
         self.memory = nn.Sequential(nn.Linear(context_dim, dim), nn.GELU(), nn.Linear(dim, dim))
-        self.cross_attention = nn.MultiheadAttention(
-            dim, _attention_heads(dim), batch_first=True
-        )
-        self.norm = nn.LayerNorm(dim)
-        self.decoder = nn.Sequential(
-            nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim), nn.GELU()
-        )
+        self.mask_query = nn.Linear(dim, dim)
+        self.mask_memory = nn.Linear(dim, dim)
         self.translation_offset = nn.Linear(dim, 3)
         self.rotation_6d = nn.Linear(dim, 6)
         self.width = nn.Linear(dim, 1)
@@ -40,7 +60,9 @@ class _CompleteGraspSetHead(nn.Module):
 
     def _decode(
         self, memory_input: Tensor, xyz: Tensor, point_domain: Tensor, context: Tensor,
-        object_index: Tensor | None = None, object_mask: Tensor | None = None,
+        decoder: M2T2GraspDecoder,
+        object_index: Tensor | None = None,
+        object_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
         b = xyz.shape[0]
         memory = self.memory(memory_input)
@@ -52,10 +74,12 @@ class _CompleteGraspSetHead(nn.Module):
             memory = memory.clone()
             padding[all_invalid, 0] = False
             memory[all_invalid, 0] = 0.0
-        attended, weights = self.cross_attention(
-            query, memory, memory, key_padding_mask=padding, need_weights=True
-        )
-        decoded = self.decoder(self.norm(query + attended))
+        decoded = decoder(query, memory, padding)
+        mask_logits = torch.einsum(
+            "bqd,bnd->bqn", self.mask_query(decoded), self.mask_memory(memory)
+        ) * decoded.shape[-1] ** -0.5
+        mask_logits = mask_logits.masked_fill(padding[:, None], -30.0)
+        weights = torch.softmax(mask_logits, -1)
         anchor = torch.bmm(weights, xyz)
         translation = anchor + 0.10 * torch.tanh(self.translation_offset(decoded))
         rotation_6d = self.rotation_6d(decoded)
@@ -109,6 +133,7 @@ class TaskGraspProposalHead(_CompleteGraspSetHead):
         task_token: Tensor,
         region_probability: Tensor,
         target_mask: Tensor,
+        decoder: M2T2GraspDecoder,
     ) -> dict[str, Tensor]:
         n = point_features.shape[1]
         memory = torch.cat((
@@ -128,7 +153,7 @@ class TaskGraspProposalHead(_CompleteGraspSetHead):
             -1, keepdim=True
         ).clamp_min(1)
         context = torch.cat((target_token, task_token, region_context, visibility), -1)
-        return self._decode(memory, xyz, target_mask, context)
+        return self._decode(memory, xyz, target_mask, context, decoder)
 
 
 class GlobalGraspProposalHead(_CompleteGraspSetHead):
@@ -151,6 +176,7 @@ class GlobalGraspProposalHead(_CompleteGraspSetHead):
         instance_id: Tensor,
         point_domain: Tensor,
         object_mask: Tensor,
+        decoder: M2T2GraspDecoder,
     ) -> dict[str, Tensor]:
         b, n, _ = point_features.shape
         if self.input_mode == "instance_assisted":
@@ -165,7 +191,7 @@ class GlobalGraspProposalHead(_CompleteGraspSetHead):
         ), -1)
         context = torch.cat((global_scene_token, global_scene_token, global_scene_token), -1)
         output = self._decode(
-            memory, xyz, point_domain, context,
+            memory, xyz, point_domain, context, decoder,
             object_index=instance_id, object_mask=object_mask,
         )
         output["point_domain"] = point_domain

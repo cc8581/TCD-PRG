@@ -6,19 +6,27 @@ import pytest
 import torch
 
 from tcd_prg.config import (
-    AblationConfig, BackboneConfig, GraphConfig, LoggingConfig, LossConfig, ModelConfig,
-    RegionHeadConfig, RouterConfig, TCDPRGConfig, TrainingConfig,
+    AblationConfig,
+    BackboneConfig,
+    GraphConfig,
+    LoggingConfig,
+    LossConfig,
+    ModelConfig,
+    RegionHeadConfig,
+    RouterConfig,
+    TCDPRGConfig,
+    TrainingConfig,
 )
 from tcd_prg.datasets import TaskOrientedClutterAdapter
 from tcd_prg.datasets.collate import collate_unified
-from tcd_prg.losses import TCDPRGObjective
-from tcd_prg.models import TCDPRGModel
-from tcd_prg.observation.saved import SavedObservationProvider
-from tcd_prg.trainers import Trainer
 from tcd_prg.datasets.torch_dataset import (
     DistributedEvaluationSampler,
     DistributedWeightedStateSampler,
 )
+from tcd_prg.losses import TCDPRGObjective
+from tcd_prg.models import TCDPRGModel
+from tcd_prg.observation.saved import SavedObservationProvider
+from tcd_prg.trainers import Trainer
 
 
 class _SkipOnceScaler:
@@ -91,7 +99,7 @@ def test_checkpoint_rejects_obsolete_schema(tmp_path, tiny_batch) -> None:
     )
     path = tmp_path / "obsolete.pt"
     torch.save({"schema_version": 5}, path)
-    with pytest.raises(RuntimeError, match="expects schema 8"):
+    with pytest.raises(RuntimeError, match="expects schema 9"):
         trainer.load_checkpoint(path)
 
 
@@ -303,7 +311,7 @@ def test_real_state_group_all_enabled_training_losses_are_finite(dataset_root) -
     ablation = AblationConfig(use_gripper_scene_verifier=False)
     model = TCDPRGModel(
         config, ablation, GraphConfig(layers=1), RouterConfig(layers=1),
-        BackboneConfig(attention_points=64),
+        BackboneConfig(backend="legacy", attention_points=64),
     )
     objective = TCDPRGObjective(
         adapter.capabilities, config, ablation, LossConfig(), RegionHeadConfig()

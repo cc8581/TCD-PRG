@@ -7,15 +7,36 @@ from torch import Tensor, nn
 
 
 class PushHead(nn.Module):
-    def __init__(self, dim: int = 256, direction_bins: int = 16) -> None:
+    def __init__(
+        self,
+        dim: int = 256,
+        direction_bins: int = 16,
+        direction_dim: int = 64,
+        direction_layers: int = 1,
+        direction_heads: int = 4,
+    ) -> None:
         super().__init__()
         self.direction_bins = direction_bins
         self.object_pointer = nn.Sequential(nn.Linear(3 * dim, dim), nn.GELU(), nn.Linear(dim, 1))
         self.point = nn.Sequential(nn.Linear(4 * dim + 4, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.contact = nn.Linear(dim, 1)
-        self.direction = nn.Linear(dim, direction_bins)
-        self.direction_residual = nn.Linear(dim, 2 * direction_bins)
-        self.utility = nn.Linear(dim, direction_bins)
+        self.direction_context = nn.Linear(dim, direction_dim)
+        self.direction_embedding = nn.Embedding(direction_bins, direction_dim)
+        layer = nn.TransformerEncoderLayer(
+            direction_dim,
+            direction_heads,
+            4 * direction_dim,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.direction_transformer = nn.TransformerEncoder(
+            layer, direction_layers, norm=nn.LayerNorm(direction_dim)
+        )
+        self.direction_score = nn.Linear(direction_dim, 1)
+        self.direction_residual = nn.Linear(direction_dim, 2)
+        self.utility = nn.Linear(direction_dim, 1)
 
     def forward(
         self,
@@ -51,12 +72,19 @@ class PushHead(nn.Module):
         )
         x = self.point(x)
         contact = self.contact(x).squeeze(-1).masked_fill(~point_mask, -30.0)
+        direction_tokens = (
+            self.direction_context(x)[:, :, None]
+            + self.direction_embedding.weight[None, None]
+        )
+        direction_tokens = self.direction_transformer(
+            direction_tokens.flatten(0, 1)
+        ).reshape(x.shape[0], x.shape[1], self.direction_bins, -1)
+        direction_logits = self.direction_score(direction_tokens).squeeze(-1)
+        direction_logits = direction_logits.masked_fill(~point_mask[:, :, None], -30.0)
         return {
             "object_logits": object_logits,
             "contact_logits": contact,
-            "direction_logits": self.direction(x),
-            "direction_residual": torch.tanh(self.direction_residual(x)).reshape(
-                x.shape[0], x.shape[1], self.direction_bins, 2
-            ),
-            "utility_delta": self.utility(x),
+            "direction_logits": direction_logits,
+            "direction_residual": torch.tanh(self.direction_residual(direction_tokens)),
+            "utility_delta": self.utility(direction_tokens).squeeze(-1),
         }

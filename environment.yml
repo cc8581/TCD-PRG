@@ -2,6 +2,7 @@ name: tcd-prg
 channels:
   - pytorch
   - nvidia
+  - pyg
   - conda-forge
 dependencies:
   - python=3.10
@@ -19,6 +20,13 @@ dependencies:
   - matplotlib
   - pytest
   - psutil
+  - addict
+  - einops
+  - timm
+  - ninja
+  - pyg>=2.6
+  - pytorch-scatter
   - pip
   - pip:
       - ruff>=0.6
+      - spconv-cu118==2.3.6

@@ -9,12 +9,23 @@ from torch import Tensor, nn
 
 from tcd_prg.config import AblationConfig, BackboneConfig, GraphConfig, ModelConfig, RouterConfig
 
-from .backbones import TaskConditionedPointTransformer
+from .backbones import (
+    PointTransformerV3SceneGeometryBackbone,
+    TaskConditionedPointTransformer,
+)
 from .common import ActionCandidateEncoder
 from .dependency_graph import TaskConditionedDependencyGraph
-from .grasp_proposal import GlobalGraspProposalHead, TaskGraspProposalHead
+from .grasp_proposal import (
+    GlobalGraspProposalHead,
+    M2T2GraspDecoder,
+    TaskGraspProposalHead,
+)
 from .grasp_verifier import GripperSceneTaskVerifier
-from .policy import FlatCandidateClassifier, MaskedHierarchicalCandidateRouter, fixed_priority_output
+from .policy import (
+    FlatCandidateClassifier,
+    MaskedHierarchicalCandidateRouter,
+    fixed_priority_output,
+)
 from .push import PushHead
 from .region import TaskRegionHead
 
@@ -32,8 +43,20 @@ class TCDPRGModel(nn.Module):
         self.ablation = ablation or AblationConfig()
         graph_config = graph_config or GraphConfig()
         router_config = router_config or RouterConfig()
-        backbone_config = backbone_config or BackboneConfig()
+        # Direct lightweight construction remains dependency-free for unit
+        # tests. Formal entry points always pass the structured backbone config.
+        backbone_config = backbone_config or BackboneConfig(backend="legacy")
         c = self.config
+        scene_backbone = None
+        if backbone_config.backend == "point_transformer_v3":
+            scene_backbone = PointTransformerV3SceneGeometryBackbone(
+                dim=c.feature_dim,
+                source_root=backbone_config.source_root,
+                grid_size_m=backbone_config.grid_size_m,
+                enable_flash_attention=backbone_config.enable_flash_attention,
+                patch_size=backbone_config.patch_size,
+                activation_checkpointing=c.activation_checkpointing,
+            )
         self.encoder = TaskConditionedPointTransformer(
             dim=c.feature_dim,
             task_dim=c.task_dim,
@@ -41,19 +64,34 @@ class TCDPRGModel(nn.Module):
             num_regions=c.num_task_regions,
             attention_points=backbone_config.attention_points,
             activation_checkpointing=c.activation_checkpointing,
+            scene_backbone=scene_backbone,
         )
         self.region_head = TaskRegionHead(c.feature_dim)
+        self.grasp_decoder = M2T2GraspDecoder(
+            c.feature_dim, c.grasp_decoder_layers, c.grasp_decoder_heads
+        )
         self.task_grasp = TaskGraspProposalHead(c.feature_dim, c.task_grasp_candidates)
         self.global_grasp = GlobalGraspProposalHead(
             c.feature_dim, c.global_grasp_candidates, c.global_grasp_input_mode,
         )
-        self.verifier = GripperSceneTaskVerifier(c.feature_dim, c.feature_dim)
+        self.verifier = GripperSceneTaskVerifier(
+            c.feature_dim,
+            c.feature_dim,
+            c.verifier_transformer_layers,
+            c.verifier_transformer_heads,
+        )
         self.graph = TaskConditionedDependencyGraph(
             c.feature_dim, physical_relations=len(graph_config.physical_relations),
             task_relations=len(graph_config.task_relations), layers=graph_config.layers,
             heads=graph_config.heads, edge_threshold=c.graph_edge_threshold,
         )
-        self.push = PushHead(c.feature_dim, c.num_direction_bins)
+        self.push = PushHead(
+            c.feature_dim,
+            c.num_direction_bins,
+            c.push_direction_feature_dim,
+            c.push_direction_transformer_layers,
+            c.push_direction_transformer_heads,
+        )
         self.router = MaskedHierarchicalCandidateRouter(
             c.feature_dim, layers=router_config.layers, heads=router_config.heads
         )
@@ -267,6 +305,7 @@ class TCDPRGModel(nn.Module):
             encoded.task_token,
             region["region_probability"],
             batch["target_mask"],
+            self.grasp_decoder,
         )
         task_grasp["width_m"] = self.task_grasp.decode_width(
             task_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m
@@ -292,6 +331,7 @@ class TCDPRGModel(nn.Module):
             batch["instance_id"],
             global_mask,
             physical_active,
+            self.grasp_decoder,
         )
         global_grasp["width_m"] = self.global_grasp.decode_width(
             global_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m

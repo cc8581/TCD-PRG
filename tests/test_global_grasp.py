@@ -31,7 +31,7 @@ def _small_model() -> TCDPRGModel:
     )
     return TCDPRGModel(
         config, AblationConfig(), GraphConfig(layers=1, heads=4),
-        RouterConfig(layers=1, heads=4), BackboneConfig(attention_points=8),
+        RouterConfig(layers=1, heads=4), BackboneConfig(backend="legacy", attention_points=8),
     ).eval()
 
 

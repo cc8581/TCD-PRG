@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import csv
 import argparse
+import csv
 import json
 import math
 import os
@@ -11,8 +11,8 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-import torch
 import psutil
+import torch
 from torch.utils.flop_counter import FlopCounterMode
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -24,7 +24,6 @@ from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter, create_gripper_provider
 from tcd_prg.trainers.reproducibility import seed_everything
-
 
 COMMON_OVERRIDES = [
     "training.max_train_groups=1",
@@ -80,7 +79,7 @@ def main() -> None:
         overrides.extend([
             "dataset.scene_points=2048",
             "dataset.target_points=1024",
-            "backbone.attention_points=512",
+            "backbone.patch_size=128",
             "training.gradient_accumulation_steps=1",
         ])
     output = (args.report or (
@@ -310,7 +309,10 @@ def main() -> None:
             "effective_batch_size": config.training.batch_size * accumulation,
             "scene_points": config.dataset.scene_points,
             "target_points": config.dataset.target_points,
-            "attention_points": config.backbone.attention_points,
+            "backbone": config.backbone.backend,
+            "voxel_size_m": config.backbone.grid_size_m,
+            "patch_size": config.backbone.patch_size,
+            "flash_attention": config.backbone.enable_flash_attention,
             "amp_dtype": config.training.amp_dtype,
             "activation_checkpointing": config.model.activation_checkpointing,
             "candidate_micro_batch": config.model.verifier_candidate_micro_batch,

@@ -14,10 +14,10 @@ AG-160-95 total opening in `[0, 0.095]` m; it is not the push distance.
 
 ## What is implemented
 
-- A single expensive task-free scene geometry backbone pass, followed by a
-  lightweight task-conditioning adapter for task-specific heads.
+- A single official Pointcept Point Transformer V3 task-free scene pass,
+  followed by a lightweight task-conditioning adapter for task-specific heads.
 - Target-only functional-region segmentation and visibility prediction.
-- Separate query-based task and global grasp heads. Each directly predicts an
+- Separate task/global query banks over one shared M2T2-style PyTorch decoder. Each predicts an
   unordered set of complete `(translation, SO(3), width, quality)` grasps;
   Hungarian matching preserves multiple valid modes without pose averaging.
 - Exact-URDF local scene–gripper overall-executability verifier.
@@ -72,8 +72,14 @@ does not install PyBullet:
 ```powershell
 conda env create -f environment.yml
 conda activate tcd-prg
+git submodule update --init third_party/PointTransformerV3
 pip install -e .
 ```
+
+Windows defaults to the official PTv3 non-Flash path. The environment installs
+the CUDA 11.8 `spconv` and PyG wheels used by PTv3 and the relation-aware graph.
+On a Linux CUDA-12 server, install the matching `spconv-cu12x` package and
+FlashAttention, then set `backbone.enable_flash_attention=true`.
 
 Rendering, exact gripper sampling and action certification call an existing
 PyBullet-capable Python environment. No PyBullet reinstall is performed. Set

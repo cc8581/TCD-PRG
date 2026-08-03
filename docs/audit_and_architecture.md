@@ -20,13 +20,13 @@ Python 3.8 worker.
 
 | Design module | GAPG source reused | TCD-PRG implementation | Main input | Main output | Supervision/loss | Inference role |
 |---|---|---|---|---|---|---|
-| Shared encoder | PointNet++ concepts | `models/backbones/task_point_transformer.py` | `[B,N,3]` XYZ/RGB/masks/task | point/object/target/global/task tokens | joint downstream gradients | exactly one scene pass |
+| Shared encoder | official Pointcept PTv3 | `models/backbones/point_transformer_v3.py` adapter + pinned submodule | voxelized XYZ/RGB | point/object/target/global/task tokens | joint downstream gradients | exactly one scene pass; Windows non-Flash/Linux Flash |
 | Functional region | none | `models/region/head.py` | target point features + task | point probability, visibility | focal BCE + Dice + visibility | constrains task grasp |
-| Task grasp set | external GraspNet/DETR concepts | `models/grasp_proposal/head.py` | shared points + target/task/region | K complete poses, openings and qualities | geodesic Hungarian matching + smooth symmetric chordal training loss | TASK_GRASP candidates |
-| Global grasp set | GraspNet/DETR concepts | same module, neutral scene features | task-free scene points | K complete poses, openings, object assignments and scene qualities | object-balanced scene-certified Hungarian set loss | PICK_REMOVE candidates |
-| Grasp verifier | `Space_GraspFusion` concept | `models/grasp_verifier/` | local scene + exact AG cloud + task context | task-conditioned action outcome | outcome BCE | router evidence; hard gate is an ablation |
-| Dependency graph | none | `models/dependency_graph/hgt.py` | object/task tokens and predicted edges | physical/task edges, hard masks and soft prior | two edge losses | soft candidate prior by default; hard/no-graph ablations |
-| PUSH | `Push_model` concept | `models/push/head.py` | point/object/task/graph/geometry/steps | object, contact, direction, per-direction utility delta | four module objectives | fixed 0.15 m action; hard feasibility is certified |
+| Task grasp set | official M2T2 architecture pattern | shared PyTorch `TransformerDecoder` + task query bank | shared points + target/task/region | K complete poses, openings and qualities | geodesic Hungarian matching + smooth symmetric chordal training loss | TASK_GRASP candidates |
+| Global grasp set | official M2T2 architecture pattern | same shared decoder + neutral global query bank | task-free scene points | K complete poses, openings, object assignments and scene qualities | object-balanced scene-certified Hungarian set loss | PICK_REMOVE candidates |
+| Grasp verifier | PyTorch `TransformerEncoder` | `models/grasp_verifier/` | candidate-frame scene/gripper tokens + task | task-conditioned action outcome | outcome BCE | router evidence; hard gate is an ablation |
+| Dependency graph | PyG `TransformerConv` | `models/dependency_graph/hgt.py` | object/task tokens + continuous predicted relation attributes | physical/task edges, hard masks and soft prior | two edge losses | soft candidate prior by default; hard/no-graph ablations |
+| PUSH | PTv3 + PyTorch direction transformer | `models/push/head.py` | point/object/task/graph/geometry/steps + direction queries | object, contact, direction, per-direction utility delta | four module objectives | fixed 0.15 m action; hard feasibility is certified |
 | Router | fixed grasp→push rule | `models/policy/router.py` | heterogeneous candidates + evidence | candidate score | multi-positive listwise | legal candidate selection |
 | Closed loop | `grasp_push_eval.py` loop | `planners/closed_loop.py` | policy, observations, executor | H=5 result and trace | evaluated through replay/simulation | reobserve and replan |
 | Exact grasp safety | PyBullet execution environment | `execution/pybullet_certifier.py` + worker | grasp + full state + FR5/AG URDF | valid/reason | deterministic, not learned | final grasp mask; PUSH motion planning is executor-owned |
@@ -59,11 +59,12 @@ Directly reused for the GAPG baseline: original grasp/push network definitions,
 preprocessing utilities and their checkpoints. Reused conceptually in the full
 method: complete continuous grasp-set prediction and local gripper–scene
 evaluation. Extended: three-view input wrapper, task conditioning, shared
-features and closed-loop evaluation. Newly implemented: the unified adapter,
-functional region head, heterogeneous task graph, utility-aware PUSH,
-candidate router, exact AG geometry, cache pipeline, capability-aware
-losses and unified metrics. Replaced in the full method: GAPG's fixed action rule
-and per-candidate scene feature recomputation.
+features and closed-loop evaluation. Newly implemented task-specific components
+are the unified task adapter, functional-region output head, continuous
+dependency closure, utility targets, candidate evidence, exact AG geometry,
+cache pipeline and unified metrics. Core representation and reasoning now use
+the pinned official PTv3 source, PyTorch Transformer modules and PyG
+TransformerConv instead of local attention blocks.
 
 ## Data flow and anti-leakage boundary
 

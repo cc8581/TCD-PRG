@@ -1,3 +1,4 @@
+from .point_transformer_v3 import PointTransformerV3SceneGeometryBackbone
 from .task_point_transformer import (
     EncoderOutput,
     SceneGeometryOutput,
@@ -9,4 +10,5 @@ from .task_point_transformer import (
 __all__ = [
     "EncoderOutput", "SceneGeometryOutput", "TaskConditionedPointTransformer",
     "TaskConditioningAdapter", "TaskFreeSceneGeometryBackbone",
+    "PointTransformerV3SceneGeometryBackbone",
 ]

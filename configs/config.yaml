@@ -39,8 +39,15 @@ cache:
   prefetch_workers: 4
 
 backbone:
+  # Official Pointcept PTv3. Windows uses the supported non-Flash path;
+  # Linux/CUDA-12 training may override enable_flash_attention=true.
+  backend: point_transformer_v3
+  source_root: third_party/PointTransformerV3
   pretrained_checkpoint: null
   freeze: false
+  grid_size_m: 0.005
+  enable_flash_attention: false
+  patch_size: 256
   attention_points: 1024
 
 region_head:
@@ -63,13 +70,21 @@ model:
   candidate_topk: 64
   task_grasp_candidates: 64
   global_grasp_candidates: 64
+  # One shared M2T2-style transformer decoder; task/global retain separate queries.
+  grasp_decoder_layers: 3
+  grasp_decoder_heads: 8
   pick_remove_candidates: 16
   push_candidates: 16
   push_directions_per_contact: 2
   max_push_candidates: 32
+  push_direction_feature_dim: 64
+  push_direction_transformer_layers: 1
+  push_direction_transformer_heads: 4
   activation_checkpointing: true
   verifier_local_radius_m: 0.25
   verifier_candidate_micro_batch: 16
+  verifier_transformer_layers: 2
+  verifier_transformer_heads: 8
   verifier_validity_threshold: 0.5
   verifier_hard_gate: false
   graph_edge_threshold: 0.5

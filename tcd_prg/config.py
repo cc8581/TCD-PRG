@@ -56,8 +56,13 @@ class CacheConfig:
 
 @dataclass(slots=True)
 class BackboneConfig:
+    backend: str = "point_transformer_v3"
+    source_root: str = "third_party/PointTransformerV3"
     pretrained_checkpoint: str | None = None
     freeze: bool = False
+    grid_size_m: float = 0.005
+    enable_flash_attention: bool = False
+    patch_size: int = 256
     attention_points: int = 1_024
 
 
@@ -100,15 +105,22 @@ class ModelConfig:
     candidate_topk: int = 64
     task_grasp_candidates: int = 64
     global_grasp_candidates: int = 64
+    grasp_decoder_layers: int = 3
+    grasp_decoder_heads: int = 8
     pick_remove_candidates: int = 16
     push_candidates: int = 16
     # ``push_candidates`` is the contact-point budget.  Each retained point is
     # expanded into independently decoded direction candidates before routing.
     push_directions_per_contact: int = 2
     max_push_candidates: int = 32
+    push_direction_feature_dim: int = 64
+    push_direction_transformer_layers: int = 1
+    push_direction_transformer_heads: int = 4
     activation_checkpointing: bool = True
     verifier_local_radius_m: float = 0.25
     verifier_candidate_micro_batch: int = 16
+    verifier_transformer_layers: int = 2
+    verifier_transformer_heads: int = 8
     verifier_validity_threshold: float = 0.5
     # The learned verifier predicts task-conditioned action outcome and is
     # therefore evidence for the router, not deterministic geometry.  Keep a
@@ -340,6 +352,12 @@ class TCDPRGConfig:
     def validate(self) -> None:
         if self.logging.log_interval <= 0:
             raise ValueError("logging.log_interval must be positive")
+        if self.backbone.backend not in {"point_transformer_v3", "legacy"}:
+            raise ValueError("backbone.backend must be point_transformer_v3 or legacy")
+        if self.backbone.grid_size_m <= 0:
+            raise ValueError("backbone.grid_size_m must be positive")
+        if self.backbone.patch_size <= 0:
+            raise ValueError("backbone.patch_size must be positive")
         if abs(self.push_distance_m - PUSH_DISTANCE_M) > 1e-7:
             raise ValueError("The main TCD-PRG primitive requires push_distance_m == 0.15")
         if abs(self.push.distance_m - PUSH_DISTANCE_M) > 1e-7:
@@ -436,6 +454,24 @@ class TCDPRGConfig:
             raise ValueError("Global grasp training requires positive samples")
         if self.model.global_grasp_candidates <= 0:
             raise ValueError("global_grasp_candidates must be positive")
+        if self.model.grasp_decoder_layers <= 0 or self.model.grasp_decoder_heads <= 0:
+            raise ValueError("Grasp decoder layers and heads must be positive")
+        if self.model.feature_dim % self.model.grasp_decoder_heads:
+            raise ValueError("feature_dim must be divisible by grasp_decoder_heads")
+        if self.model.verifier_transformer_layers <= 0:
+            raise ValueError("verifier_transformer_layers must be positive")
+        if self.model.feature_dim % self.model.verifier_transformer_heads:
+            raise ValueError("feature_dim must be divisible by verifier_transformer_heads")
+        if self.model.push_direction_transformer_layers <= 0:
+            raise ValueError("push_direction_transformer_layers must be positive")
+        if (
+            self.model.push_direction_feature_dim
+            % self.model.push_direction_transformer_heads
+        ):
+            raise ValueError(
+                "push_direction_feature_dim must be divisible by "
+                "push_direction_transformer_heads"
+            )
         if len(self.model.push_utility_component_weights) != 5:
             raise ValueError("push_utility_component_weights must match the five dataset components")
         if len(self.model.push_failure_penalties) != 3:
@@ -499,6 +535,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> TCDPRGC
         (config.observation, "render_temporary_root"),
         (config.observation, "certification_temporary_root"),
         (config.cache, "directory"),
+        (config.backbone, "source_root"),
         (config.training, "generated_policy_candidate_cache"),
         (config.baseline, "gapg_root"),
         (config.baseline, "grasp_checkpoint"),

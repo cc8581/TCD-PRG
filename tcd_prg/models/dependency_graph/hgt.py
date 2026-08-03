@@ -7,23 +7,34 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from ..common import masked_softmax
+try:
+    from torch_geometric.nn import TransformerConv
+except ImportError:  # pragma: no cover - exercised by environment validation
+    TransformerConv = None
 
 
-class EdgeAwareHGTLayer(nn.Module):
+class EdgeAwareGraphTransformerLayer(nn.Module):
+    """PyG TransformerConv over dense valid nodes with soft relation attributes."""
+
     def __init__(self, dim: int, relation_types: int, heads: int = 4) -> None:
         super().__init__()
         if dim % heads:
             raise ValueError("dim must be divisible by heads")
-        self.heads, self.head_dim = heads, dim // heads
-        self.q = nn.Linear(dim, dim)
-        self.k = nn.Linear(dim, dim)
-        self.v = nn.Linear(dim, dim)
-        self.relation_key = nn.Parameter(torch.empty(relation_types, heads, self.head_dim, self.head_dim))
-        self.relation_value = nn.Parameter(torch.empty(relation_types, heads, self.head_dim, self.head_dim))
-        nn.init.xavier_uniform_(self.relation_key)
-        nn.init.xavier_uniform_(self.relation_value)
-        self.output = nn.Linear(dim, dim)
+        if TransformerConv is None:
+            raise RuntimeError(
+                "The dependency graph requires torch-geometric>=2.6. Install the "
+                "project requirements before constructing the formal model."
+            )
+        self.conv = TransformerConv(
+            dim,
+            dim // heads,
+            heads=heads,
+            concat=True,
+            beta=True,
+            dropout=0.0,
+            edge_dim=relation_types,
+            root_weight=True,
+        )
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
@@ -31,23 +42,35 @@ class EdgeAwareHGTLayer(nn.Module):
     def forward(
         self, nodes: Tensor, node_mask: Tensor, relation_weight: Tensor, edge_mask: Tensor
     ) -> Tensor:
-        b, n, dim = nodes.shape
-        q = self.q(nodes).view(b, n, self.heads, self.head_dim)
-        k = self.k(nodes).view(b, n, self.heads, self.head_dim)
-        v = self.v(nodes).view(b, n, self.heads, self.head_dim)
-        rk = torch.einsum("bijr,rhde->bijhde", relation_weight, self.relation_key)
-        rv = torch.einsum("bijr,rhde->bijhde", relation_weight, self.relation_value)
-        source_k = k[:, None].expand(-1, n, -1, -1, -1)
-        source_v = v[:, None].expand(-1, n, -1, -1, -1)
-        transformed_k = torch.einsum("bijhde,bijhe->bijhd", rk, source_k)
-        transformed_v = torch.einsum("bijhde,bijhe->bijhd", rv, source_v)
-        logits = torch.einsum("bihd,bijhd->bihj", q, transformed_k) * self.head_dim**-0.5
-        full_mask = edge_mask & node_mask[:, :, None] & node_mask[:, None, :]
-        attention = masked_softmax(logits, full_mask[:, :, None, :], dim=-1)
-        message = torch.einsum("bihj,bijhd->bihd", attention, transformed_v).flatten(-2)
-        nodes = self.norm1(nodes + self.output(message))
-        nodes = self.norm2(nodes + self.ffn(nodes))
-        return nodes * node_mask.unsqueeze(-1)
+        del edge_mask
+        batch_size, node_count, dim = nodes.shape
+        packed_index = torch.full(
+            (batch_size, node_count), -1, dtype=torch.long, device=nodes.device
+        )
+        valid_position = torch.nonzero(node_mask, as_tuple=False)
+        packed_index[valid_position[:, 0], valid_position[:, 1]] = torch.arange(
+            len(valid_position), device=nodes.device
+        )
+        packed_nodes = nodes[node_mask]
+        edge_indices, edge_attributes = [], []
+        for row in range(batch_size):
+            valid = torch.nonzero(node_mask[row], as_tuple=False).flatten()
+            destination, source = torch.meshgrid(valid, valid, indexing="ij")
+            edge_indices.append(torch.stack((
+                packed_index[row, source.flatten()],
+                packed_index[row, destination.flatten()],
+            )))
+            edge_attributes.append(
+                relation_weight[row, destination.flatten(), source.flatten()]
+            )
+        edge_index = torch.cat(edge_indices, 1)
+        edge_attr = torch.cat(edge_attributes, 0)
+        updated = self.conv(packed_nodes, edge_index, edge_attr)
+        updated = self.norm1(packed_nodes + updated)
+        updated = self.norm2(updated + self.ffn(updated))
+        output = nodes.new_zeros(nodes.shape)
+        output[node_mask] = updated
+        return output
 
 
 @dataclass(slots=True)
@@ -132,7 +155,9 @@ class TaskConditionedDependencyGraph(nn.Module):
         self.task_edge = nn.Sequential(nn.Linear(4 * dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, task_relations))
         self.physical_edge = nn.Sequential(nn.Linear(4 * dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, physical_relations))
         self.layers = nn.ModuleList(
-            EdgeAwareHGTLayer(dim, physical_relations + 2 * task_relations + 1, heads)
+            EdgeAwareGraphTransformerLayer(
+                dim, physical_relations + 2 * task_relations + 1, heads
+            )
             for _ in range(layers)
         )
 

@@ -11,6 +11,7 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
   "numpy>=1.23,<3",
   "torch>=2.1",
+  "torch-geometric>=2.6,<3",
   "h5py>=3.9",
   "PyYAML>=6",
   "hydra-core>=1.3",

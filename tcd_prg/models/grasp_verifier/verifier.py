@@ -15,13 +15,40 @@ class GripperSceneTaskVerifier(nn.Module):
 
     HEADS = ("overall",)
 
-    def __init__(self, scene_feature_dim: int = 256, hidden_dim: int = 256) -> None:
+    def __init__(
+        self,
+        scene_feature_dim: int = 256,
+        hidden_dim: int = 256,
+        layers: int = 2,
+        heads: int = 8,
+    ) -> None:
         super().__init__()
-        self.scene_encoder = nn.Sequential(
-            nn.Linear(scene_feature_dim + 7, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim)
+        self.scene_projection = nn.Sequential(
+            nn.Linear(scene_feature_dim + 7, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
         )
-        self.gripper_encoder = nn.Sequential(nn.Linear(4, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim))
-        self.fusion = nn.Sequential(nn.Linear(4 * hidden_dim, 2 * hidden_dim), nn.GELU(), nn.Linear(2 * hidden_dim, hidden_dim))
+        self.gripper_projection = nn.Sequential(
+            nn.Linear(4, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.task_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.token_type = nn.Embedding(3, hidden_dim)
+        self.cls_token = nn.Parameter(torch.empty(hidden_dim))
+        nn.init.normal_(self.cls_token, std=0.02)
+        layer = nn.TransformerEncoderLayer(
+            hidden_dim,
+            heads,
+            4 * hidden_dim,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            layer, layers, norm=nn.LayerNorm(hidden_dim)
+        )
         self.overall = nn.Linear(hidden_dim, 1)
 
     def forward(
@@ -50,16 +77,23 @@ class GripperSceneTaskVerifier(nn.Module):
             ),
             -1,
         )
-        scene_encoded = self.scene_encoder(scene_input)
-        scene_encoded = scene_encoded.masked_fill(~scene_valid.unsqueeze(-1), torch.finfo(scene_encoded.dtype).min)
-        scene_max = scene_encoded.max(dim=2).values
-        scene_max = torch.where(scene_valid.any(2, keepdim=True), scene_max, 0.0)
-        scene_mean = (scene_encoded.masked_fill(~scene_valid.unsqueeze(-1), 0).sum(2) / scene_valid.sum(2, keepdim=True).clamp_min(1))
+        scene_encoded = self.scene_projection(scene_input)
         gripper_input = torch.cat((gripper_xyz_grasp, gripper_valid.unsqueeze(-1).float()), -1)
-        gripper_encoded = self.gripper_encoder(gripper_input)
-        gripper_encoded = gripper_encoded.masked_fill(~gripper_valid.unsqueeze(-1), torch.finfo(gripper_encoded.dtype).min)
-        gripper_max = gripper_encoded.max(dim=2).values
-        gripper_max = torch.where(gripper_valid.any(2, keepdim=True), gripper_max, 0.0)
-        task = task_token[:, None].expand(-1, scene_max.shape[1], -1)
-        fused = self.fusion(torch.cat((scene_max, scene_mean, gripper_max, task), -1))
+        gripper_encoded = self.gripper_projection(gripper_input)
+        batch_size, candidates = scene_xyz_grasp.shape[:2]
+        scene_encoded = scene_encoded + self.token_type.weight[1]
+        gripper_encoded = gripper_encoded + self.token_type.weight[2]
+        task = self.task_projection(task_token)[:, None].expand(-1, candidates, -1)
+        cls = self.cls_token + self.token_type.weight[0]
+        cls = cls[None, None].expand(batch_size, candidates, -1) + task
+        tokens = torch.cat((cls[:, :, None], scene_encoded, gripper_encoded), 2)
+        padding = torch.cat((
+            torch.zeros((batch_size, candidates, 1), dtype=torch.bool, device=tokens.device),
+            ~scene_valid,
+            ~gripper_valid,
+        ), 2)
+        flat_tokens = tokens.flatten(0, 1)
+        flat_padding = padding.flatten(0, 1)
+        encoded = self.transformer(flat_tokens, src_key_padding_mask=flat_padding)
+        fused = encoded[:, 0].reshape(batch_size, candidates, -1)
         return {"overall_logit": self.overall(fused).squeeze(-1)}
