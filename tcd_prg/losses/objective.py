@@ -97,6 +97,7 @@ class TCDPRGObjective(nn.Module):
                 f"Batch requires {maximum} unique grasps but task_grasp_candidates="
                 f"{self.model_config.task_grasp_candidates}"
             )
+        # 纯 generated-policy 阶段跳过抓取、图、Verifier 和 Push head 的前向计算。
         generated_only = (
             self.generated_policy_candidate_ratio == 1.0
             and self.total.enabled("policy_candidate")
@@ -166,6 +167,7 @@ class TCDPRGObjective(nn.Module):
             generated_loss = None
             generated = batch.get("generated_policy_candidates")
             if "generated_router" in output and generated is not None:
+                # 三态标签：UNKNOWN 不进入分母；只有认证后的正/负候选参与排序损失。
                 generated_evaluated = (
                     generated["label_status"] != int(CandidateStatus.UNKNOWN_UNTESTED)
                 )
@@ -173,6 +175,7 @@ class TCDPRGObjective(nn.Module):
                     output["generated_router"], generated["policy_success"],
                     generated_evaluated,
                 )
+            # 课程学习可在干净 teacher candidates 与真实生成误差的 candidates 间插值。
             ratio = self.generated_policy_candidate_ratio
             if generated_loss is not None and teacher_loss is not None:
                 policy_loss = (1.0 - ratio) * teacher_loss + ratio * generated_loss

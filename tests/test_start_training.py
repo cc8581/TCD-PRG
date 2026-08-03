@@ -3,9 +3,33 @@ from __future__ import annotations
 import os
 import sys
 from argparse import Namespace
+from pathlib import Path
 
 from scripts.launch_ddp_windows import _worker
-from training import DEFAULT_OVERRIDES, PROJECT, _training_arguments
+from training import DEFAULT_OVERRIDES, PROJECT, _parse_args, _training_arguments
+
+
+def test_launcher_path_arguments_have_local_config_defaults(tmp_path) -> None:
+    paths = tmp_path / "local_paths.yaml"
+    paths.write_text(
+        "dataset_root: D:/datasets/scenes\n"
+        "acronym_root: D:/datasets/acronym\n"
+        "functional_region_root: D:/datasets/regions\n"
+        "pybullet_python: D:/envs/gapg/python.exe\n",
+        encoding="utf-8",
+    )
+
+    args = _parse_args(["--paths-config", str(paths)])
+
+    assert args.dataset_root == Path("D:/datasets/scenes")
+    assert args.acronym_root == Path("D:/datasets/acronym")
+    assert args.functional_region_root == Path("D:/datasets/regions")
+    assert args.pybullet_python == "D:/envs/gapg/python.exe"
+    assert args.gpus == 1
+    assert args.output_dir.parent == PROJECT / "outputs"
+    assert args.output_dir.name.startswith("ptv3_full_")
+    assert args.resume is None
+    assert args.initialize is None
 
 
 def test_formal_launcher_defaults_and_user_override_order(tmp_path) -> None:

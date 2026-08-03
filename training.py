@@ -22,11 +22,11 @@ from pathlib import Path
 PROJECT = Path(__file__).resolve().parent
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
+# 公共配置只保存可移植参数；每台机器的数据盘路径写在被 Git 忽略的 local_paths.yaml 中。
 DEFAULT_CONFIG = PROJECT / "configs" / "config.yaml"
 DEFAULT_PATHS_CONFIG = PROJECT / "configs" / "local_paths.yaml"
 
-# Defaults sized for the current Windows RTX 3090 workstation. Command-line
-# dot-list overrides are applied afterwards and therefore take precedence.
+# 面向当前 RTX 3090 工作站的正式训练默认值。末尾追加的 key=value 参数优先级最高。
 DEFAULT_OVERRIDES = (
     "backbone.backend=point_transformer_v3",
     "backbone.enable_flash_attention=false",
@@ -60,6 +60,33 @@ def _load_local_paths(path: Path) -> dict[str, str]:
     ):
         raise ValueError(f"Local path config must be a string mapping: {path}")
     return values
+
+
+def _launcher_defaults(paths_config: Path) -> dict[str, str | Path | None]:
+    """Build visible launcher defaults without committing machine-specific paths."""
+
+    local = _load_local_paths(paths_config.resolve())
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 路径优先级：显式命令行参数 > local_paths.yaml > 仓库内约定目录。
+    return {
+        "dataset_root": _project_relative_path(
+            local.get("dataset_root", PROJECT / "data" / "TaskOrientedClutterSceneDataset")
+        ),
+        "acronym_root": _project_relative_path(
+            local.get("acronym_root", PROJECT / "data" / "ACRONYM")
+        ),
+        "functional_region_root": _project_relative_path(
+            local.get(
+                "functional_region_root",
+                PROJECT / "data" / "manual_function_regions_v1",
+            )
+        ),
+        "pybullet_python": local.get("pybullet_python", sys.executable),
+        "gpus": 1,
+        "output_dir": PROJECT / "outputs" / f"ptv3_full_{stamp}",
+        "resume": None,
+        "initialize": None,
+    }
 
 
 def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, str]:
@@ -104,26 +131,59 @@ def _quoted_override(name: str, value: str | Path) -> str:
     return f"{name}={json.dumps(str(value), ensure_ascii=False)}"
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    # 先只读取路径配置位置，使自定义 --paths-config 也能参与其余参数的默认值计算。
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--paths-config", type=Path, default=DEFAULT_PATHS_CONFIG)
+    bootstrap_args, _ = bootstrap.parse_known_args(argv)
+    defaults = _launcher_defaults(bootstrap_args.paths_config)
     parser = argparse.ArgumentParser(
-        description="Start formal PTv3 TCD-PRG training with workstation defaults."
+        description="Start formal PTv3 TCD-PRG training with workstation defaults.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--paths-config", type=Path, default=DEFAULT_PATHS_CONFIG)
-    parser.add_argument("--dataset-root", type=Path)
-    parser.add_argument("--acronym-root", type=Path)
-    parser.add_argument("--functional-region-root", type=Path)
-    parser.add_argument("--pybullet-python")
-    parser.add_argument("--gpus", type=int, default=1)
-    parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--resume", type=Path)
-    parser.add_argument("--initialize", type=Path)
+    # 下面这些值均可直接覆盖；不传时使用 local_paths.yaml 中的本机配置。
+    parser.add_argument(
+        "--dataset-root", type=Path, default=defaults["dataset_root"],
+        help="任务场景数据集根目录。",
+    )
+    parser.add_argument(
+        "--acronym-root", type=Path, default=defaults["acronym_root"],
+        help="ACRONYM 抓取数据根目录。",
+    )
+    parser.add_argument(
+        "--functional-region-root",
+        type=Path,
+        default=defaults["functional_region_root"],
+        help="人工功能区域标注根目录。",
+    )
+    parser.add_argument(
+        "--pybullet-python", default=defaults["pybullet_python"],
+        help="运行 PyBullet 兼容 worker 的 Python 解释器。",
+    )
+    parser.add_argument(
+        "--gpus", type=int, default=defaults["gpus"], help="本机训练使用的 GPU 数量。"
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=defaults["output_dir"],
+        help="checkpoint、JSONL 指标和 TensorBoard 日志目录。",
+    )
+    # resume 恢复优化器/调度器等完整状态；initialize 仅加载模型权重，二者不可同时使用。
+    parser.add_argument(
+        "--resume", type=Path, default=defaults["resume"],
+        help="恢复完整训练状态的 checkpoint；默认不恢复。",
+    )
+    parser.add_argument(
+        "--initialize", type=Path, default=defaults["initialize"],
+        help="仅初始化模型权重的 checkpoint；默认不加载。",
+    )
     parser.add_argument(
         "overrides",
         nargs="*",
         help="Additional key=value overrides; these take precedence over defaults.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.gpus <= 0:
         parser.error("--gpus must be positive")
     if args.resume and args.initialize:
@@ -157,6 +217,7 @@ def _training_arguments(
 
 def main() -> None:
     args = _parse_args()
+    # 在创建 DDP 子进程前先核对显卡数量，避免部分 worker 启动后才失败。
     if args.gpus > 1:
         import torch
 
@@ -193,6 +254,7 @@ def main() -> None:
         flush=True,
     )
     os.chdir(PROJECT)
+    # 单卡直接进入训练器；Windows 多卡使用 spawn，Linux 使用 torchrun。
     if args.gpus == 1:
         from tcd_prg.scripts.train import main as train_main
 

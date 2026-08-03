@@ -87,7 +87,7 @@ class DenseCandidateGenerator:
     def apply_push_nms(
         self, candidates: dict[str, Tensor], router_logits: Tensor
     ) -> Tensor:
-        """Deduplicate same-object PUSH actions using router evidence order."""
+        """按 Router 分数保留同物体上接触点/方向相近的唯一 PUSH 动作。"""
 
         keep = candidates["valid"].clone()
         cosine_threshold = math.cos(math.radians(self.config.push_nms_direction_deg))
@@ -175,6 +175,7 @@ class DenseCandidateGenerator:
                 actionable = graph_output.derived_actionable_mask[batch_row]
                 graph_prior = actionable.to(xyz.dtype)
             else:
+                # soft 图只调整候选证据，不因单条边预测错误而提前删除可行动物体。
                 actionable = active
                 graph_prior = getattr(
                     graph_output, "dependency_prior",
@@ -278,6 +279,8 @@ class DenseCandidateGenerator:
                 direction_probability = torch.softmax(
                     push["direction_logits"][batch_row, push_index], dim=-1
                 )
+                # 每个接触点展开 Top-M 方向，让 utility 和 Router 决定最终动作，
+                # 而不是由 direction head 的 argmax 在候选生成阶段一票否决。
                 directions_per_contact = min(
                     self.config.push_directions_per_contact, direction_probability.shape[-1]
                 )

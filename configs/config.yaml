@@ -2,6 +2,7 @@ defaults:
   - _self_
 
 dataset:
+  # 下列三个路径会被 training.py 的本机路径配置覆盖，此处保留可移植的仓库相对值。
   root: data/TaskOrientedClutterSceneDataset
   acronym_root: data/ACRONYM
   functional_region_root: data/manual_function_regions_v1
@@ -13,10 +14,11 @@ dataset:
   global_grasp_library_subdir: generic_grasp_library_v1
   global_grasp_certification_subdir: global_grasp_scene_certification_v2
   pick_remove_global_association_subdir: pick_remove_global_grasp_association_v1
-  scene_points: 16384
-  target_points: 4096
+  scene_points: 16384  # 每个状态送入网络的场景点数
+  target_points: 4096  # 目标物体最多保留的点数
 
 observation:
+  # 正式训练只读取已生成缓存，不在训练进程内启动场景生成。
   provider: cached
   render_width: 320
   render_height: 200
@@ -32,6 +34,7 @@ observation:
   certification_temporary_root: runtime/tmp/certification
 
 cache:
+  # 观测缓存采用 LRU；达到容量或磁盘余量阈值时淘汰最旧条目。
   directory: runtime/cache/observations
   max_gb: 15
   min_free_gb: 20
@@ -39,8 +42,7 @@ cache:
   prefetch_workers: 4
 
 backbone:
-  # Official Pointcept PTv3. Windows uses the supported non-Flash path;
-  # Linux/CUDA-12 training may override enable_flash_attention=true.
+  # 官方 Pointcept PTv3。Windows 默认走标准注意力；Linux/CUDA 可按环境开启 FlashAttention。
   backend: point_transformer_v3
   source_root: third_party/PointTransformerV3
   pretrained_checkpoint: null
@@ -58,6 +60,7 @@ region_head:
   visibility_threshold: 0.5
 
 model:
+  # 各动作 head 共享 256 维场景特征，避免重复执行点云骨干。
   feature_dim: 256
   task_dim: 128
   num_categories: 64
@@ -70,13 +73,13 @@ model:
   candidate_topk: 64
   task_grasp_candidates: 64
   global_grasp_candidates: 64
-  # One shared M2T2-style transformer decoder; task/global retain separate queries.
+  # Task/Global Grasp 共用一个 M2T2 风格解码器，但使用两组独立 query。
   grasp_decoder_layers: 3
   grasp_decoder_heads: 8
   pick_remove_candidates: 16
   push_candidates: 16
-  push_directions_per_contact: 2
-  max_push_candidates: 32
+  push_directions_per_contact: 2  # 每个接触点展开 Top-2 方向
+  max_push_candidates: 32         # 展开后进入 Router 前的 PUSH 上限
   push_direction_feature_dim: 64
   push_direction_transformer_layers: 1
   push_direction_transformer_heads: 4
@@ -87,8 +90,8 @@ model:
   verifier_transformer_heads: 8
   verifier_validity_threshold: 0.5
   verifier_hard_gate: false
-  graph_edge_threshold: 0.5
-  graph_candidate_mode: soft
+  graph_edge_threshold: 0.5       # 仅用于图指标/硬模式，soft 模式使用连续先验
+  graph_candidate_mode: soft      # 图预测用于加权，不直接删除候选
   graph_candidate_topk_objects: 4
   default_required_grasp_count: 20
   max_required_grasp_count: 20
@@ -103,11 +106,13 @@ model:
   global_grasp_nms_rotation_deg: 15.0
   global_grasp_nms_width_m: 0.005
   global_grasp_nms_approach_deg: 15.0
+  # Generated candidate 与教师动作的匹配阈值；同时匹配正负时标签为 UNKNOWN。
   policy_push_match_contact_m: 0.020
   policy_push_match_direction_deg: 22.5
   policy_grasp_match_translation_m: 0.020
   policy_grasp_match_rotation_deg: 20.0
   policy_grasp_match_width_m: 0.010
+  # 同物体 PUSH 的动作级 NMS 阈值。
   push_nms_contact_m: 0.015
   push_nms_direction_deg: 15.0
   push_utility_component_weights: [0.05, 1.0, -1.0, -0.25, 1.0]
@@ -134,6 +139,7 @@ router:
   max_preparation_actions: 5
 
 losses:
+  # 第一层是各任务族的总权重；internal 是任务族内部各子损失的相对权重。
   region: 1.0
   task_grasp: 1.0
   global_grasp: 1.0
@@ -151,6 +157,7 @@ losses:
     region_visibility: 0.2
 
 sampling:
+  # 这些是每个 action-state group 的采样配额，不代表标签集合已经穷举完备。
   positive_grasps: 8
   wrong_region_grasps: 8
   collision_or_approach_negative_grasps: 8
@@ -161,6 +168,7 @@ sampling:
   unit: action_state_group
 
 optimizer:
+  # 预训练/官方骨干使用更小学习率，其余 head 使用 learning_rate。
   learning_rate: 0.0001
   backbone_learning_rate: 0.00002
   weight_decay: 0.01
@@ -174,9 +182,9 @@ training:
   amp: true
   amp_dtype: float16
   batch_size: 1
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 1  # 网络可直接单步训练，不做梯度累计
   max_optimizer_steps: 100000
-  # Set to 0 only for train-only bootstrap runs before val scenes are published.
+  # 仅在验证场景尚未发布的启动阶段设为 0；正式实验保留周期验证。
   validation_interval: 1000
   checkpoint_interval: 1000
   gradient_clip_norm: 1.0
@@ -190,12 +198,13 @@ training:
   frozen_modules: []
   unfreeze_at_optimizer_step: null
   ddp_backend: auto
-  ddp_find_unused_parameters: true
+  ddp_find_unused_parameters: true  # 多任务阶段并非每批都激活全部 head
+  # generated cache 用于 Policy Stage；ratio=0/1 分别表示纯 teacher/纯 generated。
   generated_policy_candidate_cache: ""
   generated_policy_candidate_ratio: 0.0
   generated_policy_checkpoint_sha256: ""
-  generated_policy_min_positive_coverage: 0.05
-  generated_policy_min_effective_coverage: 0.01
+  generated_policy_min_positive_coverage: 0.05   # 低于该正样本状态覆盖率时拒绝纯 generated
+  generated_policy_min_effective_coverage: 0.01  # 同时含已知正负、可形成排序损失的状态比例
   validation_family_weights:
     policy_candidate: 1.0
     verify_overall: 0.5
@@ -231,7 +240,7 @@ ablation:
 
 logging:
   backend: tensorboard
-  # Terminal summaries only; train_metrics.jsonl records every optimizer step.
+  # 终端每 log_interval 步打印核心摘要；train_metrics.jsonl 保存每个优化器步的完整指标。
   log_interval: 20
 
 planner:

@@ -43,8 +43,7 @@ class TCDPRGModel(nn.Module):
         self.ablation = ablation or AblationConfig()
         graph_config = graph_config or GraphConfig()
         router_config = router_config or RouterConfig()
-        # Direct lightweight construction remains dependency-free for unit
-        # tests. Formal entry points always pass the structured backbone config.
+        # 单元测试可使用轻量 legacy 骨干；正式训练入口始终显式传入 PTv3 配置。
         backbone_config = backbone_config or BackboneConfig(backend="legacy")
         c = self.config
         scene_backbone = None
@@ -67,6 +66,8 @@ class TCDPRGModel(nn.Module):
             scene_backbone=scene_backbone,
         )
         self.region_head = TaskRegionHead(c.feature_dim)
+        # Task/Global Grasp 共享同一个 M2T2 解码器参数，但各自保留独立 query 与输出头。
+        # 这样只做一次场景编码，也不会把“任务抓取”和“移除抓取”的查询语义混在一起。
         self.grasp_decoder = M2T2GraspDecoder(
             c.feature_dim, c.grasp_decoder_layers, c.grasp_decoder_heads
         )
@@ -254,6 +255,7 @@ class TCDPRGModel(nn.Module):
 
     def _encode_scene(self, batch: dict[str, Tensor]) -> tuple[Any, Tensor]:
         object_present = batch.get("object_present", batch["object_mask"])
+        # 只有同时存在且尚未被移除的物体才参与点云几何、抓取分配和碰撞语义。
         physical_active = object_present & batch["object_active"]
         encoded = self.encoder(
             batch["xyz"],
@@ -275,6 +277,7 @@ class TCDPRGModel(nn.Module):
         generated = batch.get("generated_policy_candidates")
         if generated is None:
             raise RuntimeError("Generated-policy forward requires cached generated candidates")
+        # Policy-only 阶段若冻结场景编码器，则关闭其 autograd，避免保存无用激活。
         encoder_frozen = not any(parameter.requires_grad for parameter in self.encoder.parameters())
         if encoder_frozen:
             with torch.no_grad():
@@ -294,6 +297,7 @@ class TCDPRGModel(nn.Module):
             return self.forward_generated_policy(batch)
         if forward_mode != "full":
             raise ValueError(f"Unsupported forward_mode={forward_mode}")
+        # PTv3/场景编码仅执行一次，后续所有 head 复用同一组点、物体和任务特征。
         encoded, physical_active = self._encode_scene(batch)
         region = self.region_head(
             encoded.point_features, encoded.target_token, encoded.task_token, batch["target_mask"]

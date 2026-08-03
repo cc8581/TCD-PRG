@@ -388,6 +388,7 @@ class Trainer:
                     if self.config.training.amp_dtype == "bfloat16"
                     else torch.float16
                 )
+                # DDP 只在累计窗口末端同步梯度；默认 accumulation=1 时每步同步。
                 synchronize = micro_step % accumulation == 0
                 sync_context = (
                     nullcontext()
@@ -444,10 +445,8 @@ class Trainer:
                 self.scaler.update()
                 current_scale = float(self.scaler.get_scale())
                 self.optimizer.zero_grad(set_to_none=True)
-                # GradScaler deliberately skips optimizer.step when any
-                # unscaled gradient is non-finite.  Such an overflow is a
-                # micro-step retry, not a completed optimizer step: scheduler,
-                # EMA, counters and checkpoints must remain unchanged.
+                # AMP 溢出时 GradScaler 会跳过 optimizer.step；此时不能推进 scheduler、
+                # EMA、全局步数或 checkpoint，否则记录的“训练步”并未真正更新参数。
                 if self.scaler.is_enabled() and current_scale < previous_scale:
                     self.state.amp_skipped_steps += 1
                     skipped_terms = self._reduce_distributed_terms(
