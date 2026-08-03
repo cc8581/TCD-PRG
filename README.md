@@ -58,7 +58,7 @@ tcd_prg/
   baselines/         unified rules, one-shot and original GAPG wrapper
   scripts/           train/evaluate/prefetch/infer/replay entry points
   tools/             sample inspection and bounded dataset auditing
-training.py          canonical formal training launcher
+train.py             canonical formal training launcher
 configs/             main, seven ablations and seven baselines
 scripts/             DDP, external PyBullet workers and dependency setup
 tools/               offline data preparation and profiling utilities
@@ -110,7 +110,7 @@ Command-line `--dataset-root`, `--acronym-root`, `--functional-region-root` and
 never synchronously invokes PyBullet on the GPU path:
 
 ```powershell
-python training.py
+python train.py
 ```
 
 The launcher supplies the Windows RTX 3090 defaults, creates a timestamped
@@ -130,22 +130,6 @@ at configurable low resolution and samples them to `dataset.scene_points`.
 Cache keys bind scene/state, poses, present/active masks, model IDs, scales,
 camera profile, render seed, renderer version and point-sampling configuration.
 
-Build task-unfiltered global grasp supervision and scene certification outside
-the GPU loop (paths remain configurable and are not embedded in checkpoints):
-
-```powershell
-$DatasetRoot = "E:\datasets\TaskOrientedClutterSceneDataset"
-$AcronymRoot = "E:\datasets\ACRONYM"
-$FunctionalRegionRoot = "E:\datasets\manual_function_regions_v1"
-python tools/build_global_grasp_library.py `
-  --acronym-root $AcronymRoot `
-  --annotations $FunctionalRegionRoot `
-  --task-library "$DatasetRoot/task_training_labels_steps1_6_v1/grasp_library" `
-  --output "$DatasetRoot/generic_grasp_library_v1"
-
-python tools/certify_global_grasps.py --config configs/config.yaml --allow-render
-```
-
 Evaluate the global branch independently of the task graph and router:
 
 ```powershell
@@ -153,9 +137,10 @@ tcd-prg-eval-global --config configs/config.yaml --checkpoint outputs/full/last.
   --scene-id 0 --state-id 0 --task-index 0 --output outputs/global/state_0.json
 ```
 
-The global comparison has separate `scene_only` and `instance_assisted` tracks
-and reports unified scene-executable proposal metrics before and after exact certification.
-See [docs/global_grasp_protocol.md](docs/global_grasp_protocol.md).
+The global branch is supervised directly by the published per-object
+`grasp_library` and the PICK_REMOVE poses and outcomes in the action HDF5. Its
+labels are open-world: only executed attempts are positive or negative, while
+unexecuted and conflicting outcomes remain UNKNOWN.
 
 ## Training
 

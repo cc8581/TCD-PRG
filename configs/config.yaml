@@ -2,7 +2,7 @@ defaults:
   - _self_
 
 dataset:
-  # 下列三个路径会被 training.py 的本机路径配置覆盖，此处保留可移植的仓库相对值。
+  # 下列三个路径会被 train.py 的本机路径配置覆盖，此处保留可移植的仓库相对值。
   root: data/TaskOrientedClutterSceneDataset
   acronym_root: data/ACRONYM
   functional_region_root: data/manual_function_regions_v1
@@ -11,9 +11,6 @@ dataset:
   scene_subdir: task_clutter_scenes_20_categories
   step_labels_subdir: task_training_labels_steps1_6_v1
   action_labels_subdir: task_positive_multistep_sequences
-  global_grasp_library_subdir: generic_grasp_library_v1
-  global_grasp_certification_subdir: global_grasp_scene_certification_v2
-  pick_remove_global_association_subdir: pick_remove_global_grasp_association_v1
   scene_points: 16384  # 每个状态送入网络的场景点数
   target_points: 4096  # 目标物体最多保留的点数
 
@@ -163,8 +160,7 @@ sampling:
   collision_or_approach_negative_grasps: 8
   perturbed_negative_grasps: 4
   global_positive_grasps_per_object: 64
-  global_intrinsic_negative_grasps_per_object: 32
-  global_scene_negative_grasps_per_object: 32
+  global_negative_grasps_per_object: 32
   unit: action_state_group
 
 optimizer:
@@ -181,12 +177,11 @@ training:
   device: cuda
   amp: true
   amp_dtype: float16
-  batch_size: 1
+  batch_size: 8
   gradient_accumulation_steps: 1  # 网络可直接单步训练，不做梯度累计
   max_optimizer_steps: 100000
-  # 仅在验证场景尚未发布的启动阶段设为 0；正式实验保留周期验证。
-  validation_interval: 1000
-  checkpoint_interval: 1000
+  validation_interval: 1000     # 周期验证。
+  checkpoint_interval: 1000     # 周期保存checkpoint。
   gradient_clip_norm: 1.0
   ema_decay: 0.999
   early_stopping_patience: 20

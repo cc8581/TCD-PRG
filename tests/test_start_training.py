@@ -6,7 +6,7 @@ from argparse import Namespace
 from pathlib import Path
 
 from scripts.launch_ddp_windows import _worker
-from training import DEFAULT_OVERRIDES, PROJECT, _parse_args, _training_arguments
+from train import DEFAULT_OVERRIDES, PROJECT, _parse_args, _training_arguments
 
 
 def test_launcher_path_arguments_have_local_config_defaults(tmp_path) -> None:

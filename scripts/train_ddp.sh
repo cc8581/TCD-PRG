@@ -6,5 +6,5 @@ shift || true
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
-python training.py --gpus "${gpus}" \
+python train.py --gpus "${gpus}" \
   --config configs/config.yaml "$@"

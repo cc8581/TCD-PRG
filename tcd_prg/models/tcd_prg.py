@@ -117,10 +117,6 @@ class TCDPRGModel(nn.Module):
             for candidate in torch.nonzero(batch["candidate_mask"][row], as_tuple=False).flatten().tolist():
                 is_push = int(kind[row, candidate]) == 0
                 is_remove = int(kind[row, candidate]) == 1
-                if is_remove and not bool(parameters.get(
-                    "removal_global_match_valid", torch.zeros_like(kind, dtype=torch.bool)
-                )[row, candidate]):
-                    continue
                 query = parameters["push_contact_world"][row, candidate] if is_push else pose[row, candidate, :3]
                 if not torch.isfinite(query).all():
                     continue

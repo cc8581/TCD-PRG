@@ -13,7 +13,7 @@ notepad configs/local_paths.yaml
 ```
 
 The same YAML file is used on Linux. Paths can also be supplied explicitly to
-`training.py`; project dataset paths do not depend on environment
+`train.py`; project dataset paths do not depend on environment
 variables. The accurate FR5/AG-160-95 URDF and meshes are bundled under
 `assets/robots/FR5_AG-160-95`.
 

@@ -184,7 +184,7 @@ def build_grasp_proposal_labels(
 def build_global_grasp_labels(
     batch: dict[str, Tensor], config: ModelConfig
 ) -> dict[str, Tensor] | None:
-    """Build task-free sets using only scene-certified executable grasps."""
+    """Build task-free sets from known native PICK_REMOVE execution outcomes."""
 
     source = batch.get("global_grasp_labels")
     if source is None:

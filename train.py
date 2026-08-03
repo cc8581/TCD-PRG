@@ -2,7 +2,7 @@
 
 Run from any directory with::
 
-    python training.py
+    python train.py
 
 Extra Hydra/OmegaConf dot-list values are appended after the safe defaults, so
 the caller can override any setting without editing this file. This launcher

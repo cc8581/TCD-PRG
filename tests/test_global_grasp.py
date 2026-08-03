@@ -4,13 +4,11 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+import h5py
 
 from tcd_prg.baselines.base import GlobalGraspPrediction
 from tcd_prg.config import AblationConfig, BackboneConfig, GraphConfig, ModelConfig, RouterConfig
-from tcd_prg.constants import (
-    GLOBAL_GRASP_CERTIFICATION_FORMAT,
-    GLOBAL_GRASP_CERTIFIER_VERSION,
-)
+from tcd_prg.constants import ActionType, CandidateStatus, OutcomeCode
 from tcd_prg.datasets.collate import _empty_global_grasps_like
 from tcd_prg.datasets.task_oriented_clutter import (
     TaskOrientedClutterAdapter,
@@ -123,46 +121,38 @@ def test_global_sampling_is_pose_diverse_and_respects_quota() -> None:
     assert np.ptp(transform[selected, 0, 3]) >= 0.06
 
 
-def test_global_labels_exclude_inactive_removed_objects(tmp_path) -> None:
+def test_global_labels_use_native_library_and_exclude_inactive_objects() -> None:
     transform = np.eye(4, dtype=np.float32)[None]
     library = SimpleNamespace(
-        conversion_version="test",
-        stability_label=np.array([True]),
-        width_compatible=np.array([True]),
         source_index=np.array([0], np.int64),
         transform_object=transform,
         contact_points_object=np.zeros((1, 2, 3), np.float32),
-        approach_direction_object=np.array([[0.0, 0.0, 1.0]], np.float32),
+        contact_span_m=np.array([0.05], np.float32),
         ag_width_m=np.array([0.05], np.float32),
         quality=np.array([1.0], np.float32),
     )
 
     class Registry:
         def __init__(self) -> None:
-            self.calls: list[tuple[str, str]] = []
+            self.calls: list[str] = []
 
-        def load(self, category: str, name: str):
-            self.calls.append((category, name))
+        def load(self, name: str):
+            self.calls.append(name)
             return library
 
     registry = Registry()
     adapter = object.__new__(TaskOrientedClutterAdapter)
-    adapter.global_grasp_registry = registry
-    adapter.global_grasp_certification_root = tmp_path / "certification"
-    adapter.global_sampling = (64, 32, 32)
-    stale_cache = adapter.global_grasp_certification_root / "scene_0000"
-    stale_cache.mkdir(parents=True)
-    np.savez(
-        stale_cache / "state_0001.npz",
-        format=np.asarray("global_grasp_scene_certification_v1"),
-        scene_id=np.int64(0), state_id=np.int64(1),
-        object_index=np.array([0]), source_grasp_index=np.array([0]),
-        scene_executable=np.array([1], np.int8), conversion_version=np.asarray("test"),
-    )
+    adapter.grasp_registry = registry
+    adapter.global_sampling = (64, 32)
+    adapter._object_match_files = lambda scene_id: ("cup.npz", "bottle.npz")
     pose = np.array([
         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
         [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
     ], np.float32)
+    adapter._pick_remove_grasp_records = lambda scene_id, state_id: {
+        (0, 0): (pose[0], int(CandidateStatus.POSITIVE)),
+        (1, 0): (pose[1], int(CandidateStatus.POSITIVE)),
+    }
     observation = SceneObservation(
         scene_id=0, state_id=1, task_index=0,
         xyz=np.zeros((1, 3), np.float32), rgb=np.zeros((1, 3), np.float32),
@@ -171,30 +161,46 @@ def test_global_labels_exclude_inactive_removed_objects(tmp_path) -> None:
         object_pose=pose, object_category_id=np.array([0, 1], np.int64),
         object_present=np.array([True, True]), object_active=np.array([True, False]),
         camera_parameters=(),
-        metadata={
-            "object_category_key": ("cup", "bottle"),
-            "object_h5_name": ("cup.h5", "bottle.h5"),
-        },
+        metadata={},
     )
     labels = adapter.load_global_grasps(0, 1, observation, training=False)
-    assert labels is not None
     assert labels.object_index.tolist() == [0]
-    assert labels.scene_executable.tolist() == [-1]
-    assert registry.calls == [("cup", "cup.h5")]
-    np.savez(
-        stale_cache / "state_0001.npz",
-        format=np.asarray(GLOBAL_GRASP_CERTIFICATION_FORMAT),
-        certifier_version=np.asarray(GLOBAL_GRASP_CERTIFIER_VERSION),
-        scene_id=np.int64(0), state_id=np.int64(1),
-        physical_active=observation.physical_active,
-        object_index=np.array([0]), source_grasp_index=np.array([0]),
-        scene_executable=np.array([1], np.int8), conversion_version=np.asarray("test"),
-        label_set_complete=np.asarray(True),
-    )
-    current = adapter.load_global_grasps(0, 1, observation, training=False)
-    assert current is not None
-    assert current.scene_executable.tolist() == [1]
-    assert current.label_set_complete
+    assert labels.scene_executable.tolist() == [1]
+    assert labels.grasp_pose_world.tolist() == [pose[0].tolist()]
+    assert not labels.label_set_complete
+    assert registry.calls == ["cup.npz"]
+
+
+def test_pick_remove_conflicting_execution_results_become_unknown(tmp_path) -> None:
+    path = tmp_path / "scene_0000.h5"
+    with h5py.File(path, "w") as handle:
+        actions = handle.create_group("scene_0000/actions")
+        actions.create_dataset("action_type", data=np.full(5, int(ActionType.PICK_REMOVE), np.int8))
+        actions.create_dataset("from_state", data=np.ones(5, np.int32))
+        actions.create_dataset("payload_index", data=np.arange(5, dtype=np.int32))
+        actions.create_dataset("executed", data=np.array([True, True, True, False, True]))
+        actions.create_dataset("success", data=np.array([True, False, True, False, False]))
+        actions.create_dataset("potential_improved", data=np.array([False, False, False, False, True]))
+        actions.create_dataset(
+            "outcome_code",
+            data=np.array([
+                OutcomeCode.SUCCESS, OutcomeCode.OTHER_INVALID,
+                OutcomeCode.SUCCESS, OutcomeCode.OTHER_INVALID, OutcomeCode.IMPROVED,
+            ], np.int8),
+        )
+        pick = actions.create_group("pick_remove")
+        pick.create_dataset("acted_object", data=np.zeros(5, np.int16))
+        pick.create_dataset("removal_grasp_source_index", data=np.array([5, 5, 6, 7, 8]))
+        pose = np.tile(np.array([0, 0, 0, 0, 0, 0, 1], np.float32), (5, 1))
+        pick.create_dataset("removal_grasp_pose_world", data=pose)
+
+    adapter = object.__new__(TaskOrientedClutterAdapter)
+    adapter._path_by_scene = {0: path}
+    records = adapter._pick_remove_grasp_records(0, 1)
+    assert records[(0, 5)][1] == CandidateStatus.UNKNOWN_UNTESTED
+    assert records[(0, 6)][1] == CandidateStatus.POSITIVE
+    assert records[(0, 7)][1] == CandidateStatus.UNKNOWN_UNTESTED
+    assert records[(0, 8)][1] == CandidateStatus.NEGATIVE
 
 
 def test_global_supervision_has_one_representative_per_scene_state() -> None:

@@ -21,9 +21,6 @@ class DatasetConfig:
     scene_subdir: str = "task_clutter_scenes_20_categories"
     step_labels_subdir: str = "task_training_labels_steps1_6_v1"
     action_labels_subdir: str = "task_positive_multistep_sequences"
-    global_grasp_library_subdir: str = "generic_grasp_library_v1"
-    global_grasp_certification_subdir: str = "global_grasp_scene_certification_v2"
-    pick_remove_global_association_subdir: str = "pick_remove_global_grasp_association_v1"
     scene_points: int = 16_384
     # target_points 仅供独立资源分析器使用；正式模型输入点数由 scene_points 决定。
     target_points: int = 4_096
@@ -294,8 +291,7 @@ class SamplingConfig:
     collision_or_approach_negative_grasps: int = 8
     perturbed_negative_grasps: int = 4
     global_positive_grasps_per_object: int = 64
-    global_intrinsic_negative_grasps_per_object: int = 32
-    global_scene_negative_grasps_per_object: int = 32
+    global_negative_grasps_per_object: int = 32
     unit: str = "action_state_group"
 
 
@@ -445,8 +441,7 @@ class TCDPRGConfig:
             raise ValueError("global_grasp_input_mode must be scene_only or instance_assisted")
         if min(
             self.sampling.global_positive_grasps_per_object,
-            self.sampling.global_intrinsic_negative_grasps_per_object,
-            self.sampling.global_scene_negative_grasps_per_object,
+            self.sampling.global_negative_grasps_per_object,
         ) < 0:
             raise ValueError("Global grasp stratum sizes cannot be negative")
         if self.sampling.global_positive_grasps_per_object == 0:

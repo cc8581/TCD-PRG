@@ -21,6 +21,18 @@ class GraspLibrary:
     confidence: np.ndarray
     depth_m: np.ndarray
 
+    @property
+    def ag_width_m(self) -> np.ndarray:
+        """Expose the existing contact span under the proposal sampler's width name."""
+
+        return self.contact_span_m
+
+    @property
+    def quality(self) -> np.ndarray:
+        """Use the source grasp confidence for deterministic diversity sampling."""
+
+        return self.confidence
+
     def rows_for_source(self, source_indices: np.ndarray) -> np.ndarray:
         mapping = {int(value): row for row, value in enumerate(self.source_index)}
         try:
@@ -64,57 +76,6 @@ class GraspLibraryRegistry:
                 contact_span_m=data["contact_span"].astype(np.float32),
                 confidence=data["confidence"].astype(np.float32),
                 depth_m=depth_m.astype(np.float32),
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class GlobalGraspLibrary:
-    """Complete, task-unfiltered object-frame generic grasp library."""
-
-    model_id: str
-    source_index: np.ndarray
-    transform_object: np.ndarray
-    contact_points_object: np.ndarray
-    approach_direction_object: np.ndarray
-    contact_span_m: np.ndarray
-    ag_width_m: np.ndarray
-    width_compatible: np.ndarray
-    stability_label: np.ndarray
-    quality: np.ndarray
-    conversion_version: str
-
-
-class GlobalGraspLibraryRegistry:
-    def __init__(self, root: str | Path) -> None:
-        self.root = Path(root)
-
-    @lru_cache(maxsize=512)
-    def load(self, category_key: str, h5_name: str) -> GlobalGraspLibrary:
-        path = self.root / category_key / f"{Path(h5_name).stem}.npz"
-        if not path.is_file():
-            raise FileNotFoundError(path)
-        with np.load(path, allow_pickle=False) as data:
-            required = {
-                "model_id", "source_grasp_index", "canonical_contact_pose_object",
-                "contact_points_object", "approach_direction_object", "contact_span_m",
-                "ag_width_m", "width_compatible", "stability_label", "quality",
-                "conversion_version",
-            }
-            missing = required - set(data.files)
-            if missing:
-                raise KeyError(f"{path} missing {sorted(missing)}")
-            return GlobalGraspLibrary(
-                model_id=str(data["model_id"]),
-                source_index=data["source_grasp_index"].astype(np.int64),
-                transform_object=data["canonical_contact_pose_object"].astype(np.float32),
-                contact_points_object=data["contact_points_object"].astype(np.float32),
-                approach_direction_object=data["approach_direction_object"].astype(np.float32),
-                contact_span_m=data["contact_span_m"].astype(np.float32),
-                ag_width_m=data["ag_width_m"].astype(np.float32),
-                width_compatible=data["width_compatible"].astype(bool),
-                stability_label=data["stability_label"].astype(bool),
-                quality=data["quality"].astype(np.float32),
-                conversion_version=str(data["conversion_version"]),
             )
 
 

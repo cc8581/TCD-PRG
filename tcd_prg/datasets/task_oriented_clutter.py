@@ -8,7 +8,7 @@ import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 
 import h5py
@@ -16,8 +16,6 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from tcd_prg.constants import (
-    GLOBAL_GRASP_CERTIFICATION_FORMAT,
-    GLOBAL_GRASP_CERTIFIER_VERSION,
     PUSH_DISTANCE_M,
     ActionType,
     CandidateStatus,
@@ -29,7 +27,7 @@ from tcd_prg.observation.saved import SavedObservationProvider
 
 from .base import DatasetAdapter
 from .capabilities import DatasetCapabilities
-from .registries import FunctionalRegionRegistry, GlobalGraspLibraryRegistry, GraspLibraryRegistry
+from .registries import FunctionalRegionRegistry, GraspLibraryRegistry
 from .types import (
     ActionCandidateGroup,
     CameraParameters,
@@ -144,6 +142,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         has_instance_masks=True,
         has_task_regions=True,
         has_task_grasps=True,
+        has_global_grasps=True,
         has_push_actions=True,
         has_pick_remove_actions=True,
         has_sequences=True,
@@ -170,21 +169,14 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         scene_subdir: str = "task_clutter_scenes_20_categories",
         step_labels_subdir: str = "task_training_labels_steps1_6_v1",
         action_labels_subdir: str = "task_positive_multistep_sequences",
-        global_grasp_library_subdir: str = "generic_grasp_library_v1",
-        global_grasp_certification_subdir: str = "global_grasp_scene_certification_v2",
-        pick_remove_global_association_subdir: str = "pick_remove_global_grasp_association_v1",
         global_positive_grasps_per_object: int = 64,
-        global_intrinsic_negative_grasps_per_object: int = 32,
-        global_scene_negative_grasps_per_object: int = 32,
+        global_negative_grasps_per_object: int = 32,
         index_cache_dir: str | Path = "runtime/cache/dataset_indexes",
     ) -> None:
         self.root = Path(root)
         self.scene_root = self.root / scene_subdir
         self.step_root = self.root / step_labels_subdir
         self.action_root = self.root / action_labels_subdir
-        self.global_grasp_root = self.root / global_grasp_library_subdir
-        self.global_grasp_certification_root = self.root / global_grasp_certification_subdir
-        self.pick_remove_global_association_root = self.root / pick_remove_global_association_subdir
         self.training_index_path = self.action_root / "training_index.h5"
         self.index_cache_dir = Path(index_cache_dir)
         self.index_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -192,8 +184,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         self._reported_strata_cache = False
         self.global_sampling = (
             int(global_positive_grasps_per_object),
-            int(global_intrinsic_negative_grasps_per_object),
-            int(global_scene_negative_grasps_per_object),
+            int(global_negative_grasps_per_object),
         )
         for path in (self.scene_root, self.step_root, self.action_root):
             if not path.is_dir():
@@ -223,13 +214,6 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         )
         self.camera_parameters = self._formal_camera_parameters()
         self.grasp_registry = GraspLibraryRegistry(self.step_root / "grasp_library")
-        self.global_grasp_registry = (
-            GlobalGraspLibraryRegistry(self.global_grasp_root)
-            if self.global_grasp_root.is_dir() else None
-        )
-        self.capabilities = replace(
-            type(self).capabilities, has_global_grasps=self.global_grasp_registry is not None
-        )
         inferred_region_root = (
             self.root.parent
             / "Grasp_20_class_object_3D_model"
@@ -710,25 +694,73 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         )
         return self.observation_provider.is_available(request)
 
+    @lru_cache(maxsize=64)
+    def _object_match_files(self, scene_id: int) -> tuple[str, ...]:
+        """Cache the existing per-object grasp-library links for one scene."""
+
+        path = self.step_root / "scene_labels" / f"scene_{scene_id:04d}_labels.npz"
+        with np.load(path, allow_pickle=False) as labels:
+            return tuple(str(value) for value in labels["object_match_file"])
+
+    @lru_cache(maxsize=128)
+    def _pick_remove_grasp_records(
+        self, scene_id: int, state_id: int
+    ) -> dict[tuple[int, int], tuple[np.ndarray, int]]:
+        """Aggregate native PICK_REMOVE attempts into conflict-safe three-state labels."""
+
+        with h5py.File(self._h5_path(scene_id), "r", swmr=True) as handle:
+            actions = self._scene_group(handle, scene_id)["actions"]
+            action_type = actions["action_type"][:].astype(np.int8)
+            from_state = actions["from_state"][:].astype(np.int64)
+            action_ids = np.flatnonzero(
+                (action_type == int(ActionType.PICK_REMOVE)) & (from_state == state_id)
+            )
+            if not len(action_ids):
+                return {}
+            payload = actions["payload_index"][:][action_ids].astype(np.int64)
+            pick_remove = actions["pick_remove"]
+            objects = pick_remove["acted_object"][:][payload].astype(np.int64)
+            sources = pick_remove["removal_grasp_source_index"][:][payload].astype(np.int64)
+            poses = pick_remove["removal_grasp_pose_world"][:][payload].astype(np.float32)
+            executed = actions["executed"][:][action_ids].astype(bool)
+            # Global grasp quality means that the removal grasp itself
+            # succeeded. A merely improved post-state remains a failed grasp,
+            # even though it can still be useful policy evidence.
+            positive = executed & actions["success"][:][action_ids].astype(bool)
+
+        grouped: dict[tuple[int, int], dict[str, object]] = {}
+        for obj, source, pose, was_executed, was_positive in zip(
+            objects, sources, poses, executed, positive, strict=True
+        ):
+            key = (int(obj), int(source))
+            record = grouped.setdefault(key, {"pose": pose, "known": set()})
+            if was_executed:
+                known = record["known"]
+                assert isinstance(known, set)
+                known.add(int(CandidateStatus.POSITIVE if was_positive else CandidateStatus.NEGATIVE))
+
+        result: dict[tuple[int, int], tuple[np.ndarray, int]] = {}
+        for key, record in grouped.items():
+            known = record["known"]
+            assert isinstance(known, set)
+            status = next(iter(known)) if len(known) == 1 else int(CandidateStatus.UNKNOWN_UNTESTED)
+            result[key] = (np.asarray(record["pose"], np.float32), status)
+        return result
+
     def load_global_grasps(
         self, scene_id: int, state_id: int, observation: SceneObservation,
         training: bool = True,
-    ) -> GlobalGraspLabels | None:
-        """Transform task-free object libraries to world labels for this state.
+    ) -> GlobalGraspLabels:
+        """Build task-free removal-grasp supervision from the published dataset only.
 
-        Scene executability remains UNKNOWN until an aligned offline
-        certification cache is present; unknown entries never become negatives.
+        Geometry comes from the existing per-object ``grasp_library`` while the
+        authoritative world pose and three-state outcome come from PICK_REMOVE
+        rows in the action HDF5. The attempted set is not exhaustive, so
+        unmatched queries are never treated as negatives.
         """
 
-        if self.global_grasp_registry is None:
-            return None
-        category_keys = observation.metadata["object_category_key"]
-        h5_names = observation.metadata.get("object_h5_name")
-        if h5_names is None:
-            with np.load(
-                self.scene_root / f"scene_{scene_id:04d}" / "scene.npz", allow_pickle=False
-            ) as raw:
-                h5_names = tuple(str(x) for x in raw["object_h5_name"][: len(observation.object_pose)])
+        records = self._pick_remove_grasp_records(scene_id, state_id)
+        match_files = self._object_match_files(scene_id)
         object_indices: list[int] = []
         sources: list[int] = []
         contacts: list[np.ndarray] = []
@@ -736,111 +768,94 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         poses: list[np.ndarray] = []
         approaches: list[np.ndarray] = []
         widths: list[float] = []
-        intrinsic: list[bool] = []
         scene_labels: list[int] = []
-        versions: set[str] = set()
-        certification_file = (
-            self.global_grasp_certification_root / f"scene_{scene_id:04d}" / f"state_{state_id:04d}.npz"
-        )
-        physical_active = observation.physical_active
-        certification: dict[tuple[int, int], int] = {}
-        certification_version = ""
-        certification_complete = False
-        if certification_file.is_file():
-            with np.load(certification_file, allow_pickle=False) as cached:
-                cache_valid = (
-                    str(cached.get("format", "")) == GLOBAL_GRASP_CERTIFICATION_FORMAT
-                    and str(cached.get("certifier_version", ""))
-                    == GLOBAL_GRASP_CERTIFIER_VERSION
-                    and int(cached.get("scene_id", -1)) == scene_id
-                    and int(cached.get("state_id", -1)) == state_id
-                    and "physical_active" in cached
-                    and np.array_equal(cached["physical_active"].astype(bool), physical_active)
-                )
-                if cache_valid:
-                    certification_version = str(cached.get("conversion_version", ""))
-                    values = cached["scene_executable"].astype(np.int8)
-                    certification = {
-                        (int(obj), int(source)): int(value)
-                        for obj, source, value in zip(
-                            cached["object_index"], cached["source_grasp_index"],
-                            values, strict=True,
-                        )
-                    }
-                    certification_complete = bool(
-                        cached.get("label_set_complete", False)
-                    ) and not np.any(values < 0)
-        for object_index, active in enumerate(physical_active):
+
+        for object_index, active in enumerate(observation.physical_active):
             if not active:
                 continue
-            library = self.global_grasp_registry.load(category_keys[object_index], h5_names[object_index])
-            versions.add(library.conversion_version)
-            object_certification = (
-                certification if certification_version == library.conversion_version else {}
+            object_records = {
+                source: value for (obj, source), value in records.items() if obj == object_index
+            }
+            if not object_records:
+                continue
+            library = self.grasp_registry.load(match_files[object_index])
+            source_to_row: dict[int, int] = {}
+            for row, source in enumerate(library.source_index):
+                source_to_row.setdefault(int(source), row)
+            missing = sorted(set(object_records) - set(source_to_row))
+            if missing:
+                raise KeyError(
+                    f"scene {scene_id} object {object_index} PICK_REMOVE sources missing "
+                    f"from grasp_library: {missing[:8]}"
+                )
+            candidate_rows = np.asarray(
+                [source_to_row[source] for source in object_records], dtype=np.int64
             )
-            intrinsic_positive = library.stability_label & library.width_compatible
+            status_by_row = {
+                source_to_row[source]: int(value[1]) for source, value in object_records.items()
+            }
+            pose_by_row = {
+                source_to_row[source]: value[0] for source, value in object_records.items()
+            }
             if training:
-                scene_negative = np.asarray([
-                    object_certification.get((object_index, int(source)), -1) == 0
-                    for source in library.source_index
-                ], bool) & intrinsic_positive
-                hard_rows = _se3_diverse_rows(
-                    library, np.flatnonzero(scene_negative), self.global_sampling[2]
+                positive_rows = np.asarray(
+                    [row for row in candidate_rows if status_by_row[int(row)] == CandidateStatus.POSITIVE],
+                    np.int64,
                 )
-                positive_pool = np.flatnonzero(intrinsic_positive & ~scene_negative)
-                positive_rows = _se3_diverse_rows(library, positive_pool, self.global_sampling[0])
-                intrinsic_negative_rows = _se3_diverse_rows(
-                    library, np.flatnonzero(~intrinsic_positive), self.global_sampling[1]
+                negative_rows = np.asarray(
+                    [row for row in candidate_rows if status_by_row[int(row)] == CandidateStatus.NEGATIVE],
+                    np.int64,
                 )
-                eligible = np.unique(np.concatenate((positive_rows, intrinsic_negative_rows, hard_rows)))
+                eligible = np.concatenate((
+                    _se3_diverse_rows(library, positive_rows, self.global_sampling[0]),
+                    _se3_diverse_rows(library, negative_rows, self.global_sampling[1]),
+                ))
             else:
-                eligible = _object_frame_nms_rows(library, np.flatnonzero(intrinsic_positive))
-            rotation_world_object = quaternion_xyzw_to_matrix_numpy(observation.object_pose[object_index, 3:])
+                eligible = _object_frame_nms_rows(library, candidate_rows)
+
+            rotation_world_object = quaternion_xyzw_to_matrix_numpy(
+                observation.object_pose[object_index, 3:]
+            ).astype(np.float32)
             visible_points = observation.xyz[observation.instance_id == object_index]
-            local_contacts = library.contact_points_object[eligible]
-            world_contacts = np.empty_like(local_contacts, dtype=np.float32)
-            for candidate_row in range(len(local_contacts)):
+            for row in eligible:
+                row = int(row)
+                local_contacts = library.contact_points_object[row]
+                # Windows workers can load NumPy with a different OpenMP runtime
+                # than PyTorch; explicit 2x3 arithmetic avoids a tiny BLAS call.
+                world_contacts = np.empty((2, 3), np.float32)
                 for side in range(2):
                     for axis in range(3):
-                        world_contacts[candidate_row, side, axis] = (
-                            sum(float(rotation_world_object[axis, inner] * local_contacts[candidate_row, side, inner]) for inner in range(3))
+                        world_contacts[side, axis] = (
+                            sum(
+                                float(rotation_world_object[axis, inner])
+                                * float(local_contacts[side, inner])
+                                for inner in range(3)
+                            )
                             + float(observation.object_pose[object_index, axis])
                         )
-            anchors = np.empty((len(eligible), 3), np.float32)
-            distances = np.full(len(eligible), np.inf, np.float32)
-            if len(visible_points):
-                for start in range(0, len(eligible), 256):
-                    stop = min(len(eligible), start + 256)
-                    delta = world_contacts[start:stop, :, None] - visible_points[None, None]
-                    distance_sq = np.sum(delta * delta, axis=-1)
+                if len(visible_points):
+                    distance_sq = np.sum(
+                        (world_contacts[:, None] - visible_points[None]) ** 2, axis=-1
+                    )
                     side_distance = np.min(distance_sq, axis=-1)
-                    side = np.argmin(side_distance, axis=-1)
-                    rows = np.arange(stop - start)
-                    anchors[start:stop] = world_contacts[start:stop][rows, side]
-                    distances[start:stop] = np.sqrt(side_distance[rows, side])
-            else:
-                anchors[:] = world_contacts[:, 0]
-            for selected_index, row in enumerate(eligible):
-                pose = compose_pose_with_transform(
-                    observation.object_pose[object_index], library.transform_object[row]
-                ).astype(np.float32)
+                    side = int(np.argmin(side_distance))
+                    anchor = world_contacts[side]
+                    anchor_distance = float(np.sqrt(side_distance[side]))
+                else:
+                    anchor = world_contacts[0]
+                    anchor_distance = float("inf")
+                pose = np.asarray(pose_by_row[row], np.float32)
+                pose_rotation = quaternion_xyzw_to_matrix_numpy(pose[3:]).astype(np.float32)
                 object_indices.append(object_index)
                 sources.append(int(library.source_index[row]))
-                contacts.append(anchors[selected_index])
-                anchor_distances.append(float(distances[selected_index]))
+                contacts.append(anchor)
+                anchor_distances.append(anchor_distance)
                 poses.append(pose)
-                local_approach = library.approach_direction_object[row]
-                approaches.append(np.asarray([
-                    sum(float(rotation_world_object[axis, inner] * local_approach[inner]) for inner in range(3))
-                    for axis in range(3)
-                ], dtype=np.float32))
-                widths.append(float(library.ag_width_m[row]))
-                intrinsic.append(bool(intrinsic_positive[row]))
-                scene_labels.append(
-                    object_certification.get((object_index, int(library.source_index[row])), -1)
-                )
+                approaches.append(pose_rotation[:, 2])
+                widths.append(float(library.contact_span_m[row]))
+                scene_labels.append(status_by_row[row])
+
         count = len(object_indices)
-        version = next(iter(versions)) if len(versions) == 1 else "+".join(sorted(versions))
         return GlobalGraspLabels(
             object_index=np.asarray(object_indices, np.int64),
             source_grasp_index=np.asarray(sources, np.int64),
@@ -848,14 +863,12 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             grasp_pose_world=np.asarray(poses, np.float32).reshape(count, 7),
             approach_direction_world=np.asarray(approaches, np.float32).reshape(count, 3),
             width_m=np.asarray(widths, np.float32),
-            intrinsic_stable=np.asarray(intrinsic, bool),
+            intrinsic_stable=np.ones(count, bool),
             scene_executable=np.asarray(scene_labels, np.int8),
             anchor_visible_distance_m=np.asarray(anchor_distances, np.float32),
             valid_mask=np.ones(count, bool),
-            conversion_version=version,
-            # Training uses a quota-sampled subset and is therefore open-world
-            # even when the underlying full certification cache is complete.
-            label_set_complete=certification_complete and not training,
+            conversion_version="task_grasp_library+action_hdf5_v1",
+            label_set_complete=False,
         )
 
     def load_state_labels(self, scene_id: int, state_id: int) -> StateLabels:
@@ -969,8 +982,6 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 "push_distance_m": np.full(n, np.nan, np.float32),
                 "removal_grasp_pose_world": np.full((n, 7), np.nan, np.float32),
                 "removal_grasp_source_index": np.full(n, -1, np.int64),
-                "removal_global_library_row": np.full(n, -1, np.int64),
-                "removal_global_match_valid": np.zeros(n, bool),
                 "removal_destination_world": np.full((n, 3), np.nan, np.float32),
                 "task_grasp_source_index": np.full(n, -1, np.int64),
                 "task_grasp_pose_world": np.full((n, 7), np.nan, np.float32),
@@ -989,21 +1000,8 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 parameters[f"verifier_{head}_target"] = np.full(n, np.nan, np.float32)
                 parameters[f"verifier_{head}_valid"] = np.zeros(n, bool)
             parameters["proposal_geometry_valid"] = np.ones(n, bool)
-            step_path = self.step_root / "scene_labels" / f"scene_{scene_id:04d}_labels.npz"
-            with np.load(step_path, allow_pickle=False) as step_labels:
-                object_match_files = tuple(str(x) for x in step_labels["object_match_file"])
+            object_match_files = self._object_match_files(scene_id)
             state_pose_cache: dict[int, np.ndarray] = {}
-            association_path = self.pick_remove_global_association_root / f"scene_{scene_id:04d}.npz"
-            association: dict[int, tuple[int, bool]] = {}
-            if association_path.is_file():
-                with np.load(association_path, allow_pickle=False) as mapped:
-                    association = {
-                        int(action): (int(row), str(status) != "unmatched")
-                        for action, row, status in zip(
-                            mapped["action_id"], mapped["global_library_row"],
-                            mapped["match_status"], strict=True,
-                        )
-                    }
 
             def world_grasp(
                 object_index: int, state_id: int, source_index: int
@@ -1044,9 +1042,6 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                     acted_object[row] = p["acted_object"][payload]
                     parameters["removal_grasp_pose_world"][row] = p["removal_grasp_pose_world"][payload]
                     parameters["removal_grasp_source_index"][row] = p["removal_grasp_source_index"][payload]
-                    global_row, global_valid = association.get(int(action_ids[row]), (-1, False))
-                    parameters["removal_global_library_row"][row] = global_row
-                    parameters["removal_global_match_valid"][row] = global_valid
                     parameters["removal_destination_world"][row] = p["removal_destination_world"][payload]
                     _, width, rotation, depth_m, confidence, contacts_world = world_grasp(
                         int(acted_object[row]), int(actions["from_state"][action_ids[row]]),
