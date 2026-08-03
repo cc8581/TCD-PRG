@@ -34,6 +34,7 @@ def test_ptv3_adapter_voxelizes_and_restores_dense_point_alignment(monkeypatch) 
         patch_size=32,
         activation_checkpointing=False,
     )
+    backbone.eval()
     xyz = torch.tensor([[[0.0, 0.0, 0.0], [0.001, 0.0, 0.0], [0.1, 0.0, 0.0]]])
     output = backbone(
         xyz,
@@ -46,6 +47,34 @@ def test_ptv3_adapter_voxelizes_and_restores_dense_point_alignment(monkeypatch) 
     assert output.object_tokens.shape == (1, 2, 16)
     # The first two samples share one voxel and therefore one PTv3 feature.
     assert torch.equal(output.point_features[:, 0], output.point_features[:, 1])
+
+
+def test_ptv3_adapter_packs_variable_scene_lengths_after_grid_sample(monkeypatch) -> None:
+    monkeypatch.setattr(
+        ptv3_adapter, "_load_official_model", lambda source_root: _FakeOfficialPTv3
+    )
+    backbone = ptv3_adapter.PointTransformerV3SceneGeometryBackbone(
+        dim=16,
+        source_root="unused",
+        grid_size_m=0.01,
+        enable_flash_attention=False,
+        patch_size=32,
+        activation_checkpointing=False,
+    ).eval()
+    xyz = torch.tensor([
+        [[0.0, 0.0, 0.0], [0.001, 0.0, 0.0], [0.1, 0.0, 0.0]],
+        [[1.0, 0.0, 0.0], [9.0, 9.0, 9.0], [9.0, 9.0, 9.0]],
+    ])
+    rgb = torch.arange(18, dtype=torch.float32).reshape(2, 3, 3)
+    mask = torch.tensor([[True, True, True], [True, False, False]])
+    data, inverse, flat_valid = backbone._voxelize(xyz, rgb, mask)
+    assert data["coord"].shape == (3, 3)
+    assert data["batch"].tolist() == [0, 0, 1]
+    assert inverse.tolist() == [0, 0, 1, 2]
+    assert flat_valid.sum().item() == 4
+    # Evaluation follows official GridSample semantics deterministically: the
+    # first point in an occupied voxel is used as its representative.
+    assert torch.equal(data["coord"][0], xyz[0, 0])
 
 
 def test_task_and_global_grasp_use_one_shared_decoder() -> None:

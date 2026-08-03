@@ -131,7 +131,14 @@ by the external PyBullet worker and then cached. The optional prefetch command
 only warms an explicitly bounded hot set; full-dataset prefetch is intentionally
 unsupported because the complete observation set is larger than the cache.
 It deterministically reconstructs intermediate observations at configurable
-low resolution and samples them to `dataset.scene_points`.
+low resolution. Formal PTv3 training sets `dataset.scene_points=0`, preserving
+the complete variable-length three-view union at the configured 320x200 view
+resolution. The collator applies the official Pointcept GridSample rule at
+5 mm before padding, the backbone packs occupied voxels across the batch, and
+the decoder/inverse map restores features for every retained supervision point
+used by Region, Push, and grasp-anchor heads. Raw multi-megapixel camera pixels
+are not padded or sent to the GPU. A positive `scene_points` remains available
+only as an explicit pre-grid hardware safety cap.
 Cache keys bind scene/state, poses, present/active masks, model IDs, scales,
 camera profile, render seed, renderer version and point-sampling configuration.
 

@@ -23,7 +23,11 @@ def create_observation_provider(config: TCDPRGConfig, allow_render: bool = False
     scene_root = Path(config.dataset.root) / config.dataset.scene_subdir
     if config.observation.provider == "saved":
         return SavedObservationProvider(
-            scene_root, scene_root / "metadata.json", config.dataset.scene_points
+            scene_root,
+            scene_root / "metadata.json",
+            config.dataset.scene_points,
+            width=config.observation.render_width,
+            height=config.observation.render_height,
         )
     def external_provider() -> ExternalPyBulletObservationProvider:
         return ExternalPyBulletObservationProvider(
@@ -106,10 +110,15 @@ class UnifiedBatchCollator:
 
     config: TCDPRGConfig
     gripper_provider: ExactAG16095GeometryProvider | None = None
+    training: bool = False
     _candidate_manifest_validated: bool = field(default=False, init=False)
 
     def __call__(self, samples: list[Any]) -> dict[str, Any]:
-        batch = collate_unified(samples)
+        grid_size = (
+            self.config.backbone.grid_size_m
+            if self.config.backbone.backend == "point_transformer_v3" else None
+        )
+        batch = collate_unified(samples, grid_size_m=grid_size, training=self.training)
         # generated candidate manifest 每个 worker 只验证一次，单条 entry 仍逐样本校验来源签名。
         if self.config.training.generated_policy_candidate_cache:
             batch["generated_policy_candidates"] = load_candidate_batch(

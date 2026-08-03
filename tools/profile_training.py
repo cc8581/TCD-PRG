@@ -108,7 +108,7 @@ def main() -> None:
         if dataset_snapshot else None
     )
     gripper = create_gripper_provider(config, allow_generate=False)
-    collator = UnifiedBatchCollator(config, gripper)
+    collator = UnifiedBatchCollator(config, gripper, training=True)
     sample_started = time.perf_counter()
     sample = dataset[0]
     sample_seconds = time.perf_counter() - sample_started

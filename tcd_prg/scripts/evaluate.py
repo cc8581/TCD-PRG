@@ -41,7 +41,7 @@ def main() -> None:
         dataset, batch_size=config.training.batch_size, shuffle=False,
         num_workers=config.training.num_workers, pin_memory=config.training.pin_memory,
         persistent_workers=config.training.num_workers > 0,
-        collate_fn=UnifiedBatchCollator(config, gripper),
+        collate_fn=UnifiedBatchCollator(config, gripper, training=False),
     )
     device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
     model = TCDPRGModel(

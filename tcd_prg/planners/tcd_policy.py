@@ -12,6 +12,7 @@ from torch import Tensor
 from tcd_prg.baselines.base import GlobalGraspPrediction, ManipulationPolicy
 from tcd_prg.config import TCDPRGConfig
 from tcd_prg.constants import ActionType, MAX_PREPARATION_ACTIONS
+from tcd_prg.datasets.collate import grid_sample_indices
 from tcd_prg.datasets.types import SceneObservation
 from tcd_prg.geometry.grasp_nms import task_grasp_nms
 from tcd_prg.models import TCDPRGModel
@@ -92,6 +93,10 @@ class TCDPRGPolicy(ManipulationPolicy):
             if observation.point_valid is not None
             else np.ones(len(observation.xyz), dtype=bool)
         )
+        valid_index = np.flatnonzero(point_valid)
+        selected = valid_index[grid_sample_indices(
+            observation.xyz[valid_index], self.config.backbone.grid_size_m, training=False
+        )]
         required_grasp_count = int(observation.metadata.get(
             "required_grasp_count", self.config.model.default_required_grasp_count
         ))
@@ -106,11 +111,11 @@ class TCDPRGPolicy(ManipulationPolicy):
                 f"task_grasp_candidates={self.config.model.task_grasp_candidates}"
             )
         cpu = {
-            "xyz": torch.from_numpy(observation.xyz)[None].float(),
-            "rgb": torch.from_numpy(observation.rgb)[None].float(),
-            "instance_id": torch.from_numpy(observation.instance_id)[None].long(),
-            "point_mask": torch.from_numpy(point_valid)[None].bool(),
-            "target_mask": torch.from_numpy(observation.target_mask)[None].bool(),
+            "xyz": torch.from_numpy(observation.xyz[selected])[None].float(),
+            "rgb": torch.from_numpy(observation.rgb[selected])[None].float(),
+            "instance_id": torch.from_numpy(observation.instance_id[selected])[None].long(),
+            "point_mask": torch.ones(1, len(selected), dtype=torch.bool),
+            "target_mask": torch.from_numpy(observation.target_mask[selected])[None].bool(),
             "target_object": torch.tensor([observation.target_object], dtype=torch.long),
             "object_mask": torch.from_numpy(observation.physical_active)[None].bool(),
             "object_present": torch.from_numpy(observation.object_present)[None].bool(),

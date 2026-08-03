@@ -11,7 +11,8 @@ dataset:
   scene_subdir: task_clutter_scenes_20_categories
   step_labels_subdir: task_training_labels_steps1_6_v1
   action_labels_subdir: task_positive_multistep_sequences
-  scene_points: 16384  # 每个状态送入网络的场景点数
+  # 0 表示保留三视角融合后的全部有效点；PTv3 内部使用 5 mm GridSample 变长打包。
+  scene_points: 0
   target_points: 4096  # 目标物体最多保留的点数
 
 observation:
@@ -20,7 +21,7 @@ observation:
   render_width: 320
   render_height: 200
   camera_profile: mecheye_pro_s_three_view
-  renderer_version: tcd_prg_pybullet_v1
+  renderer_version: tcd_prg_pybullet_v2_variable_grid
   pybullet_python: python
   worker_script: scripts/render_observation_worker_py38.py
   runtime_mesh_root: runtime/cache/meshes

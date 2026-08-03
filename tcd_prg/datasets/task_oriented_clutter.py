@@ -159,7 +159,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         root: str | Path,
         observation_provider: ObservationProvider | None = None,
         point_count: int = 16_384,
-        renderer_version: str = "tcd_prg_pybullet_v1",
+        renderer_version: str = "tcd_prg_pybullet_v2_variable_grid",
         camera_profile: str = "mecheye_pro_s_three_view",
         functional_region_root: str | Path | None = None,
         verifier_wrong_region_negatives: int = 8,

@@ -21,7 +21,7 @@ class PyBulletMechEyeRenderer:
         acronym_root: str | Path,
         width: int = 320,
         height: int = 200,
-        renderer_version: str = "tcd_prg_pybullet_v1",
+        renderer_version: str = "tcd_prg_pybullet_v2_variable_grid",
     ) -> None:
         self.scene_root = Path(scene_root)
         self.acronym_root = Path(acronym_root)
@@ -148,4 +148,3 @@ class PyBulletMechEyeRenderer:
             return deterministic_stratified_sample(union, request.point_count, request.render_seed)
         finally:
             p.disconnect(client)
-

@@ -59,16 +59,40 @@ def _pad_square(arrays: list[np.ndarray], value: float | int = 0) -> Tensor:
     return torch.from_numpy(output)
 
 
-def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
+def grid_sample_indices(xyz: np.ndarray, grid_size_m: float, training: bool) -> np.ndarray:
+    """Select one representative per occupied voxel like Pointcept GridSample."""
+
+    if grid_size_m <= 0 or len(xyz) == 0:
+        return np.arange(len(xyz), dtype=np.int64)
+    grid = np.floor((xyz - xyz.min(0)) / grid_size_m).astype(np.int64)
+    _, inverse, counts = np.unique(grid, axis=0, return_inverse=True, return_counts=True)
+    order = np.argsort(inverse, kind="stable")
+    starts = np.cumsum(np.r_[0, counts[:-1]])
+    if training:
+        # Exact vectorized rule used by Pointcept's train-mode GridSample.
+        offsets = np.random.randint(0, counts.max(), len(counts)) % counts
+    else:
+        offsets = np.zeros(len(counts), dtype=np.int64)
+    return order[starts + offsets]
+
+
+def collate_unified(
+    samples: list[UnifiedSample], *, grid_size_m: float | None = None, training: bool = False
+) -> dict[str, Any]:
     if not samples:
         raise ValueError("Cannot collate an empty batch")
     observations = [x.observation for x in samples]
     candidates = [x.candidates for x in samples]
+    point_indices = [
+        grid_sample_indices(x.xyz, float(grid_size_m), training)
+        if grid_size_m is not None else np.arange(len(x.xyz), dtype=np.int64)
+        for x in observations
+    ]
     # 所有变长轴都同时生成显式 mask，后续网络不得把 padding 当作真实点或候选。
-    xyz, point_mask = _pad([x.xyz for x in observations])
-    rgb, _ = _pad([x.rgb for x in observations])
-    instance, _ = _pad([x.instance_id for x in observations], -1)
-    target_mask, _ = _pad([x.target_mask for x in observations], False)
+    xyz, point_mask = _pad([x.xyz[i] for x, i in zip(observations, point_indices, strict=True)])
+    rgb, _ = _pad([x.rgb[i] for x, i in zip(observations, point_indices, strict=True)])
+    instance, _ = _pad([x.instance_id[i] for x, i in zip(observations, point_indices, strict=True)], -1)
+    target_mask, _ = _pad([x.target_mask[i] for x, i in zip(observations, point_indices, strict=True)], False)
     have_region = all(x.region_target is not None and x.region_valid is not None for x in observations)
     object_pose, object_mask = _pad([x.object_pose for x in observations])
     object_present, _ = _pad([x.object_present for x in observations], False)
@@ -205,8 +229,12 @@ def collate_unified(samples: list[UnifiedSample]) -> dict[str, Any]:
         "samples": samples,
     }
     if have_region:
-        region_target, _ = _pad([x.region_target for x in observations], False)  # type: ignore[arg-type]
-        region_valid, _ = _pad([x.region_valid for x in observations], False)  # type: ignore[arg-type]
+        region_target, _ = _pad([  # type: ignore[index]
+            x.region_target[i] for x, i in zip(observations, point_indices, strict=True)
+        ], False)
+        region_valid, _ = _pad([  # type: ignore[index]
+            x.region_valid[i] for x, i in zip(observations, point_indices, strict=True)
+        ], False)
         result["region_target"] = region_target.bool()
         result["region_valid"] = region_valid.bool()
         result["visibility_target"] = torch.tensor(

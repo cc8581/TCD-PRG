@@ -21,8 +21,10 @@ class DatasetConfig:
     scene_subdir: str = "task_clutter_scenes_20_categories"
     step_labels_subdir: str = "task_training_labels_steps1_6_v1"
     action_labels_subdir: str = "task_positive_multistep_sequences"
-    scene_points: int = 16_384
-    # target_points 仅供独立资源分析器使用；正式模型输入点数由 scene_points 决定。
+    # 0 keeps the complete variable-length observation. Positive values are an
+    # optional deterministic safety cap for constrained hardware experiments.
+    scene_points: int = 0
+    # target_points 仅供独立资源分析器使用，不限制正式 PTv3 输入。
     target_points: int = 4_096
 
 
@@ -32,7 +34,7 @@ class ObservationConfig:
     render_width: int = 320
     render_height: int = 200
     camera_profile: str = "mecheye_pro_s_three_view"
-    renderer_version: str = "tcd_prg_pybullet_v1"
+    renderer_version: str = "tcd_prg_pybullet_v2_variable_grid"
     pybullet_python: str = "python"
     worker_script: str = "scripts/render_observation_worker_py38.py"
     runtime_mesh_root: str = "runtime/cache/meshes"
@@ -366,6 +368,8 @@ class TCDPRGConfig:
             raise ValueError("backbone.backend must be point_transformer_v3 or legacy")
         if self.backbone.grid_size_m <= 0:
             raise ValueError("backbone.grid_size_m must be positive")
+        if self.dataset.scene_points < 0:
+            raise ValueError("dataset.scene_points must be zero (unlimited) or positive")
         if self.backbone.patch_size <= 0:
             raise ValueError("backbone.patch_size must be positive")
         if abs(self.push_distance_m - PUSH_DISTANCE_M) > 1e-7:

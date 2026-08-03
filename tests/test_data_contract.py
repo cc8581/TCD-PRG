@@ -5,8 +5,23 @@ import numpy as np
 
 from tcd_prg.constants import PUSH_DISTANCE_M, ActionType, CandidateStatus
 from tcd_prg.datasets import TaskOrientedClutterAdapter
-from tcd_prg.datasets.collate import collate_unified
+from tcd_prg.datasets.collate import collate_unified, grid_sample_indices
 from tcd_prg.datasets.task_oriented_clutter import ACTION_GROUP_INDEX_CACHE_VERSION
+
+
+def test_grid_sample_keeps_one_representative_per_voxel() -> None:
+    xyz = np.asarray([
+        [0.0, 0.0, 0.0], [0.001, 0.0, 0.0], [0.1, 0.0, 0.0],
+    ], dtype=np.float32)
+    deterministic = grid_sample_indices(xyz, 0.01, training=False)
+    assert deterministic.tolist() == [0, 2]
+    state = np.random.get_state()
+    np.random.seed(7)
+    random_representative = grid_sample_indices(xyz, 0.01, training=True)
+    np.random.set_state(state)
+    assert len(random_representative) == 2
+    assert random_representative[0] in (0, 1)
+    assert random_representative[1] == 2
 
 
 def test_authoritative_training_index_avoids_scene_hdf5_scan(tmp_path) -> None:

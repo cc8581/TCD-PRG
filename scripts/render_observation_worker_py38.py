@@ -65,10 +65,13 @@ def project_world(depth, rgb, instance, camera, view_index):
 def deterministic_sample(xyz, rgb, instance, source_view, count, seed):
     if not len(xyz):
         raise RuntimeError("render produced no object pixels")
+    # count <= 0 is the formal variable-length PTv3 protocol: preserve the
+    # complete fused observation and let GridSample reduce it inside the model.
+    if count <= 0:
+        return xyz, rgb, instance, source_view
     rng = np.random.default_rng(int(seed))
     if len(xyz) <= count:
-        index = np.resize(np.arange(len(xyz), dtype=np.int64), count)
-        rng.shuffle(index)
+        return xyz, rgb, instance, source_view
     else:
         groups = np.unique(instance)
         per_group = max(1, count // max(1, len(groups)) // 2)

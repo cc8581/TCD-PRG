@@ -1,5 +1,19 @@
 # Unified data, coordinates and label semantics
 
+## Variable-length PTv3 point protocol
+
+Formal observations reconstruct the three allowed cameras at the configured
+render resolution. `dataset.scene_points=0` preserves this complete fused
+observation instead of forcing every scene to 16,384 points. At collation,
+Pointcept-compatible `GridSample` selects one representative from each 5 mm
+voxel: using Pointcept's randomized train rule and deterministically during
+validation, offline evaluation, candidate generation, and deployment. Scenes
+remain variable length and are padded only at the dense-head boundary with an
+explicit `point_mask`; PTv3 itself receives packed `coord/grid_coord/feat/batch`.
+Decoder features are aligned back to all retained supervision points through
+the voxel inverse map. Multi-megapixel source-camera pixels are resized before
+reconstruction and are never padded into a training batch.
+
 ## Sample unit
 
 The sampling key is `(scene_id, state_id, task_index, group_index)`. Each

@@ -9,6 +9,8 @@ import pytest
 from tcd_prg.config import ModelConfig, TCDPRGConfig, TrainingConfig, load_config
 from tcd_prg.observation.base import ObservationRequest
 from tcd_prg.observation.cached import CachedObservationProvider, request_hash
+from tcd_prg.observation.base import PointObservation
+from tcd_prg.observation.saved import _resize_view_nearest, deterministic_stratified_sample
 from tcd_prg.paths import PROJECT_ROOT
 
 
@@ -42,6 +44,33 @@ def test_cache_availability_is_read_only(tmp_path) -> None:
     # Renderer availability is distinct from an actual cache hit.
     assert not provider.is_available(request)
     assert list(tmp_path.rglob("*.npz")) == []
+
+
+def test_zero_scene_point_limit_preserves_variable_length_observation() -> None:
+    observation = PointObservation(
+        xyz=np.arange(21, dtype=np.float32).reshape(7, 3),
+        rgb=np.zeros((7, 3), dtype=np.float32),
+        instance_id=np.arange(7, dtype=np.int64) % 2,
+        source_view=np.zeros(7, dtype=np.int16),
+    )
+    sampled = deterministic_stratified_sample(observation, 0, seed=19)
+    assert sampled is observation
+    assert sampled.xyz.shape == (7, 3)
+
+
+def test_formal_config_uses_unlimited_variable_length_scenes() -> None:
+    config = load_config(PROJECT_ROOT / "configs" / "config.yaml")
+    assert config.dataset.scene_points == 0
+
+
+def test_saved_state_zero_is_resized_to_formal_render_resolution() -> None:
+    depth = np.arange(48, dtype=np.float32).reshape(6, 8)
+    rgb = np.zeros((6, 8, 3), dtype=np.uint8)
+    instance = np.zeros((6, 8), dtype=np.int16)
+    resized = _resize_view_nearest(depth, rgb, instance, width=4, height=3)
+    assert resized[0].shape == (3, 4)
+    assert resized[1].shape == (3, 4, 3)
+    assert resized[2].shape == (3, 4)
 
 
 def test_every_shipped_yaml_passes_strict_schema() -> None:

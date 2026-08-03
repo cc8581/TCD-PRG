@@ -157,7 +157,8 @@ def main() -> None:
         if config.ablation.use_gripper_scene_verifier
         else None
     )
-    collator = UnifiedBatchCollator(config, gripper)
+    train_collator = UnifiedBatchCollator(config, gripper, training=True)
+    validation_collator = UnifiedBatchCollator(config, gripper, training=False)
     train_sampler = (
         train_dataset.distributed_balanced_sampler(rank, world_size, config.training.seed)
         if world_size > 1 else train_dataset.balanced_sampler(config.training.seed)
@@ -169,7 +170,7 @@ def main() -> None:
         num_workers=config.training.num_workers,
         pin_memory=config.training.pin_memory,
         persistent_workers=config.training.num_workers > 0,
-        collate_fn=collator,
+        collate_fn=train_collator,
     )
     validation_sampler = (
         DistributedEvaluationSampler(len(validation_dataset), rank, world_size)
@@ -183,7 +184,7 @@ def main() -> None:
         num_workers=config.training.num_workers,
         pin_memory=config.training.pin_memory,
         persistent_workers=config.training.num_workers > 0,
-        collate_fn=collator,
+        collate_fn=validation_collator,
     ) if validation_dataset is not None and len(validation_dataset) else None
     model = TCDPRGModel(
         config.model, config.ablation, config.graph, config.router, config.backbone

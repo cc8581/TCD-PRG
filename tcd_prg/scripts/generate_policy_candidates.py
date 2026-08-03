@@ -87,7 +87,9 @@ def main() -> None:
             verifier = encoded.output.get("verifier")
             if verifier is not None:
                 candidates["evidence"][..., 2] = torch.sigmoid(verifier["overall_logit"])
-            teacher = collate_unified([sample])
+            teacher = collate_unified(
+                [sample], grid_size_m=config.backbone.grid_size_m, training=False
+            )
             labels = match_generated_candidates(candidates, teacher, 0, config.model)
             save_candidate_entry(output, sample, candidates, labels)
             valid = candidates["valid"][0].cpu()

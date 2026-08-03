@@ -49,15 +49,18 @@ def reconstruct_pinhole_world(
 
 
 def deterministic_stratified_sample(obs: PointObservation, count: int, seed: int) -> PointObservation:
-    """Instance-preserving sampling with deterministic fill from the full union."""
+    """Instance-preserving sampling, or the untouched union when ``count <= 0``."""
 
     n = len(obs.xyz)
     if n == 0:
         raise ValueError("Observation contains no object points")
+    # Pointcept/PTv3 accepts variable-length scenes. A non-positive limit keeps
+    # every reconstructed sensor point; padding is introduced only by collation.
+    if count <= 0:
+        return obs
     rng = np.random.default_rng(seed)
     if n <= count:
-        index = np.resize(np.arange(n, dtype=np.int64), count)
-        rng.shuffle(index)
+        return obs
     else:
         groups = np.unique(obs.instance_id)
         per_group = max(1, count // max(1, len(groups)) // 2)
@@ -78,13 +81,43 @@ def deterministic_stratified_sample(obs: PointObservation, count: int, seed: int
     return PointObservation(obs.xyz[index], obs.rgb[index], obs.instance_id[index], obs.source_view[index])
 
 
+def _resize_view_nearest(
+    depth: np.ndarray, rgb: np.ndarray, instance: np.ndarray, width: int, height: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Match cached state-0 views to the formal PyBullet render resolution."""
+
+    source_height, source_width = depth.shape
+    if (source_width, source_height) == (width, height):
+        return depth, rgb, instance
+    y = np.minimum(
+        ((np.arange(height) + 0.5) * source_height / height).astype(np.int64),
+        source_height - 1,
+    )
+    x = np.minimum(
+        ((np.arange(width) + 0.5) * source_width / width).astype(np.int64),
+        source_width - 1,
+    )
+    index = np.ix_(y, x)
+    return depth[index], rgb[index], instance[index]
+
+
 class SavedObservationProvider(ObservationProvider):
     """State-0 provider. Intermediate states must use a rendered provider."""
 
-    def __init__(self, scene_root: str | Path, metadata_file: str | Path, point_count: int = 16_384):
+    def __init__(
+        self,
+        scene_root: str | Path,
+        metadata_file: str | Path,
+        point_count: int = 0,
+        width: int | None = None,
+        height: int | None = None,
+    ):
         self.scene_root = Path(scene_root)
         self.metadata = json.loads(Path(metadata_file).read_text(encoding="utf-8"))
         self.point_count = point_count
+        source_width, source_height = self.metadata["image_size"]
+        self.width = int(width or source_width)
+        self.height = int(height or source_height)
         self.cameras = [c for c in self.metadata["camera_parameters"] if c["sensor_type"] != "oracle"]
         if len(self.cameras) != 3:
             raise ValueError("Formal input requires exactly three non-Oracle PRO S cameras")
@@ -97,16 +130,30 @@ class SavedObservationProvider(ObservationProvider):
             camera_types = data["view_camera_type"].astype(str)
             if any(x.lower() == "oracle" for x in camera_types[:3]) or camera_types[3].lower() != "oracle":
                 raise ValueError("Unexpected camera order; refusing possible Oracle leakage")
-            views = [
-                reconstruct_pinhole_world(
-                    data["view_depth"][i], data["view_rgb"][i], data["view_instance"][i], camera, i
+            views = []
+            for i, camera in enumerate(self.cameras):
+                depth = data["view_depth"][i]
+                rgb = data["view_rgb"][i]
+                instance = data["view_instance"][i]
+                source_height, source_width = depth.shape
+                depth, rgb, instance = _resize_view_nearest(
+                    depth, rgb, instance, self.width, self.height
                 )
-                for i, camera in enumerate(self.cameras)
-            ]
+                scaled_camera = dict(camera)
+                scaled_camera.update(
+                    fx=float(camera["fx"]) * self.width / source_width,
+                    fy=float(camera["fy"]) * self.height / source_height,
+                    cx=(float(camera["cx"]) + 0.5) * self.width / source_width - 0.5,
+                    cy=(float(camera["cy"]) + 0.5) * self.height / source_height - 0.5,
+                )
+                views.append(
+                    reconstruct_pinhole_world(depth, rgb, instance, scaled_camera, i)
+                )
         union = PointObservation(
             np.concatenate([x.xyz for x in views]),
             np.concatenate([x.rgb for x in views]),
             np.concatenate([x.instance_id for x in views]),
             np.concatenate([x.source_view for x in views]),
         )
-        return deterministic_stratified_sample(union, request.point_count or self.point_count, request.render_seed)
+        count = request.point_count if request.point_count != 0 else self.point_count
+        return deterministic_stratified_sample(union, count, request.render_seed)

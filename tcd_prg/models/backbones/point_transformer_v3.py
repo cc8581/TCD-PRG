@@ -49,10 +49,11 @@ def _load_official_model(source_root: str | Path) -> type[nn.Module]:
 class PointTransformerV3SceneGeometryBackbone(nn.Module):
     """Produce padded TCD-PRG features with one official PTv3 pass per scene.
 
-    Multiple camera samples can occupy the same voxel. They are averaged before
-    PTv3 and mapped back to every original valid point afterwards. This matches
-    Pointcept's required voxelized sparse input while preserving dataset point
-    alignment for all dense prediction heads.
+    The collator applies Pointcept GridSample to the complete formal-resolution
+    camera union before padding. This adapter defensively voxelizes the retained
+    variable-length points again, packs all scenes for PTv3, and uses the
+    inverse voxel map to restore feature alignment for every retained dense
+    supervision point consumed by the TCD-PRG heads.
     """
 
     def __init__(
@@ -114,9 +115,21 @@ class PointTransformerV3SceneGeometryBackbone(nn.Module):
         voxel_key = torch.cat((flat_batch[:, None], grid), -1)
         unique_key, inverse = torch.unique(voxel_key, dim=0, sorted=True, return_inverse=True)
         voxel_count = unique_key.shape[0]
-        counts = torch.bincount(inverse, minlength=voxel_count).to(flat_xyz.dtype)[:, None]
-        voxel_xyz = flat_xyz.new_zeros((voxel_count, 3)).index_add_(0, inverse, flat_xyz) / counts
-        voxel_rgb = flat_rgb.new_zeros((voxel_count, 3)).index_add_(0, inverse, flat_rgb) / counts
+        counts = torch.bincount(inverse, minlength=voxel_count)
+        # Repeat Pointcept's randomized representative rule for direct callers
+        # that did not pass through the formal collator. Evaluation and
+        # deployment select the first point deterministically.
+        order = torch.argsort(inverse, stable=True)
+        starts = torch.cumsum(counts, 0) - counts
+        if self.training:
+            offsets = torch.randint(
+                0, int(counts.max().item()), (voxel_count,), device=xyz.device
+            ) % counts
+        else:
+            offsets = torch.zeros(voxel_count, dtype=torch.long, device=xyz.device)
+        representative = order[starts + offsets]
+        voxel_xyz = flat_xyz[representative]
+        voxel_rgb = flat_rgb[representative]
         data = {
             "coord": voxel_xyz,
             "grid_coord": unique_key[:, 1:].to(torch.int32),

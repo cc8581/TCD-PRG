@@ -44,7 +44,7 @@ def test_formal_launcher_defaults_and_user_override_order(tmp_path) -> None:
     ))
     assert "backbone.backend=point_transformer_v3" in DEFAULT_OVERRIDES
     assert "backbone.enable_flash_attention=false" in arguments
-    assert "dataset.scene_points=16384" in arguments
+    assert "dataset.scene_points=0" in arguments
     assert "training.gradient_accumulation_steps=1" in arguments
     assert arguments[-1] == "training.batch_size=2"
     assert not any("dry" in argument.lower() for argument in arguments)

@@ -385,7 +385,8 @@ class Trainer:
                 f"steps={self.state.optimizer_steps}->{self.config.training.max_optimizer_steps} "
                 f"batch={self.config.training.batch_size} accumulation={accumulation} "
                 f"workers={self.config.training.num_workers} "
-                f"points={self.config.dataset.scene_points} "
+                f"points={'variable' if self.config.dataset.scene_points == 0 else self.config.dataset.scene_points} "
+                f"grid={self.config.backbone.grid_size_m:g}m "
                 f"terminal_interval={self.config.logging.log_interval}",
                 flush=True,
             )
