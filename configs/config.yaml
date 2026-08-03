@@ -239,9 +239,9 @@ planner:
 
 baseline:
   type: tcd_prg
-  gapg_root: .
-  grasp_checkpoint: pretrain_models/grasp_model.pt
-  push_checkpoint: pretrain_models/push_model.pt
+  gapg_root: third_party/GAPG
+  grasp_checkpoint: .deps/checkpoints/gapg/grasp_model.pt
+  push_checkpoint: .deps/checkpoints/gapg/push_model.pt
   graspnet_checkpoint: .deps/checkpoints/graspnet-rs.tar
 
 push_distance_m: 0.15

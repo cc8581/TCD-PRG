@@ -11,8 +11,8 @@ from typing import Any
 
 import numpy as np
 
-from tcd_prg.constants import ActionType
 from tcd_prg.baselines.base import GlobalGraspPrediction
+from tcd_prg.constants import ActionType
 from tcd_prg.datasets.types import SceneObservation
 from tcd_prg.paths import project_path, resolve_executable
 
@@ -79,15 +79,19 @@ class GAPGPolicyWrapper(ManipulationPolicy):
             path = Path(value)
             return path.resolve() if path.is_absolute() else (root / path).resolve()
 
+        def project_dependency(value: str | Path) -> Path:
+            path = Path(value)
+            return path.resolve() if path.is_absolute() else project_path(path)
+
         self.paths = GAPGPaths(
             repository=root,
             python=resolve_executable(python, must_exist=False),
-            graspnet_baseline=rooted(graspnet_baseline),
-            graspnet_api=rooted(graspnet_api),
+            graspnet_baseline=project_dependency(graspnet_baseline),
+            graspnet_api=project_dependency(graspnet_api),
             grasp_checkpoint=rooted(grasp_checkpoint),
             push_checkpoint=rooted(push_checkpoint),
             graspnet_checkpoint=rooted(graspnet_checkpoint),
-            worker=rooted(worker),
+            worker=project_dependency(worker),
         )
         self.seed = int(seed)
         self.device = device

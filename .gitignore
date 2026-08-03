@@ -10,8 +10,6 @@ data/task_clutter_scenes_smoke/
 data/runtime_mesh_cache_v1/
 mini_task_pipeline/runs/
 .deps/
-models/graspnet/
-models/graspnetAPI/
 .cache/
 outputs/
 runtime/

@@ -58,10 +58,16 @@ tcd_prg/
   baselines/         unified rules, one-shot and original GAPG wrapper
   scripts/           train/evaluate/prefetch/infer/replay entry points
   tools/             sample inspection and bounded dataset auditing
-configs/             main, six ablations and eight baselines
-scripts/             Python 3.8 PyBullet/GAPG workers and dependency setup
+training.py          canonical formal training launcher
+configs/             main, seven ablations and seven baselines
+scripts/             DDP, external PyBullet workers and dependency setup
+tools/               offline data preparation and profiling utilities
 tests/               unit, contract, real-data and overfit tests
 docs/                audit, data contract, reproduction and limitations
+assets/robots/       FR5/AG-160-95 URDF, collision meshes and provenance
+benchmarks/          small versioned fixtures for reproducible profiling
+third_party/         pinned PTv3 and the minimal GAPG comparison subset
+patches/             explicit compatibility patches for external dependencies
 ```
 
 ## Environment
@@ -104,7 +110,7 @@ Command-line `--dataset-root`, `--acronym-root`, `--functional-region-root` and
 never synchronously invokes PyBullet on the GPU path:
 
 ```powershell
-python scripts/start_training.py
+python training.py
 ```
 
 The launcher supplies the Windows RTX 3090 defaults, creates a timestamped

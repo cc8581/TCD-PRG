@@ -28,13 +28,17 @@ foreach ($dependency in $dependencies) {
     }
     $actual = git -C $destination remote get-url origin
     if ($actual -ne $dependency.Url) {
-        throw "Unexpected remote for $destination: $actual"
+        throw "Unexpected remote for ${destination}: $actual"
     }
     git -C $destination fetch --tags origin
     git -C $destination checkout --detach $dependency.Revision
     if ($dependency.Patch) {
+        $previousErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
         git -C $destination apply --reverse --check $dependency.Patch 2>$null
-        if ($LASTEXITCODE -ne 0) {
+        $alreadyPatched = $LASTEXITCODE -eq 0
+        $ErrorActionPreference = $previousErrorAction
+        if (-not $alreadyPatched) {
             git -C $destination apply --check $dependency.Patch
             git -C $destination apply $dependency.Patch
         }

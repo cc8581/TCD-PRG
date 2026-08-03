@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $RepoRoot
 try {
-    & python scripts/start_training.py --gpus $Gpus --config $Config @Overrides
+    & python training.py --gpus $Gpus --config $Config @Overrides
     if ($LASTEXITCODE -ne 0) {
         throw "Distributed training failed with exit code $LASTEXITCODE"
     }

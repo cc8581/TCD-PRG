@@ -83,9 +83,9 @@ class PlannerConfig:
 @dataclass(slots=True)
 class BaselineConfig:
     type: str = "tcd_prg"
-    gapg_root: str = "."
-    grasp_checkpoint: str = "pretrain_models/grasp_model.pt"
-    push_checkpoint: str = "pretrain_models/push_model.pt"
+    gapg_root: str = "third_party/GAPG"
+    grasp_checkpoint: str = ".deps/checkpoints/gapg/grasp_model.pt"
+    push_checkpoint: str = ".deps/checkpoints/gapg/push_model.pt"
     graspnet_checkpoint: str = ".deps/checkpoints/graspnet-rs.tar"
 
 

@@ -2,19 +2,19 @@
 
 ## Audited GAPG flow
 
-The inherited GAPG code uses `generate_grasp.py` to obtain GraspNet proposals,
-`grasp_evaluate.py` and `models/grasp_networks.py::Space_GraspFusion` to score
-local scene–gripper geometry, and `push_evaluate.py` plus
-`models/push_networks.py::Push_model` to rank sampled push poses. Its top-level
-`grasp_push_eval.py` implements grasp-first, otherwise push, followed by a new
-observation. The original method has no functional-region task token,
+The audited GAPG implementation uses GraspNet proposals, `Space_GraspFusion`
+to score local scene–gripper geometry, and `Push_model` to rank sampled push
+poses. Its policy is grasp-first, otherwise push, followed by a new observation.
+The original method has no functional-region task token,
 PICK_REMOVE action, explicit dependency graph, multi-positive hierarchical
 router or state-dependent multi-step supervision.
 
-TCD-PRG does not modify these original modules for comparison. The external
-wrapper in `tcd_prg/baselines/gapg_wrapper.py` converts the same three-PRO-S
-fusion and target instance mask to GAPG input and invokes the pinned source in a
-Python 3.8 worker.
+TCD-PRG keeps only the baseline runtime modules actually imported by the worker
+under `third_party/GAPG/`; obsolete GAPG data collection, training, demo and
+UR5e/YCB simulation files are excluded. The wrapper in
+`tcd_prg/baselines/gapg_wrapper.py` converts the same three-PRO-S fusion and
+target instance mask to GAPG input and invokes that isolated subset in Python
+3.8.
 
 ## Detailed mapping
 
@@ -55,8 +55,9 @@ set loss rather than separate weighted tasks.
 
 ## Reuse, extension and replacement
 
-Directly reused for the GAPG baseline: original grasp/push network definitions,
-preprocessing utilities and their checkpoints. Reused conceptually in the full
+Directly reused for the GAPG baseline: the minimal grasp/push network
+definitions in `third_party/GAPG/`, required preprocessing utilities and
+external checkpoints. Reused conceptually in the full
 method: complete continuous grasp-set prediction and local gripper–scene
 evaluation. Extended: three-view input wrapper, task conditioning, shared
 features and closed-loop evaluation. Newly implemented task-specific components

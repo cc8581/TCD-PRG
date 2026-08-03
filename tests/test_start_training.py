@@ -5,7 +5,7 @@ import sys
 from argparse import Namespace
 
 from scripts.launch_ddp_windows import _worker
-from scripts.start_training import DEFAULT_OVERRIDES, PROJECT, _training_arguments
+from training import DEFAULT_OVERRIDES, PROJECT, _training_arguments
 
 
 def test_formal_launcher_defaults_and_user_override_order(tmp_path) -> None:

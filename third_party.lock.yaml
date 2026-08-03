@@ -10,5 +10,10 @@ dependencies:
     url: https://github.com/graspnet/graspnetAPI.git
     revision: eb57dd2092d8dbe05312a29c3d0c22f3226efbfc
     destination: graspnetAPI
+vendored_runtime_subsets:
+  gapg:
+    destination: third_party/GAPG
+    provenance_commit: 2523dec701c7b1c01c5e481c595d622b1e0a47d2
+    purpose: original GAPG comparison worker imports only
 notes:
   - Third-party source is deliberately excluded from the TCD-PRG repository.

@@ -64,7 +64,7 @@ def main() -> None:
     parser.add_argument(
         "--dataset-snapshot",
         type=Path,
-        default=PROJECT / "reports" / "dataset_group_snapshot_20260730.json",
+        default=PROJECT / "benchmarks" / "dataset_group_snapshot.json",
     )
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
@@ -83,7 +83,7 @@ def main() -> None:
             "training.gradient_accumulation_steps=1",
         ])
     output = (args.report or (
-        PROJECT / "reports" / f"training_resource_profile_{mode}.json"
+        PROJECT / "outputs" / "profiles" / f"training_resource_profile_{mode}.json"
     )).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     csv_output = output.with_suffix(".csv")

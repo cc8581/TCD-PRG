@@ -9,6 +9,7 @@ from tcd_prg.baselines import GAPGPolicyWrapper, OneShotSequencePolicy
 from tcd_prg.config import ModelConfig
 from tcd_prg.constants import ActionType
 from tcd_prg.evaluators import OfflineModelEvaluator
+from tcd_prg.paths import PROJECT_ROOT
 from tcd_prg.planners import ClosedLoopPlanner, DenseCandidateGenerator
 from tcd_prg.planners.tcd_policy import (
     apply_verified_candidate_count_gate,
@@ -21,6 +22,20 @@ def test_gapg_wrapper_reports_every_missing_external_dependency(tmp_path) -> Non
     )
     with pytest.raises(FileNotFoundError, match="GAPG grasp checkpoint"):
         wrapper.paths.validate()
+
+
+def test_minimal_gapg_runtime_contains_every_worker_import() -> None:
+    root = PROJECT_ROOT / "third_party" / "GAPG"
+    expected = {
+        "utils.py",
+        "pytorch3d_compat.py",
+        "env/constants.py",
+        "models/grasp_networks.py",
+        "models/push_networks.py",
+        "models/pointnet2_encoder.py",
+        "models/pointnet2_utils.py",
+    }
+    assert {path.relative_to(root).as_posix() for path in root.rglob("*.py")} == expected
 
 
 def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
@@ -294,7 +309,9 @@ def test_one_shot_baseline_never_reencodes_after_initial_plan() -> None:
     class Wrapped:
         def __init__(self): self.encodes = 0
         def reset(self): pass
-        def encode_observation(self, observation): self.encodes += 1; return object()
+        def encode_observation(self, observation):
+            self.encodes += 1
+            return object()
         def generate_candidates(self, encoded):
             router = SimpleNamespace(candidate_logits=torch.tensor([[2.0, 1.0]]))
             return {"candidates": {"valid": torch.ones(1, 2, dtype=torch.bool)}, "router": router}
