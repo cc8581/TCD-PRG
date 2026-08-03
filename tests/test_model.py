@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -9,6 +11,7 @@ from tcd_prg.models.common import ActionCandidateEncoder
 from tcd_prg.models.grasp_verifier import GripperSceneTaskVerifier
 from tcd_prg.models.policy import MaskedHierarchicalCandidateRouter
 from tcd_prg.models.dependency_graph.hgt import derive_dependency_masks
+from tcd_prg.evaluators import OfflineModelEvaluator
 
 
 def _config() -> ModelConfig:
@@ -140,6 +143,28 @@ def test_model_routes_cached_generated_candidates_without_teacher_axis(tiny_batc
     model.region_head = ForbiddenHead()
     fast = model(batch, forward_mode="generated_policy")
     assert fast["generated_router"].candidate_logits.shape == (1, 2)
+    evaluation_batch = {
+        **batch,
+        "candidate_mask": torch.zeros(1, 1, dtype=torch.bool),
+        "policy_success_mask": torch.zeros(1, 1, dtype=torch.bool),
+        "evaluation_status": torch.full((1, 1), -1, dtype=torch.long),
+        "action_type": torch.full((1, 1), -1, dtype=torch.long),
+        "acted_object": torch.full((1, 1), -1, dtype=torch.long),
+        "samples": [SimpleNamespace(
+            observation=SimpleNamespace(
+                scene_id=1, state_id=0, task_index=0, target_object=1,
+                object_category_id=[0, 1, 2], task_region_id=2,
+            ),
+            state_labels=SimpleNamespace(
+                sequence_depth=0, target_visible_ratio=1.0, graspable=True,
+            ),
+        )],
+    }
+    evaluator = OfflineModelEvaluator(_config(), bootstrap_samples=0)
+    evaluator.update(evaluation_batch, fast)
+    metrics = evaluator.summarize()["metrics"]
+    assert metrics["generated_positive_coverage"]["mean"] == pytest.approx(1.0)
+    assert metrics["generated_effective_policy_row"]["mean"] == pytest.approx(1.0)
 
 
 def test_candidate_encoder_does_not_consume_pick_remove_destination() -> None:

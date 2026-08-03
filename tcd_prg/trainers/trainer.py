@@ -16,6 +16,7 @@ import torch
 from torch import Tensor, nn
 
 from tcd_prg.config import TCDPRGConfig
+from tcd_prg.evaluators.offline import OfflineModelEvaluator
 
 from .ema import ModelEMA
 from .reproducibility import seed_everything
@@ -263,6 +264,17 @@ class Trainer:
             for label, value in self._grouped_losses(record["metrics"])
         )
         metrics = record["metrics"]
+        for key, label, percent in (
+            ("region_foreground_iou", "rIoU", True),
+            ("task_grasp_known_hit_at_1", "task@1", True),
+            ("global_grasp_known_hit_at_1", "global@1", True),
+            ("verifier_overall_average_precision", "vAP", True),
+            ("direct_blocker_recall_at_3", "blockR3", True),
+            ("selected_candidate_success", "policy@1", True),
+        ):
+            if key in metrics:
+                value = float(metrics[key])
+                fields.append(f"{label}: {value:.1%}" if percent else f"{label}: {value:.4f}")
         generated = float(metrics.get("generated_states", 0.0))
         if generated:
             positive = float(metrics.get("generated_states_with_positive", 0.0))
@@ -311,7 +323,7 @@ class Trainer:
                 "git_commit": commit,
                 "torch": torch.__version__,
                 "train_metrics_schema_version": 3,
-                "validation_metrics_schema_version": 2,
+                "validation_metrics_schema_version": 3,
                 "training_events_schema_version": 1,
             }, indent=2),
             encoding="utf-8",
@@ -371,7 +383,9 @@ class Trainer:
             print(
                 f"[train-start] output={self.output_dir.resolve()} "
                 f"steps={self.state.optimizer_steps}->{self.config.training.max_optimizer_steps} "
-                f"accumulation={accumulation} "
+                f"batch={self.config.training.batch_size} accumulation={accumulation} "
+                f"workers={self.config.training.num_workers} "
+                f"points={self.config.dataset.scene_points} "
                 f"terminal_interval={self.config.logging.log_interval}",
                 flush=True,
             )
@@ -585,6 +599,9 @@ class Trainer:
                     self._apply_frozen_module_modes()
                     validation_items = 1
                     validation_details: dict[str, float] = {}
+                    performance_summary: dict[str, Any] = {
+                        "count": 0, "scene_count": 0, "metrics": {}
+                    }
                     if isinstance(validation, Mapping):
                         summaries: list[Mapping[str, Any]] = [validation]
                         if torch.distributed.is_initialized():
@@ -613,6 +630,44 @@ class Trainer:
                             )
                             for key, value in metric_sums.items()
                         }
+                        evaluation_records = [
+                            record
+                            for item in summaries
+                            for record in item.get("evaluation_records", [])
+                        ]
+                        if evaluation_records:
+                            evaluator = OfflineModelEvaluator(
+                                self.config.model,
+                                self.config.evaluation.bootstrap_samples,
+                                self.config.evaluation.confidence,
+                                self.config.graph,
+                                self.config.evaluation,
+                            )
+                            evaluator.evaluator.records = evaluation_records
+                            record_by_key = {
+                                (
+                                    int(record["scene_id"]), int(record["state_id"]),
+                                    int(record["task_index"]),
+                                ): record
+                                for record in evaluation_records
+                            }
+                            for item in summaries:
+                                for key, decision in item.get(
+                                    "evaluation_decisions", {}
+                                ).items():
+                                    normalized = tuple(int(value) for value in key)
+                                    if normalized in record_by_key:
+                                        decision["record"] = record_by_key[normalized]
+                                    evaluator.decisions[normalized] = decision
+                            evaluator.finalize_closed_loop_replay(
+                                self.config.evaluation.horizons
+                            )
+                            performance_summary = evaluator.summarize()
+                            validation_details.update({
+                                key: float(payload["mean"])
+                                for key, payload in performance_summary["metrics"].items()
+                                if payload.get("mean") is not None
+                            })
                     elif torch.distributed.is_initialized():
                         if isinstance(validation, tuple):
                             value = torch.tensor(
@@ -640,7 +695,7 @@ class Trainer:
                         self.state.validation_without_improvement += 1
                     if self.is_primary:
                         validation_record = {
-                            "schema_version": 2,
+                            "schema_version": 3,
                             "timestamp_utc": self._timestamp(),
                             "optimizer_step": step,
                             "validation_score": score,
@@ -654,6 +709,7 @@ class Trainer:
                                 self.config.training.early_stopping_patience
                             ),
                             "metrics": validation_details,
+                            "performance": performance_summary,
                         }
                         validation_record["training_stage"] = self._training_stage(
                             validation_details

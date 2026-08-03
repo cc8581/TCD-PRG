@@ -38,7 +38,7 @@ def _parallel_jaw_rotation_distance_deg(first: np.ndarray, second: np.ndarray) -
 
 
 class GlobalGraspEvaluator:
-    """Evaluate the unified scene-executable grasp quality before/after exact certification."""
+    """Evaluate matches to known grasps without pretending an incomplete set is exhaustive."""
 
     def __init__(self, config: GlobalGraspMatchConfig | None = None) -> None:
         self.config = config or GlobalGraspMatchConfig()
@@ -133,7 +133,7 @@ class GlobalGraspEvaluator:
         tp = np.asarray(true_positive, np.float32)
         precision = np.cumsum(tp) / np.arange(1, len(tp) + 1) if len(tp) else np.empty(0)
         recall = np.cumsum(tp) / max(1, int(positive.sum())) if len(tp) else np.empty(0)
-        ap = float(np.sum(precision * tp) / max(1, int(positive.sum()))) if len(tp) else 0.0
+        known_ap = float(np.sum(precision * tp) / max(1, int(positive.sum()))) if len(tp) else 0.0
         gt_objects = set(int(value) for value in np.unique(labels.object_index[positive]))
         valid_ranked = [prediction for prediction in ranked if prediction.object_index >= 0]
         nearest_translation: list[float] = []
@@ -158,7 +158,7 @@ class GlobalGraspEvaluator:
                 nearest_translation.append(min(distances))
                 nearest_rotation.append(min(angles))
         result = {
-            f"{prefix}_ap": ap,
+            f"{prefix}_known_average_precision": known_ap,
             f"{prefix}_object_coverage": float(len(matched_objects & gt_objects) / max(1, len(gt_objects))),
             f"{prefix}_translation_error_m": float(np.mean(translation_errors)) if translation_errors else float("nan"),
             f"{prefix}_rotation_error_deg": float(np.mean(rotation_errors)) if rotation_errors else float("nan"),
@@ -170,7 +170,14 @@ class GlobalGraspEvaluator:
             f"{prefix}_approach_direction_coverage": float(len(approach_bins) / 6.0),
             f"{prefix}_grasp_clusters_per_object": float(len(valid_ranked) / max(1, len({p.object_index for p in valid_ranked}))),
         }
+        if labels.label_set_complete:
+            result[f"{prefix}_average_precision"] = known_ap
         for k in topk:
-            result[f"{prefix}_recall@{k}"] = float(recall[min(k, len(recall)) - 1]) if len(recall) else 0.0
-            result[f"{prefix}_precision@{k}"] = float(tp[:k].mean()) if len(tp[:k]) else 0.0
+            known_recall = float(recall[min(k, len(recall)) - 1]) if len(recall) else 0.0
+            known_match_rate = float(tp[:k].mean()) if len(tp[:k]) else 0.0
+            result[f"{prefix}_known_recall@{k}"] = known_recall
+            result[f"{prefix}_known_hit@{k}"] = float(known_recall > 0.0)
+            result[f"{prefix}_known_match_rate@{k}"] = known_match_rate
+            if labels.label_set_complete:
+                result[f"{prefix}_precision@{k}"] = known_match_rate
         return result

@@ -40,8 +40,8 @@ def create_observation_provider(config: TCDPRGConfig, allow_render: bool = False
         return external_provider()
     if config.observation.provider != "cached":
         raise ValueError(f"Unknown observation provider {config.observation.provider}")
-    # Rendering is an explicit caller capability. Formal training passes
-    # allow_render=False, while the offline prefetch command passes True.
+    # Rendering is an explicit caller capability. Formal training and bounded
+    # prefetch use a renderer as cache fallback; evaluation remains cache-only.
     fallback = external_provider() if allow_render else None
     return CachedObservationProvider(
         config.cache.directory,
@@ -102,7 +102,7 @@ def create_action_certifier(config: TCDPRGConfig) -> ExternalFR5AG16095Certifier
 
 @dataclass(slots=True)
 class UnifiedBatchCollator:
-    """Pickle-safe Windows DataLoader collator with cache-only geometry reads."""
+    """Pickle-safe Windows DataLoader collator with provider-backed exact geometry."""
 
     config: TCDPRGConfig
     gripper_provider: ExactAG16095GeometryProvider | None = None

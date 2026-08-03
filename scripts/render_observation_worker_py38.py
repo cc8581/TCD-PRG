@@ -130,6 +130,8 @@ def main():
         scene_id = int(request["scene_id"])
         poses = request["object_pose"].astype(np.float64)
         present = request["object_present"].astype(bool)
+        active = request["object_active"].astype(bool)
+        physical_active = present & active
         model_ids = request["object_model_ids"].astype(str)
         scales = request["object_scales"].astype(np.float64)
         point_count = int(request["point_count"])
@@ -138,10 +140,10 @@ def main():
     try:
         pb.resetSimulation(physicsClientId=client)
         body_to_object = {}
-        for index, (model_id, scale, pose, is_present) in enumerate(
-            zip(model_ids, scales, poses, present)
+        for index, (model_id, scale, pose, is_active) in enumerate(
+            zip(model_ids, scales, poses, physical_active)
         ):
-            if not bool(is_present):
+            if not bool(is_active):
                 continue
             collision_mesh, visual_mesh, scale = asset(runtime_mesh_root, model_id, scale)
             collision = pb.createCollisionShape(

@@ -16,16 +16,18 @@ they are never committed.
 ## 2. Audit and cache
 
 Run the bounded 100-state audit. It checks action encodings, fixed PUSH distance,
-UNKNOWN semantics, camera leakage, unified shapes and dataset capabilities. Run
-the prefetcher before training. Rendering is deterministic and separated from
-the GPU loop. Prewarm exact AG geometry for all observed valid widths.
+UNKNOWN semantics, camera leakage, unified shapes and dataset capabilities.
+Optionally prefetch an explicitly bounded hot set; full-dataset prefetch is not
+supported. Rendering is deterministic and occurs in DataLoader workers on a
+cache miss, before the batch reaches the GPU. AG geometry uses the same
+read-through generation policy.
 
 ## 3. Smoke gates
 
 Configure `configs/local_paths.yaml` and run `pytest -q`. Before a large job run:
 
 1. one real batch forward;
-2. launch the formal cache-only training command and stop it after startup verification;
+2. launch formal read-through-cache training and stop it after startup verification;
 3. ten-batch overfit test;
 4. one cached state inference;
 5. one labelled multi-step replay;
@@ -47,8 +49,11 @@ off, and hierarchical router versus fixed/flat routing.
 Evaluate the full method and all baselines with identical H=5, sensor input,
 target condition, test scenes, execution constraints and seeds. Reports include
 per-category, per-region, per-sequence-length and per-occlusion groups plus
-bootstrap intervals. UNKNOWN selections reduce evaluable coverage but are not
-counted as failures. Report coverage alongside task success.
+scene-cluster bootstrap intervals. UNKNOWN selections reduce evaluable coverage
+but are not counted as failures. Report coverage alongside success. Labelled
+transition replay must retain the `labelled_replay_*` prefix and must not be
+reported as online task success. Exact definitions are in
+`docs/evaluation_protocol.md`.
 
 ## 6. Repeatability record
 

@@ -36,7 +36,7 @@ DEFAULT_OVERRIDES = (
     "training.device=cuda",
     "training.amp=true",
     "training.amp_dtype=float16",
-    "training.batch_size=1",
+    "training.batch_size=4",
     "training.gradient_accumulation_steps=1",
     "training.num_workers=4",
     "training.max_optimizer_steps=100000",
@@ -248,11 +248,6 @@ def main() -> None:
     print(f"  functional_regions={functional_region}", flush=True)
     print(f"  pybullet_python={pybullet_python}", flush=True)
     print(f"  config={args.config.resolve()}", flush=True)
-    print(
-        "  backbone=PointTransformerV3 flash=false points=16384 "
-        "batch=1 accumulation=1",
-        flush=True,
-    )
     os.chdir(PROJECT)
     # 单卡直接进入训练器；Windows 多卡使用 spawn，Linux 使用 torchrun。
     if args.gpus == 1:

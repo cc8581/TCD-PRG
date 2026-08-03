@@ -37,6 +37,8 @@ class ObservationCacheMissError(FileNotFoundError):
 
 
 class CachedObservationProvider(ObservationProvider):
+    EVICTION_CHECK_INTERVAL = 128
+
     def __init__(self, cache_dir: str | Path, fallback: ObservationProvider | None = None,
                  max_bytes: int = 15 << 30, min_free_bytes: int = 20 << 30):
         self.cache_dir = Path(cache_dir)
@@ -44,24 +46,34 @@ class CachedObservationProvider(ObservationProvider):
         self.fallback = fallback
         self.max_bytes = max_bytes
         self.min_free_bytes = min_free_bytes
+        self._writes_since_eviction = 0
 
     def _path(self, key: str) -> Path:
         return self.cache_dir / key[:2] / f"{key}.npz"
 
     def is_available(self, request: ObservationRequest) -> bool:
-        return self._path(request_hash(request)).is_file() or self.fallback is not None
+        """Return whether this request is already cached without rendering."""
+
+        return self._path(request_hash(request)).is_file()
 
     def get(self, request: ObservationRequest) -> PointObservation:
         key = request_hash(request)
         path = self._path(key)
         if path.exists():
-            os.utime(path, None)
-            with np.load(path, allow_pickle=False) as data:
-                return PointObservation(data["xyz"], data["rgb"], data["instance_id"], data["source_view"])
-        # 正式 cache-only 训练缺失即失败，不会在 DataLoader worker 中静默启动渲染。
+            try:
+                os.utime(path, None)
+                with np.load(path, allow_pickle=False) as data:
+                    return PointObservation(
+                        data["xyz"], data["rgb"], data["instance_id"], data["source_view"]
+                    )
+            except FileNotFoundError:
+                # Another DataLoader worker may evict this entry between the
+                # existence check and open; treat that race as a normal miss.
+                pass
+        # Evaluation can deliberately omit fallback and remain strictly cache-only.
         if self.fallback is None:
             raise ObservationCacheMissError(
-                f"Observation {key} is not cached; run tcd-prg-prefetch before training"
+                f"Observation {key} is not cached and no renderer fallback is configured"
             )
         observation = self.fallback.get(request)
         estimated_bytes = sum(
@@ -71,8 +83,11 @@ class CachedObservationProvider(ObservationProvider):
                 observation.instance_id, observation.source_view,
             )
         )
-        self.evict(reserve_bytes=estimated_bytes)
-        if shutil.disk_usage(self.cache_dir).free < self.min_free_bytes + estimated_bytes:
+        free = shutil.disk_usage(self.cache_dir).free
+        if free < self.min_free_bytes + estimated_bytes:
+            self.evict(reserve_bytes=estimated_bytes)
+            free = shutil.disk_usage(self.cache_dir).free
+        if free < self.min_free_bytes + estimated_bytes:
             raise OSError(
                 "Observation cache write refused: configured free-space reserve "
                 f"({self.min_free_bytes} bytes) cannot be maintained"
@@ -88,18 +103,32 @@ class CachedObservationProvider(ObservationProvider):
             source_view=observation.source_view,
         )
         os.replace(temp, path)
-        self.evict()
+        # A full recursive LRU scan on every miss becomes quadratic once the
+        # cache contains tens of thousands of states. Bounded overshoot between
+        # periodic checks is at most a few worker batches.
+        self._writes_since_eviction += 1
+        if self._writes_since_eviction >= self.EVICTION_CHECK_INTERVAL:
+            self.evict()
+            self._writes_since_eviction = 0
         return observation
 
     def evict(self, reserve_bytes: int = 0) -> None:
-        files = list(self.cache_dir.glob("*/*.npz"))
-        total = sum(p.stat().st_size for p in files)
+        entries: list[tuple[Path, int, float]] = []
+        for path in self.cache_dir.glob("*/*.npz"):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            entries.append((path, stat.st_size, stat.st_atime))
+        total = sum(size for _, size, _ in entries)
         free = shutil.disk_usage(self.cache_dir).free
         if total <= self.max_bytes and free >= self.min_free_bytes + reserve_bytes:
             return
-        for path in sorted(files, key=lambda p: p.stat().st_atime):
-            size = path.stat().st_size
-            path.unlink(missing_ok=True)
+        for path, size, _ in sorted(entries, key=lambda item: item[2]):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
             total -= size
             free = shutil.disk_usage(self.cache_dir).free
             if total <= self.max_bytes and free >= self.min_free_bytes + reserve_bytes:

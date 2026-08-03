@@ -16,18 +16,23 @@ from tcd_prg.runtime import create_adapter, create_gripper_provider
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
-    parser.add_argument("--split", choices=("train", "val", "test"))
-    parser.add_argument("--max-groups", type=int)
+    parser.add_argument("--split", choices=("train", "val", "test"), default="train")
+    parser.add_argument(
+        "--max-groups", type=int, required=True,
+        help="Bounded hot-set size; full-dataset prefetch is intentionally unsupported.",
+    )
     parser.add_argument("overrides", nargs="*")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.max_groups <= 0:
+        raise ValueError("--max-groups must be positive")
     config = load_config(args.config, args.overrides)
     adapter = create_adapter(config, allow_render=True)
     unit_iterator = adapter.iter_action_groups(args.split)
-    units = list(islice(unit_iterator, args.max_groups)) if args.max_groups else list(unit_iterator)
+    units = list(islice(unit_iterator, args.max_groups))
     unique_states = sorted({unit[:3] for unit in units})
     widths = []
     for scene_id, _, _, group_index in tqdm(units, desc="scan grasp widths"):

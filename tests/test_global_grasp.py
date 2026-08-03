@@ -240,9 +240,14 @@ def test_global_evaluator_accepts_parallel_jaw_symmetric_pose() -> None:
         0, np.zeros(3), np.array([0, 0, 0, 0, 0, 1, 0], np.float32),
         0.05, 1.0, 1.0, 1.0, True, "test",
     )
-    assert GlobalGraspEvaluator().evaluate([prediction], _labels(), certified=False, topk=(1,))[
-        "scene_recall@1"
-    ] == 1.0
+    metrics = GlobalGraspEvaluator().evaluate(
+        [prediction], _labels(), certified=False, topk=(1,)
+    )
+    assert metrics["scene_known_recall@1"] == 1.0
+    assert metrics["scene_known_hit@1"] == 1.0
+    # Native grasp libraries are not exhaustive, so unmatched predictions cannot be false positives.
+    assert "scene_precision@1" not in metrics
+    assert "scene_average_precision" not in metrics
 
 
 def test_empty_global_grasp_placeholder_preserves_complete_contract() -> None:

@@ -13,11 +13,11 @@ import numpy as np
 
 
 CORE_METRICS = (
-    "task_success_rate_h5",
-    "correct_functional_region_grasp_rate",
-    "average_preparation_steps",
-    "direct_grasp_false_positive",
-    "closed_loop_recovery_rate",
+    "labelled_replay_task_success_h5",
+    "selected_candidate_success",
+    "task_grasp_known_hit_at_1",
+    "labelled_replay_preparation_actions",
+    "labelled_replay_recovery_success",
     "planning_time_s",
 )
 

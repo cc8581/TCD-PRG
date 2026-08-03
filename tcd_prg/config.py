@@ -215,6 +215,11 @@ class EvaluationConfig:
     bootstrap_samples: int = 1_000
     confidence: float = 0.95
     max_groups: int | None = None
+    # 这些阈值属于评测协议；修改后产生的结果不得与旧实验直接混合。
+    region_probability_threshold: float = 0.5
+    verifier_probability_threshold: float = 0.5
+    ranking_topk: tuple[int, ...] = (1, 5, 10)
+    calibration_bins: int = 15
     global_grasp_tracks: tuple[str, ...] = ("scene_only", "instance_assisted")
     global_translation_threshold_m: float = 0.01
     global_rotation_threshold_deg: float = 15.0
@@ -345,6 +350,16 @@ class TCDPRGConfig:
     def validate(self) -> None:
         if self.training.gradient_accumulation_steps <= 0:
             raise ValueError("training.gradient_accumulation_steps must be positive")
+        if not 0 < self.evaluation.region_probability_threshold < 1:
+            raise ValueError("evaluation.region_probability_threshold must be in (0,1)")
+        if not 0 < self.evaluation.verifier_probability_threshold < 1:
+            raise ValueError("evaluation.verifier_probability_threshold must be in (0,1)")
+        if not self.evaluation.ranking_topk or any(
+            value <= 0 for value in self.evaluation.ranking_topk
+        ):
+            raise ValueError("evaluation.ranking_topk must contain positive integers")
+        if self.evaluation.calibration_bins <= 1:
+            raise ValueError("evaluation.calibration_bins must be greater than one")
         if self.logging.log_interval <= 0:
             raise ValueError("logging.log_interval must be positive")
         if self.backbone.backend not in {"point_transformer_v3", "legacy"}:

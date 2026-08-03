@@ -106,8 +106,9 @@ Copy `configs/local_paths.example.yaml` to `configs/local_paths.yaml` once and
 set this machine's dataset and PyBullet paths there. The local file is ignored
 by Git; source code and shared configuration contain no machine-specific path.
 Command-line `--dataset-root`, `--acronym-root`, `--functional-region-root` and
-`--pybullet-python` values take precedence. The training loop is cache-only and
-never synchronously invokes PyBullet on the GPU path:
+`--pybullet-python` values take precedence. Training uses a bounded read-through
+cache; DataLoader workers render cache misses through the external PyBullet
+runtime while the GPU consumes already prepared batches:
 
 ```powershell
 python train.py
@@ -121,12 +122,16 @@ and has no dry-run mode.
 
 ```powershell
 tcd-prg-audit --config configs/config.yaml --states 100
-tcd-prg-prefetch --config configs/config.yaml --max-groups 1000
+tcd-prg-prefetch --config configs/config.yaml --split train --max-groups 1000
 tcd-prg-inspect --config configs/config.yaml --scene-id 0 --group-index 0
 ```
 
-The prefetch command deterministically reconstructs intermediate observations
-at configurable low resolution and samples them to `dataset.scene_points`.
+Formal training uses a bounded read-through LRU cache: a cache miss is rendered
+by the external PyBullet worker and then cached. The optional prefetch command
+only warms an explicitly bounded hot set; full-dataset prefetch is intentionally
+unsupported because the complete observation set is larger than the cache.
+It deterministically reconstructs intermediate observations at configurable
+low resolution and samples them to `dataset.scene_points`.
 Cache keys bind scene/state, poses, present/active masks, model IDs, scales,
 camera profile, render seed, renderer version and point-sampling configuration.
 
@@ -145,7 +150,7 @@ unexecuted and conflicting outcomes remain UNKNOWN.
 ## Training
 
 ```powershell
-# Formal cache-only training (stop the process after startup verification when testing)
+# Formal read-through-cache training (stop after startup verification when testing)
 tcd-prg-train --config configs/config.yaml
 
 # Full method
@@ -193,7 +198,9 @@ effective epoch, and generated-candidate coverage when applicable. Detailed
 metrics are not downsampled: every successful optimizer step is appended to
 `train_metrics.jsonl`, including all loss diagnostics averaged across the full
 gradient-accumulation window. `validation_metrics.jsonl` stores every validation
-score plus all averaged validation terms, while `training_events.jsonl` records
+score, loss term, and the same component metrics used by offline evaluation;
+the terminal additionally shows a small set of core IoU/AP/Recall/Top-1 values.
+`training_events.jsonl` records
 start/end, AMP-skipped windows, checkpoints, validation, and early stopping.
 
 Generated policy caches are tied to the upstream checkpoint SHA-256 and the

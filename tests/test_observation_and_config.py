@@ -37,8 +37,9 @@ def test_observation_cache_hash_binds_geometry_camera_seed_and_sampling() -> Non
 
 
 def test_cache_availability_is_read_only(tmp_path) -> None:
-    provider = CachedObservationProvider(tmp_path)
+    provider = CachedObservationProvider(tmp_path, fallback=object())
     request = _request()
+    # Renderer availability is distinct from an actual cache hit.
     assert not provider.is_available(request)
     assert list(tmp_path.rglob("*.npz")) == []
 

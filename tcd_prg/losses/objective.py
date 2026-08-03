@@ -90,7 +90,18 @@ class TCDPRGObjective(nn.Module):
             denominator = denominator + weight * flag.to(value.dtype)
         return {"loss": numerator / denominator.clamp_min(torch.finfo(reference.dtype).eps), **values}
 
-    def forward(self, model: nn.Module, batch: dict[str, Any]) -> tuple[Tensor, dict[str, Tensor]]:
+    @staticmethod
+    def _named_grasp_terms(values: dict[str, Tensor], prefix: str) -> dict[str, Tensor]:
+        """Keep Task and Global diagnostics distinct in JSONL and TensorBoard."""
+
+        return {
+            ("loss" if name == "loss" else f"{prefix}_{name.removeprefix('grasp_')}"): value
+            for name, value in values.items()
+        }
+
+    def forward(
+        self, model: nn.Module, batch: dict[str, Any], *, return_output: bool = False,
+    ) -> tuple[Tensor, dict[str, Tensor]] | tuple[Tensor, dict[str, Tensor], dict[str, Any]]:
         if bool((batch["required_grasp_count"] > self.model_config.task_grasp_candidates).any()):
             maximum = int(batch["required_grasp_count"].max())
             raise ValueError(
@@ -121,12 +132,16 @@ class TCDPRGObjective(nn.Module):
         if self.total.enabled("task_grasp"):
             task_labels = build_grasp_proposal_labels(batch, self.model_config)
             if task_labels["sample_valid"].any():
-                families["task_grasp"] = self.task_grasp(output["task_grasp"], task_labels)
+                families["task_grasp"] = self._named_grasp_terms(
+                    self.task_grasp(output["task_grasp"], task_labels), "task_grasp"
+                )
 
         if self.total.enabled("global_grasp"):
             global_labels = build_global_grasp_labels(batch, self.model_config)
             if global_labels is not None and global_labels["sample_valid"].any():
-                families["global_grasp"] = self.global_grasp(output["global_grasp"], global_labels)
+                families["global_grasp"] = self._named_grasp_terms(
+                    self.global_grasp(output["global_grasp"], global_labels), "global_grasp"
+                )
 
         if output["graph"] is not None and self.total.enabled("physical_edge"):
             graph_labels = build_graph_labels(batch)
@@ -212,4 +227,6 @@ class TCDPRGObjective(nn.Module):
                     "match_conflict", torch.zeros_like(valid)
                 ).sum().float(),
             })
+        if return_output:
+            return total, terms, output
         return total, terms

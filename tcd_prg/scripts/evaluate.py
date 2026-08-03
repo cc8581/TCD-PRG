@@ -51,7 +51,8 @@ def main() -> None:
     model.load_state_dict(checkpoint["ema"] or checkpoint["model"])
     model.eval()
     evaluator = OfflineModelEvaluator(
-        config.model, config.evaluation.bootstrap_samples, config.evaluation.confidence
+        config.model, config.evaluation.bootstrap_samples, config.evaluation.confidence,
+        config.graph, config.evaluation,
     )
     with torch.no_grad():
         for raw in loader:

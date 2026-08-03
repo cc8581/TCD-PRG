@@ -28,8 +28,9 @@ functional-region vocabulary are not hardcoded to the current dataset.
 - cameras: exactly the allowed external sensor profiles; Oracle is rejected.
 
 Intermediate states are reconstructed from source scene, state object poses,
-present/active state, model IDs/scales, render seed and camera profile. The GPU
-training loop only reads saved/cache observations.
+present/active state, model IDs/scales, render seed and camera profile. A
+bounded read-through cache serves hits; DataLoader workers render misses before
+the resulting batch reaches the GPU.
 
 ## Grasp and gripper
 

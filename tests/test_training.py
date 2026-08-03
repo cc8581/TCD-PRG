@@ -212,7 +212,7 @@ def test_validation_metrics_and_checkpoint_events_are_persisted(tmp_path, capsys
         (tmp_path / "validation_metrics.jsonl").read_text().strip()
     )
     assert validation["validation_score"] == pytest.approx(0.5)
-    assert validation["schema_version"] == 2
+    assert validation["schema_version"] == 3
     assert validation["training_stage"] == "policy_teacher"
     assert validation["metrics"]["loss_policy_candidate"] == pytest.approx(0.3)
     assert validation["improved"]

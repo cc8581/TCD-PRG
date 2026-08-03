@@ -15,7 +15,7 @@ dataset:
   target_points: 4096  # 目标物体最多保留的点数
 
 observation:
-  # 正式训练只读取已生成缓存，不在训练进程内启动场景生成。
+  # 正式训练使用有界 LRU：命中直读，cache miss 由 DataLoader worker 按需渲染。
   provider: cached
   render_width: 320
   render_height: 200
@@ -219,6 +219,11 @@ evaluation:
   bootstrap_samples: 1000
   confidence: 0.95
   max_groups: null
+  # 所有验证入口共用这些阈值和 Top-K，保证训练验证与离线评测可直接比较。
+  region_probability_threshold: 0.5
+  verifier_probability_threshold: 0.5
+  ranking_topk: [1, 5, 10]
+  calibration_bins: 15
   global_grasp_tracks: [scene_only, instance_assisted]
   global_translation_threshold_m: 0.01
   global_rotation_threshold_deg: 15.0

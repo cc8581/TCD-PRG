@@ -7,11 +7,11 @@ import atexit
 import json
 import math
 import os
+import shutil
 from dataclasses import asdict
 
 import torch
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
 
 from tcd_prg.config import load_config
 from tcd_prg.datasets import ActionStateGroupDataset, DistributedEvaluationSampler
@@ -20,40 +20,35 @@ from tcd_prg.datasets.policy_candidates import (
     validate_cache_manifest,
     validate_generated_policy_coverage,
 )
+from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import TCDPRGModel
+from tcd_prg.observation.cached import CachedObservationProvider
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter, create_gripper_provider
 from tcd_prg.trainers import Trainer
 
 
-def preflight_observation_cache(adapter, *named_datasets: tuple[str, object]) -> int:
-    """Verify every snapshotted state/task observation before model allocation."""
+def validate_read_through_observation_cache(adapter) -> dict[str, object]:
+    """Validate the bounded cache and its renderer without scanning the dataset."""
 
-    checked: set[tuple[int, int, int]] = set()
-    for split, dataset in named_datasets:
-        if dataset is None:
-            continue
-        show_progress = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-        for unit in tqdm(
-            dataset.units,
-            desc=f"preflight {split} observations",
-            unit="group",
-            disable=not show_progress,
-        ):
-            key = (unit.scene_id, unit.state_id, unit.task_index)
-            if key in checked:
-                continue
-            if not adapter.observation_available(*key):
-                scene_id, state_id, task_index = key
-                raise RuntimeError(
-                    "Cache-only training preflight failed before model initialization: "
-                    f"missing split={split} scene={scene_id} state={state_id} "
-                    f"task={task_index} after {len(checked)} cached observations. "
-                    "Formal training never renders observations synchronously. "
-                    "Run tcd-prg-prefetch for the same config, then relaunch training."
-                )
-            checked.add(key)
-    return len(checked)
+    provider = adapter.observation_provider
+    if not isinstance(provider, CachedObservationProvider):
+        raise TypeError("Formal training requires CachedObservationProvider")
+    if provider.fallback is None:
+        raise RuntimeError("Formal training requires an on-miss observation renderer")
+    usage = shutil.disk_usage(provider.cache_dir)
+    if usage.free <= provider.min_free_bytes:
+        raise OSError(
+            f"Observation cache {provider.cache_dir} has {usage.free} free bytes, "
+            f"below the configured reserve {provider.min_free_bytes}"
+        )
+    return {
+        "mode": "read-through-lru",
+        "directory": str(provider.cache_dir.resolve()),
+        "max_gb": round(provider.max_bytes / (1 << 30), 3),
+        "free_gb": round(usage.free / (1 << 30), 3),
+        "missing": "render-on-demand",
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,8 +70,7 @@ def main() -> None:
     config = load_config(args.config, args.overrides)
     if config.observation.provider != "cached":
         raise ValueError(
-            "Formal training requires observation.provider=cached; generate observations "
-            "offline with tcd-prg-prefetch"
+            "Formal training requires observation.provider=cached for bounded read-through caching"
         )
     if args.resume and args.initialize:
         raise ValueError("--resume and --initialize are mutually exclusive")
@@ -141,7 +135,9 @@ def main() -> None:
         if use_cuda:
             torch.cuda.set_device(local_rank)
             config.training.device = f"cuda:{local_rank}"
-    adapter = create_adapter(config, allow_render=False)
+    # 正式训练按需渲染 cache miss，并由有界 LRU 控制磁盘占用；不可能预存全部状态。
+    adapter = create_adapter(config, allow_render=True)
+    observation_cache = validate_read_through_observation_cache(adapter)
     train_dataset = ActionStateGroupDataset(
         adapter, split="train", max_groups=config.training.max_train_groups
     )
@@ -154,19 +150,10 @@ def main() -> None:
     )
     if not len(train_dataset):
         raise RuntimeError("The completed-file snapshot contains no training groups")
-    # 创建 DataLoader 前完整预检 cache-only 数据，缺失观测会在训练启动前集中报错。
-    cached_observations = preflight_observation_cache(
-        adapter,
-        ("train", train_dataset),
-        ("val", validation_dataset),
-    )
     if rank == 0:
-        print(
-            f"[cache-preflight] observations={cached_observations} status=ready",
-            flush=True,
-        )
+        print(f"[observation-cache] {json.dumps(observation_cache, ensure_ascii=False)}", flush=True)
     gripper = (
-        create_gripper_provider(config, allow_generate=False)
+        create_gripper_provider(config, allow_generate=True)
         if config.ablation.use_gripper_scene_verifier
         else None
     )
@@ -278,20 +265,27 @@ def main() -> None:
         total, count = 0.0, 0
         metric_sums: dict[str, float] = {}
         metric_counts: dict[str, int] = {}
+        evaluator = OfflineModelEvaluator(
+            config.model, config.evaluation.bootstrap_samples,
+            config.evaluation.confidence, config.graph, config.evaluation,
+        )
         with torch.no_grad():
             for raw in validation_loader:
                 batch = trainer._move(raw, trainer.device)
-                _, terms = objective(module, batch)
+                _, terms, model_output = objective(module, batch, return_output=True)
+                evaluator.update(batch, model_output, terms)
                 score = sum(
                     weight * float(terms[f"loss_{family}"])
                     for family, weight in config.training.validation_family_weights.items()
                     if f"loss_{family}" in terms
                 )
-                total += score
-                count += 1
+                # 验证分数按真实 state-group 数加权，最后一个不满 batch 不得与完整 batch 等权。
+                groups = int(batch["xyz"].shape[0])
+                total += score * groups
+                count += groups
                 for key, value in terms.items():
-                    metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
-                    metric_counts[key] = metric_counts.get(key, 0) + 1
+                    metric_sums[key] = metric_sums.get(key, 0.0) + float(value) * groups
+                    metric_counts[key] = metric_counts.get(key, 0) + groups
                 if count >= config.training.max_validation_groups:
                     break
         module.train()
@@ -300,6 +294,8 @@ def main() -> None:
             "score_count": count,
             "metric_sums": metric_sums,
             "metric_counts": metric_counts,
+            "evaluation_records": evaluator.evaluator.records,
+            "evaluation_decisions": evaluator.decisions,
         }
 
     state = trainer.train(
