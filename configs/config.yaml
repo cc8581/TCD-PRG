@@ -120,6 +120,7 @@ model:
 grasp_verifier:
   local_scene_points: 128
   gripper_points: 128
+  gripper_width_quantization_m: 0.001 # 1 mm 档位，最大几何近似误差 0.5 mm
 
 graph:
   physical_relations: [near, contact, support, press, occlude]
@@ -138,17 +139,17 @@ router:
   max_preparation_actions: 5
 
 losses:
-  # 第一层是各任务族的总权重；internal 是任务族内部各子损失的相对权重。
+  # 七个任务模块等预算：Graph 两项各 1/2，Push 四项各 1/4。
   region: 1.0
   task_grasp: 1.0
   global_grasp: 1.0
-  physical_edge: 1.0
-  task_edge: 1.0
+  physical_edge: 0.5
+  task_edge: 0.5
   verify_overall: 1.0
-  push_object: 1.0
-  push_contact: 1.0
-  push_direction: 1.0
-  push_potential: 1.0
+  push_object: 0.25
+  push_contact: 0.25
+  push_direction: 0.25
+  push_potential: 0.25
   policy_candidate: 1.0
   internal:
     region_focal: 1.0
@@ -184,7 +185,7 @@ training:
   max_optimizer_steps: 100000
   validation_interval: 1000     # 周期验证。
   checkpoint_interval: 1000     # 周期保存checkpoint。
-  gradient_clip_norm: 1.0
+  gradient_clip_norm: 20.0 # 联合多任务全局范数阈值；模块级诊断用于继续校准
   ema_decay: 0.999
   early_stopping_patience: 20
   deterministic: true
@@ -244,6 +245,7 @@ logging:
   backend: tensorboard
   # 终端每 log_interval 步打印核心摘要；train_metrics.jsonl 保存每个优化器步的完整指标。
   log_interval: 20
+  gradient_diagnostics_interval: 200
 
 planner:
   max_preparation_actions: 5

@@ -29,7 +29,8 @@ def request_hash(request: ObservationRequest) -> str:
         "point_count": request.point_count,
         "renderer_version": request.renderer_version,
     }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(serialized).hexdigest()
 
 
 class ObservationCacheMissError(FileNotFoundError):
@@ -128,6 +129,12 @@ class CachedObservationProvider(ObservationProvider):
             try:
                 path.unlink()
             except FileNotFoundError:
+                continue
+            except PermissionError:
+                # Windows does not allow unlinking an npz while another
+                # DataLoader worker has it open.  A locked cache entry is not
+                # corrupt and will be eligible again during the next eviction
+                # pass, so continue with the remaining LRU candidates.
                 continue
             total -= size
             free = shutil.disk_usage(self.cache_dir).free

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -7,9 +8,8 @@ import numpy as np
 import pytest
 
 from tcd_prg.config import ModelConfig, TCDPRGConfig, TrainingConfig, load_config
-from tcd_prg.observation.base import ObservationRequest
+from tcd_prg.observation.base import ObservationRequest, PointObservation
 from tcd_prg.observation.cached import CachedObservationProvider, request_hash
-from tcd_prg.observation.base import PointObservation
 from tcd_prg.observation.saved import _resize_view_nearest, deterministic_stratified_sample
 from tcd_prg.paths import PROJECT_ROOT
 
@@ -44,6 +44,33 @@ def test_cache_availability_is_read_only(tmp_path) -> None:
     # Renderer availability is distinct from an actual cache hit.
     assert not provider.is_available(request)
     assert list(tmp_path.rglob("*.npz")) == []
+
+
+def test_cache_eviction_skips_entries_locked_by_another_worker(tmp_path, monkeypatch) -> None:
+    provider = CachedObservationProvider(
+        tmp_path, fallback=object(), max_bytes=0, min_free_bytes=0,
+    )
+    locked = tmp_path / "00" / "locked.npz"
+    removable = tmp_path / "01" / "removable.npz"
+    for path in (locked, removable):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"cache-entry")
+    os.utime(locked, (1, 1))
+    os.utime(removable, (2, 2))
+
+    original_unlink = Path.unlink
+
+    def unlink_unless_locked(path: Path, *args, **kwargs) -> None:
+        if path == locked:
+            raise PermissionError("entry is open in another DataLoader worker")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink_unless_locked)
+
+    provider.evict()
+
+    assert locked.exists()
+    assert not removable.exists()
 
 
 def test_zero_scene_point_limit_preserves_variable_length_observation() -> None:

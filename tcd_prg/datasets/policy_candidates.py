@@ -14,6 +14,7 @@ from torch import Tensor
 
 from tcd_prg.config import ModelConfig, TCDPRGConfig
 from tcd_prg.constants import ActionType, CandidateStatus
+from tcd_prg.geometry.gripper_provider import ExactAG16095GeometryProvider
 from tcd_prg.geometry.se3 import parallel_jaw_rotation_distance, quaternion_xyzw_to_matrix
 from tcd_prg.paths import project_path
 
@@ -88,7 +89,8 @@ def generator_signature(config: TCDPRGConfig) -> str:
         "code": {path: _path_sha256(path) for path in code_files},
     }
     if config.ablation.use_gripper_scene_verifier:
-        fields["gripper_geometry"] = _path_sha256(config.observation.gripper_cache_dir)
+        # 运行时缓存可能包含数万文件；签名绑定生成协议和资产，而不是扫描缓存内容。
+        fields["gripper_geometry_protocol"] = ExactAG16095GeometryProvider.VERSION
         fields["gripper_worker"] = _path_sha256(config.observation.gripper_worker_script)
         fields["robot_urdf"] = _path_sha256(config.dataset.fr5_ag_urdf)
     payload = json.dumps(fields, sort_keys=True, separators=(",", ":"), default=str)

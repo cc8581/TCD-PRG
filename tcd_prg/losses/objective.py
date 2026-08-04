@@ -101,7 +101,8 @@ class TCDPRGObjective(nn.Module):
 
     def forward(
         self, model: nn.Module, batch: dict[str, Any], *, return_output: bool = False,
-    ) -> tuple[Tensor, dict[str, Tensor]] | tuple[Tensor, dict[str, Tensor], dict[str, Any]]:
+        return_family_losses: bool = False,
+    ) -> Any:
         if bool((batch["required_grasp_count"] > self.model_config.task_grasp_candidates).any()):
             maximum = int(batch["required_grasp_count"].max())
             raise ValueError(
@@ -119,6 +120,10 @@ class TCDPRGObjective(nn.Module):
         )
         output = model(batch, forward_mode="generated_policy" if generated_only else "full")
         families: dict[str, dict[str, Tensor]] = {}
+        activity: dict[str, Tensor] = {
+            f"active_loss_{name}": batch["xyz"].new_zeros(())
+            for name in self.MODULE_OBJECTIVES if self.total.enabled(name)
+        }
 
         region_labels = build_region_labels(batch)
         if region_labels is not None and self.total.enabled("region"):
@@ -128,6 +133,10 @@ class TCDPRGObjective(nn.Module):
                 "region_dice": region_labels["region_valid"].any(),
                 "region_visibility": region_labels["visibility_valid"].any(),
             })
+            activity["active_loss_region"] = (
+                region_labels["region_valid"].any()
+                | region_labels["visibility_valid"].any()
+            ).float()
 
         if self.total.enabled("task_grasp"):
             task_labels = build_grasp_proposal_labels(batch, self.model_config)
@@ -135,6 +144,7 @@ class TCDPRGObjective(nn.Module):
                 families["task_grasp"] = self._named_grasp_terms(
                     self.task_grasp(output["task_grasp"], task_labels), "task_grasp"
                 )
+                activity["active_loss_task_grasp"] = task_labels["sample_valid"].any().float()
 
         if self.total.enabled("global_grasp"):
             global_labels = build_global_grasp_labels(batch, self.model_config)
@@ -142,18 +152,26 @@ class TCDPRGObjective(nn.Module):
                 families["global_grasp"] = self._named_grasp_terms(
                     self.global_grasp(output["global_grasp"], global_labels), "global_grasp"
                 )
+                activity["active_loss_global_grasp"] = global_labels["sample_valid"].any().float()
 
         if output["graph"] is not None and self.total.enabled("physical_edge"):
             graph_labels = build_graph_labels(batch)
             graph_losses = self.graph(output["graph"], graph_labels)
             families["physical_edge"] = {"loss": graph_losses["physical_edge"]}
             families["task_edge"] = {"loss": graph_losses["task_edge"]}
+            activity["active_loss_physical_edge"] = graph_labels[
+                "physical_edge_valid"
+            ].any().float()
+            activity["active_loss_task_edge"] = graph_labels["task_edge_valid"].any().float()
 
         if output["verifier"] is not None and self.total.enabled("verify_overall"):
             verifier_labels = build_verifier_labels(batch)
             families["verify_overall"] = {
                 "loss": self.verify(output["verifier"], verifier_labels)
             }
+            activity["active_loss_verify_overall"] = verifier_labels[
+                "overall_valid"
+            ].any().float()
 
         if self.total.enabled("push_object"):
             push_output, push_labels = build_push_supervision(
@@ -169,9 +187,21 @@ class TCDPRGObjective(nn.Module):
             }
             if self.total.enabled("push_potential"):
                 families["push_potential"] = {"loss": push_losses["push_potential"]}
+            activity.update({
+                "active_loss_push_object": self._listwise_active(
+                    push_labels["object_positive"], push_labels["object_valid_mask"]
+                ).float(),
+                "active_loss_push_contact": push_labels["contact_valid"].any().float(),
+                "active_loss_push_direction": push_labels["direction_valid"].any().float(),
+            })
+            if self.total.enabled("push_potential"):
+                activity["active_loss_push_potential"] = push_labels[
+                    "utility_valid"
+                ].any().float()
 
         if self.total.enabled("policy_candidate") and self.ablation.router_type != "fixed_priority":
             teacher_loss = None
+            teacher_active = None
             if "router" in output:
                 evaluated = batch["policy_success_mask"] | (
                     batch["evaluation_status"] == int(CandidateStatus.NEGATIVE)
@@ -179,7 +209,11 @@ class TCDPRGObjective(nn.Module):
                 teacher_loss = self.policy(
                     output["router"], batch["policy_success_mask"], evaluated
                 )
+                teacher_active = self._listwise_active(
+                    batch["policy_success_mask"], evaluated
+                )
             generated_loss = None
+            generated_active = None
             generated = batch.get("generated_policy_candidates")
             if "generated_router" in output and generated is not None:
                 # 三态标签：UNKNOWN 不进入分母；只有认证后的正/负候选参与排序损失。
@@ -189,6 +223,9 @@ class TCDPRGObjective(nn.Module):
                 generated_loss = self.policy(
                     output["generated_router"], generated["policy_success"],
                     generated_evaluated,
+                )
+                generated_active = self._listwise_active(
+                    generated["policy_success"], generated_evaluated
                 )
             # 课程学习可在干净 teacher candidates 与真实生成误差的 candidates 间插值。
             ratio = self.generated_policy_candidate_ratio
@@ -203,7 +240,18 @@ class TCDPRGObjective(nn.Module):
                     "Generated policy training is enabled but the batch has no generated candidates"
                 )
             families["policy_candidate"] = {"loss": policy_loss}
+            policy_active = torch.zeros((), dtype=torch.bool, device=policy_loss.device)
+            if teacher_active is not None and ratio < 1.0:
+                policy_active |= teacher_active
+            if generated_active is not None and ratio > 0.0:
+                policy_active |= generated_active
+            activity["active_loss_policy_candidate"] = policy_active.float()
         total, terms = self.total(families)
+        terms.update(activity)
+        weighted_family_losses = {
+            name: float(self.total.weights[name]) * values["loss"]
+            for name, values in families.items() if self.total.enabled(name)
+        }
         generated = batch.get("generated_policy_candidates")
         if generated is not None:
             valid = generated["valid"]
@@ -227,6 +275,10 @@ class TCDPRGObjective(nn.Module):
                     "match_conflict", torch.zeros_like(valid)
                 ).sum().float(),
             })
+        if return_output and return_family_losses:
+            return total, terms, output, weighted_family_losses
         if return_output:
             return total, terms, output
+        if return_family_losses:
+            return total, terms, weighted_family_losses
         return total, terms

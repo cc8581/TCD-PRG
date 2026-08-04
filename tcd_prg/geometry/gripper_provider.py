@@ -10,24 +10,27 @@ from pathlib import Path
 
 import numpy as np
 
-from .gripper import AG16095Calibration, GripperGeometry
 from tcd_prg.paths import project_path, resolve_executable
+
+from .gripper import AG16095Calibration, GripperGeometry
 
 
 class ExactAG16095GeometryProvider:
     """Sample exact URDF collision meshes at a requested total opening."""
 
-    VERSION = "ag16095_collision_surface_v2"
+    VERSION = "ag16095_collision_surface_v3_quantized"
 
     def __init__(self, python_executable: str | Path, worker_script: str | Path,
                  urdf: str | Path, cache_dir: str | Path, point_count: int = 128,
-                 seed: int = 2026, calibration: AG16095Calibration | None = None,
+                 width_quantization_m: float = 0.001, seed: int = 2026,
+                 calibration: AG16095Calibration | None = None,
                  allow_generate: bool = True) -> None:
         self.python_executable = resolve_executable(python_executable)
         self.worker_script = project_path(worker_script)
         self.urdf = project_path(urdf)
         self.cache_dir = project_path(cache_dir)
         self.point_count, self.seed = int(point_count), int(seed)
+        self.width_quantization_m = float(width_quantization_m)
         self.calibration = calibration or AG16095Calibration()
         self.allow_generate = bool(allow_generate)
         for path in (self.worker_script, self.urdf):
@@ -35,18 +38,42 @@ class ExactAG16095GeometryProvider:
                 raise FileNotFoundError(path)
         if self.point_count <= 0:
             raise ValueError("point_count must be positive")
+        if self.width_quantization_m <= 0:
+            raise ValueError("width_quantization_m must be positive")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._urdf_digest = hashlib.sha256(self.urdf.read_bytes()).hexdigest()
+
+    def quantize_widths(self, widths_m: np.ndarray | float) -> np.ndarray:
+        """Map continuous commands to deterministic finite geometry bins."""
+
+        widths = np.asarray(self.calibration.clamp_width(widths_m), dtype=np.float64)
+        minimum = float(self.calibration.min_width_m)
+        quantized = minimum + np.rint(
+            (widths - minimum) / self.width_quantization_m
+        ) * self.width_quantization_m
+        return np.clip(
+            quantized,
+            self.calibration.min_width_m,
+            self.calibration.max_width_m,
+        )
+
+    def uniform_width_bins(self) -> np.ndarray:
+        count = int(np.ceil(
+            (self.calibration.max_width_m - self.calibration.min_width_m)
+            / self.width_quantization_m
+        ))
+        raw = self.calibration.min_width_m + np.arange(count + 1) * self.width_quantization_m
+        return np.unique(self.quantize_widths(raw))
 
     def _key(self, width_m: float) -> str:
         payload = {"version": self.VERSION, "urdf_sha256": self._urdf_digest,
                    "width_m": round(float(width_m), 7), "point_count": self.point_count,
-                   "seed": self.seed}
+                   "width_quantization_m": self.width_quantization_m, "seed": self.seed}
         return hashlib.sha256(json.dumps(payload, sort_keys=True,
                                           separators=(",", ":")).encode()).hexdigest()
 
     def get(self, width_m: float) -> GripperGeometry:
-        width = float(self.calibration.clamp_width(width_m))
+        width = float(self.quantize_widths(width_m))
         return self.get_many(np.asarray([width], dtype=np.float32))[0]
 
     def _load(self, width: float) -> GripperGeometry | None:
@@ -61,7 +88,7 @@ class ExactAG16095GeometryProvider:
         return geometry
 
     def get_many(self, widths_m: np.ndarray) -> tuple[GripperGeometry, ...]:
-        widths = np.asarray(self.calibration.clamp_width(widths_m), dtype=np.float64).reshape(-1)
+        widths = self.quantize_widths(widths_m).reshape(-1)
         unique = np.unique(np.round(widths, 7))
         geometries = {float(width): self._load(float(width)) for width in unique}
         missing = np.asarray([width for width, value in geometries.items() if value is None])
@@ -100,12 +127,17 @@ class ExactAG16095GeometryProvider:
         return tuple(geometries[float(round(float(width), 7))] for width in widths)  # type: ignore[misc]
 
     def prewarm(self, widths_m: np.ndarray) -> tuple[Path, ...]:
-        widths = np.unique(np.round(np.asarray(widths_m, dtype=np.float64), 7))
+        widths = np.unique(np.round(self.quantize_widths(widths_m), 7))
         widths = widths[np.isfinite(widths)]
         self.get_many(widths)
         paths = []
         for width in widths:
-            clamped = float(self.calibration.clamp_width(width))
-            key = self._key(clamped)
+            quantized = float(self.quantize_widths(width))
+            key = self._key(quantized)
             paths.append(self.cache_dir / key[:2] / f"{key}.npz")
         return tuple(paths)
+
+    def prewarm_uniform_bins(self) -> tuple[Path, ...]:
+        """Materialize the complete finite geometry universe before training."""
+
+        return self.prewarm(self.uniform_width_bins())

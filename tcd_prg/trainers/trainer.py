@@ -48,27 +48,39 @@ class Trainer:
         "generated_conflict_candidates",
     }
     LOSS_GROUPS = (
-        ("region", ("loss_region",)),
-        ("task_g", ("loss_task_grasp",)),
-        ("global_g", ("loss_global_grasp",)),
-        ("graph", ("loss_physical_edge", "loss_task_edge")),
-        ("verify", ("loss_verify_overall",)),
+        ("region", ("weighted_loss_region",)),
+        ("task_g", ("weighted_loss_task_grasp",)),
+        ("global_g", ("weighted_loss_global_grasp",)),
+        ("graph", ("weighted_loss_physical_edge", "weighted_loss_task_edge")),
+        ("verify", ("weighted_loss_verify_overall",)),
         (
             "push",
             (
-                "loss_push_object",
-                "loss_push_contact",
-                "loss_push_direction",
-                "loss_push_potential",
+                "weighted_loss_push_object",
+                "weighted_loss_push_contact",
+                "weighted_loss_push_direction",
+                "weighted_loss_push_potential",
             ),
         ),
-        ("policy", ("loss_policy_candidate",)),
+        ("policy", ("weighted_loss_policy_candidate",)),
     )
     TERMINAL_AVERAGE_TERMS = {
         "gradient_norm",
+        "gradient_norm_after_clip",
+        "gradient_clip_scale",
+        "gradient_clipped",
         "optimizer_step_seconds",
         "data_seconds",
         "samples_per_second",
+    }
+    GRADIENT_GROUPS = {
+        "encoder": ("encoder",),
+        "region": ("region_head",),
+        "grasp": ("grasp_decoder", "task_grasp", "global_grasp"),
+        "graph": ("graph",),
+        "verify": ("verifier",),
+        "push": ("push",),
+        "policy": ("router", "flat_router", "candidate_encoder", "candidate_evidence"),
     }
 
     def __init__(
@@ -196,9 +208,20 @@ class Trainer:
         grouped: list[tuple[str, float]] = []
         for label, keys in cls.LOSS_GROUPS:
             values = [float(record[key]) for key in keys if key in record]
+            if not values:
+                fallback = tuple(key.removeprefix("weighted_") for key in keys)
+                values = [float(record[key]) for key in fallback if key in record]
             if values:
                 grouped.append((label, sum(values)))
         return grouped
+
+    @staticmethod
+    def _group_coverage(record: Mapping[str, Any], keys: tuple[str, ...]) -> float | None:
+        values = [
+            float(record[f"active_{key.removeprefix('weighted_')}"])
+            for key in keys if f"active_{key.removeprefix('weighted_')}" in record
+        ]
+        return sum(values) / len(values) if values else None
 
     @classmethod
     def _summarize_terminal_window(
@@ -218,7 +241,14 @@ class Trainer:
                 continue
             if key in cls.COUNT_TERMS:
                 summary[key] = sum(values)
-            elif key.startswith("loss_") or key in cls.TERMINAL_AVERAGE_TERMS:
+            elif key.startswith("loss_") or key.startswith("weighted_loss_"):
+                # 缺失监督的 family 对总损失贡献为零；终端也必须按完整窗口平均。
+                summary[key] = sum(values) / len(records)
+            elif (
+                key.startswith("active_loss_")
+                or key.startswith("gradient_")
+                or key in cls.TERMINAL_AVERAGE_TERMS
+            ):
                 summary[key] = sum(values) / len(values)
         return summary
 
@@ -230,10 +260,12 @@ class Trainer:
             f"eta: {self._format_duration(float(record['eta_seconds']))}",
             f"loss: {float(record['loss_total']):.4f}",
         ]
-        fields.extend(
-            f"{label}: {value:.4f}"
-            for label, value in self._grouped_losses(record)
-        )
+        group_keys = dict(self.LOSS_GROUPS)
+        for label, value in self._grouped_losses(record):
+            keys = group_keys[label]
+            coverage = self._group_coverage(record, keys)
+            suffix = f"({coverage:.0%})" if coverage is not None and coverage < 1.0 else ""
+            fields.append(f"{label}: {value:.4f}{suffix}")
         generated = float(record.get("generated_states", 0.0))
         if generated:
             positive = float(record.get("generated_states_with_positive", 0.0))
@@ -244,7 +276,9 @@ class Trainer:
             ))
         fields.extend((
             f"lr: {max(record['learning_rates']):.3e}",
-            f"grad: {float(record['gradient_norm']):.3f}",
+            f"grad: {float(record['gradient_norm']):.3f}"
+            f"->{float(record.get('gradient_norm_after_clip', record['gradient_norm'])):.3f}",
+            f"clip: {float(record.get('gradient_clip_scale', 1.0)):.3f}",
             f"time: {float(record['optimizer_step_seconds']):.3f}",
             f"data: {float(record['data_seconds']):.3f}",
         ))
@@ -322,7 +356,7 @@ class Trainer:
             json.dumps({
                 "git_commit": commit,
                 "torch": torch.__version__,
-                "train_metrics_schema_version": 3,
+                "train_metrics_schema_version": 4,
                 "validation_metrics_schema_version": 3,
                 "training_events_schema_version": 1,
             }, indent=2),
@@ -347,6 +381,28 @@ class Trainer:
             if isinstance(value, Tensor) and value.ndim:
                 return int(value.shape[0])
         return 1
+
+    @classmethod
+    def _gradient_group_norms(cls, model: nn.Module) -> dict[str, float]:
+        """Measure disjoint top-level module norms without another backward pass."""
+
+        source = model.module if hasattr(model, "module") else model
+        squared: dict[str, Tensor] = {}
+        for name, parameter in source.named_parameters():
+            if parameter.grad is None:
+                continue
+            group = "other"
+            top = name.split(".", 1)[0]
+            for label, prefixes in cls.GRADIENT_GROUPS.items():
+                if top in prefixes:
+                    group = label
+                    break
+            value = parameter.grad.detach().float().square().sum()
+            squared[group] = squared.get(group, value.new_zeros(())) + value
+        return {
+            f"gradient_norm_{group}": float(value.sqrt())
+            for group, value in squared.items()
+        }
 
     def train(
         self,
@@ -455,9 +511,19 @@ class Trainer:
                     batch_finished_time = time.time()
                     continue
                 self.scaler.unscale_(self.optimizer)
+                diagnostics: dict[str, float] = {}
+                diagnostics_interval = self.config.logging.gradient_diagnostics_interval
+                if diagnostics_interval > 0 and (
+                    self.state.optimizer_steps + 1
+                ) % diagnostics_interval == 0:
+                    diagnostics = self._gradient_group_norms(self.model)
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), self.config.training.gradient_clip_norm
                 )
+                gradient_norm_value = float(gradient_norm)
+                clip_threshold = float(self.config.training.gradient_clip_norm)
+                clip_scale = min(1.0, clip_threshold / max(gradient_norm_value, 1e-12))
+                gradient_norm_after_clip = min(gradient_norm_value, clip_threshold)
                 previous_scale = float(self.scaler.get_scale())
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -476,7 +542,9 @@ class Trainer:
                         "amp_step_skipped",
                         previous_amp_scale=previous_scale,
                         current_amp_scale=current_scale,
-                        gradient_norm=float(gradient_norm),
+                        gradient_norm=gradient_norm_value,
+                        gradient_norm_after_clip=gradient_norm_after_clip,
+                        gradient_clip_scale=clip_scale,
                         micro_batches=window_micro_batches,
                         samples=window_samples,
                         metrics=skipped_terms,
@@ -485,7 +553,7 @@ class Trainer:
                         print(
                             f"[amp-skip step={self.state.optimizer_steps:07d}] "
                             f"scale={previous_scale:.0f}->{current_scale:.0f} "
-                            f"grad={float(gradient_norm):.3f}",
+                            f"grad={gradient_norm_value:.3f}",
                             flush=True,
                         )
                     if self.tensorboard is not None:
@@ -537,7 +605,7 @@ class Trainer:
                 )
                 if self.is_primary:
                     record = {
-                        "schema_version": 3,
+                        "schema_version": 4,
                         "timestamp_utc": self._timestamp(),
                         "optimizer_step": step,
                         "amp_skipped_steps": self.state.amp_skipped_steps,
@@ -549,7 +617,10 @@ class Trainer:
                         "generated_positive_states_seen": self.state.generated_positive_states_seen,
                         "effective_policy_rows_seen": self.state.effective_policy_rows_seen,
                         "effective_epochs": self.state.effective_epochs,
-                        "gradient_norm": float(gradient_norm),
+                        "gradient_norm": gradient_norm_value,
+                        "gradient_norm_after_clip": gradient_norm_after_clip,
+                        "gradient_clip_scale": clip_scale,
+                        "gradient_clipped": float(clip_scale < 1.0),
                         "elapsed_seconds": now - started,
                         "eta_seconds": eta_seconds,
                         "optimizer_step_seconds": step_seconds,
@@ -567,6 +638,7 @@ class Trainer:
                             else "local"
                         ),
                         "learning_rates": [group["lr"] for group in self.optimizer.param_groups],
+                        **diagnostics,
                         **aggregated_terms,
                     }
                     record["training_stage"] = self._training_stage(record)

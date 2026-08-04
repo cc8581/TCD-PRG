@@ -69,6 +69,7 @@ class MultiTaskLoss(nn.Module):
                 if name != "loss":
                     selected[name] = value.detach()
             weighted = self.weights[family] * family_total
+            selected[f"weighted_loss_{family}"] = weighted.detach()
             total = weighted if total is None else total + weighted
         if total is None:
             raise ValueError("No applicable loss objective for this dataset/configuration")

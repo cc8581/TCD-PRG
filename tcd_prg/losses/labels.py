@@ -267,11 +267,13 @@ def build_push_supervision(
     gathered["utility_delta"] = output["utility_delta"][row, point_index, direction_bin]
     center_angle = (direction_bin.float() + 0.5) * 2 * math.pi / bins
     center = torch.stack((torch.cos(center_angle), torch.sin(center_angle)), -1)
+    # 分类头学习“值得选择的方向”，失败/无改善方向只通过 utility 监督其后果。
+    positive = batch["action_improves_state"] & candidate & parameter_valid
     contact_target = torch.zeros_like(output["contact_logits"])
     contact_valid = torch.zeros_like(output["contact_logits"], dtype=torch.bool)
     sigma_sq = float(config.contact_heatmap_sigma_m) ** 2
     for batch_row in range(action_type.shape[0]):
-        for candidate_index in torch.nonzero(parameter_valid[batch_row], as_tuple=False).flatten().tolist():
+        for candidate_index in torch.nonzero(positive[batch_row], as_tuple=False).flatten().tolist():
             object_index = int(batch["acted_object"][batch_row, candidate_index])
             domain = batch["point_mask"][batch_row] & (batch["instance_id"][batch_row] == object_index)
             delta = batch["xyz"][batch_row] - parameters["push_contact_world"][batch_row, candidate_index]
@@ -281,7 +283,6 @@ def build_push_supervision(
             contact_target[batch_row] = torch.maximum(
                 contact_target[batch_row], torch.exp(-0.5 * distance_sq / sigma_sq) * neighborhood
             )
-    positive = batch["action_improves_state"] & candidate
     object_positive = torch.zeros_like(batch["object_mask"])
     for batch_row in range(action_type.shape[0]):
         objects = batch["acted_object"][batch_row, positive[batch_row]]
@@ -309,7 +310,7 @@ def build_push_supervision(
         "contact_valid": contact_valid,
         "direction_bin": direction_bin,
         "direction_residual": direction[..., :2] - center,
-        "direction_valid": parameter_valid,
+        "direction_valid": positive,
         "utility_delta": utility,
         "utility_valid": (
             parameter_valid & evaluated & (batch["potential_after_valid"] | has_failure)

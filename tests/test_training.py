@@ -169,7 +169,9 @@ def test_trainer_prints_concise_summary_and_saves_every_step_metric(
         for line in (tmp_path / "train_metrics.jsonl").read_text().splitlines()
     ]
     assert len(records) == 1
-    assert records[0]["schema_version"] == 3
+    assert records[0]["schema_version"] == 4
+    assert records[0]["gradient_norm_after_clip"] <= config.training.gradient_clip_norm
+    assert 0.0 < records[0]["gradient_clip_scale"] <= 1.0
     assert records[0]["training_stage"] == "geometry"
     assert records[0]["micro_batches"] == 2
     assert records[0]["window_samples"] == 4
@@ -182,6 +184,34 @@ def test_trainer_prints_concise_summary_and_saves_every_step_metric(
         for line in (tmp_path / "training_events.jsonl").read_text().splitlines()
     ]
     assert events == ["training_started", "training_completed"]
+
+
+def test_terminal_window_zero_fills_inactive_loss_contributions() -> None:
+    summary = Trainer._summarize_terminal_window([
+        {
+            "loss_total": 3.0, "loss_task_grasp": 2.0,
+            "active_loss_task_grasp": 1.0,
+        },
+        {"loss_total": 1.0, "active_loss_task_grasp": 0.0},
+    ])
+    assert summary["loss_total"] == pytest.approx(2.0)
+    assert summary["loss_task_grasp"] == pytest.approx(1.0)
+    assert summary["active_loss_task_grasp"] == pytest.approx(0.5)
+
+
+def test_terminal_weighted_groups_reconcile_with_total_loss() -> None:
+    records = [
+        {
+            "loss_total": 3.0,
+            "weighted_loss_task_grasp": 2.0,
+            "weighted_loss_push_object": 1.0,
+        },
+        {"loss_total": 1.0, "weighted_loss_push_object": 1.0},
+    ]
+    summary = Trainer._summarize_terminal_window(records)
+    grouped = dict(Trainer._grouped_losses(summary))
+    assert grouped == {"task_g": pytest.approx(1.0), "push": pytest.approx(1.0)}
+    assert sum(grouped.values()) == pytest.approx(summary["loss_total"])
 
 
 def test_validation_metrics_and_checkpoint_events_are_persisted(tmp_path, capsys) -> None:

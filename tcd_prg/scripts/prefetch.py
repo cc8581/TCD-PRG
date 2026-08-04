@@ -6,7 +6,6 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import islice
 
-import numpy as np
 from tqdm import tqdm
 
 from tcd_prg.config import load_config
@@ -34,13 +33,8 @@ def main() -> None:
     unit_iterator = adapter.iter_action_groups(args.split)
     units = list(islice(unit_iterator, args.max_groups))
     unique_states = sorted({unit[:3] for unit in units})
-    widths = []
-    for scene_id, _, _, group_index in tqdm(units, desc="scan grasp widths"):
-        group = adapter.load_action_group(scene_id, group_index)
-        value = group.action_parameters["grasp_width_m"]
-        widths.extend(value[np.isfinite(value)].tolist())
     provider = create_gripper_provider(config, allow_generate=True)
-    provider.prewarm(np.asarray(widths, dtype=np.float32))
+    gripper_paths = provider.prewarm_uniform_bins()
 
     def render(unit: tuple[int, int, int]):
         return adapter.load_observation(*unit).xyz.shape[0]
@@ -51,7 +45,7 @@ def main() -> None:
             future.result()
     print(
         f"prefetch complete: groups={len(units)}, states={len(unique_states)}, "
-        f"gripper_widths={len(set(round(x, 7) for x in widths))}"
+        f"gripper_width_bins={len(gripper_paths)}"
     )
 
 

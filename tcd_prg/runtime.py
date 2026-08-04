@@ -87,6 +87,7 @@ def create_gripper_provider(
         config.dataset.fr5_ag_urdf,
         config.observation.gripper_cache_dir,
         point_count=config.grasp_verifier.gripper_points,
+        width_quantization_m=config.grasp_verifier.gripper_width_quantization_m,
         seed=config.training.seed,
         allow_generate=allow_generate,
     )

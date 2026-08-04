@@ -1,8 +1,10 @@
+import pytest
 import torch
 
 from tcd_prg.config import AblationConfig, LossConfig, ModelConfig
 from tcd_prg.constants import ActionType, CandidateStatus
 from tcd_prg.datasets.capabilities import DatasetCapabilities
+from tcd_prg.diagnostics import family_gradient_norms
 from tcd_prg.losses.labels import (
     _pack_grasp_set,
     build_global_grasp_labels,
@@ -321,3 +323,22 @@ def test_push_utility_uses_ground_truth_direction_and_keeps_failed_transition() 
     assert gathered["utility_delta"].item() == 2.0
     assert labels["utility_delta"].item() == -1.0
     assert labels["utility_valid"].item()
+    assert not labels["direction_valid"].item()
+    assert not labels["contact_valid"].any()
+
+    positive_batch = {**batch, "action_improves_state": torch.ones(1, 1, dtype=torch.bool)}
+    _, positive_labels = build_push_supervision(output, positive_batch, ModelConfig())
+    assert positive_labels["direction_valid"].item()
+    assert positive_labels["contact_valid"].any()
+
+
+def test_family_gradient_audit_reports_weighted_shared_norms() -> None:
+    parameter = torch.tensor([1.0, -2.0], requires_grad=True)
+    first = parameter.square().sum()
+    second = (3.0 * parameter).sum()
+    result = family_gradient_norms(
+        {"first": first, "second": second}, (parameter,), first + second
+    )
+    assert result["first"] == pytest.approx(float((2.0 * parameter).norm()))
+    assert result["second"] == pytest.approx(float(torch.full_like(parameter, 3.0).norm()))
+    assert result["total"] == pytest.approx(float((2.0 * parameter + 3.0).norm()))

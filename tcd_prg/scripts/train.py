@@ -152,11 +152,22 @@ def main() -> None:
         raise RuntimeError("The completed-file snapshot contains no training groups")
     if rank == 0:
         print(f"[observation-cache] {json.dumps(observation_cache, ensure_ascii=False)}", flush=True)
-    gripper = (
-        create_gripper_provider(config, allow_generate=True)
-        if config.ablation.use_gripper_scene_verifier
-        else None
-    )
+    gripper = None
+    if config.ablation.use_gripper_scene_verifier:
+        if rank == 0:
+            # 正式训练只在 DataLoader 启动前生成有限宽度档位；worker 永不调用 PyBullet。
+            gripper = create_gripper_provider(config, allow_generate=True)
+            gripper_paths = gripper.prewarm_uniform_bins()
+            gripper.allow_generate = False
+            print(
+                f"[gripper-cache] ready bins={len(gripper_paths)} "
+                f"quantization={config.grasp_verifier.gripper_width_quantization_m:g}m",
+                flush=True,
+            )
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        if rank != 0:
+            gripper = create_gripper_provider(config, allow_generate=False)
     train_collator = UnifiedBatchCollator(config, gripper, training=True)
     validation_collator = UnifiedBatchCollator(config, gripper, training=False)
     train_sampler = (
@@ -248,6 +259,7 @@ def main() -> None:
             json.dump({
                 "dataset_capabilities": asdict(adapter.capabilities),
                 "enabled": enabled,
+                "family_weights": objective.total.weights,
                 "disabled": {name: "dataset capability or ablation"
                              for name, value in enabled.items() if not value},
             }, handle, ensure_ascii=False, indent=2)

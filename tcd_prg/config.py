@@ -179,7 +179,8 @@ class TrainingConfig:
     # validation_interval=0 仅用于没有验证集的启动阶段，正式实验不应关闭验证。
     validation_interval: int = 1_000
     checkpoint_interval: int = 1_000
-    gradient_clip_norm: float = 1.0
+    # 联合目标的全局梯度范数远大于单任务 Transformer；20 仅截断实测尖峰。
+    gradient_clip_norm: float = 20.0
     ema_decay: float | None = 0.999
     early_stopping_patience: int = 20
     deterministic: bool = True
@@ -237,6 +238,8 @@ class GraspVerifierConfig:
     # Verifier 仅打包有效抓取候选；128+128 个点控制局部自注意力的二次复杂度。
     local_scene_points: int = 128
     gripper_points: int = 128
+    # 连续夹爪宽度映射到有限档位，避免训练 worker 为每个浮点宽度启动 PyBullet。
+    gripper_width_quantization_m: float = 0.001
 
 
 @dataclass(slots=True)
@@ -265,17 +268,17 @@ class RouterConfig:
 
 @dataclass(slots=True)
 class LossConfig:
-    # 这些权重控制任务族之间的比例；族内子损失权重单独放在 internal 中。
+    # 七个任务模块等预算：Graph 两项各占 1/2，Push 四项各占 1/4。
     region: float = 1.0
     task_grasp: float = 1.0
     global_grasp: float = 1.0
-    physical_edge: float = 1.0
-    task_edge: float = 1.0
+    physical_edge: float = 0.5
+    task_edge: float = 0.5
     verify_overall: float = 1.0
-    push_object: float = 1.0
-    push_contact: float = 1.0
-    push_direction: float = 1.0
-    push_potential: float = 1.0
+    push_object: float = 0.25
+    push_contact: float = 0.25
+    push_direction: float = 0.25
+    push_potential: float = 0.25
     policy_candidate: float = 1.0
     internal: dict[str, float] = field(default_factory=lambda: {
         "region_focal": 1.0,
@@ -324,6 +327,8 @@ class LoggingConfig:
     backend: str = "tensorboard"
     # 终端只按间隔打印核心摘要；JSONL 和 TensorBoard 保留每个成功优化器步的完整指标。
     log_interval: int = 20
+    # 模块级梯度范数只低频统计，不增加额外 backward。
+    gradient_diagnostics_interval: int = 200
 
 
 @dataclass(slots=True)
@@ -368,6 +373,8 @@ class TCDPRGConfig:
             raise ValueError("evaluation.calibration_bins must be greater than one")
         if self.logging.log_interval <= 0:
             raise ValueError("logging.log_interval must be positive")
+        if self.logging.gradient_diagnostics_interval < 0:
+            raise ValueError("gradient_diagnostics_interval must be non-negative")
         if self.backbone.backend not in {"point_transformer_v3", "legacy"}:
             raise ValueError("backbone.backend must be point_transformer_v3 or legacy")
         if self.backbone.grid_size_m <= 0:
@@ -444,6 +451,11 @@ class TCDPRGConfig:
             self.grasp_verifier.gripper_points,
         ) <= 0:
             raise ValueError("grasp verifier point budgets must be positive")
+        if not (
+            0.0 < self.grasp_verifier.gripper_width_quantization_m
+            <= self.model.max_grasp_width_m - self.model.min_grasp_width_m
+        ):
+            raise ValueError("gripper_width_quantization_m must fit the grasp width range")
         if not 0.0 <= self.training.generated_policy_candidate_ratio <= 1.0:
             raise ValueError("generated_policy_candidate_ratio must be in [0,1]")
         if self.training.validation_interval < 0:
