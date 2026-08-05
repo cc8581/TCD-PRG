@@ -167,7 +167,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         verifier_approach_negatives: int = 8,
         sampling_seed: int = 2026,
         scene_subdir: str = "task_clutter_scenes_20_categories",
-        step_labels_subdir: str = "task_training_labels_steps1_6_v1",
+        step_labels_subdir: str = "task_training_labels",
         action_labels_subdir: str = "task_positive_multistep_sequences",
         global_positive_grasps_per_object: int = 64,
         global_negative_grasps_per_object: int = 32,
@@ -218,7 +218,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             self.root.parent
             / "Grasp_20_class_object_3D_model"
             / "data"
-            / "manual_function_regions_v1"
+            / "manual_function_regions"
         )
         region_root = Path(functional_region_root) if functional_region_root else inferred_region_root
         self.functional_region_registry = FunctionalRegionRegistry(region_root) if region_root.is_dir() else None

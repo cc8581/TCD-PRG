@@ -73,6 +73,54 @@ def test_cache_eviction_skips_entries_locked_by_another_worker(tmp_path, monkeyp
     assert not removable.exists()
 
 
+def test_cache_eviction_keeps_most_recent_entries_within_capacity(tmp_path) -> None:
+    provider = CachedObservationProvider(
+        tmp_path, fallback=object(), max_bytes=2 * len(b"cache-entry"), min_free_bytes=0,
+    )
+    oldest = tmp_path / "00" / "oldest.npz"
+    middle = tmp_path / "01" / "middle.npz"
+    newest = tmp_path / "02" / "newest.npz"
+    for timestamp, path in enumerate((oldest, middle, newest), start=1):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"cache-entry")
+        os.utime(path, (timestamp, timestamp))
+
+    provider.evict()
+
+    assert not oldest.exists()
+    assert middle.exists()
+    assert newest.exists()
+
+
+def test_cache_step_cleanup_removes_completed_entries_only(tmp_path, monkeypatch) -> None:
+    provider = CachedObservationProvider(tmp_path, fallback=object())
+    removable = tmp_path / "00" / "complete.npz"
+    locked = tmp_path / "01" / "locked.npz"
+    temporary = tmp_path / "02" / "active.123.tmp.npz"
+    for path in (removable, locked, temporary):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"cache-entry")
+
+    original_unlink = Path.unlink
+
+    def unlink_unless_locked(path: Path, *args, **kwargs) -> None:
+        if path == locked:
+            raise PermissionError("entry is open in another DataLoader worker")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink_unless_locked)
+    result = provider.clear_completed()
+
+    assert result == {
+        "removed_files": 1,
+        "removed_bytes": len(b"cache-entry"),
+        "locked_files": 1,
+    }
+    assert not removable.exists()
+    assert locked.exists()
+    assert temporary.exists()
+
+
 def test_zero_scene_point_limit_preserves_variable_length_observation() -> None:
     observation = PointObservation(
         xyz=np.arange(21, dtype=np.float32).reshape(7, 3),
@@ -88,6 +136,14 @@ def test_zero_scene_point_limit_preserves_variable_length_observation() -> None:
 def test_formal_config_uses_unlimited_variable_length_scenes() -> None:
     config = load_config(PROJECT_ROOT / "configs" / "config.yaml")
     assert config.dataset.scene_points == 0
+
+
+def test_formal_config_uses_bounded_lru_and_full_validation() -> None:
+    config = load_config(PROJECT_ROOT / "configs" / "config.yaml")
+    assert config.cache.max_gb == 5.0
+    assert config.cache.eviction == "lru"
+    assert config.training.max_validation_groups is None
+    assert config.logging.validation_log_interval == 20
 
 
 def test_saved_state_zero_is_resized_to_formal_render_resolution() -> None:

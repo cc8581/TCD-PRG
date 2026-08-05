@@ -99,7 +99,7 @@ def test_checkpoint_rejects_obsolete_schema(tmp_path, tiny_batch) -> None:
     )
     path = tmp_path / "obsolete.pt"
     torch.save({"schema_version": 5}, path)
-    with pytest.raises(RuntimeError, match="expects schema 9"):
+    with pytest.raises(RuntimeError, match="expects schema 10"):
         trainer.load_checkpoint(path)
 
 
@@ -261,6 +261,34 @@ def test_validation_metrics_and_checkpoint_events_are_persisted(tmp_path, capsys
     assert "validation_completed" in events
 
 
+def test_periodic_checkpoint_overwrites_last_without_step_archives(tmp_path) -> None:
+    config = TCDPRGConfig(
+        training=TrainingConfig(
+            device="cpu", amp=False, max_optimizer_steps=2,
+            gradient_accumulation_steps=1, validation_interval=0,
+            checkpoint_interval=1,
+        ),
+        logging=LoggingConfig(backend="none", log_interval=10),
+        output_dir=str(tmp_path),
+    )
+    model = torch.nn.Linear(3, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    batch = {"x": torch.randn(2, 3)}
+
+    def loss_step(module, current):
+        loss = module(current["x"]).square().mean()
+        return loss, {"loss_total": loss}
+
+    trainer = Trainer(model, optimizer, config, loss_step)
+    finished_steps: list[int] = []
+    trainer.train([batch], step_finished=finished_steps.append)
+
+    payload = torch.load(tmp_path / "last.pt", map_location="cpu", weights_only=False)
+    assert payload["trainer_state"]["optimizer_steps"] == 2
+    assert finished_steps == [1, 2]
+    assert list(tmp_path.glob("step_*.pt")) == []
+
+
 def test_terminal_summary_averages_interval_and_shows_generated_coverage(
     tmp_path, capsys
 ) -> None:
@@ -330,7 +358,7 @@ def test_real_state_group_all_enabled_training_losses_are_finite(dataset_root) -
     provider = SavedObservationProvider(scene_root, scene_root / "metadata.json", 256)
     region_root = (
         dataset_root.parent / "Grasp_20_class_object_3D_model"
-        / "data" / "manual_function_regions_v1"
+        / "data" / "manual_function_regions"
     )
     adapter = TaskOrientedClutterAdapter(
         dataset_root, observation_provider=provider, point_count=256,
@@ -367,6 +395,25 @@ def test_distributed_training_sampler_avoids_rank_overlap() -> None:
     rank1 = set(DistributedWeightedStateSampler(weights, 1, 2, 4, seed=9))
     assert rank0.isdisjoint(rank1)
     assert rank0 | rank1 == set(range(4))
+
+
+def test_single_gpu_training_sampler_is_without_replacement() -> None:
+    weights = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0], dtype=torch.double)
+    sampler = DistributedWeightedStateSampler(weights, 0, 1, len(weights), seed=9)
+    first_epoch = list(sampler)
+    assert len(first_epoch) == len(weights)
+    assert len(set(first_epoch)) == len(weights)
+
+    sampler.set_epoch(1)
+    second_epoch = list(sampler)
+    assert len(set(second_epoch)) == len(weights)
+    assert second_epoch != first_epoch
+
+
+def test_distributed_training_sampler_rejects_non_divisible_sample_count() -> None:
+    weights = torch.ones(7, dtype=torch.double)
+    with pytest.raises(ValueError, match="divisible by world_size"):
+        DistributedWeightedStateSampler(weights, 0, 3, len(weights), seed=9)
 
 
 def test_distributed_validation_sampler_has_no_padding_or_overlap() -> None:

@@ -3,8 +3,8 @@ __pycache__/
 *.pyc
 .vscode/
 data/tiny_task_push_grasp_v0/
-data/manual_function_regions_v1/
-data/task_grasp_matches_v1/
+data/manual_function_regions/
+data/task_grasp_matches/
 data/task_clutter_scenes_v1/
 data/task_clutter_scenes_smoke/
 data/runtime_mesh_cache_v1/

@@ -122,7 +122,7 @@ def test_adapter_shapes_oracle_exclusion_and_uuid(dataset_root) -> None:
 
 def test_model_id_grasp_library_and_function_region_link(dataset_root) -> None:
     raw = dataset_root / "task_clutter_scenes_20_categories" / "scene_0000" / "scene.npz"
-    label = dataset_root / "task_training_labels_steps1_6_v1" / "scene_labels" / "scene_0000_labels.npz"
+    label = dataset_root / "task_training_labels" / "scene_labels" / "scene_0000_labels.npz"
     with np.load(raw, allow_pickle=False) as scene, np.load(label, allow_pickle=False) as steps:
         count = int(steps["object_count"])
         assert np.array_equal(scene["object_model_id"][:count], steps["object_model_id"])

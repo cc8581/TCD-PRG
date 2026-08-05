@@ -24,6 +24,7 @@ from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.observation.cached import CachedObservationProvider
+from tcd_prg.pretrained import load_pretrained_backbone, prepare_pretrained_checkpoint
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter, create_gripper_provider
 from tcd_prg.trainers import Trainer
 
@@ -137,9 +138,18 @@ def main() -> None:
             config.training.device = f"cuda:{local_rank}"
     # 正式训练按需渲染 cache miss，并由有界 LRU 控制磁盘占用；不可能预存全部状态。
     adapter = create_adapter(config, allow_render=True)
+    provider = adapter.observation_provider
+    if rank == 0 and isinstance(provider, CachedObservationProvider):
+        provider.evict()
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
     observation_cache = validate_read_through_observation_cache(adapter)
     train_dataset = ActionStateGroupDataset(
-        adapter, split="train", max_groups=config.training.max_train_groups
+        adapter,
+        split="train",
+        max_groups=config.training.max_train_groups,
+        fraction=config.training.data_fraction,
+        subset_seed=config.training.seed,
     )
     validation_dataset = (
         ActionStateGroupDataset(
@@ -150,8 +160,20 @@ def main() -> None:
     )
     if not len(train_dataset):
         raise RuntimeError("The completed-file snapshot contains no training groups")
+    if world_size > 1 and len(train_dataset) % world_size != 0:
+        raise ValueError(
+            "Multi-GPU training requires the number of training groups to be divisible "
+            f"by the GPU count: groups={len(train_dataset)}, gpus={world_size}. "
+            "Adjust training.data_fraction or the completed dataset snapshot."
+        )
     if rank == 0:
         print(f"[observation-cache] {json.dumps(observation_cache, ensure_ascii=False)}", flush=True)
+        print(
+            f"[train-data] fraction={config.training.data_fraction:g} "
+            f"groups={len(train_dataset)} "
+            f"source_groups={train_dataset.source_group_count}",
+            flush=True,
+        )
     gripper = None
     if config.ablation.use_gripper_scene_verifier:
         if rank == 0:
@@ -200,30 +222,103 @@ def main() -> None:
     model = TCDPRGModel(
         config.model, config.ablation, config.graph, config.router, config.backbone
     )
+    pretrained_report = None
+    resume_pretrained_names: list[str] = []
+    if args.resume:
+        resume_payload = torch.load(args.resume, map_location="cpu", weights_only=False)
+        resume_config = resume_payload.get("config", {})
+        resume_extra = resume_config.get("extra", {}) if isinstance(resume_config, dict) else {}
+        resume_pretrained_names = list(
+            resume_extra.get("pretrained_matched_parameter_names", [])
+        )
+        resume_training = (
+            resume_config.get("training", {}) if isinstance(resume_config, dict) else {}
+        )
+        if isinstance(resume_training, dict):
+            config.training.frozen_modules = tuple(
+                resume_training.get("frozen_modules", config.training.frozen_modules)
+            )
+            config.training.unfreeze_at_optimizer_step = resume_training.get(
+                "unfreeze_at_optimizer_step",
+                config.training.unfreeze_at_optimizer_step,
+            )
     if args.initialize:
         initialized = torch.load(args.initialize, map_location="cpu", weights_only=False)
         model.load_state_dict(initialized.get("ema") or initialized.get("model") or initialized)
+    elif not args.resume:
+        distributed = torch.distributed.is_initialized()
+        checkpoint_path = None
+        # Only rank zero may resolve a missing managed checkpoint. Other ranks
+        # wait until the atomic download and checksum validation are complete.
+        if rank == 0 or not distributed:
+            checkpoint_path = prepare_pretrained_checkpoint(
+                config.backbone, allow_download=True
+            )
+        if distributed:
+            torch.distributed.barrier()
+        if rank != 0:
+            checkpoint_path = prepare_pretrained_checkpoint(
+                config.backbone, allow_download=False
+            )
+        if checkpoint_path is not None:
+            pretrained_report = load_pretrained_backbone(
+                model, checkpoint_path, config.backbone
+            )
+            config.extra["pretrained_matched_parameter_names"] = list(
+                pretrained_report["matched_parameter_names"]
+            )
+            if rank == 0:
+                os.makedirs(config.output_dir, exist_ok=True)
+                with open(
+                    os.path.join(config.output_dir, "pretrained_backbone.json"),
+                    "w", encoding="utf-8",
+                ) as handle:
+                    json.dump(pretrained_report, handle, ensure_ascii=False, indent=2)
+                print(
+                    "[pretrained] matched_parameter_fraction="
+                    f"{pretrained_report['matched_parameter_fraction']:.1%}",
+                    flush=True,
+                )
     if config.backbone.freeze and "encoder" not in config.training.frozen_modules:
         config.training.frozen_modules = (*config.training.frozen_modules, "encoder")
-    if config.backbone.pretrained_checkpoint:
-        pretrained = torch.load(config.backbone.pretrained_checkpoint, map_location="cpu",
-                                weights_only=False)
-        state = pretrained.get("ema") or pretrained.get("model") or pretrained
-        encoder_state = {
-            key.removeprefix("encoder."): value for key, value in state.items()
-            if key.startswith("encoder.")
-        }
-        if not encoder_state:
-            raise ValueError("Pretrained checkpoint contains no compatible encoder.* weights")
-        model.encoder.load_state_dict(encoder_state, strict=True)
-    backbone_parameters = list(model.encoder.parameters())
-    backbone_ids = {id(parameter) for parameter in backbone_parameters}
-    other_parameters = [p for p in model.parameters() if id(p) not in backbone_ids]
-    # PTv3 骨干和新建动作头采用两个参数组，骨干学习率更小以保护预训练表示。
+    elif pretrained_report and config.backbone.pretrained_freeze_steps > 0:
+        prefixes = tuple(pretrained_report["freeze_prefixes"])
+        config.training.frozen_modules = tuple(dict.fromkeys(
+            (*config.training.frozen_modules, *prefixes)
+        ))
+        config.training.unfreeze_at_optimizer_step = max(
+            config.backbone.pretrained_freeze_steps,
+            config.training.unfreeze_at_optimizer_step or 0,
+        )
+
+    # Only parameters actually restored from pre-training receive the small LR.
+    pretrained_parameter_names = (
+        list(pretrained_report["matched_parameter_names"])
+        if pretrained_report is not None else resume_pretrained_names
+    )
+    if pretrained_parameter_names:
+        named_parameters = dict(model.named_parameters())
+        missing_names = [
+            name for name in pretrained_parameter_names if name not in named_parameters
+        ]
+        if missing_names:
+            raise RuntimeError(
+                "Checkpoint pre-trained parameter names do not match this model: "
+                + ", ".join(missing_names[:8])
+            )
+        low_lr_parameters = [
+            named_parameters[name] for name in pretrained_parameter_names
+        ]
+        low_lr = config.optimizer.backbone_learning_rate
+    else:
+        low_lr_parameters = list(model.encoder.parameters())
+        low_lr = config.optimizer.learning_rate
+    low_lr_ids = {id(parameter) for parameter in low_lr_parameters}
+    other_parameters = [p for p in model.parameters() if id(p) not in low_lr_ids]
     optimizer = torch.optim.AdamW(
         [
-            {"params": backbone_parameters, "lr": config.optimizer.backbone_learning_rate},
-            {"params": other_parameters, "lr": config.optimizer.learning_rate},
+            {"params": low_lr_parameters, "lr": low_lr, "name": "pretrained_trunk"},
+            {"params": other_parameters, "lr": config.optimizer.learning_rate, "name": "new_modules"},
         ],
         weight_decay=config.optimizer.weight_decay,
     )
@@ -282,8 +377,10 @@ def main() -> None:
             config.model, config.evaluation.bootstrap_samples,
             config.evaluation.confidence, config.graph, config.evaluation,
         )
+        validation_batches = len(validation_loader)
+        validation_groups = len(validation_loader.sampler)
         with torch.no_grad():
-            for raw in validation_loader:
+            for validation_step, raw in enumerate(validation_loader, start=1):
                 batch = trainer._move(raw, trainer.device)
                 _, terms, model_output = objective(module, batch, return_output=True)
                 evaluator.update(batch, model_output, terms)
@@ -299,7 +396,21 @@ def main() -> None:
                 for key, value in terms.items():
                     metric_sums[key] = metric_sums.get(key, 0.0) + float(value) * groups
                     metric_counts[key] = metric_counts.get(key, 0) + groups
-                if count >= config.training.max_validation_groups:
+                if rank == 0 and (
+                    validation_step == 1
+                    or validation_step % config.logging.validation_log_interval == 0
+                    or validation_step == validation_batches
+                ):
+                    print(
+                        f"[validation batch={validation_step:07d}/{validation_batches:07d}] "
+                        f"groups={count}/{validation_groups} "
+                        f"score={total / max(1, count):.6f}",
+                        flush=True,
+                    )
+                if (
+                    config.training.max_validation_groups is not None
+                    and count >= config.training.max_validation_groups
+                ):
                     break
         module.train()
         return {

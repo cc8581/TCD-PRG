@@ -19,13 +19,11 @@ class DatasetConfig:
     fr5_ag_urdf: str = "assets/robots/FR5_AG-160-95/urdf/fr5_ag160_95.urdf"
     adapter: str = "task_oriented_clutter"
     scene_subdir: str = "task_clutter_scenes_20_categories"
-    step_labels_subdir: str = "task_training_labels_steps1_6_v1"
+    step_labels_subdir: str = "task_training_labels"
     action_labels_subdir: str = "task_positive_multistep_sequences"
-    # 0 keeps the complete variable-length observation. Positive values are an
-    # optional deterministic safety cap for constrained hardware experiments.
     scene_points: int = 0
     # target_points 仅供独立资源分析器使用，不限制正式 PTv3 输入。
-    target_points: int = 4_096
+    target_points: int = 4096
 
 
 @dataclass(slots=True)
@@ -49,7 +47,7 @@ class ObservationConfig:
 class CacheConfig:
     directory: str = "runtime/cache/observations"
     index_directory: str = "runtime/cache/dataset_indexes"
-    max_gb: float = 15.0
+    max_gb: float = 5.0
     min_free_gb: float = 20.0
     eviction: str = "lru"
     prefetch_workers: int = 4
@@ -61,6 +59,14 @@ class BackboneConfig:
     backend: str = "point_transformer_v3"
     source_root: str = "third_party/PointTransformerV3"
     pretrained_checkpoint: str | None = None
+    pretrained_format: str = "auto"
+    pretrained_auto_download: bool = False
+    pretrained_url: str = ""
+    pretrained_sha256: str = ""
+    pretrained_cache_dir: str = "runtime/cache/pretrained"
+    pretrained_required: bool = False
+    pretrained_min_parameter_fraction: float = 0.35
+    pretrained_freeze_steps: int = 0
     freeze: bool = False
     grid_size_m: float = 0.005
     enable_flash_attention: bool = False
@@ -173,6 +179,7 @@ class TrainingConfig:
     device: str = "cuda"
     amp: bool = True
     amp_dtype: str = "float16"
+    amp_initial_scale: float = 4096.0
     batch_size: int = 1
     gradient_accumulation_steps: int = 1
     max_optimizer_steps: int = 100_000
@@ -186,8 +193,11 @@ class TrainingConfig:
     deterministic: bool = True
     num_workers: int = 4
     pin_memory: bool = True
-    max_validation_groups: int = 256
+    # None validates the complete validation split.
+    max_validation_groups: int | None = None
     max_train_groups: int | None = None
+    # Deterministic fraction of the complete training split, in (0, 1].
+    data_fraction: float = 1.0
     frozen_modules: tuple[str, ...] = ()
     unfreeze_at_optimizer_step: int | None = None
     ddp_backend: str = "auto"
@@ -327,6 +337,8 @@ class LoggingConfig:
     backend: str = "tensorboard"
     # 终端只按间隔打印核心摘要；JSONL 和 TensorBoard 保留每个成功优化器步的完整指标。
     log_interval: int = 20
+    # Validation progress is measured in validation DataLoader batches.
+    validation_log_interval: int = 20
     # 模块级梯度范数只低频统计，不增加额外 backward。
     gradient_diagnostics_interval: int = 200
 
@@ -361,6 +373,10 @@ class TCDPRGConfig:
     def validate(self) -> None:
         if self.training.gradient_accumulation_steps <= 0:
             raise ValueError("training.gradient_accumulation_steps must be positive")
+        if not 0.0 < self.training.data_fraction <= 1.0:
+            raise ValueError("training.data_fraction must be in (0,1]")
+        if self.training.amp_initial_scale <= 0:
+            raise ValueError("training.amp_initial_scale must be positive")
         if not 0 < self.evaluation.region_probability_threshold < 1:
             raise ValueError("evaluation.region_probability_threshold must be in (0,1)")
         if not 0 < self.evaluation.verifier_probability_threshold < 1:
@@ -373,10 +389,27 @@ class TCDPRGConfig:
             raise ValueError("evaluation.calibration_bins must be greater than one")
         if self.logging.log_interval <= 0:
             raise ValueError("logging.log_interval must be positive")
+        if self.logging.validation_log_interval <= 0:
+            raise ValueError("logging.validation_log_interval must be positive")
         if self.logging.gradient_diagnostics_interval < 0:
             raise ValueError("gradient_diagnostics_interval must be non-negative")
+        if (
+            self.training.max_validation_groups is not None
+            and self.training.max_validation_groups <= 0
+        ):
+            raise ValueError("training.max_validation_groups must be null or positive")
         if self.backbone.backend not in {"point_transformer_v3", "legacy"}:
             raise ValueError("backbone.backend must be point_transformer_v3 or legacy")
+        if self.backbone.pretrained_format not in {
+            "auto", "tcd_prg", "sonata", "pointcept", "ptv3"
+        }:
+            raise ValueError("Unsupported backbone.pretrained_format")
+        if not 0.0 <= self.backbone.pretrained_min_parameter_fraction <= 1.0:
+            raise ValueError("pretrained_min_parameter_fraction must be in [0,1]")
+        if self.backbone.pretrained_freeze_steps < 0:
+            raise ValueError("pretrained_freeze_steps must be non-negative")
+        if self.backbone.pretrained_auto_download and not self.backbone.pretrained_url:
+            raise ValueError("pretrained_auto_download requires pretrained_url")
         if self.backbone.grid_size_m <= 0:
             raise ValueError("backbone.grid_size_m must be positive")
         if self.dataset.scene_points < 0:

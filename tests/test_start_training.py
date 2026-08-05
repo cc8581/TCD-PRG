@@ -6,7 +6,7 @@ from argparse import Namespace
 from pathlib import Path
 
 from scripts.launch_ddp_windows import _worker
-from train import DEFAULT_OVERRIDES, PROJECT, _parse_args, _training_arguments
+from train import PROJECT, _parse_args, _training_arguments
 
 
 def test_launcher_path_arguments_have_local_config_defaults(tmp_path) -> None:
@@ -30,6 +30,12 @@ def test_launcher_path_arguments_have_local_config_defaults(tmp_path) -> None:
     assert args.output_dir.name.startswith("ptv3_full_")
     assert args.resume is None
     assert args.initialize is None
+    assert args.batch_size is None
+    assert args.num_workers is None
+    assert args.gradient_accumulation_steps is None
+    assert args.max_optimizer_steps is None
+    assert args.validation_interval is None
+    assert args.data_fraction is None
 
 
 def test_formal_launcher_defaults_and_user_override_order(tmp_path) -> None:
@@ -40,14 +46,35 @@ def test_formal_launcher_defaults_and_user_override_order(tmp_path) -> None:
         output_dir=tmp_path / "output",
         resume=None,
         initialize=None,
-        overrides=["training.batch_size=2"],
+        data_fraction=None,
     ))
-    assert "backbone.backend=point_transformer_v3" in DEFAULT_OVERRIDES
-    assert "backbone.enable_flash_attention=false" in arguments
-    assert "dataset.scene_points=0" in arguments
-    assert "training.gradient_accumulation_steps=1" in arguments
-    assert arguments[-1] == "training.batch_size=2"
+    assert not any(argument.startswith("backbone.") for argument in arguments)
+    assert not any(argument.startswith("training.") for argument in arguments)
+    assert not any(argument.startswith("cache.") for argument in arguments)
+    assert arguments[-1].startswith("output_dir=")
     assert not any("dry" in argument.lower() for argument in arguments)
+
+
+def test_launcher_data_fraction_flag_is_forwarded(tmp_path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("name: test\n", encoding="utf-8")
+    args = _parse_args([
+        "--config", str(config), "--data-fraction", "0.25",
+    ])
+    arguments = _training_arguments(args)
+    assert "training.data_fraction=0.25" in arguments
+
+
+def test_launcher_only_forwards_explicit_named_training_overrides(tmp_path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("name: test\n", encoding="utf-8")
+    args = _parse_args([
+        "--config", str(config), "--batch-size", "3", "--max-optimizer-steps", "17",
+    ])
+    arguments = _training_arguments(args)
+    assert "training.batch_size=3" in arguments
+    assert "training.max_optimizer_steps=17" in arguments
+    assert not any(argument.startswith("training.num_workers=") for argument in arguments)
 
 
 def test_windows_worker_passes_ddp_state_explicitly(monkeypatch) -> None:

@@ -15,6 +15,7 @@ from tcd_prg.losses.masked import multi_positive_listwise_loss, safe_smooth_l1
 from tcd_prg.losses.objective import TCDPRGObjective
 from tcd_prg.losses.proposal import CompleteGraspSetLoss
 from tcd_prg.losses.total import MultiTaskLoss
+from tcd_prg.losses.verifier import GraspVerifierLoss
 
 
 def test_nan_loss_is_masked() -> None:
@@ -127,6 +128,10 @@ def test_complete_grasp_hungarian_matching_keeps_two_modes_distinct() -> None:
     losses = CompleteGraspSetLoss()(output, labels)
     assert losses["grasp_translation"] < 1e-7
     assert losses["grasp_width"] < 1e-7
+    assert losses["grasp_quality_positive_queries"] == 2
+    assert losses["grasp_quality_negative_queries"] == 0
+    assert losses["grasp_ignored_unmatched_queries"] == 0
+    assert losses["grasp_supervised_rows"] == 1
     losses["loss"].backward()
 
 
@@ -174,8 +179,11 @@ def test_partial_grasp_set_does_not_make_unmatched_queries_negative() -> None:
         "sample_valid": torch.tensor([True]),
         "unmatched_quality_valid": torch.tensor([False]),
     }
-    quality = CompleteGraspSetLoss()(output, labels)["grasp_quality"]
-    assert torch.allclose(quality, torch.log(torch.tensor(2.0)))
+    losses = CompleteGraspSetLoss()(output, labels)
+    assert torch.allclose(losses["grasp_quality"], torch.log(torch.tensor(2.0)))
+    assert losses["grasp_quality_positive_queries"] == 1
+    assert losses["grasp_quality_negative_queries"] == 0
+    assert losses["grasp_ignored_unmatched_queries"] == 1
 
 
 def test_only_queries_near_explicit_negatives_receive_negative_supervision() -> None:
@@ -203,8 +211,53 @@ def test_only_queries_near_explicit_negatives_receive_negative_supervision() -> 
         "negative_width_m": torch.full((1, 1), 0.05),
         "negative_valid": torch.ones(1, 1, dtype=torch.bool),
     }
-    quality = CompleteGraspSetLoss()(output, labels)["grasp_quality"]
-    assert torch.allclose(quality, torch.log(torch.tensor(2.0)))
+    losses = CompleteGraspSetLoss()(output, labels)
+    assert torch.allclose(losses["grasp_quality"], torch.log(torch.tensor(2.0)))
+    assert losses["grasp_quality_positive_queries"] == 1
+    assert losses["grasp_quality_negative_queries"] == 1
+    assert losses["grasp_ignored_unmatched_queries"] == 1
+
+
+def test_verifier_reports_class_balance_and_prior_baseline() -> None:
+    losses = GraspVerifierLoss()(
+        {"overall_logit": torch.tensor([[2.0, -2.0], [-1.0, 3.0]])},
+        {
+            "overall_target": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            "overall_valid": torch.ones(2, 2, dtype=torch.bool),
+        },
+    )
+    assert losses["verifier_supervised_rows"] == 2
+    assert losses["verifier_positive_candidates"] == 2
+    assert losses["verifier_negative_candidates"] == 2
+    assert losses["verifier_balanced_accuracy"] == 1
+    assert losses["verifier_prior_bce"] == pytest.approx(float(torch.log(torch.tensor(2.0))))
+    assert losses["verifier_auroc"] == 1
+    assert losses["verifier_average_precision"] == 1
+    assert losses["verifier_ranking_metrics_valid"] == 1
+
+
+def test_verifier_marks_single_class_ranking_metrics_invalid() -> None:
+    losses = GraspVerifierLoss()(
+        {"overall_logit": torch.tensor([[1.0, 2.0]])},
+        {
+            "overall_target": torch.ones(1, 2),
+            "overall_valid": torch.ones(1, 2, dtype=torch.bool),
+        },
+    )
+    assert losses["verifier_ranking_metrics_valid"] == 0
+    assert losses["verifier_auroc"] == 0
+    assert losses["verifier_average_precision"] == 0
+
+
+def test_activity_helpers_report_fraction_of_supervised_rows() -> None:
+    valid = torch.tensor([[True, False], [False, False]])
+    assert TCDPRGObjective._row_active(valid).float().mean() == 0.5
+
+    positive = torch.tensor([[True, False], [True, False]])
+    evaluated = torch.tensor([[True, True], [True, False]])
+    active = TCDPRGObjective._listwise_active_rows(positive, evaluated)
+    assert active.tolist() == [True, False]
+    assert active.float().mean() == 0.5
 
 
 def test_unknown_task_grasp_marks_label_set_non_exhaustive() -> None:
@@ -323,13 +376,16 @@ def test_push_utility_uses_ground_truth_direction_and_keeps_failed_transition() 
     assert gathered["utility_delta"].item() == 2.0
     assert labels["utility_delta"].item() == -1.0
     assert labels["utility_valid"].item()
-    assert not labels["direction_valid"].item()
-    assert not labels["contact_valid"].any()
+    assert labels["direction_evaluated"].any()
+    assert not labels["direction_positive"].any()
+    assert labels["contact_valid"].any()
+    assert not (labels["contact_target"] > 0).any()
 
     positive_batch = {**batch, "action_improves_state": torch.ones(1, 1, dtype=torch.bool)}
     _, positive_labels = build_push_supervision(output, positive_batch, ModelConfig())
-    assert positive_labels["direction_valid"].item()
-    assert positive_labels["contact_valid"].any()
+    assert positive_labels["direction_positive"].any()
+    assert positive_labels["direction_residual_valid"].any()
+    assert (positive_labels["contact_target"] > 0).any()
 
 
 def test_family_gradient_audit_reports_weighted_shared_norms() -> None:

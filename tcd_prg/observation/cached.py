@@ -116,6 +116,8 @@ class CachedObservationProvider(ObservationProvider):
     def evict(self, reserve_bytes: int = 0) -> None:
         entries: list[tuple[Path, int, float]] = []
         for path in self.cache_dir.glob("*/*.npz"):
+            if path.name.endswith(".tmp.npz"):
+                continue
             try:
                 stat = path.stat()
             except FileNotFoundError:
@@ -140,3 +142,28 @@ class CachedObservationProvider(ObservationProvider):
             free = shutil.disk_usage(self.cache_dir).free
             if total <= self.max_bytes and free >= self.min_free_bytes + reserve_bytes:
                 break
+
+    def clear_completed(self) -> dict[str, int]:
+        """Remove completed observations while tolerating active worker readers."""
+
+        removed_files = 0
+        removed_bytes = 0
+        locked_files = 0
+        for path in self.cache_dir.glob("*/*.npz"):
+            if path.name.endswith(".tmp.npz"):
+                continue
+            try:
+                size = path.stat().st_size
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                locked_files += 1
+                continue
+            removed_files += 1
+            removed_bytes += size
+        return {
+            "removed_files": removed_files,
+            "removed_bytes": removed_bytes,
+            "locked_files": locked_files,
+        }

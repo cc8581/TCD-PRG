@@ -46,6 +46,33 @@ class Trainer:
         "generated_known_candidates",
         "generated_unknown_candidates",
         "generated_conflict_candidates",
+        "task_grasp_matched_positive_queries",
+        "task_grasp_matched_negative_queries",
+        "task_grasp_quality_valid_queries",
+        "task_grasp_quality_positive_queries",
+        "task_grasp_quality_negative_queries",
+        "task_grasp_ignored_unmatched_queries",
+        "task_grasp_supervised_rows",
+        "global_grasp_matched_positive_queries",
+        "global_grasp_matched_negative_queries",
+        "global_grasp_quality_valid_queries",
+        "global_grasp_quality_positive_queries",
+        "global_grasp_quality_negative_queries",
+        "global_grasp_ignored_unmatched_queries",
+        "global_grasp_supervised_rows",
+        "verifier_valid_candidates",
+        "verifier_supervised_rows",
+        "verifier_positive_candidates",
+        "verifier_negative_candidates",
+        "verifier_ranking_metrics_valid",
+        "push_object_effective_rows",
+        "push_contact_positive_points",
+        "push_contact_negative_points",
+        "push_contact_valid_points",
+        "push_direction_effective_rows",
+        "push_direction_residual_targets",
+        "push_potential_valid_candidates",
+        "policy_effective_rows",
     }
     LOSS_GROUPS = (
         ("region", ("weighted_loss_region",)),
@@ -110,7 +137,8 @@ class Trainer:
         self.validation_metrics_path = self.output_dir / "validation_metrics.jsonl"
         self.events_path = self.output_dir / "training_events.jsonl"
         self.scaler = torch.cuda.amp.GradScaler(
-            enabled=config.training.amp and self.device.type == "cuda"
+            enabled=config.training.amp and self.device.type == "cuda",
+            init_scale=config.training.amp_initial_scale,
         )
         source_model = self.model.module if hasattr(self.model, "module") else self.model
         self.ema = (
@@ -337,7 +365,12 @@ class Trainer:
 
         source = self.model.module if hasattr(self.model, "module") else self.model
         for prefix in self.config.training.frozen_modules:
-            module = source.get_submodule(prefix)
+            try:
+                module = source.get_submodule(prefix)
+            except AttributeError:
+                # Exact parameter names are valid freeze targets, but do not
+                # have an independent train/eval mode.
+                continue
             if not any(parameter.requires_grad for parameter in module.parameters()):
                 module.eval()
 
@@ -409,6 +442,7 @@ class Trainer:
         loader: Iterable[Mapping[str, Any]],
         validate: Callable[[nn.Module], Any] | None = None,
         groups_per_effective_epoch: int | None = None,
+        step_finished: Callable[[int], None] | None = None,
     ) -> TrainerState:
         accumulation = self.config.training.gradient_accumulation_steps
         unfreeze_step = self.config.training.unfreeze_at_optimizer_step
@@ -664,8 +698,10 @@ class Trainer:
                 window_micro_batches = 0
                 window_samples = 0
                 window_data_seconds = 0.0
+                if step_finished is not None:
+                    step_finished(step)
                 if step % self.config.training.checkpoint_interval == 0:
-                    self.save_checkpoint(self.output_dir / f"step_{step:08d}.pt")
+                    self.save_checkpoint(self.output_dir / "last.pt")
                 if validate and step % self.config.training.validation_interval == 0:
                     validation = validate(self.ema.model if self.ema else self.model)
                     self.model.train()
@@ -879,7 +915,7 @@ class Trainer:
         path.parent.mkdir(parents=True, exist_ok=True)
         source = self.model.module if hasattr(self.model, "module") else self.model
         payload = {
-            "schema_version": 9,
+            "schema_version": 10,
             "model": source.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler else None,
@@ -903,10 +939,10 @@ class Trainer:
     def load_checkpoint(self, path: str | Path) -> None:
         payload = torch.load(path, map_location=self.device, weights_only=False)
         schema_version = int(payload.get("schema_version", 1))
-        if schema_version != 9:
+        if schema_version != 10:
             raise RuntimeError(
                 "Unsupported TCD-PRG checkpoint schema "
-                f"{schema_version}; this code expects schema 9. Official PTv3 features, the "
+                f"{schema_version}; this code expects schema 10. Official PTv3 features, the "
                 "shared M2T2-style decoder, PyG graph transformer, transformer verifier and "
                 "direction-token PUSH head require a fresh checkpoint. Load the "
                 "original GAPG encoder through the pretrained-backbone option, "

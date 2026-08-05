@@ -248,45 +248,97 @@ def build_push_supervision(
         parameters["push_contact_world"], batch["acted_object"], candidate,
     )
     row = torch.arange(action_type.shape[0], device=action_type.device)[:, None]
-    gathered = {
-        "object_logits": output["object_logits"],
-        "contact_logits": output["contact_logits"],
-        "point_index": point_index,
-        "direction_logits": output["direction_logits"][row, point_index],
-    }
     direction = torch.nn.functional.normalize(
         torch.nan_to_num(parameters["push_direction_world"]), dim=-1
     )
     angle = torch.atan2(direction[..., 1], direction[..., 0]).remainder(2 * math.pi)
     bins = output["direction_logits"].shape[-1]
-    # 执行方向先量化到粗 bin，再在对应 bin 上监督连续残差和方向条件 utility。
     direction_bin = torch.floor(angle * bins / (2 * math.pi)).long().remainder(bins)
-    gathered["direction_residual"] = output["direction_residual"][
-        row, point_index, direction_bin
-    ]
-    gathered["utility_delta"] = output["utility_delta"][row, point_index, direction_bin]
+    gathered = {
+        "object_logits": output["object_logits"],
+        "contact_logits": output["contact_logits"],
+        "point_index": point_index,
+        "direction_logits": output["direction_logits"][row, point_index],
+        "direction_residual": output["direction_residual"][row, point_index],
+        "utility_delta": output["utility_delta"][row, point_index, direction_bin],
+    }
+
+    evaluated = batch["evaluation_status"] != int(CandidateStatus.UNKNOWN_UNTESTED)
+    evaluated_push = candidate & parameter_valid & evaluated
+    positive = evaluated_push & batch["action_improves_state"]
     center_angle = (direction_bin.float() + 0.5) * 2 * math.pi / bins
     center = torch.stack((torch.cos(center_angle), torch.sin(center_angle)), -1)
-    # 分类头学习“值得选择的方向”，失败/无改善方向只通过 utility 监督其后果。
-    positive = batch["action_improves_state"] & candidate & parameter_valid
+    action_residual = direction[..., :2] - center
+
+    # Every evaluated contact neighbourhood is supervised. Failed pushes are
+    # explicit negatives; untested surface regions remain UNKNOWN.
     contact_target = torch.zeros_like(output["contact_logits"])
     contact_valid = torch.zeros_like(output["contact_logits"], dtype=torch.bool)
     sigma_sq = float(config.contact_heatmap_sigma_m) ** 2
     for batch_row in range(action_type.shape[0]):
-        for candidate_index in torch.nonzero(positive[batch_row], as_tuple=False).flatten().tolist():
+        for candidate_index in torch.nonzero(
+            evaluated_push[batch_row], as_tuple=False
+        ).flatten().tolist():
             object_index = int(batch["acted_object"][batch_row, candidate_index])
-            domain = batch["point_mask"][batch_row] & (batch["instance_id"][batch_row] == object_index)
-            delta = batch["xyz"][batch_row] - parameters["push_contact_world"][batch_row, candidate_index]
+            domain = batch["point_mask"][batch_row] & (
+                batch["instance_id"][batch_row] == object_index
+            )
+            delta = (
+                batch["xyz"][batch_row]
+                - parameters["push_contact_world"][batch_row, candidate_index]
+            )
             distance_sq = (delta * delta).sum(-1)
             neighborhood = domain & (distance_sq <= 9.0 * sigma_sq)
             contact_valid[batch_row] |= neighborhood
-            contact_target[batch_row] = torch.maximum(
-                contact_target[batch_row], torch.exp(-0.5 * distance_sq / sigma_sq) * neighborhood
-            )
+            if bool(positive[batch_row, candidate_index]):
+                contact_target[batch_row] = torch.maximum(
+                    contact_target[batch_row],
+                    torch.exp(-0.5 * distance_sq / sigma_sq) * neighborhood,
+                )
+
+    # Untested active objects are UNKNOWN and never enter the listwise denominator.
     object_positive = torch.zeros_like(batch["object_mask"])
+    object_evaluated = torch.zeros_like(batch["object_mask"])
     for batch_row in range(action_type.shape[0]):
-        objects = batch["acted_object"][batch_row, positive[batch_row]]
-        object_positive[batch_row, objects[objects >= 0]] = True
+        evaluated_objects = batch["acted_object"][batch_row, evaluated_push[batch_row]]
+        evaluated_objects = evaluated_objects[evaluated_objects >= 0]
+        object_evaluated[batch_row, evaluated_objects] = True
+        positive_objects = batch["acted_object"][batch_row, positive[batch_row]]
+        positive_objects = positive_objects[positive_objects >= 0]
+        object_positive[batch_row, positive_objects] = True
+
+    # Aggregate all evaluated bins at each unique contact point. This makes the
+    # direction head a multi-positive ranking problem rather than contradictory CE.
+    direction_positive = torch.zeros(
+        (*candidate.shape, bins), dtype=torch.bool, device=candidate.device
+    )
+    direction_evaluated = torch.zeros_like(direction_positive)
+    direction_residual_target = output["direction_residual"].new_zeros(
+        (*candidate.shape, bins, 2)
+    )
+    direction_residual_count = output["direction_residual"].new_zeros(
+        (*candidate.shape, bins)
+    )
+    for batch_row in range(action_type.shape[0]):
+        canonical: dict[int, int] = {}
+        for candidate_index in torch.nonzero(
+            evaluated_push[batch_row], as_tuple=False
+        ).flatten().tolist():
+            point = int(point_index[batch_row, candidate_index])
+            slot = canonical.setdefault(point, candidate_index)
+            bin_index = int(direction_bin[batch_row, candidate_index])
+            direction_evaluated[batch_row, slot, bin_index] = True
+            if bool(positive[batch_row, candidate_index]):
+                direction_positive[batch_row, slot, bin_index] = True
+                direction_residual_target[batch_row, slot, bin_index] += (
+                    action_residual[batch_row, candidate_index]
+                )
+                direction_residual_count[batch_row, slot, bin_index] += 1.0
+    direction_residual_valid = direction_residual_count > 0
+    direction_residual_target = direction_residual_target / (
+        direction_residual_count.clamp_min(1.0).unsqueeze(-1)
+    )
+
     component_weights = torch.as_tensor(
         config.push_utility_component_weights,
         dtype=batch["potential_delta"].dtype,
@@ -302,15 +354,17 @@ def build_push_supervision(
     )
     utility = utility - (torch.nan_to_num(failures) * penalties).sum(-1)
     has_failure = (torch.nan_to_num(failures) > 0.5).any(-1)
-    evaluated = batch["evaluation_status"] != int(CandidateStatus.UNKNOWN_UNTESTED)
     return gathered, {
         "object_positive": object_positive,
-        "object_valid_mask": batch["object_mask"] & batch["object_active"],
+        "object_valid_mask": (
+            batch["object_mask"] & batch["object_active"] & object_evaluated
+        ),
         "contact_target": contact_target,
         "contact_valid": contact_valid,
-        "direction_bin": direction_bin,
-        "direction_residual": direction[..., :2] - center,
-        "direction_valid": positive,
+        "direction_positive": direction_positive,
+        "direction_evaluated": direction_evaluated,
+        "direction_residual_target": direction_residual_target,
+        "direction_residual_valid": direction_residual_valid,
         "utility_delta": utility,
         "utility_valid": (
             parameter_valid & evaluated & (batch["potential_after_valid"] | has_failure)

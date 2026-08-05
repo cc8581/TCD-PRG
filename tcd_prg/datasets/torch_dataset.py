@@ -10,8 +10,9 @@ from collections import Counter
 from dataclasses import dataclass
 from itertools import islice
 
+import numpy as np
 import torch
-from torch.utils.data import Dataset, Sampler, WeightedRandomSampler
+from torch.utils.data import Dataset, Sampler
 
 from .base import DatasetAdapter
 from .types import UnifiedSample
@@ -26,6 +27,20 @@ class StateGroupUnit:
     stratum: str = "unclassified"
 
 
+def _deterministic_fraction_indices(size: int, fraction: float, seed: int) -> np.ndarray:
+    """Select an exact deterministic subset without replacement."""
+
+    if size < 0:
+        raise ValueError("size must be non-negative")
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("fraction must be in (0,1]")
+    if size == 0 or fraction == 1.0:
+        return np.arange(size, dtype=np.int64)
+    count = max(1, min(size, int(round(size * fraction))))
+    selected = np.random.default_rng(seed).choice(size, size=count, replace=False)
+    return np.sort(selected.astype(np.int64, copy=False))
+
+
 class ActionStateGroupDataset(Dataset[UnifiedSample]):
     """Immutable snapshot of completed action-state groups."""
 
@@ -35,15 +50,33 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
         split: str | None = None,
         max_groups: int | None = None,
         include_strata: bool = True,
+        fraction: float = 1.0,
+        subset_seed: int = 2026,
     ) -> None:
         self.adapter = adapter
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError("fraction must be in (0,1]")
+        if max_groups is not None and max_groups <= 0:
+            raise ValueError("max_groups must be positive")
         iterator = adapter.iter_action_groups(split)
-        if max_groups is not None:
-            if max_groups <= 0:
-                raise ValueError("max_groups must be positive")
-            raw_units = list(islice(iterator, max_groups))
+        if fraction == 1.0:
+            if max_groups is not None:
+                raw_units = list(islice(iterator, max_groups))
+                self.source_group_count: int | None = None
+            else:
+                raw_units = list(iterator)
+                self.source_group_count = len(raw_units)
         else:
             raw_units = list(iterator)
+            self.source_group_count = len(raw_units)
+            selected = _deterministic_fraction_indices(
+                len(raw_units), fraction, subset_seed
+            )
+            raw_units = [raw_units[int(index)] for index in selected]
+            if max_groups is not None:
+                raw_units = raw_units[:max_groups]
+        self.requested_fraction = float(fraction)
+        self.selected_group_count = len(raw_units)
         strata_method = getattr(adapter, "action_group_strata", None)
         strata = strata_method(raw_units) if include_strata and strata_method else {}
         self.units = tuple(
@@ -67,19 +100,18 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
             include_global_grasps=index in self._global_grasp_representatives,
         )
 
-    def balanced_sampler(self, seed: int = 2026, samples: int | None = None) -> WeightedRandomSampler:
-        """Inverse-frequency sampler over state semantics, not individual actions."""
+    def balanced_sampler(
+        self, seed: int = 2026, samples: int | None = None
+    ) -> "DistributedWeightedStateSampler":
+        """Inverse-frequency sampler without duplicate groups within an epoch."""
 
         counts = Counter(unit.stratum for unit in self.units)
         if not counts:
             raise ValueError("Cannot sample an empty dataset")
         weights = torch.tensor([1.0 / counts[unit.stratum] for unit in self.units], dtype=torch.double)
-        generator = torch.Generator().manual_seed(seed)
-        return WeightedRandomSampler(
-            weights,
-            num_samples=samples or len(self.units),
-            replacement=True,
-            generator=generator,
+        return DistributedWeightedStateSampler(
+            weights, rank=0, world_size=1,
+            total_samples=samples or len(self.units), seed=seed,
         )
 
     def distributed_balanced_sampler(
@@ -107,22 +139,27 @@ class DistributedWeightedStateSampler(Sampler[int]):
             raise ValueError("total_samples must be positive")
         if not 0 <= rank < world_size:
             raise ValueError("rank must be in [0, world_size)")
+        if total_samples > weights.numel():
+            raise ValueError(
+                "total_samples cannot exceed the dataset size for sampling without replacement"
+            )
+        if total_samples < world_size:
+            raise ValueError("total_samples must be at least world_size")
+        if total_samples % world_size != 0:
+            raise ValueError(
+                "total_samples must be divisible by world_size for multi-GPU training: "
+                f"total_samples={total_samples}, world_size={world_size}"
+            )
         self.weights, self.rank, self.world_size = weights, rank, world_size
-        self.samples_per_rank = (total_samples + world_size - 1) // world_size
+        self.samples_per_rank = total_samples // world_size
         self.total_size = self.samples_per_rank * world_size
         self.seed, self.epoch = seed, 0
 
     def __iter__(self):
         generator = torch.Generator().manual_seed(self.seed + self.epoch)
-        chunks: list[torch.Tensor] = []
-        remaining = self.total_size
-        while remaining > 0:
-            permutation = torch.multinomial(
-                self.weights, len(self.weights), replacement=False, generator=generator
-            )
-            chunks.append(permutation[:remaining])
-            remaining -= min(remaining, len(permutation))
-        global_indices = torch.cat(chunks)
+        global_indices = torch.multinomial(
+            self.weights, self.total_size, replacement=False, generator=generator
+        )
         return iter(global_indices[self.rank : self.total_size : self.world_size].tolist())
 
     def __len__(self) -> int:

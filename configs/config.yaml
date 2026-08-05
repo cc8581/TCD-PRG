@@ -5,11 +5,11 @@ dataset:
   # 下列三个路径会被 train.py 的本机路径配置覆盖，此处保留可移植的仓库相对值。
   root: data/TaskOrientedClutterSceneDataset
   acronym_root: data/ACRONYM
-  functional_region_root: data/manual_function_regions_v1
+  functional_region_root: data/manual_function_regions
   fr5_ag_urdf: assets/robots/FR5_AG-160-95/urdf/fr5_ag160_95.urdf
   adapter: task_oriented_clutter
   scene_subdir: task_clutter_scenes_20_categories
-  step_labels_subdir: task_training_labels_steps1_6_v1
+  step_labels_subdir: task_training_labels
   action_labels_subdir: task_positive_multistep_sequences
   # 0 表示保留三视角融合后的全部有效点；PTv3 内部使用 5 mm GridSample 变长打包。
   scene_points: 0
@@ -32,9 +32,9 @@ observation:
   certification_temporary_root: runtime/tmp/certification
 
 cache:
-  # 观测缓存采用 LRU；达到容量或磁盘余量阈值时淘汰最旧条目。
+  # 命中会刷新访问时间；达到容量或磁盘余量阈值时，LRU 自动淘汰最久未访问条目。
   directory: runtime/cache/observations
-  max_gb: 15
+  max_gb: 5
   min_free_gb: 20
   eviction: lru
   prefetch_workers: 4
@@ -43,7 +43,16 @@ backbone:
   # 官方 Pointcept PTv3。Windows 默认走标准注意力；Linux/CUDA 可按环境开启 FlashAttention。
   backend: point_transformer_v3
   source_root: third_party/PointTransformerV3
+  # Official self-supervised PTv3 encoder; only key/shape matches are loaded.
   pretrained_checkpoint: null
+  pretrained_format: sonata
+  pretrained_auto_download: true
+  pretrained_url: "https://huggingface.co/Pointcept/Sonata/resolve/main/sonata_20251024.pth?download=true"
+  pretrained_sha256: "8aab33915ddfec2628da10ee1236ace7ed720b7ebba0dd9bc86f9ca7f9de102f"
+  pretrained_cache_dir: runtime/cache/pretrained
+  pretrained_required: true
+  pretrained_min_parameter_fraction: 0.35
+  pretrained_freeze_steps: 2000
   freeze: false
   grid_size_m: 0.005
   enable_flash_attention: false
@@ -180,19 +189,21 @@ training:
   device: cuda
   amp: true
   amp_dtype: float16
-  batch_size: 8
-  gradient_accumulation_steps: 1  # 网络可直接单步训练，不做梯度累计
+  amp_initial_scale: 4096
+  batch_size: 6
+  gradient_accumulation_steps: 4  # 有效 batch 更稳定，不增加单步显存
   max_optimizer_steps: 100000
-  validation_interval: 1000     # 周期验证。
-  checkpoint_interval: 1000     # 周期保存checkpoint。
+  validation_interval: 10000     # 周期验证。
+  checkpoint_interval: 10000     # 周期保存checkpoint。
   gradient_clip_norm: 20.0 # 联合多任务全局范数阈值；模块级诊断用于继续校准
   ema_decay: 0.999
   early_stopping_patience: 20
   deterministic: true
   num_workers: 4
   pin_memory: true
-  max_validation_groups: 256
+  max_validation_groups: null  # null 表示验证完整 validation split
   max_train_groups: null
+  data_fraction: 1.0  # 0.5 表示使用训练 split 的50%
   frozen_modules: []
   unfreeze_at_optimizer_step: null
   ddp_backend: auto
@@ -243,8 +254,8 @@ ablation:
 
 logging:
   backend: tensorboard
-  # 终端每 log_interval 步打印核心摘要；train_metrics.jsonl 保存每个优化器步的完整指标。
-  log_interval: 20
+  log_interval: 20    # 终端每 log_interval 步打印核心摘要；train_metrics.jsonl 保存每个优化器步的完整指标。
+  validation_log_interval: 20  # 验证期间每 N 个 validation batch 打印一次进度。
   gradient_diagnostics_interval: 200
 
 planner:

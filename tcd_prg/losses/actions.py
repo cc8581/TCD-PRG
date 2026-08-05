@@ -2,23 +2,31 @@
 
 from torch import Tensor, nn
 
-from .masked import (
-    multi_positive_listwise_loss,
-    safe_bce_with_logits,
-    safe_cross_entropy,
-    safe_smooth_l1,
-)
+from .masked import multi_positive_listwise_loss, safe_bce_with_logits, safe_smooth_l1
 
 
 class PushLoss(nn.Module):
     def forward(self, output: dict[str, Tensor], labels: dict[str, Tensor]) -> dict[str, Tensor]:
-        # 方向分类负责粗 bin，残差回归负责 bin 内连续修正，两者共同组成方向损失。
-        direction_bin = safe_cross_entropy(
-            output["direction_logits"], labels["direction_bin"], labels["direction_valid"]
+        direction_bin = multi_positive_listwise_loss(
+            output["direction_logits"],
+            labels["direction_positive"],
+            labels["direction_evaluated"],
         )
         direction_residual = safe_smooth_l1(
-            output["direction_residual"], labels["direction_residual"], labels["direction_valid"]
+            output["direction_residual"],
+            labels["direction_residual_target"],
+            labels["direction_residual_valid"],
         )
+        object_positive = labels["object_positive"].bool() & labels["object_valid_mask"].bool()
+        object_negative = labels["object_valid_mask"].bool() & ~object_positive
+        object_effective = object_positive.any(-1) & object_negative.any(-1)
+        direction_positive = (
+            labels["direction_positive"].bool() & labels["direction_evaluated"].bool()
+        )
+        direction_negative = labels["direction_evaluated"].bool() & ~direction_positive
+        direction_effective = direction_positive.any(-1) & direction_negative.any(-1)
+        contact_positive = labels["contact_valid"].bool() & (labels["contact_target"] > 0)
+        contact_negative = labels["contact_valid"].bool() & ~contact_positive
         return {
             "push_object": multi_positive_listwise_loss(
                 output["object_logits"], labels["object_positive"], labels["object_valid_mask"]
@@ -29,7 +37,13 @@ class PushLoss(nn.Module):
             "push_direction": direction_bin + direction_residual,
             "push_direction_bin_diagnostic": direction_bin,
             "push_direction_residual_diagnostic": direction_residual,
-            # utility_delta 是接触点和方向联合条件化的状态效用变化。
+            "push_object_effective_rows": object_effective.sum().float(),
+            "push_contact_positive_points": contact_positive.sum().float(),
+            "push_contact_negative_points": contact_negative.sum().float(),
+            "push_contact_valid_points": labels["contact_valid"].sum().float(),
+            "push_direction_effective_rows": direction_effective.sum().float(),
+            "push_direction_residual_targets": labels["direction_residual_valid"].sum().float(),
+            "push_potential_valid_candidates": labels["utility_valid"].sum().float(),
             "push_potential": safe_smooth_l1(
                 output["utility_delta"], labels["utility_delta"], labels["utility_valid"]
             ),
