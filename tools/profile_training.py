@@ -27,11 +27,10 @@ from tcd_prg.trainers.reproducibility import seed_everything
 
 COMMON_OVERRIDES = [
     "training.max_train_groups=1",
-    "training.max_validation_groups=1",
     "training.max_optimizer_steps=1",
     "training.num_workers=0",
     "training.pin_memory=false",
-    "training.validation_interval=1000",
+    "training.validation_interval=0",
     "logging.log_interval=1",
 ]
 
@@ -75,15 +74,17 @@ def main() -> None:
     if args.full:
         overrides.append("training.gradient_accumulation_steps=1")
     else:
-        overrides.extend([
-            "dataset.scene_points=2048",
-            "dataset.target_points=1024",
-            "backbone.patch_size=128",
-            "training.gradient_accumulation_steps=1",
-        ])
-    output = (args.report or (
-        PROJECT / "outputs" / "profiles" / f"training_resource_profile_{mode}.json"
-    )).resolve()
+        overrides.extend(
+            [
+                "dataset.scene_points=2048",
+                "dataset.target_points=1024",
+                "backbone.patch_size=128",
+                "training.gradient_accumulation_steps=1",
+            ]
+        )
+    output = (
+        args.report or (PROJECT / "outputs" / "profiles" / f"training_resource_profile_{mode}.json")
+    ).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     csv_output = output.with_suffix(".csv")
     overall_started = time.perf_counter()
@@ -96,15 +97,16 @@ def main() -> None:
     dataset = ActionStateGroupDataset(adapter, split="train", max_groups=1)
     dataset_snapshot = (
         json.loads(dataset_snapshot_path.read_text(encoding="utf-8"))
-        if dataset_snapshot_path.exists() else None
+        if dataset_snapshot_path.exists()
+        else None
     )
     train_group_count = (
         dataset_snapshot["action_state_groups_by_split"].get("train", 0)
-        if dataset_snapshot else None
+        if dataset_snapshot
+        else None
     )
     validation_group_count = (
-        dataset_snapshot["action_state_groups_by_split"].get("val", 0)
-        if dataset_snapshot else None
+        dataset_snapshot["action_state_groups_by_split"].get("val", 0) if dataset_snapshot else None
     )
     gripper = create_gripper_provider(config, allow_generate=False)
     collator = UnifiedBatchCollator(config, gripper, training=True)
@@ -117,9 +119,7 @@ def main() -> None:
     data_setup_seconds = time.perf_counter() - data_started
 
     model_started = time.perf_counter()
-    model = TCDPRGModel(
-        config.model, config.ablation, config.graph, config.router, config.backbone
-    )
+    model = TCDPRGModel(config.model, config.ablation, config.graph, config.router, config.backbone)
     backbone_parameters = list(model.encoder.parameters())
     backbone_ids = {id(parameter) for parameter in backbone_parameters}
     other_parameters = [p for p in model.parameters() if id(p) not in backbone_ids]
@@ -135,7 +135,10 @@ def main() -> None:
     model = model.to(device).train()
     optimizer.load_state_dict(checkpoint["optimizer"])
     objective = TCDPRGObjective(
-        adapter.capabilities, config.model, config.ablation, config.losses,
+        adapter.capabilities,
+        config.model,
+        config.ablation,
+        config.losses,
         config.region_head,
     )
     model_setup_seconds = time.perf_counter() - model_started
@@ -187,7 +190,9 @@ def main() -> None:
         backward_end = torch.cuda.Event(enable_timing=True)
         optimizer_end = torch.cuda.Event(enable_timing=True)
         forward_start.record()
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+        with torch.autocast(
+            device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"
+        ):
             loss, terms = objective(model, batch)
         forward_end.record()
         scaler.scale(loss).backward()
@@ -225,7 +230,9 @@ def main() -> None:
         backward_end = torch.cuda.Event(enable_timing=True)
         optimizer_end = torch.cuda.Event(enable_timing=True)
         forward_start.record()
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+        with torch.autocast(
+            device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"
+        ):
             loss, terms = objective(model, batch)
         forward_end.record()
         scaler.scale(loss).backward()
@@ -242,17 +249,18 @@ def main() -> None:
         if scaler.get_scale() < old_scale:
             amp_retry_count += 1
             continue
-        benchmark_timings.append({
-            "forward_and_loss_ms": forward_start.elapsed_time(forward_end),
-            "backward_ms": forward_end.elapsed_time(backward_end),
-            "unscale_clip_optimizer_ms": backward_end.elapsed_time(optimizer_end),
-            "successful_step_total_cuda_ms": forward_start.elapsed_time(optimizer_end),
-            "successful_step_wall_seconds": time.perf_counter() - wall_started,
-        })
+        benchmark_timings.append(
+            {
+                "forward_and_loss_ms": forward_start.elapsed_time(forward_end),
+                "backward_ms": forward_end.elapsed_time(backward_end),
+                "unscale_clip_optimizer_ms": backward_end.elapsed_time(optimizer_end),
+                "successful_step_total_cuda_ms": forward_start.elapsed_time(optimizer_end),
+                "successful_step_wall_seconds": time.perf_counter() - wall_started,
+            }
+        )
     timing_keys = tuple(benchmark_timings[0])
     timing = {
-        key: statistics.median(item[key] for item in benchmark_timings)
-        for key in timing_keys
+        key: statistics.median(item[key] for item in benchmark_timings) for key in timing_keys
     }
     total_cuda_samples = sorted(item["successful_step_total_cuda_ms"] for item in benchmark_timings)
     benchmark_summary = {
@@ -269,7 +277,9 @@ def main() -> None:
     # so these values are conservative lower bounds.
     optimizer.zero_grad(set_to_none=True)
     with FlopCounterMode(display=False) as forward_counter:
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+        with torch.autocast(
+            device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"
+        ):
             counted_loss, _ = objective(model, batch)
     forward_flops = int(forward_counter.get_total_flops())
     with FlopCounterMode(display=False) as backward_counter:
@@ -315,7 +325,9 @@ def main() -> None:
             "amp_dtype": config.training.amp_dtype,
             "activation_checkpointing": config.model.activation_checkpointing,
             "candidate_micro_batch": config.model.verifier_candidate_micro_batch,
-            "profiled_unit": list(dataset.units[0].__dict__.values()) if hasattr(dataset.units[0], "__dict__") else {
+            "profiled_unit": list(dataset.units[0].__dict__.values())
+            if hasattr(dataset.units[0], "__dict__")
+            else {
                 "scene_id": dataset.units[0].scene_id,
                 "state_id": dataset.units[0].state_id,
                 "task_index": dataset.units[0].task_index,

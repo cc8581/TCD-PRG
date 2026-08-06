@@ -29,6 +29,7 @@ class DatasetConfig:
 @dataclass(slots=True)
 class ObservationConfig:
     provider: str = "cached"
+    allow_render_on_miss: bool = True
     render_width: int = 320
     render_height: int = 200
     camera_profile: str = "mecheye_pro_s_three_view"
@@ -192,11 +193,15 @@ class TrainingConfig:
     deterministic: bool = True
     num_workers: int = 4
     pin_memory: bool = True
-    # None validates the complete validation split.
-    max_validation_groups: int | None = None
     max_train_groups: int | None = None
-    # Deterministic fraction of the complete training split, in (0, 1].
+    max_validation_groups: int | None = 256
+    # Restrict the published scene snapshot before deterministic splitting.
+    scene_start: int = 0
+    scene_count: int | None = None
+    # Deterministically select this fraction of published scenes before splitting.
     data_fraction: float = 1.0
+    # Scene-level train/val or train/val/test weights; values are normalized.
+    split_ratios: tuple[float, ...] = (8.0, 1.0, 1.0)
     frozen_modules: tuple[str, ...] = ()
     unfreeze_at_optimizer_step: int | None = None
     ddp_backend: str = "auto"
@@ -374,6 +379,15 @@ class TCDPRGConfig:
             raise ValueError("training.gradient_accumulation_steps must be positive")
         if not 0.0 < self.training.data_fraction <= 1.0:
             raise ValueError("training.data_fraction must be in (0,1]")
+        if self.training.scene_start < 0:
+            raise ValueError("training.scene_start must be non-negative")
+        if self.training.scene_count is not None and self.training.scene_count <= 0:
+            raise ValueError("training.scene_count must be positive when configured")
+        if (
+            self.training.max_validation_groups is not None
+            and self.training.max_validation_groups <= 0
+        ):
+            raise ValueError("training.max_validation_groups must be positive")
         if self.training.amp_initial_scale <= 0:
             raise ValueError("training.amp_initial_scale must be positive")
         if not 0 < self.evaluation.region_probability_threshold < 1:
@@ -392,11 +406,17 @@ class TCDPRGConfig:
             raise ValueError("logging.validation_log_interval must be positive")
         if self.logging.gradient_diagnostics_interval < 0:
             raise ValueError("gradient_diagnostics_interval must be non-negative")
-        if (
-            self.training.max_validation_groups is not None
-            and self.training.max_validation_groups <= 0
-        ):
-            raise ValueError("training.max_validation_groups must be null or positive")
+        ratios = self.training.split_ratios
+        if len(ratios) not in {2, 3}:
+            raise ValueError("training.split_ratios must contain train/val or train/val/test")
+        if any(value < 0 for value in ratios) or sum(ratios) <= 0:
+            raise ValueError("training.split_ratios must be non-negative with a positive sum")
+        if ratios[0] <= 0:
+            raise ValueError("training.split_ratios must allocate scenes to train")
+        if self.training.validation_interval > 0 and ratios[1] <= 0:
+            raise ValueError(
+                "training.split_ratios must allocate scenes to val when validation is enabled"
+            )
         if self.backbone.backend not in {"point_transformer_v3", "legacy"}:
             raise ValueError("backbone.backend must be point_transformer_v3 or legacy")
         if self.backbone.pretrained_format not in {

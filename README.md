@@ -199,6 +199,11 @@ uniformly sampled action rows. Logs include optimizer steps, samples/states/
 candidate groups seen and effective epochs. `loss_routing.json` records losses
 automatically disabled by dataset capabilities or ablations.
 
+Dataset partitions are configured with `training.data_fraction` and
+`training.split_ratios`. Scene sampling happens before the seeded scene-level
+train/val/test split; validation always covers the complete resulting val
+partition. The split codes stored in `training_index.h5` are not used.
+
 The terminal prints a concise live summary at `logging.log_interval`: total and
 paper-level module losses, learning rate, gradient norm, throughput, AMP skips,
 effective epoch, and generated-candidate coverage when applicable. Detailed

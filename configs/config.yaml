@@ -18,6 +18,9 @@ dataset:
 observation:
   # 正式训练使用有界 LRU：命中直读，cache miss 由 DataLoader worker 按需渲染。
   provider: cached
+  # 离线点云全部生成并校验后设为 false。严格模式下 cache miss 直接报错，
+  # 训练启动时也不会执行 LRU eviction，从而避免删除离线预生成缓存。
+  allow_render_on_miss: false
   render_width: 320
   render_height: 200
   camera_profile: mecheye_pro_s_three_view
@@ -196,13 +199,16 @@ training:
   validation_interval: 2000     # 周期验证。
   gradient_clip_norm: 20.0 # 联合多任务全局范数阈值；模块级诊断用于继续校准
   ema_decay: 0.999
-  early_stopping_patience: 20
+  early_stopping_patience: 15
   deterministic: False
   num_workers: 6
   pin_memory: true
-  max_validation_groups: 256  # 每次只验证前 256 个 validation state-group
   max_train_groups: null
-  data_fraction: 1.0  # 0.5 表示使用训练 split 的50%
+  max_validation_groups: 256
+  scene_start: 0
+  scene_count: 2500
+  data_fraction: 1.0         # Use every scene in the configured snapshot.
+  split_ratios: [9, 1]      # Deterministic scene-level 90/10 train/val split.
   frozen_modules: []
   unfreeze_at_optimizer_step: null
   ddp_backend: auto

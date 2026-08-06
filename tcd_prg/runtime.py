@@ -29,6 +29,7 @@ def create_observation_provider(config: TCDPRGConfig, allow_render: bool = False
             width=config.observation.render_width,
             height=config.observation.render_height,
         )
+
     def external_provider() -> ExternalPyBulletObservationProvider:
         return ExternalPyBulletObservationProvider(
             config.observation.pybullet_python,
@@ -75,6 +76,11 @@ def create_adapter(config: TCDPRGConfig, allow_render: bool = False):
         global_positive_grasps_per_object=config.sampling.global_positive_grasps_per_object,
         global_negative_grasps_per_object=config.sampling.global_negative_grasps_per_object,
         index_cache_dir=config.cache.index_directory,
+        data_fraction=config.training.data_fraction,
+        split_ratios=config.training.split_ratios,
+        split_seed=config.training.seed,
+        scene_start=config.training.scene_start,
+        scene_count=config.training.scene_count,
     )
 
 
@@ -117,7 +123,8 @@ class UnifiedBatchCollator:
     def __call__(self, samples: list[Any]) -> dict[str, Any]:
         grid_size = (
             self.config.backbone.grid_size_m
-            if self.config.backbone.backend == "point_transformer_v3" else None
+            if self.config.backbone.backend == "point_transformer_v3"
+            else None
         )
         batch = collate_unified(samples, grid_size_m=grid_size, training=self.training)
         # generated candidate manifest 每个 worker 只验证一次，单条 entry 仍逐样本校验来源签名。

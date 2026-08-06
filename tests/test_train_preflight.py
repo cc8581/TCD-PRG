@@ -21,10 +21,12 @@ def test_formal_training_accepts_bounded_read_through_cache(tmp_path) -> None:
     assert status["directory"] == str(tmp_path.resolve())
 
 
-def test_formal_training_rejects_cache_without_renderer(tmp_path) -> None:
+def test_formal_training_accepts_strict_cache_without_renderer(tmp_path) -> None:
     provider = CachedObservationProvider(tmp_path, fallback=None)
-    with pytest.raises(RuntimeError, match="on-miss observation renderer"):
-        validate_read_through_observation_cache(_Adapter(provider))
+    status = validate_read_through_observation_cache(_Adapter(provider))
+    assert status["mode"] == "strict-cache-only"
+    assert status["missing"] == "error"
+    assert status["max_gb"] is None
 
 
 def test_formal_training_enforces_free_space_reserve(tmp_path) -> None:

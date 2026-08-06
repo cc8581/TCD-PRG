@@ -22,6 +22,13 @@ The sampling key is `(scene_id, state_id, task_index, group_index)`. Each
 keys, not learned continuous quantities. Stable object UUIDs are
 `scene_XXXX/object_YY`, equivalent to `(scene_id, object_index)`.
 
+Published scenes are deterministically shuffled with `training.seed`. The
+configured `training.data_fraction` is selected first, then those scenes are
+partitioned according to `training.split_ratios` into train/val or
+train/val/test. Splitting is scene-level, so states and action groups from one
+scene cannot cross partitions. `training_index.h5` remains an efficient action
+group lookup table, but its legacy split column is ignored.
+
 Padded tensors use explicit `point_mask`, `object_mask`, `object_active` and
 `candidate_mask`. Object count, category count, point count, view count and
 functional-region vocabulary are not hardcoded to the current dataset.

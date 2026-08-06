@@ -47,6 +47,49 @@ ACTION_GROUP_STRATA = (
 )
 
 
+def split_scene_ids(
+    scene_ids: Iterable[int],
+    data_fraction: float,
+    split_ratios: tuple[float, ...],
+    seed: int,
+) -> dict[str, tuple[int, ...]]:
+    """Deterministically sample and partition published scenes without leakage."""
+
+    scene_array = np.asarray(sorted(set(int(value) for value in scene_ids)), np.int64)
+    if not 0.0 < data_fraction <= 1.0:
+        raise ValueError("data_fraction must be in (0,1]")
+    ratios = np.asarray(split_ratios, np.float64)
+    if ratios.shape not in {(2,), (3,)} or np.any(ratios < 0) or ratios.sum() <= 0:
+        raise ValueError("split_ratios must be non-negative train/val[/test] weights")
+    if not len(scene_array):
+        return {name: () for name in ("train", "val", "test")}
+
+    selected_count = max(1, min(len(scene_array), int(round(len(scene_array) * data_fraction))))
+    selected = np.random.default_rng(seed).permutation(scene_array)[:selected_count]
+    expected = ratios / ratios.sum() * selected_count
+    counts = np.floor(expected).astype(np.int64)
+    positive = np.flatnonzero(ratios > 0)
+    if selected_count >= len(positive):
+        counts[positive] = np.maximum(counts[positive], 1)
+        while counts.sum() > selected_count:
+            removable = np.flatnonzero(counts > 1)
+            index = removable[np.argmax(counts[removable] - expected[removable])]
+            counts[index] -= 1
+    remainder = selected_count - int(counts.sum())
+    if remainder:
+        order = np.argsort(-(expected - counts), kind="stable")
+        counts[order[:remainder]] += 1
+
+    names = ("train", "val", "test")
+    result: dict[str, tuple[int, ...]] = {name: () for name in names}
+    start = 0
+    for name, count in zip(names, counts.tolist(), strict=False):
+        stop = start + int(count)
+        result[name] = tuple(sorted(int(value) for value in selected[start:stop]))
+        start = stop
+    return result
+
+
 def _show_index_progress() -> bool:
     """Only rank zero owns terminal progress in distributed training."""
 
@@ -84,9 +127,13 @@ def _se3_diverse_rows(library, rows: np.ndarray, count: int) -> np.ndarray:
     minimum = np.full(len(rows), np.inf, np.float64)
     while len(selected) < count:
         prior = selected[-1]
-        translation_distance = np.sqrt(np.sum((translation - translation[prior]) ** 2, axis=-1)) / 0.01
+        translation_distance = (
+            np.sqrt(np.sum((translation - translation[prior]) ** 2, axis=-1)) / 0.01
+        )
         approach_distance = 1.0 - np.clip(np.sum(approach * approach[prior], axis=-1), -1.0, 1.0)
-        jaw_distance = 1.0 - np.abs(np.clip(np.sum(closing_axis * closing_axis[prior], axis=-1), -1.0, 1.0))
+        jaw_distance = 1.0 - np.abs(
+            np.clip(np.sum(closing_axis * closing_axis[prior], axis=-1), -1.0, 1.0)
+        )
         width_distance = np.abs(width - width[prior]) / 0.005
         minimum = np.minimum(
             minimum, translation_distance + approach_distance + jaw_distance + width_distance
@@ -97,8 +144,11 @@ def _se3_diverse_rows(library, rows: np.ndarray, count: int) -> np.ndarray:
 
 
 def _object_frame_nms_rows(
-    library, rows: np.ndarray, translation_m: float = 0.01,
-    rotation_cosine: float = 0.965925826, width_m: float = 0.005,
+    library,
+    rows: np.ndarray,
+    translation_m: float = 0.01,
+    rotation_cosine: float = 0.965925826,
+    width_m: float = 0.005,
 ) -> np.ndarray:
     """NMS full evaluation truth under parallel-jaw symmetry."""
 
@@ -112,19 +162,19 @@ def _object_frame_nms_rows(
             continue
         prior = np.asarray(selected, np.int64)
         candidate = transforms[row]
-        translation_close = np.sum(
-            (transforms[prior, :3, 3] - candidate[:3, 3]) ** 2, axis=-1
-        ) <= translation_m**2
+        translation_close = (
+            np.sum((transforms[prior, :3, 3] - candidate[:3, 3]) ** 2, axis=-1) <= translation_m**2
+        )
         if not translation_close.any():
             selected.append(row)
             continue
         nearby = prior[translation_close]
-        approach_close = np.sum(
-            transforms[nearby, :3, 2] * candidate[:3, 2], axis=-1
-        ) >= rotation_cosine
-        jaw_close = np.abs(np.sum(
-            transforms[nearby, :3, 0] * candidate[:3, 0], axis=-1
-        )) >= rotation_cosine
+        approach_close = (
+            np.sum(transforms[nearby, :3, 2] * candidate[:3, 2], axis=-1) >= rotation_cosine
+        )
+        jaw_close = (
+            np.abs(np.sum(transforms[nearby, :3, 0] * candidate[:3, 0], axis=-1)) >= rotation_cosine
+        )
         opening_close = np.abs(library.ag_width_m[nearby] - library.ag_width_m[row]) <= width_m
         if not np.any(approach_close & jaw_close & opening_close):
             selected.append(row)
@@ -172,6 +222,11 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         global_positive_grasps_per_object: int = 64,
         global_negative_grasps_per_object: int = 32,
         index_cache_dir: str | Path = "runtime/cache/dataset_indexes",
+        data_fraction: float = 1.0,
+        split_ratios: tuple[float, ...] = (8.0, 1.0, 1.0),
+        split_seed: int = 2026,
+        scene_start: int = 0,
+        scene_count: int | None = None,
     ) -> None:
         self.root = Path(root)
         self.scene_root = self.root / scene_subdir
@@ -190,38 +245,56 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             if not path.is_dir():
                 raise FileNotFoundError(path)
         self.metadata = json.loads((self.scene_root / "metadata.json").read_text(encoding="utf-8"))
-        self.action_metadata = json.loads((self.action_root / "metadata.json").read_text(encoding="utf-8"))
+        self.action_metadata = json.loads(
+            (self.action_root / "metadata.json").read_text(encoding="utf-8")
+        )
         self.raw_relation_names = tuple(self.metadata["relations"])
         required_raw = {"near", "contact", "support", "occlude", "block_path"}
         if not required_raw.issubset(self.raw_relation_names):
             raise ValueError(
-                f"Dataset relation channels do not satisfy the adapter contract: {self.raw_relation_names}"
+                "Dataset relation channels do not satisfy the adapter contract: "
+                f"{self.raw_relation_names}"
             )
         self.relation_names = ("near", "contact", "support", "press", "occlude")
         self.point_count = point_count
         self.renderer_version = renderer_version
         self.camera_profile = camera_profile
         self.verifier_sampling = (
-            int(verifier_wrong_region_negatives), int(verifier_collision_negatives),
-            int(verifier_approach_negatives), int(sampling_seed),
+            int(verifier_wrong_region_negatives),
+            int(verifier_collision_negatives),
+            int(verifier_approach_negatives),
+            int(sampling_seed),
         )
         # 初始化时快照已原子发布的 HDF5，训练期间不会扫描或读取仍在写入的 .work 文件。
-        self._h5_paths = tuple(sorted((self.action_root / "scene_labels").glob("scene_*.h5")))
+        published_paths = tuple(
+            sorted((self.action_root / "scene_labels").glob("scene_*.h5"))
+        )
+        scene_stop = None if scene_count is None else int(scene_start) + int(scene_count)
+        self._h5_paths = tuple(
+            path
+            for path in published_paths
+            if int(path.stem.split("_")[-1]) >= int(scene_start)
+            and (scene_stop is None or int(path.stem.split("_")[-1]) < scene_stop)
+        )
         self._scene_ids = tuple(int(p.stem.split("_")[-1]) for p in self._h5_paths)
         self._path_by_scene = dict(zip(self._scene_ids, self._h5_paths, strict=True))
+        self.scene_splits = split_scene_ids(
+            self._scene_ids, data_fraction, split_ratios, split_seed
+        )
         self.observation_provider = observation_provider or SavedObservationProvider(
             self.scene_root, self.scene_root / "metadata.json", point_count
         )
         self.camera_parameters = self._formal_camera_parameters()
         self.grasp_registry = GraspLibraryRegistry(self.step_root / "grasp_library")
         inferred_region_root = (
-            self.root.parent
-            / "Grasp_20_class_object_3D_model"
-            / "data"
-            / "manual_function_regions"
+            self.root.parent / "Grasp_20_class_object_3D_model" / "data" / "manual_function_regions"
         )
-        region_root = Path(functional_region_root) if functional_region_root else inferred_region_root
-        self.functional_region_registry = FunctionalRegionRegistry(region_root) if region_root.is_dir() else None
+        region_root = (
+            Path(functional_region_root) if functional_region_root else inferred_region_root
+        )
+        self.functional_region_registry = (
+            FunctionalRegionRegistry(region_root) if region_root.is_dir() else None
+        )
 
     @property
     def snapshot_scene_ids(self) -> tuple[int, ...]:
@@ -266,18 +339,15 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             raise FileNotFoundError(f"No completed action HDF5 for scene {scene_id}") from error
 
     def iter_action_groups(self, split: str | None = None) -> Iterable[tuple[int, int, int, int]]:
-        # 生成器发布的全局 training_index 是权威索引，避免每次训练重开 10,000 个 HDF5。
+        # training_index 仅用于快速定位 group；其中旧 split 列不参与当前场景划分。
         if self.training_index_path.is_file():
             rows = self._load_action_group_index()
             if split is not None:
-                split_code = {"train": 0, "val": 1, "test": 2}.get(split)
-                if split_code is None:
+                if split not in self.scene_splits:
                     raise ValueError(f"Unsupported split: {split}")
-                rows = rows[rows[:, 5] == split_code]
-            yield from (
-                (int(row[1]), int(row[4]), int(row[3]), int(row[2]))
-                for row in rows
-            )
+                scene_ids = np.asarray(self.scene_splits[split], np.int32)
+                rows = rows[np.isin(rows[:, 1], scene_ids)]
+            yield from ((int(row[1]), int(row[4]), int(row[3]), int(row[2])) for row in rows)
             return
 
         # 兼容没有全局索引的旧数据集；首次扫描会明确显示当前场景进度。
@@ -288,10 +358,10 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             disable=not _show_index_progress(),
         ):
             if split is not None:
-                scene_file = self.scene_root / f"scene_{scene_id:04d}" / "scene.npz"
-                with np.load(scene_file, allow_pickle=False) as data:
-                    if str(data["split"].item()) != split:
-                        continue
+                if split not in self.scene_splits:
+                    raise ValueError(f"Unsupported split: {split}")
+                if scene_id not in self.scene_splits[split]:
+                    continue
             with h5py.File(self._h5_path(scene_id), "r", swmr=True) as handle:
                 group = self._scene_group(handle, scene_id)["action_state_groups"]
                 states = group["from_state"][:]
@@ -323,13 +393,15 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         stat = self.training_index_path.stat()
         with h5py.File(self.training_index_path, "r", swmr=True) as handle:
             signature = str(handle.attrs.get("generation_signature", ""))
-        payload = "|".join((
-            ACTION_GROUP_INDEX_CACHE_VERSION,
-            str(self.action_root.resolve()),
-            signature,
-            str(stat.st_size),
-            str(stat.st_mtime_ns),
-        ))
+        payload = "|".join(
+            (
+                ACTION_GROUP_INDEX_CACHE_VERSION,
+                str(self.action_root.resolve()),
+                signature,
+                str(stat.st_size),
+                str(stat.st_mtime_ns),
+            )
+        )
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         return self.index_cache_dir / f"action_group_strata_{digest}.npz"
 
@@ -459,7 +531,9 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
 
         result: dict[tuple[int, int, int, int], str] = {}
         requested = None if units is None else set(units)
-        scene_ids = self._scene_ids if requested is None else sorted({unit[0] for unit in requested})
+        scene_ids = (
+            self._scene_ids if requested is None else sorted({unit[0] for unit in requested})
+        )
         for scene_id in scene_ids:
             with h5py.File(self._h5_path(scene_id), "r", swmr=True) as handle:
                 scene = self._scene_group(handle, scene_id)
@@ -472,11 +546,15 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 action_type = actions["action_type"][:]
                 executed = actions["executed"][:]
                 success = actions["success"][:] | actions["potential_improved"][:]
-                for group_index, (state_id, task_index) in enumerate(zip(states, tasks, strict=True)):
+                for group_index, (state_id, task_index) in enumerate(
+                    zip(states, tasks, strict=True)
+                ):
                     unit = (scene_id, int(state_id), int(task_index), group_index)
                     if requested is not None and unit not in requested:
                         continue
-                    ids = group_action_ids[int(offsets[group_index]) : int(offsets[group_index + 1])]
+                    ids = group_action_ids[
+                        int(offsets[group_index]) : int(offsets[group_index + 1])
+                    ]
                     evaluated_positive = executed[ids] & success[ids]
                     positive_types = set(int(x) for x in action_type[ids][evaluated_positive])
                     if int(ActionType.TASK_GRASP) in positive_types:
@@ -571,7 +649,9 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 self.scene_root / f"scene_{scene_id:04d}" / "scene.npz", allow_pickle=False
             ) as raw_scene:
                 h5_names = tuple(str(x) for x in raw_scene["object_h5_name"][: len(object_pose)])
-                category_keys = tuple(str(x) for x in raw_scene["object_category_key"][: len(object_pose)])
+                category_keys = tuple(
+                    str(x) for x in raw_scene["object_category_key"][: len(object_pose)]
+                )
                 model_ids = tuple(str(x) for x in raw_scene["object_model_id"][: len(object_pose)])
                 object_scales = raw_scene["object_scale"][: len(object_pose)].astype(np.float32)
             request = self._make_observation_request(
@@ -737,7 +817,9 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             if was_executed:
                 known = record["known"]
                 assert isinstance(known, set)
-                known.add(int(CandidateStatus.POSITIVE if was_positive else CandidateStatus.NEGATIVE))
+                known.add(
+                    int(CandidateStatus.POSITIVE if was_positive else CandidateStatus.NEGATIVE)
+                )
 
         result: dict[tuple[int, int], tuple[np.ndarray, int]] = {}
         for key, record in grouped.items():
@@ -748,7 +830,10 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         return result
 
     def load_global_grasps(
-        self, scene_id: int, state_id: int, observation: SceneObservation,
+        self,
+        scene_id: int,
+        state_id: int,
+        observation: SceneObservation,
         training: bool = True,
     ) -> GlobalGraspLabels:
         """Build task-free removal-grasp supervision from the published dataset only.
@@ -799,17 +884,27 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             }
             if training:
                 positive_rows = np.asarray(
-                    [row for row in candidate_rows if status_by_row[int(row)] == CandidateStatus.POSITIVE],
+                    [
+                        row
+                        for row in candidate_rows
+                        if status_by_row[int(row)] == CandidateStatus.POSITIVE
+                    ],
                     np.int64,
                 )
                 negative_rows = np.asarray(
-                    [row for row in candidate_rows if status_by_row[int(row)] == CandidateStatus.NEGATIVE],
+                    [
+                        row
+                        for row in candidate_rows
+                        if status_by_row[int(row)] == CandidateStatus.NEGATIVE
+                    ],
                     np.int64,
                 )
-                eligible = np.concatenate((
-                    _se3_diverse_rows(library, positive_rows, self.global_sampling[0]),
-                    _se3_diverse_rows(library, negative_rows, self.global_sampling[1]),
-                ))
+                eligible = np.concatenate(
+                    (
+                        _se3_diverse_rows(library, positive_rows, self.global_sampling[0]),
+                        _se3_diverse_rows(library, negative_rows, self.global_sampling[1]),
+                    )
+                )
             else:
                 eligible = _object_frame_nms_rows(library, candidate_rows)
 
@@ -825,14 +920,11 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 world_contacts = np.empty((2, 3), np.float32)
                 for side in range(2):
                     for axis in range(3):
-                        world_contacts[side, axis] = (
-                            sum(
-                                float(rotation_world_object[axis, inner])
-                                * float(local_contacts[side, inner])
-                                for inner in range(3)
-                            )
-                            + float(observation.object_pose[object_index, axis])
-                        )
+                        world_contacts[side, axis] = sum(
+                            float(rotation_world_object[axis, inner])
+                            * float(local_contacts[side, inner])
+                            for inner in range(3)
+                        ) + float(observation.object_pose[object_index, axis])
                 if len(visible_points):
                     distance_sq = np.sum(
                         (world_contacts[:, None] - visible_points[None]) ** 2, axis=-1
@@ -875,15 +967,21 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         with h5py.File(self._h5_path(scene_id), "r", swmr=True) as handle:
             scene = self._scene_group(handle, scene_id)
             states = scene["states"]
-            occlusion = _ragged(states["occlusion_blockers"][:], states["occlusion_blocker_offsets"][:], state_id)
+            occlusion = _ragged(
+                states["occlusion_blockers"][:], states["occlusion_blocker_offsets"][:], state_id
+            )
             task_occ = _ragged(
-                states["task_occlusion_blockers"][:], states["task_occlusion_blocker_offsets"][:], state_id
+                states["task_occlusion_blockers"][:],
+                states["task_occlusion_blocker_offsets"][:],
+                state_id,
             )
             task_index = int(states["task_index"][state_id])
             target_object = int(scene["catalog/task_object_index"][task_index])
             raw_relation = states["relation_graph"][state_id].astype(np.float32)
             object_count = raw_relation.shape[0]
-            raw_index = {name: self.raw_relation_names.index(name) for name in self.raw_relation_names}
+            raw_index = {
+                name: self.raw_relation_names.index(name) for name in self.raw_relation_names
+            }
             approach = np.flatnonzero(
                 raw_relation[:, target_object, raw_index["block_path"]] > 0.5
             ).astype(np.int64)
@@ -941,16 +1039,16 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             sequence_task = scene["sequences/task_index"][:]
             task_sequences = np.flatnonzero(sequence_task == task_index)
             topology = dependencies["sequence_topology_valid"][:]
-            sequence_topology_valid = bool(
-                len(task_sequences) and np.all(topology[task_sequences])
-            )
+            sequence_topology_valid = bool(len(task_sequences) and np.all(topology[task_sequences]))
             return StateLabels(
                 relation_graph=relation,
                 task_block_graph=task_block_graph,
                 blockers=blockers,
                 task_pressed=bool(states["task_pressed"][state_id]),
                 task_region_pressed=bool(states["task_region_pressed"][state_id]),
-                verified_positive_grasp_count=int(states["verified_positive_grasp_count"][state_id]),
+                verified_positive_grasp_count=int(
+                    states["verified_positive_grasp_count"][state_id]
+                ),
                 required_grasp_count=int(states["required_grasp_count"][state_id]),
                 direct_goal_valid=bool(states["direct_goal_valid"][state_id]),
                 terminal_goal_valid=bool(states["terminal_goal_valid"][state_id]),
@@ -970,7 +1068,9 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         with h5py.File(self._h5_path(scene_id), "r", swmr=True) as handle:
             scene = self._scene_group(handle, scene_id)
             groups = scene["action_state_groups"]
-            action_ids = _ragged(groups["action_ids"][:], groups["action_offsets"][:], group_index).astype(np.int64)
+            action_ids = _ragged(
+                groups["action_ids"][:], groups["action_offsets"][:], group_index
+            ).astype(np.int64)
             actions = scene["actions"]
             action_type = actions["action_type"][action_ids].astype(np.int64)
             payload_index = actions["payload_index"][action_ids].astype(np.int64)
@@ -996,7 +1096,14 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 "risk_other_invalid": np.zeros(n, np.float32),
                 "stable": np.full(n, np.nan, np.float32),
             }
-            for head in ("stability", "task_compatibility", "collision", "clearance", "approach", "overall"):
+            for head in (
+                "stability",
+                "task_compatibility",
+                "collision",
+                "clearance",
+                "approach",
+                "overall",
+            ):
                 parameters[f"verifier_{head}_target"] = np.full(n, np.nan, np.float32)
                 parameters[f"verifier_{head}_valid"] = np.zeros(n, bool)
             parameters["proposal_geometry_valid"] = np.ones(n, bool)
@@ -1011,17 +1118,19 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 if state_id not in state_pose_cache:
                     state_pose_cache[state_id] = scene["states/object_pose"][state_id]
                 object_pose = state_pose_cache[state_id][object_index]
-                pose = compose_pose_with_transform(object_pose, library.transform_object[library_row])
+                pose = compose_pose_with_transform(
+                    object_pose, library.transform_object[library_row]
+                )
                 rotation = quaternion_xyzw_to_matrix_numpy(pose[3:]).astype(np.float32)
                 object_rotation = quaternion_xyzw_to_matrix_numpy(object_pose[3:])
                 local_contacts = library.contact_points_object[library_row]
                 world_contacts = np.empty((2, 3), np.float32)
                 for side in range(2):
                     for axis in range(3):
-                        world_contacts[side, axis] = (
-                            sum(float(object_rotation[axis, inner] * local_contacts[side, inner]) for inner in range(3))
-                            + float(object_pose[axis])
-                        )
+                        world_contacts[side, axis] = sum(
+                            float(object_rotation[axis, inner] * local_contacts[side, inner])
+                            for inner in range(3)
+                        ) + float(object_pose[axis])
                 return (
                     pose,
                     float(library.contact_span_m[library_row]),
@@ -1030,6 +1139,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                     float(library.confidence[library_row]),
                     world_contacts,
                 )
+
             for row, (kind, payload) in enumerate(zip(action_type, payload_index, strict=True)):
                 if kind == ActionType.PUSH:
                     p = actions["push"]
@@ -1040,12 +1150,19 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 elif kind == ActionType.PICK_REMOVE:
                     p = actions["pick_remove"]
                     acted_object[row] = p["acted_object"][payload]
-                    parameters["removal_grasp_pose_world"][row] = p["removal_grasp_pose_world"][payload]
-                    parameters["removal_grasp_source_index"][row] = p["removal_grasp_source_index"][payload]
-                    parameters["removal_destination_world"][row] = p["removal_destination_world"][payload]
+                    parameters["removal_grasp_pose_world"][row] = p["removal_grasp_pose_world"][
+                        payload
+                    ]
+                    parameters["removal_grasp_source_index"][row] = p["removal_grasp_source_index"][
+                        payload
+                    ]
+                    parameters["removal_destination_world"][row] = p["removal_destination_world"][
+                        payload
+                    ]
                     _, width, rotation, depth_m, confidence, contacts_world = world_grasp(
-                        int(acted_object[row]), int(actions["from_state"][action_ids[row]]),
-                        int(parameters["removal_grasp_source_index"][row])
+                        int(acted_object[row]),
+                        int(actions["from_state"][action_ids[row]]),
+                        int(parameters["removal_grasp_source_index"][row]),
                     )
                     parameters["grasp_width_m"][row] = width
                     parameters["grasp_approach_world"][row] = rotation[:, 2]
@@ -1058,8 +1175,9 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                     acted_object[row] = p["target_object"][payload]
                     parameters["task_grasp_source_index"][row] = p["grasp_source_index"][payload]
                     pose, width, rotation, depth_m, confidence, contacts_world = world_grasp(
-                        int(acted_object[row]), int(actions["from_state"][action_ids[row]]),
-                        int(parameters["task_grasp_source_index"][row])
+                        int(acted_object[row]),
+                        int(actions["from_state"][action_ids[row]]),
+                        int(parameters["task_grasp_source_index"][row]),
                     )
                     parameters["task_grasp_pose_world"][row] = pose
                     parameters["grasp_width_m"][row] = width
@@ -1074,18 +1192,27 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             if np.any(np.abs(parameters["push_distance_m"][push_rows] - PUSH_DISTANCE_M) > 1e-6):
                 raise ValueError("Dataset violates fixed 0.15 m PUSH primitive")
             executed = actions["executed"][action_ids].astype(bool)
-            parameters["stable"][executed] = actions["stable"][action_ids][executed].astype(np.float32)
+            parameters["stable"][executed] = actions["stable"][action_ids][executed].astype(
+                np.float32
+            )
             outcome = actions["outcome_code"][action_ids].astype(np.int64)
-            parameters["risk_unstable"] = (executed & ~actions["stable"][action_ids].astype(bool)).astype(np.float32)
+            parameters["risk_unstable"] = (
+                executed & ~actions["stable"][action_ids].astype(bool)
+            ).astype(np.float32)
             parameters["risk_out_of_workspace"] = (
                 executed & actions["non_target_out_of_workspace"][action_ids].astype(bool)
             ).astype(np.float32)
             known_failure = executed & ~actions["success"][action_ids].astype(bool)
             parameters["risk_other_invalid"] = (
                 known_failure
-                & ~(parameters["risk_unstable"].astype(bool) | parameters["risk_out_of_workspace"].astype(bool))
+                & ~(
+                    parameters["risk_unstable"].astype(bool)
+                    | parameters["risk_out_of_workspace"].astype(bool)
+                )
             ).astype(np.float32)
-            status = np.where(executed, CandidateStatus.NEGATIVE, CandidateStatus.UNKNOWN_UNTESTED).astype(np.int8)
+            status = np.where(
+                executed, CandidateStatus.NEGATIVE, CandidateStatus.UNKNOWN_UNTESTED
+            ).astype(np.int8)
             positive = (
                 actions["success"][action_ids].astype(bool)
                 | actions["potential_improved"][action_ids].astype(bool)
@@ -1095,12 +1222,16 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             grasp_rows = (action_type == int(ActionType.TASK_GRASP)) | (
                 action_type == int(ActionType.PICK_REMOVE)
             )
-            parameters["verifier_stability_target"][grasp_rows & executed] = parameters["stable"][grasp_rows & executed]
+            parameters["verifier_stability_target"][grasp_rows & executed] = parameters["stable"][
+                grasp_rows & executed
+            ]
             parameters["verifier_stability_valid"][grasp_rows & executed] = True
             task_rows = action_type == int(ActionType.TASK_GRASP)
             parameters["verifier_task_compatibility_target"][task_rows] = 1.0
             parameters["verifier_task_compatibility_valid"][task_rows] = True
-            parameters["verifier_overall_target"][grasp_rows & executed] = positive[grasp_rows & executed]
+            parameters["verifier_overall_target"][grasp_rows & executed] = positive[
+                grasp_rows & executed
+            ]
             parameters["verifier_overall_valid"][grasp_rows & executed] = True
             verified_grasp = grasp_rows & executed & positive
             parameters["verifier_collision_target"][verified_grasp] = 0.0
@@ -1119,29 +1250,43 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 after_state_valid=actions["after_state_valid"][action_ids].astype(bool),
                 after_pose_valid=actions["after_pose_valid"][action_ids].astype(bool),
                 potential_after_valid=actions["potential_after_valid"][action_ids].astype(bool),
-                acted_object_motion_valid=actions["acted_object_motion_valid"][action_ids].astype(bool),
+                acted_object_motion_valid=actions["acted_object_motion_valid"][action_ids].astype(
+                    bool
+                ),
                 target_motion_valid=actions["target_motion_valid"][action_ids].astype(bool),
                 potential_delta=actions["potential_delta"][action_ids].astype(np.float32),
                 success_mask=positive & executed,
                 action_parameters=parameters,
                 label_set_complete=(
                     bool(groups["label_set_complete"][group_index])
-                    if "label_set_complete" in groups else False
+                    if "label_set_complete" in groups
+                    else False
                 ),
             )
             from_state_id = int(groups["from_state"][group_index])
             task_index = int(groups["task_index"][group_index])
             if int(scene["states/sequence_depth"][from_state_id]) == 0:
                 candidate_group = self._append_initial_verifier_candidates(
-                    scene_id, scene, candidate_group, task_index, from_state_id,
-                    object_match_files, world_grasp,
+                    scene_id,
+                    scene,
+                    candidate_group,
+                    task_index,
+                    from_state_id,
+                    object_match_files,
+                    world_grasp,
                 )
         candidate_group.validate()
         return candidate_group
 
     def _append_initial_verifier_candidates(
-        self, scene_id: int, scene: h5py.Group, base: ActionCandidateGroup,
-        task_index: int, state_id: int, object_match_files: tuple[str, ...], world_grasp,
+        self,
+        scene_id: int,
+        scene: h5py.Group,
+        base: ActionCandidateGroup,
+        task_index: int,
+        state_id: int,
+        object_match_files: tuple[str, ...],
+        world_grasp,
     ) -> ActionCandidateGroup:
         """Append evaluated region/collision/approach negatives from Steps 1--6."""
 
@@ -1156,7 +1301,9 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             start, stop = int(offsets[target_object]), int(offsets[target_object + 1])
 
             def unpack(name: str) -> np.ndarray:
-                return np.unpackbits(labels[name][start:stop], bitorder="little")[:count].astype(bool)
+                return np.unpackbits(labels[name][start:stop], bitorder="little")[:count].astype(
+                    bool
+                )
 
             collision_free = unpack("candidate_coarse_collision_free_packed")
             reachable = unpack("candidate_coarse_fr5_reachable_packed")
@@ -1172,9 +1319,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             np.flatnonzero(correct_region & collision_free & ~reachable),
         )
         requested = self.verifier_sampling[:3]
-        rng = np.random.default_rng(
-            self.verifier_sampling[3] + scene_id * 1009 + task_index * 9176
-        )
+        rng = np.random.default_rng(self.verifier_sampling[3] + scene_id * 1009 + task_index * 9176)
         selected, kinds = [], []
         for kind, (pool, amount) in enumerate(zip(pools, requested, strict=True)):
             if len(pool):
@@ -1224,6 +1369,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             key: np.concatenate((value, extension[key]), axis=0)
             for key, value in base.action_parameters.items()
         }
+
         def append(name: str, values: np.ndarray) -> np.ndarray:
             return np.concatenate((getattr(base, name), values), axis=0)
 
@@ -1234,9 +1380,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             action_type=append(
                 "action_type", np.full(count_new, int(ActionType.TASK_GRASP), np.int64)
             ),
-            acted_object=append(
-                "acted_object", np.full(count_new, target_object, np.int64)
-            ),
+            acted_object=append("acted_object", np.full(count_new, target_object, np.int64)),
             valid_mask=append("valid_mask", np.ones(count_new, bool)),
             evaluation_status=append(
                 "evaluation_status", np.full(count_new, int(CandidateStatus.NEGATIVE), np.int8)
@@ -1249,7 +1393,9 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             after_state_valid=append("after_state_valid", np.zeros(count_new, bool)),
             after_pose_valid=append("after_pose_valid", np.zeros(count_new, bool)),
             potential_after_valid=append("potential_after_valid", np.zeros(count_new, bool)),
-            acted_object_motion_valid=append("acted_object_motion_valid", np.zeros(count_new, bool)),
+            acted_object_motion_valid=append(
+                "acted_object_motion_valid", np.zeros(count_new, bool)
+            ),
             target_motion_valid=append("target_motion_valid", np.zeros(count_new, bool)),
             potential_delta=append(
                 "potential_delta",
@@ -1260,7 +1406,9 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             label_set_complete=base.label_set_complete,
         )
 
-    def load_sequences(self, scene_id: int, task_index: int | None = None) -> tuple[SequenceLabels, ...]:
+    def load_sequences(
+        self, scene_id: int, task_index: int | None = None
+    ) -> tuple[SequenceLabels, ...]:
         result = []
         with h5py.File(self._h5_path(scene_id), "r", swmr=True) as handle:
             scene = self._scene_group(handle, scene_id)
@@ -1272,18 +1420,28 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                     continue
                 result.append(
                     SequenceLabels(
-                        state_ids=_ragged(sequences["state_ids"][:], sequences["state_offsets"][:], index).astype(np.int64),
+                        state_ids=_ragged(
+                            sequences["state_ids"][:], sequences["state_offsets"][:], index
+                        ).astype(np.int64),
                         transition_ids=_ragged(
-                            sequences["transition_ids"][:], sequences["transition_offsets"][:], index
+                            sequences["transition_ids"][:],
+                            sequences["transition_offsets"][:],
+                            index,
                         ).astype(np.int64),
                         policy_action_ids=_ragged(
-                            sequences["policy_action_ids"][:], sequences["policy_action_offsets"][:], index
+                            sequences["policy_action_ids"][:],
+                            sequences["policy_action_offsets"][:],
+                            index,
                         ).astype(np.int64),
                         terminal_action_ids=_ragged(
-                            sequences["terminal_action_ids"][:], sequences["terminal_action_offsets"][:], index
+                            sequences["terminal_action_ids"][:],
+                            sequences["terminal_action_offsets"][:],
+                            index,
                         ).astype(np.int64),
                         final_grasp_source_indices=_ragged(
-                            sequences["final_grasp_source_indices"][:], sequences["final_grasp_offsets"][:], index
+                            sequences["final_grasp_source_indices"][:],
+                            sequences["final_grasp_offsets"][:],
+                            index,
                         ).astype(np.int64),
                         sequence_topology_valid=bool(topology[index]),
                         task_index=int(task),

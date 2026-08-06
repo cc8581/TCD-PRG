@@ -59,6 +59,9 @@ def _launcher_defaults(paths_config: Path) -> dict[str, str | Path | None]:
             )
         ),
         "pybullet_python": local.get("pybullet_python", sys.executable),
+        "observation_cache_dir": _project_relative_path(
+            local.get("observation_cache_dir", PROJECT / "runtime" / "cache" / "observations")
+        ),
         "gpus": 1,
         "output_dir": PROJECT / "outputs" / f"ptv3_full_{stamp}",
         "resume": None,
@@ -66,7 +69,7 @@ def _launcher_defaults(paths_config: Path) -> dict[str, str | Path | None]:
     }
 
 
-def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, str]:
+def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, str, Path]:
     local = _load_local_paths(args.paths_config.resolve())
     dataset = _project_relative_path(
         args.dataset_root
@@ -85,6 +88,10 @@ def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, str]:
     pybullet_python = str(
         args.pybullet_python or local.get("pybullet_python", sys.executable)
     )
+    observation_cache = _project_relative_path(
+        args.observation_cache_dir
+        or local.get("observation_cache_dir", PROJECT / "runtime" / "cache" / "observations")
+    )
     for name, path in (
         ("dataset", dataset),
         ("ACRONYM", acronym),
@@ -96,7 +103,10 @@ def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, str]:
                 f"Copy configs/local_paths.example.yaml to {args.paths_config} "
                 "and fill in this machine's paths, or pass the matching --*-root option."
             )
-    return dataset.resolve(), acronym.resolve(), functional_region.resolve(), pybullet_python
+    return (
+        dataset.resolve(), acronym.resolve(), functional_region.resolve(),
+        pybullet_python, observation_cache.resolve(),
+    )
 
 
 def _project_relative_path(value: str | Path) -> Path:
@@ -148,6 +158,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--acronym-root", type=Path, default=defaults["acronym_root"], help="Root directory of the ACRONYM grasp dataset.")
     parser.add_argument("--functional-region-root", type=Path, default=defaults["functional_region_root"], help="Root directory of the manual functional-region annotations.")
     parser.add_argument("--pybullet-python", default=defaults["pybullet_python"], help="Python interpreter used by the PyBullet compatibility workers.")
+    parser.add_argument("--observation-cache-dir", type=Path, default=defaults["observation_cache_dir"], help="Content-addressed observation cache directory.")
     parser.add_argument("--gpus", type=int, default=defaults["gpus"], help="Number of local training GPUs.")
     parser.add_argument("--output-dir", type=Path, default=defaults["output_dir"], help="Directory for checkpoints, JSONL metrics, and TensorBoard logs.")
     # resume 恢复优化器/调度器等完整状态；initialize 仅加载模型权重，二者不可同时使用。
@@ -207,7 +218,7 @@ def main() -> None:
                 f"Requested {args.gpus} GPUs, but PyTorch detects only {available}. "
                 "Multi-GPU training was not started."
             )
-    dataset, acronym, functional_region, pybullet_python = _resolve_paths(args)
+    dataset, acronym, functional_region, pybullet_python, observation_cache = _resolve_paths(args)
     ptv3_source = PROJECT / "third_party" / "PointTransformerV3" / "model.py"
     if not ptv3_source.is_file():
         raise FileNotFoundError(
@@ -219,6 +230,7 @@ def main() -> None:
         _quoted_override("dataset.acronym_root", acronym),
         _quoted_override("dataset.functional_region_root", functional_region),
         _quoted_override("observation.pybullet_python", pybullet_python),
+        _quoted_override("cache.directory", observation_cache),
     )
     training_args = _training_arguments(args, path_overrides)
     print("TCD-PRG formal training", flush=True)
