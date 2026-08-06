@@ -59,11 +59,14 @@ def _pad_square(arrays: list[np.ndarray], value: float | int = 0) -> Tensor:
     return torch.from_numpy(output)
 
 
-def grid_sample_indices(xyz: np.ndarray, grid_size_m: float, training: bool) -> np.ndarray:
-    """Select one representative per occupied voxel like Pointcept GridSample."""
+def grid_sample(
+    xyz: np.ndarray, grid_size_m: float, training: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return representatives and their original Pointcept voxel coordinates."""
 
     if grid_size_m <= 0 or len(xyz) == 0:
-        return np.arange(len(xyz), dtype=np.int64)
+        indices = np.arange(len(xyz), dtype=np.int64)
+        return indices, np.zeros((len(indices), 3), dtype=np.int32)
     grid = np.floor((xyz - xyz.min(0)) / grid_size_m).astype(np.int64)
     _, inverse, counts = np.unique(grid, axis=0, return_inverse=True, return_counts=True)
     order = np.argsort(inverse, kind="stable")
@@ -73,7 +76,14 @@ def grid_sample_indices(xyz: np.ndarray, grid_size_m: float, training: bool) -> 
         offsets = np.random.randint(0, counts.max(), len(counts)) % counts
     else:
         offsets = np.zeros(len(counts), dtype=np.int64)
-    return order[starts + offsets]
+    selected = order[starts + offsets]
+    return selected, grid[selected].astype(np.int32, copy=False)
+
+
+def grid_sample_indices(xyz: np.ndarray, grid_size_m: float, training: bool) -> np.ndarray:
+    """Compatibility wrapper returning only selected representative indices."""
+
+    return grid_sample(xyz, grid_size_m, training)[0]
 
 
 def collate_unified(
@@ -83,11 +93,15 @@ def collate_unified(
         raise ValueError("Cannot collate an empty batch")
     observations = [x.observation for x in samples]
     candidates = [x.candidates for x in samples]
-    point_indices = [
-        grid_sample_indices(x.xyz, float(grid_size_m), training)
-        if grid_size_m is not None else np.arange(len(x.xyz), dtype=np.int64)
-        for x in observations
-    ]
+    if grid_size_m is not None:
+        point_samples = [
+            grid_sample(x.xyz, float(grid_size_m), training) for x in observations
+        ]
+        point_indices = [item[0] for item in point_samples]
+        grid_coord, _ = _pad([item[1] for item in point_samples])
+    else:
+        point_indices = [np.arange(len(x.xyz), dtype=np.int64) for x in observations]
+        grid_coord = None
     # 所有变长轴都同时生成显式 mask，后续网络不得把 padding 当作真实点或候选。
     xyz, point_mask = _pad([x.xyz[i] for x, i in zip(observations, point_indices, strict=True)])
     rgb, _ = _pad([x.rgb[i] for x, i in zip(observations, point_indices, strict=True)])
@@ -228,6 +242,10 @@ def collate_unified(
         "remaining_steps_valid": torch.tensor(remaining_steps_valid, dtype=torch.bool),
         "samples": samples,
     }
+    if grid_coord is not None:
+        # These are the coordinates used for representative selection.  Passing
+        # them through avoids a second GPU unique/sort pass in the PTv3 adapter.
+        result["grid_coord"] = grid_coord.to(torch.int32)
     if have_region:
         region_target, _ = _pad([  # type: ignore[index]
             x.region_target[i] for x, i in zip(observations, point_indices, strict=True)

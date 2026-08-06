@@ -32,7 +32,6 @@ COMMON_OVERRIDES = [
     "training.num_workers=0",
     "training.pin_memory=false",
     "training.validation_interval=1000",
-    "training.checkpoint_interval=1",
     "logging.log_interval=1",
 ]
 
@@ -371,7 +370,6 @@ def main() -> None:
             "process_peak_working_set_bytes": process_memory.peak_wset,
             "process_private_bytes": process_memory.private,
             "checkpoint_last_bytes": checkpoint_path.stat().st_size,
-            "checkpoint_interval_bytes": (run / "step_00000001.pt").stat().st_size,
         },
         "successful_step": {
             "loss_total": float(loss.detach()),

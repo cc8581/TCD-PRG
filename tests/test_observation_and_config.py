@@ -138,11 +138,11 @@ def test_formal_config_uses_unlimited_variable_length_scenes() -> None:
     assert config.dataset.scene_points == 0
 
 
-def test_formal_config_uses_bounded_lru_and_full_validation() -> None:
+def test_formal_config_uses_bounded_lru_and_limited_validation() -> None:
     config = load_config(PROJECT_ROOT / "configs" / "config.yaml")
-    assert config.cache.max_gb == 5.0
+    assert config.cache.max_gb == 10.0
     assert config.cache.eviction == "lru"
-    assert config.training.max_validation_groups is None
+    assert config.training.max_validation_groups == 256
     assert config.logging.validation_log_interval == 20
 
 

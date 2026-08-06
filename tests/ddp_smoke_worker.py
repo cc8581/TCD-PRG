@@ -23,7 +23,6 @@ def run(rank: int, world_size: int, init_method: str, output_dir: str) -> None:
             amp=False,
             max_optimizer_steps=1,
             gradient_accumulation_steps=1,
-            checkpoint_interval=1,
             validation_interval=100,
         ),
         logging=LoggingConfig(backend="none", log_interval=1),

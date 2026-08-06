@@ -185,7 +185,6 @@ class TrainingConfig:
     max_optimizer_steps: int = 100_000
     # validation_interval=0 仅用于没有验证集的启动阶段，正式实验不应关闭验证。
     validation_interval: int = 1_000
-    checkpoint_interval: int = 1_000
     # 联合目标的全局梯度范数远大于单任务 Transformer；20 仅截断实测尖峰。
     gradient_clip_norm: float = 20.0
     ema_decay: float | None = 0.999

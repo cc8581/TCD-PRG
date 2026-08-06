@@ -106,56 +106,110 @@ class TCDPRGModel(nn.Module):
             nn.Linear(7, c.feature_dim), nn.GELU(), nn.Linear(c.feature_dim, c.feature_dim)
         )
 
+    @staticmethod
+    @torch.no_grad()
+    def _nearest_object_point_indices(
+        xyz: Tensor, point_mask: Tensor, instance_id: Tensor,
+        object_index: Tensor, query: Tensor, valid: Tensor,
+        chunk_size: int = 16,
+    ) -> tuple[Tensor, Tensor]:
+        """Find nearest same-instance points without per-candidate CUDA syncs."""
+
+        if query.ndim != 3 or query.shape[-1] != 3:
+            raise ValueError("query must be [B,K,3]")
+        batch_size, candidates = query.shape[:2]
+        nearest = torch.zeros(
+            (batch_size, candidates), dtype=torch.long, device=xyz.device
+        )
+        found = torch.zeros_like(nearest, dtype=torch.bool)
+        valid = valid.bool() & torch.isfinite(query).all(-1) & (object_index >= 0)
+        safe_query = torch.nan_to_num(query, nan=0.0, posinf=0.0, neginf=0.0).float()
+        reference = xyz.float()
+        for start in range(0, candidates, chunk_size):
+            end = min(candidates, start + chunk_size)
+            current_valid = valid[:, start:end]
+            domain = current_valid[:, :, None] & point_mask[:, None] & (
+                instance_id[:, None] == object_index[:, start:end, None]
+            )
+            distance = torch.cdist(safe_query[:, start:end], reference)
+            distance = distance.masked_fill(~domain, float("inf"))
+            nearest[:, start:end] = distance.argmin(-1)
+            found[:, start:end] = domain.any(-1)
+        return nearest, found
+
     def _candidate_evidence_from_batch(
         self, batch: dict[str, Tensor], result: dict[str, Any], kind: Tensor,
         acted_object: Tensor, pose: Tensor
     ) -> Tensor:
-        """Gather proposal/PUSH evidence for labelled training candidates."""
+        """Gather proposal/PUSH evidence without Python loops over CUDA candidates."""
 
-        b, k = kind.shape
-        evidence = torch.zeros((b, k, 7), device=kind.device)
+        batch_size, candidates = kind.shape
+        evidence = torch.zeros((batch_size, candidates, 7), device=kind.device)
         parameters = batch["action_parameters"]
-        for row in range(b):
-            for candidate in torch.nonzero(batch["candidate_mask"][row], as_tuple=False).flatten().tolist():
-                is_push = int(kind[row, candidate]) == 0
-                is_remove = int(kind[row, candidate]) == 1
-                query = parameters["push_contact_world"][row, candidate] if is_push else pose[row, candidate, :3]
-                if not torch.isfinite(query).all():
-                    continue
-                mask = batch["point_mask"][row] & (
-                    batch["instance_id"][row] == acted_object[row, candidate]
-                )
-                points = torch.nonzero(mask, as_tuple=False).flatten()
-                if not len(points):
-                    continue
-                if not is_push and "grasp_contact_points_world" in parameters:
-                    contacts = parameters["grasp_contact_points_world"][row, candidate]
-                    if torch.isfinite(contacts).all():
-                        contact_distance = torch.cdist(contacts, batch["xyz"][row, points])
-                        query = contacts[contact_distance.min(-1).values.argmin()]
-                delta = batch["xyz"][row, points] - query
-                point = points[(delta * delta).sum(-1).argmin()]
-                if is_push:
-                    direction = parameters["push_direction_world"][row, candidate]
-                    angle = torch.atan2(direction[1], direction[0]).remainder(2 * torch.pi)
-                    direction_bin = torch.floor(
-                        angle * self.config.num_direction_bins / (2 * torch.pi)
-                    ).long().remainder(self.config.num_direction_bins)
-                    evidence[row, candidate, 0] = result["push"]["utility_delta"][
-                        row, point, direction_bin
-                    ]
-                    evidence[row, candidate, 1] = torch.sigmoid(
-                        result["push"]["contact_logits"][row, point]
-                    )
-                    evidence[row, candidate, 3] = torch.softmax(
-                        result["push"]["direction_logits"][row, point], dim=-1
-                    )[direction_bin]
-                else:
-                    head = result["global_grasp"] if is_remove else result["task_grasp"]
-                    nearest = torch.linalg.vector_norm(
-                        head["translation_world"][row] - pose[row, candidate, :3], dim=-1
-                    ).argmin()
-                    evidence[row, candidate, 1] = torch.sigmoid(head["quality_logit"][row, nearest])
+        candidate_valid = batch["candidate_mask"].bool()
+
+        object_count = batch["object_mask"].shape[1]
+        object_index = torch.arange(object_count, device=kind.device)
+        visible_object = (
+            batch["point_mask"][:, None]
+            & (batch["instance_id"][:, None] == object_index[None, :, None])
+        ).any(-1)
+        object_in_range = (acted_object >= 0) & (acted_object < object_count)
+        candidate_has_points = object_in_range & visible_object.gather(
+            1, acted_object.clamp(0, object_count - 1)
+        )
+
+        push_contact = parameters["push_contact_world"]
+        push_direction = parameters["push_direction_world"]
+        push_valid = (
+            candidate_valid
+            & (kind == int(ActionType.PUSH))
+            & torch.isfinite(push_contact).all(-1)
+            & torch.isfinite(push_direction).all(-1)
+        )
+        push_point, push_found = self._nearest_object_point_indices(
+            batch["xyz"], batch["point_mask"], batch["instance_id"],
+            acted_object, push_contact, push_valid,
+        )
+        push_rows, push_candidates = torch.nonzero(push_found, as_tuple=True)
+        if push_rows.numel():
+            points = push_point[push_rows, push_candidates]
+            directions = push_direction[push_rows, push_candidates]
+            angles = torch.atan2(directions[:, 1], directions[:, 0]).remainder(2 * torch.pi)
+            direction_bin = torch.floor(
+                angles * self.config.num_direction_bins / (2 * torch.pi)
+            ).long().remainder(self.config.num_direction_bins)
+            evidence[push_rows, push_candidates, 0] = result["push"]["utility_delta"][
+                push_rows, points, direction_bin
+            ].to(evidence.dtype)
+            evidence[push_rows, push_candidates, 1] = torch.sigmoid(
+                result["push"]["contact_logits"][push_rows, points]
+            ).to(evidence.dtype)
+            selected_logits = result["push"]["direction_logits"][push_rows, points]
+            evidence[push_rows, push_candidates, 3] = torch.softmax(
+                selected_logits, dim=-1
+            ).gather(1, direction_bin[:, None]).squeeze(1).to(evidence.dtype)
+
+        finite_pose = torch.isfinite(pose[..., :3]).all(-1)
+        for action_type, head_name in (
+            (ActionType.PICK_REMOVE, "global_grasp"),
+            (ActionType.TASK_GRASP, "task_grasp"),
+        ):
+            eligible = (
+                candidate_valid & (kind == int(action_type))
+                & finite_pose & candidate_has_points
+            )
+            with torch.no_grad():
+                nearest_query = torch.cdist(
+                    torch.nan_to_num(
+                        pose[..., :3], nan=0.0, posinf=0.0, neginf=0.0
+                    ).float(),
+                    result[head_name]["translation_world"].detach().float(),
+                ).argmin(-1)
+            quality = result[head_name]["quality_logit"].gather(1, nearest_query)
+            evidence[..., 1] = torch.where(
+                eligible, torch.sigmoid(quality), evidence[..., 1]
+            )
         return evidence
 
     def verify_cached(
@@ -211,28 +265,19 @@ class TCDPRGModel(nn.Module):
         if not required.issubset(batch):
             return None
         contacts = batch["action_parameters"]["push_contact_world"]
-        forced: list[Tensor] = []
-        for row in range(batch["xyz"].shape[0]):
-            selected: list[Tensor] = []
-            push_candidates = batch["candidate_mask"][row] & (
-                batch["action_type"][row] == int(ActionType.PUSH)
-            ) & torch.isfinite(contacts[row]).all(-1)
-            for candidate in torch.nonzero(push_candidates, as_tuple=False).flatten():
-                object_index = batch["acted_object"][row, candidate]
-                domain = batch["point_mask"][row] & (
-                    batch["instance_id"][row] == object_index
-                )
-                points = torch.nonzero(domain, as_tuple=False).flatten()
-                if points.numel():
-                    distance = batch["xyz"][row, points] - contacts[row, candidate]
-                    selected.append(points[distance.square().sum(-1).argmin()])
-            forced.append(
-                torch.unique(torch.stack(selected))
-                if selected else torch.empty(
-                    0, dtype=torch.long, device=batch["xyz"].device
-                )
-            )
-        return tuple(forced)
+        push_candidates = (
+            batch["candidate_mask"]
+            & (batch["action_type"] == int(ActionType.PUSH))
+            & torch.isfinite(contacts).all(-1)
+        )
+        point_index, found = self._nearest_object_point_indices(
+            batch["xyz"], batch["point_mask"], batch["instance_id"],
+            batch["acted_object"], contacts, push_candidates,
+        )
+        return tuple(
+            torch.unique(point_index[row, found[row]], sorted=True)
+            for row in range(batch["xyz"].shape[0])
+        )
 
     def route_cached(
         self, batch: dict[str, Tensor], result: dict[str, Any], candidate_inputs: dict[str, Any]
@@ -313,6 +358,7 @@ class TCDPRGModel(nn.Module):
             batch["task_region_id"],
             use_task_region_condition=self.ablation.use_task_region_condition,
             target_object=batch["target_object"],
+            grid_coord=batch.get("grid_coord"),
         )
         return encoded, physical_active
 

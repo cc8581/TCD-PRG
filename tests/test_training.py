@@ -261,12 +261,11 @@ def test_validation_metrics_and_checkpoint_events_are_persisted(tmp_path, capsys
     assert "validation_completed" in events
 
 
-def test_periodic_checkpoint_overwrites_last_without_step_archives(tmp_path) -> None:
+def test_validation_overwrites_last_without_step_archives(tmp_path) -> None:
     config = TCDPRGConfig(
         training=TrainingConfig(
             device="cpu", amp=False, max_optimizer_steps=2,
-            gradient_accumulation_steps=1, validation_interval=0,
-            checkpoint_interval=1,
+            gradient_accumulation_steps=1, validation_interval=1,
         ),
         logging=LoggingConfig(backend="none", log_interval=10),
         output_dir=str(tmp_path),
@@ -281,11 +280,16 @@ def test_periodic_checkpoint_overwrites_last_without_step_archives(tmp_path) -> 
 
     trainer = Trainer(model, optimizer, config, loss_step)
     finished_steps: list[int] = []
-    trainer.train([batch], step_finished=finished_steps.append)
+    trainer.train(
+        [batch],
+        validate=lambda module: (1.0, 1),
+        step_finished=finished_steps.append,
+    )
 
     payload = torch.load(tmp_path / "last.pt", map_location="cpu", weights_only=False)
     assert payload["trainer_state"]["optimizer_steps"] == 2
     assert finished_steps == [1, 2]
+    assert (tmp_path / "best.pt").is_file()
     assert list(tmp_path.glob("step_*.pt")) == []
 
 

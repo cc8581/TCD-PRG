@@ -34,7 +34,7 @@ observation:
 cache:
   # 命中会刷新访问时间；达到容量或磁盘余量阈值时，LRU 自动淘汰最久未访问条目。
   directory: runtime/cache/observations
-  max_gb: 5
+  max_gb: 10
   min_free_gb: 20
   eviction: lru
   prefetch_workers: 4
@@ -55,7 +55,7 @@ backbone:
   pretrained_freeze_steps: 2000
   freeze: false
   grid_size_m: 0.005
-  enable_flash_attention: false
+  enable_flash_attention: True
   patch_size: 128
   attention_points: 1024
 
@@ -78,10 +78,10 @@ model:
   min_grasp_width_m: 0.0
   max_grasp_width_m: 0.095
   candidate_topk: 64
-  task_grasp_candidates: 64
-  global_grasp_candidates: 64
+  task_grasp_candidates: 32
+  global_grasp_candidates: 32
   # Task/Global Grasp 共用一个 M2T2 风格解码器，但使用两组独立 query。
-  grasp_decoder_layers: 3
+  grasp_decoder_layers: 2
   grasp_decoder_heads: 8
   pick_remove_candidates: 16
   push_candidates: 16
@@ -93,8 +93,8 @@ model:
   push_direction_transformer_heads: 4
   activation_checkpointing: false # 显存不足时再开启；开启会重复计算 PTv3 前向
   verifier_local_radius_m: 0.25
-  verifier_candidate_micro_batch: 16
-  verifier_transformer_layers: 2
+  verifier_candidate_micro_batch: 64
+  verifier_transformer_layers: 1
   verifier_transformer_heads: 8
   verifier_validity_threshold: 0.5
   verifier_hard_gate: false
@@ -127,8 +127,8 @@ model:
   push_failure_penalties: [1.0, 2.0, 1.0]
 
 grasp_verifier:
-  local_scene_points: 128
-  gripper_points: 128
+  local_scene_points: 64
+  gripper_points: 64
   gripper_width_quantization_m: 0.001 # 1 mm 档位，最大几何近似误差 0.5 mm
 
 graph:
@@ -192,16 +192,15 @@ training:
   amp_initial_scale: 4096
   batch_size: 6
   gradient_accumulation_steps: 4  # 有效 batch 更稳定，不增加单步显存
-  max_optimizer_steps: 100000
-  validation_interval: 10000     # 周期验证。
-  checkpoint_interval: 10000     # 周期保存checkpoint。
+  max_optimizer_steps: 30000
+  validation_interval: 2000     # 周期验证。
   gradient_clip_norm: 20.0 # 联合多任务全局范数阈值；模块级诊断用于继续校准
   ema_decay: 0.999
   early_stopping_patience: 20
-  deterministic: true
-  num_workers: 4
+  deterministic: False
+  num_workers: 6
   pin_memory: true
-  max_validation_groups: null  # null 表示验证完整 validation split
+  max_validation_groups: 256  # 每次只验证前 256 个 validation state-group
   max_train_groups: null
   data_fraction: 1.0  # 0.5 表示使用训练 split 的50%
   frozen_modules: []

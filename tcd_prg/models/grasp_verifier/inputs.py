@@ -70,20 +70,24 @@ def build_verifier_inputs(
         else tuple(gripper_provider.get(float(width)) for width in valid_widths)
     )
     geometry_iterator = iter(prefetched)
+    radius_squared = float(local_radius_m) ** 2
     for row in range(batch_size):
         valid_scene_indices = torch.nonzero(batch["point_mask"][row], as_tuple=False).flatten()
+        valid_scene_xyz = batch["xyz"][row, valid_scene_indices]
         for candidate in torch.nonzero(grasp_candidate[row], as_tuple=False).flatten().tolist():
             origin = pose[row, candidate, :3]
-            distances = torch.linalg.vector_norm(
-                batch["xyz"][row, valid_scene_indices] - origin, dim=-1
-            )
-            order = torch.argsort(distances)
-            within = order[distances[order] <= local_radius_m]
-            if not len(within):
+            distance_squared = (valid_scene_xyz - origin).square().sum(-1)
+            within = distance_squared <= radius_squared
+            count = min(local_scene_points, int(within.sum()))
+            if count == 0:
                 grasp_candidate[row, candidate] = False
                 continue
-            chosen = within[:local_scene_points]
-            count = len(chosen)
+            # Only the nearest L points are needed; a full O(N log N) sort per
+            # candidate is unnecessary. sorted=True preserves deterministic order.
+            chosen = torch.topk(
+                distance_squared.masked_fill(~within, float("inf")),
+                k=count, largest=False, sorted=True,
+            ).indices
             indices = valid_scene_indices[chosen]
             scene_index[row, candidate, :count] = indices
             # 场景点和夹爪点统一变换到候选 TCP 坐标系，网络无需学习绝对世界位姿。

@@ -49,11 +49,11 @@ def _load_official_model(source_root: str | Path) -> type[nn.Module]:
 class PointTransformerV3SceneGeometryBackbone(nn.Module):
     """Produce padded TCD-PRG features with one official PTv3 pass per scene.
 
-    The collator applies Pointcept GridSample to the complete formal-resolution
-    camera union before padding. This adapter defensively voxelizes the retained
-    variable-length points again, packs all scenes for PTv3, and uses the
-    inverse voxel map to restore feature alignment for every retained dense
-    supervision point consumed by the TCD-PRG heads.
+    The formal collator applies Pointcept GridSample before padding and passes
+    the exact selected voxel coordinates.  The fast path therefore packs those
+    representatives directly, avoiding a second CUDA ``unique``/``argsort``.
+    Direct callers that omit ``grid_coord`` retain the defensive voxelization
+    fallback and inverse map.
     """
 
     def __init__(
@@ -87,7 +87,8 @@ class PointTransformerV3SceneGeometryBackbone(nn.Module):
         self.global_pool = MaskedAttentionPool(dim, dim)
 
     def _voxelize(
-        self, xyz: Tensor, rgb: Tensor, point_mask: Tensor
+        self, xyz: Tensor, rgb: Tensor, point_mask: Tensor,
+        grid_coord: Tensor | None = None,
     ) -> tuple[dict[str, Any], Tensor, Tensor]:
         batch_size, point_count = point_mask.shape
         flat_valid = point_mask.flatten()
@@ -100,7 +101,24 @@ class PointTransformerV3SceneGeometryBackbone(nn.Module):
             .expand(-1, point_count)
             .reshape(-1)[flat_valid]
         )
-        # 每个 batch 样本独立平移到局部网格，避免不同场景的体素坐标互相影响。
+        if grid_coord is not None:
+            if grid_coord.shape != xyz.shape:
+                raise ValueError("grid_coord must have the same [B,N,3] shape as xyz")
+            # Formal DataLoader path: GridSample already selected one point per
+            # coordinate. Preserve those exact coordinates; recomputing the
+            # origin after randomized representative selection can shift voxel
+            # boundaries and would require another unique/sort operation.
+            flat_grid = grid_coord.reshape(-1, 3)[flat_valid].to(torch.int32)
+            inverse = torch.arange(flat_xyz.shape[0], device=xyz.device)
+            data = {
+                "coord": flat_xyz,
+                "grid_coord": flat_grid,
+                "feat": torch.cat((flat_xyz, flat_rgb), -1),
+                "batch": flat_batch.to(torch.long),
+            }
+            return data, inverse, flat_valid
+
+        # Defensive fallback for direct callers that did not use collate_unified.
         grid_rows = []
         for row in range(batch_size):
             selected = flat_batch == row
@@ -116,9 +134,6 @@ class PointTransformerV3SceneGeometryBackbone(nn.Module):
         unique_key, inverse = torch.unique(voxel_key, dim=0, sorted=True, return_inverse=True)
         voxel_count = unique_key.shape[0]
         counts = torch.bincount(inverse, minlength=voxel_count)
-        # Repeat Pointcept's randomized representative rule for direct callers
-        # that did not pass through the formal collator. Evaluation and
-        # deployment select the first point deterministically.
         order = torch.argsort(inverse, stable=True)
         starts = torch.cumsum(counts, 0) - counts
         if self.training:
@@ -139,9 +154,12 @@ class PointTransformerV3SceneGeometryBackbone(nn.Module):
         return data, inverse, flat_valid
 
     def forward(
-        self, xyz: Tensor, rgb: Tensor, instance_id: Tensor, point_mask: Tensor, object_mask: Tensor
+        self, xyz: Tensor, rgb: Tensor, instance_id: Tensor, point_mask: Tensor,
+        object_mask: Tensor, grid_coord: Tensor | None = None,
     ) -> SceneGeometryOutput:
-        data, inverse, flat_valid = self._voxelize(xyz, rgb, point_mask)
+        data, inverse, flat_valid = self._voxelize(
+            xyz, rgb, point_mask, grid_coord=grid_coord
+        )
         if self.activation_checkpointing and self.training:
             def encode(
                 coord: Tensor, grid_coord: Tensor, feat: Tensor, batch: Tensor
@@ -168,10 +186,12 @@ class PointTransformerV3SceneGeometryBackbone(nn.Module):
         point_features = xyz.new_zeros((*point_mask.shape, voxel_features.shape[-1]))
         point_features.view(-1, voxel_features.shape[-1])[flat_valid] = voxel_features[inverse]
         query = self.pool_query[None].expand(xyz.shape[0], -1)
-        objects = [
-            self.object_pool(point_features, point_mask & (instance_id == index), query)
-            for index in range(object_mask.shape[1])
-        ]
-        object_tokens = torch.stack(objects, 1) * object_mask.unsqueeze(-1)
+        object_index = torch.arange(object_mask.shape[1], device=instance_id.device)
+        object_point_mask = point_mask[:, None] & (
+            instance_id[:, None] == object_index[None, :, None]
+        )
+        object_tokens = self.object_pool.forward_grouped(
+            point_features, object_point_mask, query
+        ) * object_mask.unsqueeze(-1)
         global_token = self.global_pool(point_features, point_mask, query)
         return SceneGeometryOutput(point_features, object_tokens, object_mask, global_token)

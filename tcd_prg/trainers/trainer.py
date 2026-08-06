@@ -700,8 +700,6 @@ class Trainer:
                 window_data_seconds = 0.0
                 if step_finished is not None:
                     step_finished(step)
-                if step % self.config.training.checkpoint_interval == 0:
-                    self.save_checkpoint(self.output_dir / "last.pt")
                 if validate and step % self.config.training.validation_interval == 0:
                     validation = validate(self.ema.model if self.ema else self.model)
                     self.model.train()
@@ -846,6 +844,7 @@ class Trainer:
                         validation_items=validation_items,
                         metrics=validation_details,
                     )
+                    self.save_checkpoint(self.output_dir / "last.pt")
                     if (
                         self.state.validation_without_improvement
                         >= self.config.training.early_stopping_patience

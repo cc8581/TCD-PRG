@@ -198,8 +198,10 @@ class TaskFreeSceneGeometryBackbone(nn.Module):
         self.global_pool = MaskedAttentionPool(dim, dim)
 
     def forward(
-        self, xyz: Tensor, rgb: Tensor, instance_id: Tensor, point_mask: Tensor, object_mask: Tensor
+        self, xyz: Tensor, rgb: Tensor, instance_id: Tensor, point_mask: Tensor,
+        object_mask: Tensor, grid_coord: Tensor | None = None,
     ) -> SceneGeometryOutput:
+        del grid_coord  # The lightweight legacy backbone does not voxelize.
         b, n, _ = xyz.shape
         base = self.input_projection(torch.cat((xyz, rgb, point_mask.unsqueeze(-1).float()), -1))
         base = base * point_mask.unsqueeze(-1)
@@ -217,11 +219,13 @@ class TaskFreeSceneGeometryBackbone(nn.Module):
         context = anchor_features[row, nearest]
         point_features = self.context_projection(torch.cat((base, context), -1)) * point_mask.unsqueeze(-1)
         query = self.pool_query.unsqueeze(0).expand(b, -1)
-        objects = [
-            self.object_pool(point_features, point_mask & (instance_id == index), query)
-            for index in range(object_mask.shape[1])
-        ]
-        object_tokens = torch.stack(objects, 1) * object_mask.unsqueeze(-1)
+        object_index = torch.arange(object_mask.shape[1], device=instance_id.device)
+        object_point_mask = point_mask[:, None] & (
+            instance_id[:, None] == object_index[None, :, None]
+        )
+        object_tokens = self.object_pool.forward_grouped(
+            point_features, object_point_mask, query
+        ) * object_mask.unsqueeze(-1)
         global_token = self.global_pool(point_features, point_mask, query)
         return SceneGeometryOutput(point_features, object_tokens, object_mask, global_token)
 
@@ -304,10 +308,16 @@ class TaskConditionedPointTransformer(nn.Module):
         self, xyz: Tensor, rgb: Tensor, instance_id: Tensor, point_mask: Tensor,
         target_mask: Tensor, object_mask: Tensor, task_category_id: Tensor,
         task_region_id: Tensor, use_task_region_condition: bool = True,
-        target_object: Tensor | None = None,
+        target_object: Tensor | None = None, grid_coord: Tensor | None = None,
     ) -> EncoderOutput:
         # scene_backbone 每次 forward 只运行一次，Task/Global/Graph/Push 全部复用其输出。
-        scene = self.scene_backbone(xyz, rgb, instance_id, point_mask, object_mask)
+        if grid_coord is None:
+            # Preserve compatibility with lightweight/custom backbones used by tests.
+            scene = self.scene_backbone(xyz, rgb, instance_id, point_mask, object_mask)
+        else:
+            scene = self.scene_backbone(
+                xyz, rgb, instance_id, point_mask, object_mask, grid_coord=grid_coord
+            )
         if target_object is None:
             counts = torch.stack([
                 (target_mask & (instance_id == index)).sum(-1)
