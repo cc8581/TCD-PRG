@@ -1,72 +1,85 @@
 # Evaluation protocol
 
-Training validation and `tcd-prg-evaluate` use `OfflineModelEvaluator`; metric
-names therefore have one implementation and one aggregation rule. Losses remain
-optimization diagnostics. They are not renamed as accuracy or task success.
+TCD-PRG uses a **standard-only** public evaluation surface. Internal proxy metrics
+are not exported, printed as performance metrics, or accepted by the paper-table
+exporter. Training losses remain available for optimization monitoring, but they
+are not performance metrics.
 
-## Aggregation
+## Protocols retained
 
-- Binary predictions use explicit thresholds from `evaluation.*` (graph edges
-  use `model.graph_edge_threshold`).
-- Confusion counts are summed before precision, recall, F1, IoU and Dice are
-  calculated. They are not averaged batch by batch.
-- AUROC, non-interpolated average precision and Brier score use scikit-learn's
-  reference implementations, which correctly group equal scores. Calibration
-  also reports an explicitly defined 15-bin equal-width ECE by default.
-- Scalar confidence intervals resample complete scenes, not correlated states
-  inside a scene. Every metric includes its contributing count and a 95% scene-
-  cluster bootstrap interval by default.
-- UNKNOWN candidates are excluded from supervised ranking metrics. Selection
-  coverage is reported separately as `selected_candidate_known`.
-- Metrics without valid observations are omitted. The exporter never creates a
-  zero-valued placeholder for an unimplemented metric.
+### Task Region
 
-## Lightweight component metrics
+Binary semantic segmentation metrics are computed from dataset-level confusion
+counts. The primary metric is mIoU, defined as the mean of foreground and
+background IoU. Standard foreground/background precision, recall, F1, IoU and
+Dice are also available.
 
-The shared evaluator reports foreground region precision/recall/F1/IoU/Dice,
-visibility AP/AUROC/calibration, per-relation graph AP/AUROC/confusion metrics,
-derived blocker metrics, Verifier AP/AUROC/F1/calibration, Push object Top-1/3,
-contact distance, direction angle, utility MAE and candidate NDCG, and policy
-Top-1 known/success plus NDCG. Teacher and generated policy candidates have
-separate names.
+### Dependency Graph
 
-For Task and Global Grasp, predictions are confidence-ranked and greedily
-one-to-one matched after the configured translation, parallel-jaw-symmetric
-rotation, width and object checks. Because native grasp libraries are not an
-exhaustive grasp universe, the always-valid metrics are named
-`known_hit_at_K` and `known_recall_at_K`. Precision and AP are emitted only when
-the data producer explicitly sets `label_set_complete=true`. A valid but unseen
-grasp is therefore never silently counted as a false positive.
+Relation prediction follows a scene-graph PredCls-style no-graph-constraint
+ranking. Every valid relation triplet is independently ranked, multiple
+predicates may be retained for the same object pair, and physical self-relations
+are excluded. Report ngR@20/50/100 and ngmR@20/50/100.
 
-## Closed-loop terminology
+### Grasp Verifier
 
-`labelled_replay_task_success_hK` follows selected actions through known HDF5
-state transitions for at most K preparation actions. UNKNOWN selections make
-the episode unevaluable. This is an offline replay proxy, not physics or robot
-execution success, and the name must not be shortened to `task_success_rate`.
+Candidate-level binary classification reports pooled AP, AUROC, Precision,
+Recall, F1, Brier score and ECE over explicitly valid labels.
 
-Formal end-to-end reports must additionally execute fixed validation/test scenes
-and report real rollout task success, grasp execution success, task compliance,
-Push outcome success, invalid-action rate, action count, planning/execution time,
-failure taxonomy and multiple seeds. Online results must live in a separate
-evaluation artifact so they cannot be confused with labelled replay.
+### Global Grasp
+
+Global grasp comparison is not computed from TCD pose-neighbourhood labels.
+Use `tcd-prg-eval-graspnet`, which delegates the complete official evaluation
+path to `graspnetAPI.GraspNetEval`: 3 cm / 30 degree NMS, object association,
+Top-10 per object / scene Top-50 selection, collision and force-closure scoring,
+and AP aggregation. The accepted outputs are GraspNet AP and AP_mu values.
+
+### Task Grasp
+
+Pose-neighbourhood hits are not reported. Task-oriented grasp performance is
+measured only from executed trials as task success rate:
+
+`successful task trials / executed task-grasp trials`.
+
+Use `tcd-prg-eval-episodes` with `task_grasp_trial=true` and the corresponding
+`task_success` outcome.
+
+### Push / Policy
+
+Head-level object Top-K, contact error, direction error, utility error, NDCG,
+selected-candidate accuracy and labelled-transition replay are removed. Executed
+closed-loop evaluation follows the three VPG metrics:
+
+1. Completion Rate: completed trials / all trials.
+2. Grasp Success Rate: per-completed-trial grasp successes / grasp attempts,
+   averaged over completed trials.
+3. Action Efficiency: per-completed-trial object count / actions before
+   completion, averaged over completed trials.
+
+Use `tcd-prg-eval-episodes`.
+
+## Metrics deliberately removed
+
+The following families are no longer part of evaluation output:
+
+- `*_known_hit_at_K`, `*_known_recall_at_K`, pose-neighbourhood AP/precision;
+- matched grasp translation/rotation/width errors;
+- task-grasp anchor-region precision;
+- relation AP/AUROC/F1 derived from independent edge classification;
+- direct/indirect/actionable blocker proxy metrics;
+- region-visibility proxy metrics;
+- Push object Top-K, direction/contact/utility errors and candidate NDCG;
+- policy candidate NDCG, selected-candidate success/type/object correctness;
+- generated-candidate proxy metrics;
+- labelled replay success/recovery/preparation metrics;
+- planning-time entries previously classified as diagnostics.
+
+If a task cannot be evaluated under its accepted protocol with available data,
+no surrogate metric is emitted.
 
 ## Checkpoint selection
 
-`best.pt` continues to minimize the configured weighted validation loss so
-training remains resumable across sparse metric subsets. Performance metrics are
-stored beside the loss in validation schema v3 and must be used when selecting
-checkpoints for final offline/online comparison. Never select on the test split.
-
-## Protocol references
-
-- Pointcept semantic evaluation: global intersection/union counts and
-  mIoU/mAcc/mPrecision/macro-F1.
-- scikit-learn metrics: `roc_auc_score`, `average_precision_score` and
-  `brier_score_loss`.
-- GraspNet: pose NMS followed by confidence-ranked Precision@K/AP under an
-  executable-grasp protocol.
-- M2T2: precision-coverage simulation evaluation plus execution success rates.
-
-The project-specific extensions above preserve these conventions but use names
-that expose label incompleteness and labelled-transition replay explicitly.
+`best.pt` continues to minimize the configured weighted validation loss. This is
+an optimization/checkpoint-selection quantity, not a paper performance metric.
+Final comparisons must use the task-specific standard protocols above on the
+validation/test benchmark or executed trial set.

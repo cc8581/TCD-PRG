@@ -239,6 +239,7 @@ class EvaluationConfig:
     region_probability_threshold: float = 0.5
     verifier_probability_threshold: float = 0.5
     ranking_topk: tuple[int, ...] = (1, 5, 10)
+    relation_ranking_topk: tuple[int, ...] = (20, 50, 100)
     calibration_bins: int = 15
     global_grasp_tracks: tuple[str, ...] = ("scene_only", "instance_assisted")
     global_translation_threshold_m: float = 0.01
@@ -398,6 +399,12 @@ class TCDPRGConfig:
             value <= 0 for value in self.evaluation.ranking_topk
         ):
             raise ValueError("evaluation.ranking_topk must contain positive integers")
+        if not self.evaluation.relation_ranking_topk or any(
+            value <= 0 for value in self.evaluation.relation_ranking_topk
+        ):
+            raise ValueError(
+                "evaluation.relation_ranking_topk must contain positive integers"
+            )
         if self.evaluation.calibration_bins <= 1:
             raise ValueError("evaluation.calibration_bins must be greater than one")
         if self.logging.log_interval <= 0:

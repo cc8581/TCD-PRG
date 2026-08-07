@@ -1,4 +1,4 @@
-"""Aggregate reproducible evaluation directories into paper tables and curves."""
+"""Aggregate evaluation directories into paper tables using standard metrics only."""
 
 from __future__ import annotations
 
@@ -11,14 +11,12 @@ from typing import Any
 
 import numpy as np
 
+from tcd_prg.evaluators.protocols import metric_protocol
 
 CORE_METRICS = (
-    "labelled_replay_task_success_h5",
-    "selected_candidate_success",
-    "task_grasp_known_hit_at_1",
-    "labelled_replay_preparation_actions",
-    "labelled_replay_recovery_success",
-    "planning_time_s",
+    "standard_region_miou",
+    "standard_task_relation_ng_mean_recall_at_50",
+    "standard_verifier_overall_average_precision",
 )
 
 
@@ -28,8 +26,7 @@ def load_run(path: Path) -> tuple[str, dict[str, float]]:
     name = configuration.get("name") or path.name
     metrics = payload["summary"]["metrics"]
     return str(name), {
-        key: float(value["mean"]) for key, value in metrics.items()
-        if value.get("mean") is not None
+        key: float(value["mean"]) for key, value in metrics.items() if value.get("mean") is not None
     }
 
 
@@ -43,12 +40,19 @@ def main() -> None:
     parser.add_argument("--output-dir", default="outputs/paper")
     parser.add_argument("--metrics", nargs="*", default=list(CORE_METRICS))
     args = parser.parse_args()
+
+    # No escape hatch: paper tables may contain audited standard metrics only.
+    for metric in args.metrics:
+        metric_protocol(metric)
+
     grouped: dict[str, list[dict[str, float]]] = defaultdict(list)
     for value in args.runs:
         path = Path(value)
         name, metrics = load_run(path)
         grouped[name].append(metrics)
-    output = Path(args.output_dir); output.mkdir(parents=True, exist_ok=True)
+
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     for name, seeds in sorted(grouped.items()):
         row: dict[str, Any] = {"method": name, "seeds": len(seeds)}
@@ -57,14 +61,21 @@ def main() -> None:
             row[f"{metric}_mean"] = float(values.mean()) if len(values) else float("nan")
             row[f"{metric}_std"] = float(values.std(ddof=1)) if len(values) > 1 else 0.0
         rows.append(row)
-    columns = ["method", "seeds"] + [item for metric in args.metrics
-                                      for item in (f"{metric}_mean", f"{metric}_std")]
+
+    columns = ["method", "seeds"] + [
+        item for metric in args.metrics for item in (f"{metric}_mean", f"{metric}_std")
+    ]
     with (output / "paper_table.csv").open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
-        writer.writeheader(); writer.writerows(rows)
-    latex = ["\\begin{tabular}{l" + "c" * len(args.metrics) + "}", "\\toprule",
-             "Method & " + " & ".join(latex_escape(item) for item in args.metrics) + " \\\\",
-             "\\midrule"]
+        writer.writeheader()
+        writer.writerows(rows)
+
+    latex = [
+        "\\begin{tabular}{l" + "c" * len(args.metrics) + "}",
+        "\\toprule",
+        "Method & " + " & ".join(latex_escape(item) for item in args.metrics) + " \\\\",
+        "\\midrule",
+    ]
     for row in rows:
         values = []
         for metric in args.metrics:
@@ -73,21 +84,6 @@ def main() -> None:
         latex.append(latex_escape(str(row["method"])) + " & " + " & ".join(values) + " \\\\")
     latex.extend(("\\bottomrule", "\\end{tabular}"))
     (output / "paper_table.tex").write_text("\n".join(latex) + "\n", encoding="utf-8")
-    try:
-        import matplotlib.pyplot as plt
-
-        x = np.arange(len(rows)); width = 0.8 / max(1, len(args.metrics))
-        figure, axis = plt.subplots(figsize=(max(7, len(rows) * 1.2), 4.5))
-        for index, metric in enumerate(args.metrics):
-            axis.bar(x + index * width, [row[f"{metric}_mean"] for row in rows],
-                     width, label=metric)
-        axis.set_xticks(x + width * (len(args.metrics) - 1) / 2,
-                        [str(row["method"]) for row in rows], rotation=20, ha="right")
-        axis.legend(fontsize=7); axis.grid(axis="y", alpha=0.25)
-        figure.tight_layout(); figure.savefig(output / "paper_metrics.png", dpi=200)
-        plt.close(figure)
-    except ImportError as error:
-        print(f"Curve export skipped because matplotlib is unavailable: {error}")
 
 
 if __name__ == "__main__":

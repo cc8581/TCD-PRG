@@ -6,13 +6,13 @@ import pytest
 import torch
 
 from tcd_prg.config import AblationConfig, ModelConfig
+from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.models.common import ActionCandidateEncoder
+from tcd_prg.models.dependency_graph.hgt import derive_dependency_masks
 from tcd_prg.models.grasp_verifier import GripperSceneTaskVerifier
 from tcd_prg.models.policy import MaskedHierarchicalCandidateRouter
 from tcd_prg.models.push import PushHead
-from tcd_prg.models.dependency_graph.hgt import derive_dependency_masks
-from tcd_prg.evaluators import OfflineModelEvaluator
 
 
 def _config() -> ModelConfig:
@@ -83,20 +83,27 @@ def test_push_direction_sparse_points_include_forced_supervision() -> None:
     torch.manual_seed(9)
     b, n, objects, dim = 1, 8, 2, 16
     head = PushHead(
-        dim=dim, direction_bins=4, direction_dim=8,
-        direction_layers=1, direction_heads=2, direction_contact_topk=2,
+        dim=dim,
+        direction_bins=4,
+        direction_dim=8,
+        direction_layers=1,
+        direction_heads=2,
+        direction_contact_topk=2,
     ).eval()
     inputs = (
-        torch.randn(b, n, dim), torch.randn(b, n, 3),
-        torch.arange(n)[None] % objects, torch.ones(b, n, dtype=torch.bool),
-        torch.randn(b, objects, dim), torch.ones(b, objects, dtype=torch.bool),
-        torch.randn(b, dim), torch.randn(b, dim), torch.randn(b, objects, dim),
+        torch.randn(b, n, dim),
+        torch.randn(b, n, 3),
+        torch.arange(n)[None] % objects,
+        torch.ones(b, n, dtype=torch.bool),
+        torch.randn(b, objects, dim),
+        torch.ones(b, objects, dtype=torch.bool),
+        torch.randn(b, dim),
+        torch.randn(b, dim),
+        torch.randn(b, objects, dim),
         torch.tensor([3]),
     )
     baseline = head(*inputs)
-    forced_point = torch.nonzero(
-        ~baseline["direction_point_mask"][0], as_tuple=False
-    ).flatten()[:1]
+    forced_point = torch.nonzero(~baseline["direction_point_mask"][0], as_tuple=False).flatten()[:1]
     output = head(*inputs, forced_direction_points=(forced_point,))
     assert output["direction_logits"].shape == (b, n, 4)
     assert output["direction_residual"].shape == (b, n, 4, 2)
@@ -110,8 +117,15 @@ def test_router_never_selects_invalid_candidate() -> None:
     router = MaskedHierarchicalCandidateRouter(32, layers=1)
     valid = torch.tensor([[False, True, False]])
     output = router(
-        torch.randn(1, 32), torch.randn(1, 32), torch.randn(1, 2, 32), torch.ones(1, 2, dtype=torch.bool),
-        torch.randn(1, 3, 32), torch.tensor([[0, 2, 1]]), torch.tensor([[0, 1, 0]]), valid, torch.tensor([5])
+        torch.randn(1, 32),
+        torch.randn(1, 32),
+        torch.randn(1, 2, 32),
+        torch.ones(1, 2, dtype=torch.bool),
+        torch.randn(1, 3, 32),
+        torch.tensor([[0, 2, 1]]),
+        torch.tensor([[0, 1, 0]]),
+        valid,
+        torch.tensor([5]),
     )
     selected = router.select(output, torch.tensor([[0, 2, 1]]), torch.tensor([[0, 1, 0]]))
     assert selected.item() == 1
@@ -123,9 +137,15 @@ def test_router_all_invalid_is_finite_and_selects_nothing() -> None:
     candidate_type = torch.tensor([[-1, -1]])
     candidate_object = torch.tensor([[-1, -1]])
     output = router(
-        torch.randn(1, 32), torch.randn(1, 32), torch.randn(1, 2, 32),
-        torch.ones(1, 2, dtype=torch.bool), torch.randn(1, 2, 32),
-        candidate_type, candidate_object, valid, torch.tensor([5]),
+        torch.randn(1, 32),
+        torch.randn(1, 32),
+        torch.randn(1, 2, 32),
+        torch.ones(1, 2, dtype=torch.bool),
+        torch.randn(1, 2, 32),
+        candidate_type,
+        candidate_object,
+        valid,
+        torch.tensor([5]),
     )
     assert torch.isfinite(output.candidate_logits).all()
     assert router.select(output, candidate_type, candidate_object).item() == -1
@@ -219,21 +239,29 @@ def test_model_routes_cached_generated_candidates_without_teacher_axis(tiny_batc
         "evaluation_status": torch.full((1, 1), -1, dtype=torch.long),
         "action_type": torch.full((1, 1), -1, dtype=torch.long),
         "acted_object": torch.full((1, 1), -1, dtype=torch.long),
-        "samples": [SimpleNamespace(
-            observation=SimpleNamespace(
-                scene_id=1, state_id=0, task_index=0, target_object=1,
-                object_category_id=[0, 1, 2], task_region_id=2,
-            ),
-            state_labels=SimpleNamespace(
-                sequence_depth=0, target_visible_ratio=1.0, graspable=True,
-            ),
-        )],
+        "samples": [
+            SimpleNamespace(
+                observation=SimpleNamespace(
+                    scene_id=1,
+                    state_id=0,
+                    task_index=0,
+                    target_object=1,
+                    object_category_id=[0, 1, 2],
+                    task_region_id=2,
+                ),
+                state_labels=SimpleNamespace(
+                    sequence_depth=0,
+                    target_visible_ratio=1.0,
+                    graspable=True,
+                ),
+            )
+        ],
     }
     evaluator = OfflineModelEvaluator(_config(), bootstrap_samples=0)
     evaluator.update(evaluation_batch, fast)
     metrics = evaluator.summarize()["metrics"]
-    assert metrics["generated_positive_coverage"]["mean"] == pytest.approx(1.0)
-    assert metrics["generated_effective_policy_row"]["mean"] == pytest.approx(1.0)
+    assert "generated_positive_coverage" not in metrics
+    assert "generated_effective_policy_row" not in metrics
 
 
 def test_candidate_encoder_does_not_consume_pick_remove_destination() -> None:
@@ -267,8 +295,13 @@ def test_network_features_do_not_depend_on_simulation_object_pose(tiny_batch) ->
 def test_policy_heads_match_training_contract(tiny_batch) -> None:
     output = TCDPRGModel(_config()).eval()(tiny_batch)
     assert set(output["task_grasp"]) == {
-        "translation_world", "rotation_matrix", "rotation_6d", "width_raw",
-        "width_m", "quality_logit", "attention_point_index",
+        "translation_world",
+        "rotation_matrix",
+        "rotation_6d",
+        "width_raw",
+        "width_m",
+        "quality_logit",
+        "attention_point_index",
     }
     assert "object_logits" in output["global_grasp"]
     assert output["push"]["utility_delta"].shape[-1] == _config().num_direction_bins

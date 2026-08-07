@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import h5py
 import numpy as np
 import torch
-import h5py
 
-from tcd_prg.baselines.base import GlobalGraspPrediction
 from tcd_prg.config import AblationConfig, BackboneConfig, GraphConfig, ModelConfig, RouterConfig
 from tcd_prg.constants import ActionType, CandidateStatus, OutcomeCode
 from tcd_prg.datasets.collate import _empty_global_grasps_like
@@ -16,20 +15,27 @@ from tcd_prg.datasets.task_oriented_clutter import (
 )
 from tcd_prg.datasets.torch_dataset import ActionStateGroupDataset
 from tcd_prg.datasets.types import GlobalGraspLabels, SceneObservation
-from tcd_prg.evaluators.global_grasp import GlobalGraspEvaluator
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.planners.candidate_generator import DenseCandidateGenerator
 
 
 def _small_model() -> TCDPRGModel:
     config = ModelConfig(
-        feature_dim=16, task_dim=8, num_categories=8, num_task_regions=8,
-        global_grasp_candidates=6, task_grasp_candidates=4,
-        global_grasp_input_mode="scene_only", activation_checkpointing=False,
+        feature_dim=16,
+        task_dim=8,
+        num_categories=8,
+        num_task_regions=8,
+        global_grasp_candidates=6,
+        task_grasp_candidates=4,
+        global_grasp_input_mode="scene_only",
+        activation_checkpointing=False,
     )
     return TCDPRGModel(
-        config, AblationConfig(), GraphConfig(layers=1, heads=4),
-        RouterConfig(layers=1, heads=4), BackboneConfig(backend="legacy", attention_points=8),
+        config,
+        AblationConfig(),
+        GraphConfig(layers=1, heads=4),
+        RouterConfig(layers=1, heads=4),
+        BackboneConfig(backend="legacy", attention_points=8),
     ).eval()
 
 
@@ -57,7 +63,10 @@ def test_scene_only_geometry_is_invariant_to_posthoc_instance_assignment(tiny_ba
         one = model(first)["global_grasp"]
         two = model(second)["global_grasp"]
     for key in (
-        "translation_world", "rotation_matrix", "width_m", "quality_logit",
+        "translation_world",
+        "rotation_matrix",
+        "width_m",
+        "quality_logit",
         "attention_point_index",
     ):
         assert torch.equal(one[key], two[key]), key
@@ -88,7 +97,8 @@ def test_global_prediction_uses_complete_pose_and_se3_nms() -> None:
     config = ModelConfig(feature_dim=8, global_grasp_candidates=2, candidate_topk=2)
     generator = DenseCandidateGenerator(config)
     batch = {
-        "xyz": torch.zeros(1, 1, 3), "instance_id": torch.tensor([[0]]),
+        "xyz": torch.zeros(1, 1, 3),
+        "instance_id": torch.tensor([[0]]),
         "point_mask": torch.ones(1, 1, dtype=torch.bool),
         "object_mask": torch.ones(1, 1, dtype=torch.bool),
         "object_present": torch.ones(1, 1, dtype=torch.bool),
@@ -145,21 +155,32 @@ def test_global_labels_use_native_library_and_exclude_inactive_objects() -> None
     adapter.grasp_registry = registry
     adapter.global_sampling = (64, 32)
     adapter._object_match_files = lambda scene_id: ("cup.npz", "bottle.npz")
-    pose = np.array([
-        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-    ], np.float32)
+    pose = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        ],
+        np.float32,
+    )
     adapter._pick_remove_grasp_records = lambda scene_id, state_id: {
         (0, 0): (pose[0], int(CandidateStatus.POSITIVE)),
         (1, 0): (pose[1], int(CandidateStatus.POSITIVE)),
     }
     observation = SceneObservation(
-        scene_id=0, state_id=1, task_index=0,
-        xyz=np.zeros((1, 3), np.float32), rgb=np.zeros((1, 3), np.float32),
-        instance_id=np.array([0], np.int64), target_mask=np.array([True]),
-        target_object=0, task_region_id=0, object_uuid=("0", "1"),
-        object_pose=pose, object_category_id=np.array([0, 1], np.int64),
-        object_present=np.array([True, True]), object_active=np.array([True, False]),
+        scene_id=0,
+        state_id=1,
+        task_index=0,
+        xyz=np.zeros((1, 3), np.float32),
+        rgb=np.zeros((1, 3), np.float32),
+        instance_id=np.array([0], np.int64),
+        target_mask=np.array([True]),
+        target_object=0,
+        task_region_id=0,
+        object_uuid=("0", "1"),
+        object_pose=pose,
+        object_category_id=np.array([0, 1], np.int64),
+        object_present=np.array([True, True]),
+        object_active=np.array([True, False]),
         camera_parameters=(),
         metadata={},
     )
@@ -180,13 +201,21 @@ def test_pick_remove_conflicting_execution_results_become_unknown(tmp_path) -> N
         actions.create_dataset("payload_index", data=np.arange(5, dtype=np.int32))
         actions.create_dataset("executed", data=np.array([True, True, True, False, True]))
         actions.create_dataset("success", data=np.array([True, False, True, False, False]))
-        actions.create_dataset("potential_improved", data=np.array([False, False, False, False, True]))
+        actions.create_dataset(
+            "potential_improved", data=np.array([False, False, False, False, True])
+        )
         actions.create_dataset(
             "outcome_code",
-            data=np.array([
-                OutcomeCode.SUCCESS, OutcomeCode.OTHER_INVALID,
-                OutcomeCode.SUCCESS, OutcomeCode.OTHER_INVALID, OutcomeCode.IMPROVED,
-            ], np.int8),
+            data=np.array(
+                [
+                    OutcomeCode.SUCCESS,
+                    OutcomeCode.OTHER_INVALID,
+                    OutcomeCode.SUCCESS,
+                    OutcomeCode.OTHER_INVALID,
+                    OutcomeCode.IMPROVED,
+                ],
+                np.int8,
+            ),
         )
         pick = actions.create_group("pick_remove")
         pick.create_dataset("acted_object", data=np.zeros(5, np.int16))
@@ -225,29 +254,18 @@ def test_global_supervision_has_one_representative_per_scene_state() -> None:
 
 def _labels() -> GlobalGraspLabels:
     return GlobalGraspLabels(
-        object_index=np.array([0]), source_grasp_index=np.array([1]),
+        object_index=np.array([0]),
+        source_grasp_index=np.array([1]),
         contact_point_world=np.zeros((1, 3), np.float32),
         grasp_pose_world=np.array([[0, 0, 0, 0, 0, 0, 1]], np.float32),
         approach_direction_world=np.array([[0, 0, 1]], np.float32),
-        width_m=np.array([0.05], np.float32), intrinsic_stable=np.array([True]),
-        scene_executable=np.array([1], np.int8), valid_mask=np.array([True]),
-        anchor_visible_distance_m=np.array([0.0], np.float32), conversion_version="test",
+        width_m=np.array([0.05], np.float32),
+        intrinsic_stable=np.array([True]),
+        scene_executable=np.array([1], np.int8),
+        valid_mask=np.array([True]),
+        anchor_visible_distance_m=np.array([0.0], np.float32),
+        conversion_version="test",
     )
-
-
-def test_global_evaluator_accepts_parallel_jaw_symmetric_pose() -> None:
-    prediction = GlobalGraspPrediction(
-        0, np.zeros(3), np.array([0, 0, 0, 0, 0, 1, 0], np.float32),
-        0.05, 1.0, 1.0, 1.0, True, "test",
-    )
-    metrics = GlobalGraspEvaluator().evaluate(
-        [prediction], _labels(), certified=False, topk=(1,)
-    )
-    assert metrics["scene_known_recall@1"] == 1.0
-    assert metrics["scene_known_hit@1"] == 1.0
-    # Native grasp libraries are not exhaustive, so unmatched predictions cannot be false positives.
-    assert "scene_precision@1" not in metrics
-    assert "scene_average_precision" not in metrics
 
 
 def test_empty_global_grasp_placeholder_preserves_complete_contract() -> None:

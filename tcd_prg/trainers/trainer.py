@@ -327,12 +327,9 @@ class Trainer:
         )
         metrics = record["metrics"]
         for key, label, percent in (
-            ("region_foreground_iou", "rIoU", True),
-            ("task_grasp_known_hit_at_1", "task@1", True),
-            ("global_grasp_known_hit_at_1", "global@1", True),
-            ("verifier_overall_average_precision", "vAP", True),
-            ("direct_blocker_recall_at_3", "blockR3", True),
-            ("selected_candidate_success", "policy@1", True),
+            ("standard_region_miou", "mIoU", True),
+            ("standard_verifier_overall_average_precision", "vAP", True),
+            ("standard_task_relation_ng_mean_recall_at_50", "t-ngmR50", True),
         ):
             if key in metrics:
                 value = float(metrics[key])
@@ -751,24 +748,6 @@ class Trainer:
                                 self.config.evaluation,
                             )
                             evaluator.evaluator.records = evaluation_records
-                            record_by_key = {
-                                (
-                                    int(record["scene_id"]), int(record["state_id"]),
-                                    int(record["task_index"]),
-                                ): record
-                                for record in evaluation_records
-                            }
-                            for item in summaries:
-                                for key, decision in item.get(
-                                    "evaluation_decisions", {}
-                                ).items():
-                                    normalized = tuple(int(value) for value in key)
-                                    if normalized in record_by_key:
-                                        decision["record"] = record_by_key[normalized]
-                                    evaluator.decisions[normalized] = decision
-                            evaluator.finalize_closed_loop_replay(
-                                self.config.evaluation.horizons
-                            )
                             performance_summary = evaluator.summarize()
                             validation_details.update({
                                 key: float(payload["mean"])

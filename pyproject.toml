@@ -29,7 +29,8 @@ dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6", "mypy>=1.10"]
 [project.scripts]
 tcd-prg-train = "tcd_prg.scripts.train:main"
 tcd-prg-eval = "tcd_prg.scripts.evaluate:main"
-tcd-prg-eval-global = "tcd_prg.scripts.evaluate_global_grasps:main"
+tcd-prg-eval-graspnet = "tcd_prg.scripts.evaluate_graspnet_dump:main"
+tcd-prg-eval-episodes = "tcd_prg.scripts.evaluate_episodes:main"
 tcd-prg-inspect = "tcd_prg.tools.inspect_sample:main"
 tcd-prg-prefetch = "tcd_prg.scripts.prefetch:main"
 tcd-prg-audit = "tcd_prg.tools.audit_dataset:main"

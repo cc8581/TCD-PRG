@@ -440,7 +440,6 @@ def main() -> None:
             "metric_sums": metric_sums,
             "metric_counts": metric_counts,
             "evaluation_records": evaluator.evaluator.records,
-            "evaluation_decisions": evaluator.decisions,
         }
 
     state = trainer.train(

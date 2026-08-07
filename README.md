@@ -142,17 +142,19 @@ only as an explicit pre-grid hardware safety cap.
 Cache keys bind scene/state, poses, present/active masks, model IDs, scales,
 camera profile, render seed, renderer version and point-sampling configuration.
 
-Evaluate the global branch independently of the task graph and router:
+Evaluate a GraspNet-format prediction dump with the official GraspNet evaluator:
 
 ```powershell
-tcd-prg-eval-global --config configs/config.yaml --checkpoint outputs/full/last.pt `
-  --scene-id 0 --state-id 0 --task-index 0 --output outputs/global/state_0.json
+tcd-prg-eval-graspnet --graspnet-root D:\GraspNet `
+  --dump-folder outputs\graspnet_dump --camera kinect --split all
 ```
 
-The global branch is supervised directly by the published per-object
+The global branch is trained directly from the published per-object
 `grasp_library` and the PICK_REMOVE poses and outcomes in the action HDF5. Its
 labels are open-world: only executed attempts are positive or negative, while
-unexecuted and conflicting outcomes remain UNKNOWN.
+unexecuted and conflicting outcomes remain UNKNOWN. These sparse native labels
+are not used to report proxy AP or recall; public Global Grasp comparison is
+delegated to the official GraspNet protocol.
 
 ## Training
 

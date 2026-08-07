@@ -242,6 +242,7 @@ evaluation:
   region_probability_threshold: 0.5
   verifier_probability_threshold: 0.5
   ranking_topk: [1, 5, 10]
+  relation_ranking_topk: [20, 50, 100]
   calibration_bins: 15
   global_grasp_tracks: [scene_only, instance_assisted]
   global_translation_threshold_m: 0.01
