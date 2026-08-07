@@ -363,6 +363,10 @@ def build_push_supervision(
         "contact_valid": contact_valid,
         "direction_positive": direction_positive,
         "direction_evaluated": direction_evaluated,
+        # Per-candidate diagnostics retained for offline validation. The loss
+        # itself uses the aggregated multi-positive tensors above.
+        "direction_valid": evaluated_push,
+        "direction_bin": direction_bin,
         "direction_residual_target": direction_residual_target,
         "direction_residual_valid": direction_residual_valid,
         "utility_delta": utility,

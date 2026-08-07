@@ -378,6 +378,8 @@ def test_push_utility_uses_ground_truth_direction_and_keeps_failed_transition() 
     assert labels["utility_valid"].item()
     assert labels["direction_evaluated"].any()
     assert not labels["direction_positive"].any()
+    assert labels["direction_valid"].any()
+    assert labels["direction_bin"].shape == labels["direction_valid"].shape
     assert labels["contact_valid"].any()
     assert not (labels["contact_target"] > 0).any()
 

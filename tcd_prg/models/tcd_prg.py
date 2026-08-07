@@ -137,9 +137,31 @@ class TCDPRGModel(nn.Module):
             found[:, start:end] = domain.any(-1)
         return nearest, found
 
+    @classmethod
+    @torch.no_grad()
+    def _push_candidate_point_cache(
+        cls, batch: dict[str, Tensor]
+    ) -> tuple[Tensor, Tensor] | None:
+        """Compute labelled PUSH nearest points once for the complete forward pass."""
+
+        required = {"action_parameters", "action_type", "candidate_mask", "acted_object"}
+        if not required.issubset(batch):
+            return None
+        contacts = batch["action_parameters"]["push_contact_world"]
+        push_candidates = (
+            batch["candidate_mask"]
+            & (batch["action_type"] == int(ActionType.PUSH))
+            & torch.isfinite(contacts).all(-1)
+        )
+        return cls._nearest_object_point_indices(
+            batch["xyz"], batch["point_mask"], batch["instance_id"],
+            batch["acted_object"], contacts, push_candidates,
+        )
+
     def _candidate_evidence_from_batch(
         self, batch: dict[str, Tensor], result: dict[str, Any], kind: Tensor,
-        acted_object: Tensor, pose: Tensor
+        acted_object: Tensor, pose: Tensor,
+        push_point_cache: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
         """Gather proposal/PUSH evidence without Python loops over CUDA candidates."""
 
@@ -161,16 +183,20 @@ class TCDPRGModel(nn.Module):
 
         push_contact = parameters["push_contact_world"]
         push_direction = parameters["push_direction_world"]
-        push_valid = (
-            candidate_valid
-            & (kind == int(ActionType.PUSH))
-            & torch.isfinite(push_contact).all(-1)
-            & torch.isfinite(push_direction).all(-1)
-        )
-        push_point, push_found = self._nearest_object_point_indices(
-            batch["xyz"], batch["point_mask"], batch["instance_id"],
-            acted_object, push_contact, push_valid,
-        )
+        if push_point_cache is None:
+            push_valid = (
+                candidate_valid
+                & (kind == int(ActionType.PUSH))
+                & torch.isfinite(push_contact).all(-1)
+                & torch.isfinite(push_direction).all(-1)
+            )
+            push_point, push_found = self._nearest_object_point_indices(
+                batch["xyz"], batch["point_mask"], batch["instance_id"],
+                acted_object, push_contact, push_valid,
+            )
+        else:
+            push_point, push_found = push_point_cache
+            push_found = push_found & torch.isfinite(push_direction).all(-1)
         push_rows, push_candidates = torch.nonzero(push_found, as_tuple=True)
         if push_rows.numel():
             points = push_point[push_rows, push_candidates]
@@ -257,23 +283,16 @@ class TCDPRGModel(nn.Module):
 
     @torch.no_grad()
     def _push_supervision_point_indices(
-        self, batch: dict[str, Tensor]
+        self, batch: dict[str, Tensor],
+        point_cache: tuple[Tensor, Tensor] | None = None,
     ) -> tuple[Tensor, ...] | None:
         """Return nearest scene points for every labelled PUSH candidate."""
 
-        required = {"action_parameters", "action_type", "candidate_mask", "acted_object"}
-        if not required.issubset(batch):
+        if point_cache is None:
+            point_cache = self._push_candidate_point_cache(batch)
+        if point_cache is None:
             return None
-        contacts = batch["action_parameters"]["push_contact_world"]
-        push_candidates = (
-            batch["candidate_mask"]
-            & (batch["action_type"] == int(ActionType.PUSH))
-            & torch.isfinite(contacts).all(-1)
-        )
-        point_index, found = self._nearest_object_point_indices(
-            batch["xyz"], batch["point_mask"], batch["instance_id"],
-            batch["acted_object"], contacts, push_candidates,
-        )
+        point_index, found = point_cache
         return tuple(
             torch.unique(point_index[row, found[row]], sorted=True)
             for row in range(batch["xyz"].shape[0])
@@ -444,6 +463,7 @@ class TCDPRGModel(nn.Module):
         else:
             graph = None
             graph_context = encoded.object_tokens
+        push_point_cache = self._push_candidate_point_cache(batch)
         push = self.push(
             encoded.point_features,
             batch["xyz"],
@@ -455,7 +475,7 @@ class TCDPRGModel(nn.Module):
             encoded.target_token,
             graph_context,
             batch["remaining_steps"],
-            self._push_supervision_point_indices(batch),
+            self._push_supervision_point_indices(batch, push_point_cache),
         )
         result: dict[str, Any] = {
             "encoded": encoded,
@@ -499,7 +519,8 @@ class TCDPRGModel(nn.Module):
                 "valid": batch["candidate_mask"],
             }
             candidate_inputs["evidence"] = self._candidate_evidence_from_batch(
-                batch, result, kind, batch["acted_object"], pose
+                batch, result, kind, batch["acted_object"], pose,
+                push_point_cache=push_point_cache,
             )
         if candidate_inputs is not None:
             result["router"] = self.route_cached(batch, result, candidate_inputs)
