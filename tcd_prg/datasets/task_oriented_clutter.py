@@ -38,7 +38,7 @@ from .types import (
 )
 
 ACTION_GROUP_INDEX_CACHE_VERSION = "tcd_prg_action_group_strata_v1"
-GLOBAL_GRASP_STATE_CACHE_VERSION = "tcd_prg_global_grasp_states_v1"
+GLOBAL_GRASP_STATE_CACHE_VERSION = "tcd_prg_global_grasp_task_states_v2"
 ACTION_GROUP_STRATA = (
     "direct_grasp",
     "pick_remove",
@@ -267,9 +267,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             int(sampling_seed),
         )
         # 初始化时快照已原子发布的 HDF5，训练期间不会扫描或读取仍在写入的 .work 文件。
-        published_paths = tuple(
-            sorted((self.action_root / "scene_labels").glob("scene_*.h5"))
-        )
+        published_paths = tuple(sorted((self.action_root / "scene_labels").glob("scene_*.h5")))
         scene_stop = None if scene_count is None else int(scene_start) + int(scene_count)
         self._h5_paths = tuple(
             path
@@ -571,9 +569,34 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                     result[unit] = stratum
         return result
 
-    def _global_grasp_state_cache_path(self) -> Path:
-        digest = self._strata_cache_path().stem.removeprefix("action_group_strata_")
-        return self.index_cache_dir / f"global_grasp_states_{digest}.npz"
+    def _global_grasp_state_cache_path(
+        self, min_grasp_width_m: float, max_grasp_width_m: float
+    ) -> Path:
+        """Content-sensitive cache key for task-aware Global supervision units."""
+
+        digest = hashlib.sha256()
+        digest.update(GLOBAL_GRASP_STATE_CACHE_VERSION.encode("utf-8"))
+        digest.update(str(self.action_root.resolve()).encode("utf-8"))
+        digest.update(self._strata_cache_path().stem.encode("utf-8"))
+        digest.update(
+            f"|width={float(min_grasp_width_m):.9g}:{float(max_grasp_width_m):.9g}"
+            f"|sampling={self.global_sampling}".encode()
+        )
+        # The old cache was keyed only through training_index metadata.  Scene
+        # action HDF5 files can be regenerated independently, so include every
+        # published action file's size/mtime.  A regenerated dataset therefore
+        # cannot silently reuse stale Global-state membership.
+        for source in self._h5_paths:
+            stat = source.stat()
+            digest.update(f"|{source.name}:{stat.st_size}:{stat.st_mtime_ns}".encode())
+        for source in (
+            self.step_root / "grasp_library",
+            self.step_root / "scene_labels",
+        ):
+            if source.exists():
+                stat = source.stat()
+                digest.update(f"|{source.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode())
+        return self.index_cache_dir / f"global_grasp_task_states_{digest.hexdigest()}.npz"
 
     @staticmethod
     def _load_global_grasp_state_cache(path: Path) -> np.ndarray | None:
@@ -583,67 +606,205 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             with np.load(path, allow_pickle=False) as cached:
                 if str(cached["version"].item()) != GLOBAL_GRASP_STATE_CACHE_VERSION:
                     return None
-                states = cached["scene_state"].astype(np.int32, copy=False)
-            return states if states.ndim == 2 and states.shape[1] == 2 else None
+                states = cached["scene_state_task"].astype(np.int32, copy=False)
+            return states if states.ndim == 2 and states.shape[1] == 3 else None
         except (OSError, KeyError, ValueError):
             return None
 
-    def _build_global_grasp_state_cache(self, path: Path) -> np.ndarray:
-        supervised: list[tuple[int, int]] = []
+    def _build_global_grasp_state_cache(
+        self,
+        path: Path,
+        min_grasp_width_m: float,
+        max_grasp_width_m: float,
+    ) -> np.ndarray:
+        """Index only task/state pairs that can actually yield Global supervision.
+
+        This mirrors the semantics used later by ``load_global_grasps`` and
+        ``build_global_grasp_labels``:
+        - PICK_REMOVE outcome must be conflict-free and executed;
+        - the authoritative stored pose must be finite;
+        - the grasp-library width must be inside the model's legal width range;
+        - the corresponding positive/negative sampling quota must be non-zero;
+        - the acted object must still be active under the same task history.
+
+        The cache stores ``(scene_id, state_id, task_index)``.  GlobalStateDataset
+        subsequently deduplicates those candidates back to one row per physical
+        ``(scene_id, state_id)``.  Thus task-specific activity is used only to
+        choose a valid representative; it does not re-weight states by task count.
+        """
+
+        supervised: set[tuple[int, int, int]] = set()
         for scene_id in tqdm(
             self._scene_ids,
-            desc="cache Global Grasp states",
+            desc="cache task-aware Global Grasp states",
             unit="scene",
             disable=not _show_index_progress(),
         ):
             with h5py.File(self._h5_path(scene_id), "r", swmr=True) as handle:
-                actions = self._scene_group(handle, scene_id)["actions"]
+                scene = self._scene_group(handle, scene_id)
+                actions = scene["actions"]
                 action_type = actions["action_type"][:].astype(np.int8)
                 from_state = actions["from_state"][:].astype(np.int64)
+                to_state = actions["to_state"][:].astype(np.int64)
+                payload_index = actions["payload_index"][:].astype(np.int64)
                 executed = actions["executed"][:].astype(bool)
                 success = actions["success"][:].astype(bool)
-                candidate = np.flatnonzero(
-                    (action_type == int(ActionType.PICK_REMOVE)) & executed
-                )
-                if not len(candidate):
+                action_task = actions["task_index"][:].astype(np.int64)
+                after_state_valid = actions["after_state_valid"][:].astype(bool)
+                sequence_depth = scene["states/sequence_depth"][:].astype(np.int64)
+                action_ids = np.flatnonzero(action_type == int(ActionType.PICK_REMOVE))
+                if not len(action_ids):
                     continue
-                payload = actions["payload_index"][:][candidate].astype(np.int64)
+                payload = payload_index[action_ids]
                 pick_remove = actions["pick_remove"]
                 objects = pick_remove["acted_object"][:][payload].astype(np.int64)
                 sources = pick_remove["removal_grasp_source_index"][:][payload].astype(np.int64)
-                states = from_state[candidate]
-                positives = success[candidate]
-            # bit 1 = observed positive, bit 2 = observed negative. A bitmask of
-            # 3 is a conflict and therefore remains UNKNOWN under open-world semantics.
-            known: dict[tuple[int, int, int], int] = {}
-            for state_id, object_id, source_id, positive in zip(
-                states, objects, sources, positives, strict=True
-            ):
-                key = (int(state_id), int(object_id), int(source_id))
-                known[key] = known.get(key, 0) | (1 if bool(positive) else 2)
-            certified_states = {
-                state_id
-                for (state_id, _, _), status_mask in known.items()
-                if status_mask in {1, 2}
-            }
-            supervised.extend((scene_id, state_id) for state_id in certified_states)
-        array = np.asarray(sorted(set(supervised)), np.int32).reshape(-1, 2)
+                poses = pick_remove["removal_grasp_pose_world"][:][payload].astype(np.float32)
+
+                # Reconstruct task-specific removal history once per scene using
+                # the exact semantics of _object_active, without reopening HDF5
+                # for every state/task candidate.
+                acted_object = np.full(len(action_type), -1, dtype=np.int64)
+                acted_object[action_ids] = objects
+                predecessors: dict[tuple[int, int], list[int]] = defaultdict(list)
+                for index, target in enumerate(to_state):
+                    source = int(from_state[index])
+                    target = int(target)
+                    if (
+                        after_state_valid[index]
+                        and target >= 0
+                        and sequence_depth[source] < sequence_depth[target]
+                    ):
+                        predecessors[(int(action_task[index]), target)].append(index)
+                removed_cache: dict[tuple[int, int], frozenset[int]] = {}
+                visiting: set[tuple[int, int]] = set()
+
+                def removed(
+                    task_index: int,
+                    state_id: int,
+                    *,
+                    removed_cache: dict[tuple[int, int], frozenset[int]] = removed_cache,
+                    sequence_depth: np.ndarray = sequence_depth,
+                    visiting: set[tuple[int, int]] = visiting,
+                    predecessors: dict[tuple[int, int], list[int]] = predecessors,
+                    action_task: np.ndarray = action_task,
+                    from_state: np.ndarray = from_state,
+                    action_type: np.ndarray = action_type,
+                    acted_object: np.ndarray = acted_object,
+                ) -> frozenset[int]:
+                    key = (int(task_index), int(state_id))
+                    if key in removed_cache:
+                        return removed_cache[key]
+                    if sequence_depth[state_id] == 0:
+                        removed_cache[key] = frozenset()
+                        return removed_cache[key]
+                    if key in visiting:
+                        raise ValueError("Cycle in depth-monotone transition graph")
+                    visiting.add(key)
+                    histories: list[frozenset[int]] = []
+                    for transition_index in predecessors.get(key, []):
+                        history = set(
+                            removed(
+                                int(action_task[transition_index]),
+                                int(from_state[transition_index]),
+                            )
+                        )
+                        if int(action_type[transition_index]) == int(ActionType.PICK_REMOVE):
+                            history.add(int(acted_object[transition_index]))
+                        histories.append(frozenset(history))
+                    visiting.remove(key)
+                    removed_cache[key] = frozenset().union(*histories) if histories else frozenset()
+                    return removed_cache[key]
+
+                # Match _pick_remove_grasp_records exactly: the first action row
+                # supplies the pose, while only executed rows contribute known
+                # positive/negative status.  The task set records where certified
+                # execution evidence actually came from.
+                grouped: dict[tuple[int, int, int], dict[str, object]] = {}
+                for action_index, object_id, source_id, pose in zip(
+                    action_ids, objects, sources, poses, strict=True
+                ):
+                    key = (
+                        int(from_state[action_index]),
+                        int(object_id),
+                        int(source_id),
+                    )
+                    record = grouped.setdefault(
+                        key,
+                        {"pose": pose, "status_mask": 0, "tasks": set()},
+                    )
+                    if bool(executed[action_index]):
+                        record["status_mask"] = int(record["status_mask"]) | (
+                            1 if bool(success[action_index]) else 2
+                        )
+                        tasks = record["tasks"]
+                        assert isinstance(tasks, set)
+                        tasks.add(int(action_task[action_index]))
+
+            match_files = self._object_match_files(scene_id)
+            source_rows: dict[int, dict[int, int]] = {}
+            libraries: dict[int, object] = {}
+            for (state_id, object_id, source_id), record in grouped.items():
+                status_mask = int(record["status_mask"])
+                if status_mask not in {1, 2}:
+                    continue
+                if status_mask == 1 and self.global_sampling[0] <= 0:
+                    continue
+                if status_mask == 2 and self.global_sampling[1] <= 0:
+                    continue
+                pose = np.asarray(record["pose"], np.float32)
+                if not np.isfinite(pose).all():
+                    continue
+                library = libraries.get(object_id)
+                if library is None:
+                    library = self.grasp_registry.load(match_files[object_id])
+                    libraries[object_id] = library
+                    mapping: dict[int, int] = {}
+                    for row, source in enumerate(library.source_index):
+                        mapping.setdefault(int(source), row)
+                    source_rows[object_id] = mapping
+                mapping = source_rows[object_id]
+                if source_id not in mapping:
+                    raise KeyError(
+                        f"scene {scene_id} object {object_id} PICK_REMOVE source "
+                        f"{source_id} missing from grasp_library"
+                    )
+                width = float(library.contact_span_m[mapping[source_id]])
+                if (
+                    not np.isfinite(width)
+                    or width < float(min_grasp_width_m)
+                    or width > float(max_grasp_width_m)
+                ):
+                    continue
+                tasks = record["tasks"]
+                assert isinstance(tasks, set)
+                for task_index in tasks:
+                    if object_id in removed(int(task_index), state_id):
+                        continue
+                    supervised.add((scene_id, state_id, int(task_index)))
+
+        array = np.asarray(sorted(supervised), np.int32).reshape(-1, 3)
         temporary = path.with_name(f"{path.stem}.{os.getpid()}.tmp.npz")
         np.savez_compressed(
             temporary,
             version=np.asarray(GLOBAL_GRASP_STATE_CACHE_VERSION),
-            scene_state=array,
+            scene_state_task=array,
         )
         os.replace(temporary, path)
         return array
 
-    @lru_cache(maxsize=4)  # noqa: B019 - adapter lifetime owns this small index cache
-    def global_grasp_supervised_states(
-        self, split: str | None = None
-    ) -> frozenset[tuple[int, int]]:
-        """Return certified Global-Grasp scene-state keys using a persistent index."""
+    @lru_cache(maxsize=8)  # noqa: B019 - adapter lifetime owns this small index cache
+    def global_grasp_supervised_task_states(
+        self,
+        split: str | None,
+        min_grasp_width_m: float,
+        max_grasp_width_m: float,
+    ) -> frozenset[tuple[int, int, int]]:
+        """Return task-aware representatives with actually usable Global labels."""
 
-        path = self._global_grasp_state_cache_path()
+        if min_grasp_width_m < 0 or max_grasp_width_m <= min_grasp_width_m:
+            raise ValueError("Invalid Global Grasp width interval")
+        path = self._global_grasp_state_cache_path(min_grasp_width_m, max_grasp_width_m)
         cached = self._load_global_grasp_state_cache(path)
         if cached is None:
             lock = path.with_suffix(".lock")
@@ -660,7 +821,9 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                     try:
                         cached = self._load_global_grasp_state_cache(path)
                         if cached is None:
-                            cached = self._build_global_grasp_state_cache(path)
+                            cached = self._build_global_grasp_state_cache(
+                                path, min_grasp_width_m, max_grasp_width_m
+                            )
                     finally:
                         lock.unlink(missing_ok=True)
                     break
@@ -680,9 +843,20 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         if split is not None:
             if split not in self.scene_splits:
                 raise ValueError(f"Unsupported split: {split}")
-            scene_ids = set(self.scene_splits[split])
-            cached = cached[np.isin(cached[:, 0], np.asarray(sorted(scene_ids), np.int32))]
-        return frozenset((int(scene_id), int(state_id)) for scene_id, state_id in cached)
+            scene_ids = np.asarray(sorted(self.scene_splits[split]), np.int32)
+            cached = cached[np.isin(cached[:, 0], scene_ids)]
+        return frozenset(
+            (int(scene_id), int(state_id), int(task_index))
+            for scene_id, state_id, task_index in cached
+        )
+
+    def global_grasp_supervised_states(
+        self, split: str | None = None
+    ) -> frozenset[tuple[int, int]]:
+        """Compatibility view; formal training uses the task-aware API above."""
+
+        triples = self.global_grasp_supervised_task_states(split, 0.0, float("inf"))
+        return frozenset((scene_id, state_id) for scene_id, state_id, _ in triples)
 
     def has_global_grasp_supervision(self, scene_id: int, state_id: int) -> bool:
         return (int(scene_id), int(state_id)) in self.global_grasp_supervised_states(None)

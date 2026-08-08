@@ -159,7 +159,11 @@ def main() -> None:
         global_grasp_mode="never",
     )
     global_dataset = (
-        GlobalStateDataset(train_dataset)
+        GlobalStateDataset(
+            train_dataset,
+            config.model.min_grasp_width_m,
+            config.model.max_grasp_width_m,
+        )
         if float(config.losses.global_grasp) > 0 and adapter.capabilities.has_global_grasps
         else None
     )

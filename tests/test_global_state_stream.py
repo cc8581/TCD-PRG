@@ -32,7 +32,7 @@ class _Adapter:
 def test_global_state_dataset_is_unique_and_supervised_only():
     adapter = _Adapter()
     action = ActionStateGroupDataset(adapter, split="train", global_grasp_mode="never")
-    global_states = GlobalStateDataset(action)
+    global_states = GlobalStateDataset(action, 0.01, 0.08)
     assert [(unit.scene_id, unit.state_id) for unit in global_states.units] == [(0, 0), (1, 0)]
     assert len(global_states) == 2
     _ = global_states[0]

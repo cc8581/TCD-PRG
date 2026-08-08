@@ -286,31 +286,70 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
 
 
 class GlobalStateDataset(Dataset[UnifiedSample]):
-    """Unique scene-state stream containing only states with certified Global labels."""
+    """One task-valid representative per unique Global ``(scene,state)``.
 
-    def __init__(self, action_dataset: ActionStateGroupDataset) -> None:
+    Global Grasp supervision is task-free, but the current observation contract
+    reconstructs ``physical_active`` through a task-specific transition graph.
+    Therefore an arbitrary task representative is unsafe.  The adapter first
+    identifies task/state pairs that can actually produce certified labels; this
+    dataset then deduplicates those candidates back to one physical scene-state.
+    """
+
+    def __init__(
+        self,
+        action_dataset: ActionStateGroupDataset,
+        min_grasp_width_m: float,
+        max_grasp_width_m: float,
+    ) -> None:
         self.adapter = action_dataset.adapter
-        representative: dict[tuple[int, int], StateGroupUnit] = {}
+        representative: dict[tuple[int, int, int], StateGroupUnit] = {}
         for unit in action_dataset.units:
-            representative.setdefault((unit.scene_id, unit.state_id), unit)
-        supervised_method = getattr(self.adapter, "global_grasp_supervised_states", None)
+            representative.setdefault(
+                (unit.scene_id, unit.state_id, unit.task_index), unit
+            )
+
+        supervised_method = getattr(
+            self.adapter, "global_grasp_supervised_task_states", None
+        )
         if supervised_method is not None:
-            supervised = supervised_method(action_dataset.split)
-            units = [unit for key, unit in representative.items() if key in supervised]
+            supervised = supervised_method(
+                action_dataset.split,
+                float(min_grasp_width_m),
+                float(max_grasp_width_m),
+            )
+            candidates: dict[tuple[int, int], list[StateGroupUnit]] = defaultdict(list)
+            for key, unit in representative.items():
+                if key in supervised:
+                    candidates[(unit.scene_id, unit.state_id)].append(unit)
+            units = [
+                min(
+                    candidates[key],
+                    key=lambda unit: (unit.task_index, unit.group_index),
+                )
+                for key in sorted(candidates)
+            ]
         else:
-            available = getattr(self.adapter, "has_global_grasp_supervision", None)
-            if available is None:
+            # Compatibility path for external adapters that have not adopted the
+            # task-aware index.  TCD's formal adapter always takes the branch above.
+            old_method = getattr(self.adapter, "global_grasp_supervised_states", None)
+            if old_method is None:
                 raise AttributeError(
                     "GlobalStateDataset requires a Global Grasp supervision index method"
                 )
+            supervised = old_method(action_dataset.split)
+            scene_state_rep: dict[tuple[int, int], StateGroupUnit] = {}
+            for unit in action_dataset.units:
+                scene_state_rep.setdefault((unit.scene_id, unit.state_id), unit)
             units = [
-                unit
-                for unit in representative.values()
-                if bool(available(unit.scene_id, unit.state_id))
+                unit for key, unit in scene_state_rep.items() if key in supervised
             ]
+
         self.units = tuple(units)
         if not self.units:
             raise ValueError("No scene-state has certified Global Grasp supervision")
+        keys = [(unit.scene_id, unit.state_id) for unit in self.units]
+        if len(keys) != len(set(keys)):
+            raise RuntimeError("GlobalStateDataset must contain unique scene-state keys")
 
     def __len__(self) -> int:
         return len(self.units)

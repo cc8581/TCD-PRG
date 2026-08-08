@@ -61,6 +61,7 @@ class Trainer:
         "global_grasp_quality_negative_queries",
         "global_grasp_ignored_unmatched_queries",
         "global_grasp_supervised_rows",
+        "global_grasp_invalid_rows",
         "verifier_valid_candidates",
         "verifier_supervised_rows",
         "verifier_positive_candidates",

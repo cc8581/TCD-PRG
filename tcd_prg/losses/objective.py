@@ -134,9 +134,21 @@ class TCDPRGObjective(nn.Module):
             raise RuntimeError("Global Grasp stream requested while global_grasp loss is disabled")
         output = model(batch, forward_mode="global_grasp")
         labels = build_global_grasp_labels(batch, self.model_config)
-        if labels is None or not bool(labels["sample_valid"].all()):
+        if labels is None:
+            raise RuntimeError("GlobalStateDataset batch has no Global Grasp label tensor")
+        sample_valid = labels["sample_valid"].bool()
+        if not bool(sample_valid.any()):
+            identities = [
+                (
+                    int(sample.observation.scene_id),
+                    int(sample.observation.state_id),
+                    int(sample.observation.task_index),
+                )
+                for sample in batch.get("samples", [])
+            ]
             raise RuntimeError(
-                "GlobalStateDataset yielded a row without certified Global Grasp supervision"
+                "GlobalStateDataset batch contains no usable certified supervision; "
+                f"scene/state/task={identities}"
             )
         values = self._named_grasp_terms(
             self.global_grasp(output["global_grasp"], labels), "global_grasp"
@@ -146,7 +158,8 @@ class TCDPRGObjective(nn.Module):
         terms = {
             "loss_global_grasp": raw_loss.detach(),
             "weighted_loss_global_grasp": weighted.detach(),
-            "active_loss_global_grasp": labels["sample_valid"].float().mean().detach(),
+            "active_loss_global_grasp": sample_valid.float().mean().detach(),
+            "global_grasp_invalid_rows": (~sample_valid).sum().float().detach(),
             **{name: value.detach() for name, value in values.items()},
         }
         return weighted, terms
