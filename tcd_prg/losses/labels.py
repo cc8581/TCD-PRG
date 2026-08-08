@@ -147,8 +147,10 @@ def build_grasp_proposal_labels(
     candidate = batch["candidate_mask"] & (batch["action_type"] == int(ActionType.TASK_GRASP))
     pose = parameters["task_grasp_pose_world"]
     width = parameters["grasp_width_m"]
-    overall_valid = parameters.get("verifier_overall_valid", torch.zeros_like(candidate)).bool()
-    overall = parameters.get("verifier_overall_target", torch.zeros_like(width)).float()
+    # verifier 字段为硬契约：缺失时必须报错，而不是静默退化成
+    # action_improves_state 语义或全 1 质量目标。
+    overall_valid = parameters["verifier_overall_valid"].bool()
+    overall = parameters["verifier_overall_target"].float()
     successful = torch.where(overall_valid, overall > 0.5, batch["action_improves_state"])
     valid = (
         candidate & successful & torch.isfinite(pose).all(-1) & torch.isfinite(width)
@@ -156,7 +158,7 @@ def build_grasp_proposal_labels(
     )
     quality = torch.where(
         overall_valid, torch.nan_to_num(overall),
-        torch.nan_to_num(parameters.get("grasp_confidence", torch.ones_like(width)), nan=1.0),
+        torch.nan_to_num(parameters["grasp_confidence"], nan=1.0),
     ).clamp(0.0, 1.0)
     known_negative = (
         candidate
@@ -211,9 +213,8 @@ def build_global_grasp_labels(
     _attach_negative_grasp_set(
         labels, pose, width, known_negative, object_index=source["object_index"]
     )
-    representative = batch.get(
-        "global_loss_sample_valid", torch.ones(pose.shape[0], dtype=torch.bool, device=pose.device)
-    )
+    # 代表掩码是安全关键字段：缺失时报错，绝不默认全部有效。
+    representative = batch["global_loss_sample_valid"].bool()
     label_set_complete = source.get(
         "label_set_complete", torch.zeros_like(representative)
     ).bool() & ~(source["valid_mask"] & ~certified).any(-1)

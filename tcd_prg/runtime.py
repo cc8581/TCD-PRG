@@ -75,6 +75,7 @@ def create_adapter(config: TCDPRGConfig, allow_render: bool = False):
         action_labels_subdir=config.dataset.action_labels_subdir,
         global_positive_grasps_per_object=config.sampling.global_positive_grasps_per_object,
         global_negative_grasps_per_object=config.sampling.global_negative_grasps_per_object,
+        grasp_width_bounds=(config.model.min_grasp_width_m, config.model.max_grasp_width_m),
         index_cache_dir=config.cache.index_directory,
         data_fraction=config.training.data_fraction,
         split_ratios=config.training.split_ratios,

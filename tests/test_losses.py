@@ -273,12 +273,52 @@ def test_unknown_task_grasp_marks_label_set_non_exhaustive() -> None:
         "action_parameters": {
             "task_grasp_pose_world": pose,
             "grasp_width_m": torch.full((1, 2), 0.05),
+            # 未执行/未验证的候选 valid=False，回退到 action_improves_state。
+            "verifier_overall_valid": torch.zeros(1, 2, dtype=torch.bool),
+            "verifier_overall_target": torch.zeros(1, 2),
+            "grasp_confidence": torch.ones(1, 2),
         },
     }
     labels = build_grasp_proposal_labels(batch, ModelConfig(task_grasp_candidates=2))
     assert labels["sample_valid"].item()
     assert not labels["unmatched_quality_valid"].item()
     assert labels["target_valid"].sum().item() == 1
+
+
+def test_grasp_proposal_labels_require_verifier_contract() -> None:
+    pose = torch.zeros(1, 1, 7)
+    pose[..., 6] = 1.0
+    batch = {
+        "candidate_mask": torch.ones(1, 1, dtype=torch.bool),
+        "action_type": torch.full((1, 1), int(ActionType.TASK_GRASP)),
+        "evaluation_status": torch.tensor([[int(CandidateStatus.POSITIVE)]]),
+        "action_improves_state": torch.tensor([[True]]),
+        "action_parameters": {
+            "task_grasp_pose_world": pose,
+            "grasp_width_m": torch.full((1, 1), 0.05),
+        },
+    }
+    # verifier 字段是硬契约：缺失必须报错而非静默改变监督语义。
+    with pytest.raises(KeyError):
+        build_grasp_proposal_labels(batch, ModelConfig(task_grasp_candidates=1))
+
+
+def test_global_grasp_labels_require_sample_valid_mask() -> None:
+    pose = torch.zeros(1, 1, 7)
+    pose[..., 6] = 1.0
+    batch = {
+        "global_grasp_labels": {
+            "object_index": torch.zeros(1, 1, dtype=torch.long),
+            "grasp_pose_world": pose,
+            "width_m": torch.full((1, 1), 0.05),
+            "scene_executable": torch.tensor([[1]], dtype=torch.int8),
+            "valid_mask": torch.ones(1, 1, dtype=torch.bool),
+            "label_set_complete": torch.tensor([False]),
+        },
+    }
+    # global_loss_sample_valid 缺失时报错，绝不默认全部有效。
+    with pytest.raises(KeyError):
+        build_global_grasp_labels(batch, ModelConfig(global_grasp_candidates=1))
 
 
 def test_sampled_global_labels_never_imply_complete_unmatched_negatives() -> None:

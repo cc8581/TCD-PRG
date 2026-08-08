@@ -179,6 +179,10 @@ def main() -> None:
                 if config.training.max_validation_groups is not None
                 else None
             ),
+            global_grasp_width_bounds=(
+                config.model.min_grasp_width_m,
+                config.model.max_grasp_width_m,
+            ),
         )
         if config.training.validation_interval > 0
         else None

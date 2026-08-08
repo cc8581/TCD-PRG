@@ -181,6 +181,7 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
         stratified_max_groups: bool = False,
         stratum_quota: Mapping[str, int] | None = None,
         subset_manifest_path: str | Path | None = None,
+        global_grasp_width_bounds: tuple[float, float] | None = None,
     ) -> None:
         self.adapter = adapter
         self.split = split
@@ -225,6 +226,31 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
         )
         self.global_grasp_mode = global_grasp_mode
         representatives: dict[tuple[int, int], int] = {}
+        certified: frozenset[tuple[int, int, int]] | None = None
+        if global_grasp_mode == "representative" and global_grasp_width_bounds is not None:
+            supervised_method = getattr(adapter, "global_grasp_supervised_task_states", None)
+            if supervised_method is not None:
+                certified = supervised_method(
+                    split,
+                    float(global_grasp_width_bounds[0]),
+                    float(global_grasp_width_bounds[1]),
+                )
+        if certified:
+            # physical_active 由 task 相关的转移图重建，任意 task 的代表可能把
+            # 认证监督行全部过滤掉。优先选择认证三元组对应的 unit 作为代表；
+            # 没有认证 unit 的 state 退回首个 unit（与旧行为一致，标签为空时
+            # 下游 sample_valid 会安全跳过）。
+            preferred: dict[tuple[int, int], tuple[tuple[int, int], int]] = {}
+            for index, unit in enumerate(self.units):
+                triple = (unit.scene_id, unit.state_id, unit.task_index)
+                if triple not in certified:
+                    continue
+                key = (unit.scene_id, unit.state_id)
+                rank = (unit.task_index, unit.group_index)
+                if key not in preferred or rank < preferred[key][0]:
+                    preferred[key] = (rank, index)
+            for key, (_, index) in preferred.items():
+                representatives[key] = index
         for index, unit in enumerate(self.units):
             representatives.setdefault((unit.scene_id, unit.state_id), index)
         self._global_grasp_representatives = frozenset(representatives.values())

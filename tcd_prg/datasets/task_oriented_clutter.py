@@ -37,7 +37,7 @@ from .types import (
     StateLabels,
 )
 
-ACTION_GROUP_INDEX_CACHE_VERSION = "tcd_prg_action_group_strata_v1"
+ACTION_GROUP_INDEX_CACHE_VERSION = "tcd_prg_action_group_strata_v2"
 GLOBAL_GRASP_STATE_CACHE_VERSION = "tcd_prg_global_grasp_task_states_v2"
 ACTION_GROUP_STRATA = (
     "direct_grasp",
@@ -222,6 +222,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         action_labels_subdir: str = "task_positive_multistep_sequences",
         global_positive_grasps_per_object: int = 64,
         global_negative_grasps_per_object: int = 32,
+        grasp_width_bounds: tuple[float, float] | None = None,
         index_cache_dir: str | Path = "runtime/cache/dataset_indexes",
         data_fraction: float = 1.0,
         split_ratios: tuple[float, ...] = (8.0, 1.0, 1.0),
@@ -242,6 +243,16 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             int(global_positive_grasps_per_object),
             int(global_negative_grasps_per_object),
         )
+        if grasp_width_bounds is not None:
+            width_min, width_max = (
+                float(grasp_width_bounds[0]),
+                float(grasp_width_bounds[1]),
+            )
+            if width_min < 0 or width_max <= width_min:
+                raise ValueError("grasp_width_bounds must satisfy 0 <= min < max")
+            self.grasp_width_bounds: tuple[float, float] | None = (width_min, width_max)
+        else:
+            self.grasp_width_bounds = None
         for path in (self.scene_root, self.step_root, self.action_root):
             if not path.is_dir():
                 raise FileNotFoundError(path)
@@ -383,26 +394,94 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             self._action_group_index = rows.astype(np.int32, copy=False)
             if _show_index_progress():
                 print(
-                    f"[dataset-index] source=training_index.h5 groups={len(rows)}",
+                    f"[dataset-index] source=training_index.h5 groups={len(rows)} "
+                    f"snapshot_scenes={len(self._scene_ids)} "
+                    "(in-memory index load; per-scene HDF5 scans stay snapshot-local)",
                     flush=True,
                 )
         return self._action_group_index
 
+    def _step_label_fingerprint(self) -> bytes:
+        """Fingerprint every grasp-library / scene-label npz.
+
+        Directory mtimes do not change when a producer rewrites a file in
+        place, so per-file size/mtime is required to keep derived caches
+        honest about the data they were built from.  Uses a single
+        ``os.scandir`` walk with entry-cached stats (no extra per-file
+        syscalls on Windows) and relative paths, and is memoized per adapter
+        instance: with tens of thousands of npz files on a spinning disk the
+        naive ``rglob`` + ``stat`` + ``resolve`` implementation stalls
+        startup for minutes, while this walk finishes in seconds.
+        """
+
+        cached = getattr(self, "_step_label_fingerprint_cache", None)
+        if cached is not None:
+            return cached
+        started = time.monotonic()
+        digest = hashlib.sha256()
+        pending: list[tuple[str, os.stat_result]] = []
+        for directory in (
+            self.step_root / "grasp_library",
+            self.step_root / "scene_labels",
+        ):
+            if not directory.is_dir():
+                continue
+            stack = [directory]
+            while stack:
+                current = stack.pop()
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.name.endswith(".npz"):
+                            relative = os.path.relpath(entry.path, directory)
+                            pending.append((relative, entry.stat(follow_symlinks=False)))
+        for relative, stat in sorted(pending, key=lambda item: item[0]):
+            digest.update(f"|{relative}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8"))
+        fingerprint = digest.digest()
+        self._step_label_fingerprint_cache = fingerprint
+        if _show_index_progress():
+            print(
+                f"[dataset-index] fingerprinted {len(pending)} step-label npz files "
+                f"in {time.monotonic() - started:.1f}s",
+                flush=True,
+            )
+        return fingerprint
+
+    def _fingerprint_step_label_files(self, digest) -> None:
+        """Hash the grasp-library / scene-label fingerprint into a cache digest."""
+
+        digest.update(self._step_label_fingerprint())
+
     def _strata_cache_path(self) -> Path:
+        # Memoized: the path also feeds the Global Grasp cache digest, and
+        # recomputing it would re-stat every published scene HDF5.
+        cached = getattr(self, "_strata_cache_path_cache", None)
+        if cached is not None:
+            return cached
         stat = self.training_index_path.stat()
         with h5py.File(self.training_index_path, "r", swmr=True) as handle:
             signature = str(handle.attrs.get("generation_signature", ""))
-        payload = "|".join(
-            (
-                ACTION_GROUP_INDEX_CACHE_VERSION,
-                str(self.action_root.resolve()),
-                signature,
-                str(stat.st_size),
-                str(stat.st_mtime_ns),
+        digest = hashlib.sha256()
+        digest.update(ACTION_GROUP_INDEX_CACHE_VERSION.encode("utf-8"))
+        digest.update(str(self.action_root.resolve()).encode("utf-8"))
+        digest.update(signature.encode("utf-8"))
+        digest.update(f"|index={stat.st_size}:{stat.st_mtime_ns}".encode("utf-8"))
+        digest.update(f"|width={self.grasp_width_bounds}".encode("utf-8"))
+        # Strata content reads each scene's action HDF5, which can be
+        # regenerated independently of the training index.  Fingerprint every
+        # published scene file so a regenerated dataset cannot silently reuse
+        # stale strata (and therefore stale sampling/validation subsets).
+        for source in self._h5_paths:
+            file_stat = source.stat()
+            digest.update(
+                f"|{source.name}:{file_stat.st_size}:{file_stat.st_mtime_ns}".encode("utf-8")
             )
-        )
-        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        return self.index_cache_dir / f"action_group_strata_{digest}.npz"
+        # The width-window check reads grasp libraries through scene labels.
+        self._fingerprint_step_label_files(digest)
+        path = self.index_cache_dir / f"action_group_strata_{digest.hexdigest()}.npz"
+        self._strata_cache_path_cache = path
+        return path
 
     @staticmethod
     def _load_strata_cache(path: Path, expected_rows: int) -> np.ndarray | None:
@@ -422,6 +501,14 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         scene_column = rows[:, 1]
         scene_ids, starts = np.unique(scene_column, return_index=True)
         stops = np.r_[starts[1:], len(rows)]
+        # training_index 覆盖完整生成结果，但下游只会查询当前配置快照
+        # （scene_start/scene_count 选定的 _path_by_scene）内的场景。跳过快照
+        # 外的行：既避免为永远用不到的场景白扫 HDF5，也避免快照外场景文件
+        # 缺失时构建在半途崩溃。被跳过行的 stratum 保持 unresolved_or_unknown。
+        keep = np.asarray(
+            [int(scene_id) in self._path_by_scene for scene_id in scene_ids], dtype=bool
+        )
+        scene_ids, starts, stops = scene_ids[keep], starts[keep], stops[keep]
         for scene_id, start, stop in tqdm(
             zip(scene_ids.tolist(), starts.tolist(), stops.tolist(), strict=True),
             total=len(scene_ids),
@@ -439,25 +526,21 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 group_action_ids = groups["action_ids"][:]
                 actions = scene["actions"]
                 action_type = actions["action_type"][:]
-                executed = actions["executed"][:]
-                success = actions["success"][:] | actions["potential_improved"][:]
+                executed = actions["executed"][:].astype(bool)
+                positive = self._action_positive_mask(
+                    actions["success"][:],
+                    actions["potential_improved"][:],
+                    actions["outcome_code"][:],
+                )
+                width_payload = self._strata_width_payload(actions, int(scene_id))
                 for row_index, group_index in enumerate(scene_rows[:, 2], start=start):
                     group_index = int(group_index)
                     ids = group_action_ids[
                         int(offsets[group_index]) : int(offsets[group_index + 1])
                     ]
-                    evaluated_positive = executed[ids] & success[ids]
-                    positive_types = set(int(x) for x in action_type[ids][evaluated_positive])
-                    if int(ActionType.TASK_GRASP) in positive_types:
-                        stratum = "direct_grasp"
-                    elif int(ActionType.PICK_REMOVE) in positive_types:
-                        stratum = "pick_remove"
-                    elif int(ActionType.PUSH) in positive_types:
-                        stratum = "push"
-                    elif np.any(executed[ids] & (action_type[ids] == int(ActionType.PUSH))):
-                        stratum = "push_failure"
-                    else:
-                        stratum = "unresolved_or_unknown"
+                    stratum = self._group_stratum(
+                        ids, action_type, executed, positive, width_payload
+                    )
                     codes[row_index] = ACTION_GROUP_STRATA.index(stratum)
         temporary = path.with_name(f"{path.stem}.{os.getpid()}.tmp.npz")
         np.savez_compressed(
@@ -467,6 +550,95 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         )
         os.replace(temporary, path)
         return codes
+
+    @staticmethod
+    def _action_positive_mask(
+        success: np.ndarray, potential_improved: np.ndarray, outcome_code: np.ndarray
+    ) -> np.ndarray:
+        """Positive-outcome definition shared with ``load_action_group``.
+
+        ``load_action_group`` counts TERMINAL_POSITIVE outcomes as positive
+        verifier evidence; strata must use the same definition or they would
+        mis-classify groups whose only successes are terminal positives.
+        """
+
+        return (
+            success.astype(bool)
+            | potential_improved.astype(bool)
+            | (outcome_code == int(OutcomeCode.TERMINAL_POSITIVE))
+        )
+
+    def _strata_width_payload(
+        self, actions: h5py.Group, scene_id: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[str, ...]] | None:
+        """Per-scene payload arrays for the direct-grasp width check.
+
+        Returns None when no model width interval is configured, preserving
+        the legacy width-agnostic classification.
+        """
+
+        if self.grasp_width_bounds is None:
+            return None
+        return (
+            actions["payload_index"][:].astype(np.int64),
+            actions["task_grasp/target_object"][:].astype(np.int64),
+            actions["task_grasp/grasp_source_index"][:].astype(np.int64),
+            self._object_match_files(scene_id),
+        )
+
+    def _positive_task_grasp_within_width(
+        self,
+        rows: np.ndarray,
+        payload: tuple[np.ndarray, np.ndarray, np.ndarray, tuple[str, ...]],
+    ) -> bool:
+        """True when a positive TASK_GRASP survives the label-side width window.
+
+        ``build_grasp_proposal_labels`` drops grasp targets outside the model
+        width interval; ``direct_grasp`` must not be claimed for a group whose
+        positive task grasps would all be filtered out at loss time.
+        """
+
+        assert self.grasp_width_bounds is not None
+        minimum, maximum = self.grasp_width_bounds
+        payload_index, task_grasp_object, task_grasp_source, match_files = payload
+        for row in rows:
+            payload_row = int(payload_index[int(row)])
+            library = self.grasp_registry.load(
+                match_files[int(task_grasp_object[payload_row])]
+            )
+            grasp_row = int(
+                library.rows_for_source(
+                    np.asarray([int(task_grasp_source[payload_row])])
+                )[0]
+            )
+            width = float(library.contact_span_m[grasp_row])
+            if np.isfinite(width) and minimum <= width <= maximum:
+                return True
+        return False
+
+    def _group_stratum(
+        self,
+        ids: np.ndarray,
+        action_type: np.ndarray,
+        executed: np.ndarray,
+        positive: np.ndarray,
+        width_payload: tuple[np.ndarray, np.ndarray, np.ndarray, tuple[str, ...]] | None,
+    ) -> str:
+        evaluated_positive = executed[ids] & positive[ids]
+        positive_types = set(int(x) for x in action_type[ids][evaluated_positive])
+        direct = int(ActionType.TASK_GRASP) in positive_types
+        if direct and width_payload is not None:
+            rows = ids[evaluated_positive & (action_type[ids] == int(ActionType.TASK_GRASP))]
+            direct = self._positive_task_grasp_within_width(rows, width_payload)
+        if direct:
+            return "direct_grasp"
+        if int(ActionType.PICK_REMOVE) in positive_types:
+            return "pick_remove"
+        if int(ActionType.PUSH) in positive_types:
+            return "push"
+        if np.any(executed[ids] & (action_type[ids] == int(ActionType.PUSH))):
+            return "push_failure"
+        return "unresolved_or_unknown"
 
     def _load_or_build_strata_cache(self) -> tuple[np.ndarray, np.ndarray]:
         rows = self._load_action_group_index()
@@ -516,7 +688,14 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
     def action_group_strata(
         self, units: Iterable[tuple[int, int, int, int]] | None = None
     ) -> dict[tuple[int, int, int, int], str]:
-        """Classify groups without loading observations or grasp libraries."""
+        """Classify groups without loading observations.
+
+        Strata are a best-effort upper bound on available supervision used for
+        sampling balance and validation quotas only.  The positive definition
+        and the model width window match the loss-side label builders, but
+        push-contact visibility still depends on the rendered observation and
+        is intentionally not modeled here.
+        """
 
         if self.training_index_path.is_file():
             rows, codes = self._load_or_build_strata_cache()
@@ -543,8 +722,13 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                 tasks = groups["task_index"][:]
                 actions = scene["actions"]
                 action_type = actions["action_type"][:]
-                executed = actions["executed"][:]
-                success = actions["success"][:] | actions["potential_improved"][:]
+                executed = actions["executed"][:].astype(bool)
+                positive = self._action_positive_mask(
+                    actions["success"][:],
+                    actions["potential_improved"][:],
+                    actions["outcome_code"][:],
+                )
+                width_payload = self._strata_width_payload(actions, int(scene_id))
                 for group_index, (state_id, task_index) in enumerate(
                     zip(states, tasks, strict=True)
                 ):
@@ -554,19 +738,9 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                     ids = group_action_ids[
                         int(offsets[group_index]) : int(offsets[group_index + 1])
                     ]
-                    evaluated_positive = executed[ids] & success[ids]
-                    positive_types = set(int(x) for x in action_type[ids][evaluated_positive])
-                    if int(ActionType.TASK_GRASP) in positive_types:
-                        stratum = "direct_grasp"
-                    elif int(ActionType.PICK_REMOVE) in positive_types:
-                        stratum = "pick_remove"
-                    elif int(ActionType.PUSH) in positive_types:
-                        stratum = "push"
-                    elif np.any(executed[ids] & (action_type[ids] == int(ActionType.PUSH))):
-                        stratum = "push_failure"
-                    else:
-                        stratum = "unresolved_or_unknown"
-                    result[unit] = stratum
+                    result[unit] = self._group_stratum(
+                        ids, action_type, executed, positive, width_payload
+                    )
         return result
 
     def _global_grasp_state_cache_path(
@@ -589,13 +763,9 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         for source in self._h5_paths:
             stat = source.stat()
             digest.update(f"|{source.name}:{stat.st_size}:{stat.st_mtime_ns}".encode())
-        for source in (
-            self.step_root / "grasp_library",
-            self.step_root / "scene_labels",
-        ):
-            if source.exists():
-                stat = source.stat()
-                digest.update(f"|{source.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode())
+        # Per-file fingerprint: directory mtimes do not change when a producer
+        # rewrites a grasp library or scene-label npz in place.
+        self._fingerprint_step_label_files(digest)
         return self.index_cache_dir / f"global_grasp_task_states_{digest.hexdigest()}.npz"
 
     @staticmethod

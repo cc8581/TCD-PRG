@@ -3,7 +3,7 @@ from __future__ import annotations
 import h5py
 import numpy as np
 
-from tcd_prg.constants import PUSH_DISTANCE_M, ActionType, CandidateStatus
+from tcd_prg.constants import PUSH_DISTANCE_M, ActionType, CandidateStatus, OutcomeCode
 from tcd_prg.datasets import TaskOrientedClutterAdapter
 from tcd_prg.datasets.collate import collate_unified, grid_sample_indices
 from tcd_prg.datasets.task_oriented_clutter import (
@@ -103,6 +103,10 @@ def test_action_strata_cache_is_reused_without_hdf5_scan(tmp_path) -> None:
     adapter.index_cache_dir = tmp_path / "cache"
     adapter.index_cache_dir.mkdir()
     adapter._action_group_index = None
+    adapter.grasp_width_bounds = None
+    adapter._h5_paths = ()
+    adapter._scene_ids = ()
+    adapter.step_root = tmp_path
     cache = adapter._strata_cache_path()
     np.savez_compressed(
         cache,
@@ -134,8 +138,13 @@ def test_first_strata_scan_builds_reusable_cache(tmp_path) -> None:
         actions.create_dataset("executed", data=np.asarray([True, True]))
         actions.create_dataset("success", data=np.asarray([True, False]))
         actions.create_dataset("potential_improved", data=np.asarray([False, False]))
+        actions.create_dataset(
+            "outcome_code",
+            data=np.asarray([OutcomeCode.SUCCESS, OutcomeCode.OTHER_INVALID], np.int8),
+        )
     adapter = object.__new__(TaskOrientedClutterAdapter)
     adapter._path_by_scene = {10: scene_file}
+    adapter.grasp_width_bounds = None
     cache = tmp_path / "strata.npz"
 
     codes = adapter._build_strata_cache(cache, rows)

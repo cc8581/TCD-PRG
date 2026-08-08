@@ -30,7 +30,13 @@ def main() -> None:
     config = load_config(args.config, args.overrides)
     adapter = create_adapter(config, allow_render=False)
     dataset = ActionStateGroupDataset(
-        adapter, split=args.split, max_groups=config.evaluation.max_groups
+        adapter,
+        split=args.split,
+        max_groups=config.evaluation.max_groups,
+        global_grasp_width_bounds=(
+            config.model.min_grasp_width_m,
+            config.model.max_grasp_width_m,
+        ),
     )
     if not len(dataset):
         raise RuntimeError(f"No completed action groups exist for split={args.split}")
