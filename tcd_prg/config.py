@@ -182,6 +182,14 @@ class TrainingConfig:
     amp_dtype: str = "float16"
     amp_initial_scale: float = 4096.0
     batch_size: int = 1
+    # Task/state selection is primary.  Strata only guide which group to use
+    # inside an already-selected state; they never replace that task/state.
+    action_batch_coverage_strata: tuple[str, ...] = (
+        "direct_grasp", "pick_remove", "push", "push_failure",
+        "unresolved_or_unknown",
+    )
+    # Unique scene-state Global Grasp stream is added once per action batch.
+    global_stream_weight: float = 1.0
     gradient_accumulation_steps: int = 1
     max_optimizer_steps: int = 100_000
     # validation_interval=0 仅用于没有验证集的启动阶段，正式实验不应关闭验证。
@@ -194,7 +202,16 @@ class TrainingConfig:
     num_workers: int = 4
     pin_memory: bool = True
     max_train_groups: int | None = None
-    max_validation_groups: int | None = 256
+    max_validation_groups: int | None = None
+    # Used only when max_validation_groups is finite.  The resulting exact
+    # subset is persisted to validation_subset.json and reused on resume.
+    validation_stratum_quota: dict[str, int] = field(default_factory=lambda: {
+        "direct_grasp": 64,
+        "pick_remove": 64,
+        "push": 48,
+        "push_failure": 48,
+        "unresolved_or_unknown": 32,
+    })
     # Restrict the published scene snapshot before deterministic splitting.
     scene_start: int = 0
     scene_count: int | None = None
@@ -242,9 +259,23 @@ class EvaluationConfig:
     relation_ranking_topk: tuple[int, ...] = (20, 50, 100)
     calibration_bins: int = 15
     global_grasp_tracks: tuple[str, ...] = ("scene_only", "instance_assisted")
+    # Internal convergence diagnostics only. Public Global Grasp comparison
+    # continues to use the official graspnetAPI evaluator.
+    task_translation_threshold_m: float = 0.01
+    task_rotation_threshold_deg: float = 12.0
+    task_width_threshold_m: float = 0.005
     global_translation_threshold_m: float = 0.01
     global_rotation_threshold_deg: float = 15.0
     global_width_threshold_m: float = 0.005
+    # NMS thresholds are intentionally independent from GT matching thresholds.
+    task_nms_translation_m: float = 0.01
+    task_nms_rotation_deg: float = 12.0
+    task_nms_width_m: float = 0.005
+    global_nms_translation_m: float = 0.01
+    global_nms_rotation_deg: float = 15.0
+    global_nms_width_m: float = 0.005
+    # Deprecated compatibility field; internal diagnostics always apply the
+    # explicit NMS configuration above and standard GraspNet uses graspnetAPI.
     global_metrics_after_nms: bool = True
 
 
@@ -378,6 +409,19 @@ class TCDPRGConfig:
     def validate(self) -> None:
         if self.training.gradient_accumulation_steps <= 0:
             raise ValueError("training.gradient_accumulation_steps must be positive")
+        expected_strata = {
+            "direct_grasp", "pick_remove", "push", "push_failure",
+            "unresolved_or_unknown",
+        }
+        coverage_strata = tuple(self.training.action_batch_coverage_strata)
+        if len(set(coverage_strata)) != len(coverage_strata):
+            raise ValueError("training.action_batch_coverage_strata must not contain duplicates")
+        if not set(coverage_strata).issubset(expected_strata):
+            raise ValueError(
+                "training.action_batch_coverage_strata contains an unknown action stratum"
+            )
+        if self.training.global_stream_weight <= 0:
+            raise ValueError("training.global_stream_weight must be positive")
         if not 0.0 < self.training.data_fraction <= 1.0:
             raise ValueError("training.data_fraction must be in (0,1]")
         if self.training.scene_start < 0:
@@ -389,6 +433,21 @@ class TCDPRGConfig:
             and self.training.max_validation_groups <= 0
         ):
             raise ValueError("training.max_validation_groups must be positive")
+        if self.training.max_validation_groups is not None:
+            if set(self.training.validation_stratum_quota) != expected_strata:
+                raise ValueError(
+                    "training.validation_stratum_quota must define exactly the five action strata"
+                )
+            if any(
+                int(value) < 0 for value in self.training.validation_stratum_quota.values()
+            ):
+                raise ValueError("training.validation_stratum_quota values must be non-negative")
+            if sum(
+                int(value) for value in self.training.validation_stratum_quota.values()
+            ) != self.training.max_validation_groups:
+                raise ValueError(
+                    "training.validation_stratum_quota must sum to max_validation_groups"
+                )
         if self.training.amp_initial_scale <= 0:
             raise ValueError("training.amp_initial_scale must be positive")
         if not 0 < self.evaluation.region_probability_threshold < 1:
@@ -405,6 +464,22 @@ class TCDPRGConfig:
             raise ValueError(
                 "evaluation.relation_ranking_topk must contain positive integers"
             )
+        diagnostic_thresholds = (
+            self.evaluation.task_translation_threshold_m,
+            self.evaluation.task_rotation_threshold_deg,
+            self.evaluation.task_width_threshold_m,
+            self.evaluation.global_translation_threshold_m,
+            self.evaluation.global_rotation_threshold_deg,
+            self.evaluation.global_width_threshold_m,
+            self.evaluation.task_nms_translation_m,
+            self.evaluation.task_nms_rotation_deg,
+            self.evaluation.task_nms_width_m,
+            self.evaluation.global_nms_translation_m,
+            self.evaluation.global_nms_rotation_deg,
+            self.evaluation.global_nms_width_m,
+        )
+        if any(float(value) <= 0 for value in diagnostic_thresholds):
+            raise ValueError("All grasp diagnostic matching/NMS thresholds must be positive")
         if self.evaluation.calibration_bins <= 1:
             raise ValueError("evaluation.calibration_bins must be greater than one")
         if self.logging.log_interval <= 0:

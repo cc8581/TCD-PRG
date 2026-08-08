@@ -193,18 +193,33 @@ training:
   amp: true
   amp_dtype: float16
   amp_initial_scale: 4096
-  batch_size: 6
-  gradient_accumulation_steps: 4  # 有效 batch 更稳定，不增加单步显存
+  batch_size: 8
+  # Task/state 优先；stratum 仅在已选 state 的多个 group 中做尽力覆盖。
+  # Task/state-first sampling.  These strata are only best-effort coverage
+  # targets when an already-selected state has multiple action groups.
+  action_batch_coverage_strata:
+    [direct_grasp, pick_remove, push, push_failure, unresolved_or_unknown]
+  # 独立 unique scene-state Global Grasp stream；不按当前 loss 人工放大。
+  global_stream_weight: 1.0
+  gradient_accumulation_steps: 3  # 有效 batch 更稳定，不增加单步显存
   max_optimizer_steps: 30000
-  validation_interval: 2000     # 周期验证。
-  gradient_clip_norm: 20.0 # 联合多任务全局范数阈值；模块级诊断用于继续校准
+  validation_interval: 100     # 周期验证。
+  gradient_clip_norm: 20.0 # 梯度裁剪，避免梯度爆炸；PTv3 前向可能产生极端梯度。
   ema_decay: 0.999
   early_stopping_patience: 15
   deterministic: False
   num_workers: 6
   pin_memory: true
   max_train_groups: null
-  max_validation_groups: 256
+  # 正式实验使用完整 validation split。若设为 256/512 等有限值，必须同时
+  # 配置对应 quota；子集会固定写入 outputs/.../validation_subset.json。
+  max_validation_groups: null
+  validation_stratum_quota:
+    direct_grasp: 64
+    pick_remove: 64
+    push: 48
+    push_failure: 48
+    unresolved_or_unknown: 32
   scene_start: 0
   scene_count: 2500
   data_fraction: 1.0         # Use every scene in the configured snapshot.
@@ -245,10 +260,21 @@ evaluation:
   relation_ranking_topk: [20, 50, 100]
   calibration_bins: 15
   global_grasp_tracks: [scene_only, instance_assisted]
-  global_translation_threshold_m: 0.01
+  # 以下 grasp pose 阈值只服务训练收敛诊断，不进入 paper 标准指标。
+  task_translation_threshold_m: 0.010
+  task_rotation_threshold_deg: 12.0
+  task_width_threshold_m: 0.005
+  global_translation_threshold_m: 0.010
   global_rotation_threshold_deg: 15.0
   global_width_threshold_m: 0.005
-  global_metrics_after_nms: true
+  # NMS 与 GT matching 的物理含义独立，即使当前数值相同也分别配置。
+  task_nms_translation_m: 0.010
+  task_nms_rotation_deg: 12.0
+  task_nms_width_m: 0.005
+  global_nms_translation_m: 0.010
+  global_nms_rotation_deg: 15.0
+  global_nms_width_m: 0.005
+  global_metrics_after_nms: true # deprecated compatibility; diagnostics always apply NMS
 
 ablation:
   use_task_region_condition: true

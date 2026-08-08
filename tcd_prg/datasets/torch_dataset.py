@@ -1,14 +1,21 @@
-"""PyTorch datasets and state-group balanced sampling.
+"""PyTorch datasets and deterministic state-group sampling.
 
-The sampling unit is always ``(scene_id, state_id, task_index,
-action_state_group)``.  No action row is exposed as an independent sample.
+The primary action-stream sampling unit is always
+``(scene_id, state_id, task_index, action_state_group)``.  Global Grasp direct
+supervision is exposed through a separate unique ``(scene_id, state_id)``
+stream so task multiplicity cannot change its statistical weight.
 """
 
 from __future__ import annotations
 
-from collections import Counter
+import json
+import math
+import os
+from collections import Counter, defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import islice
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -41,6 +48,124 @@ def _deterministic_fraction_indices(size: int, fraction: float, seed: int) -> np
     return np.sort(selected.astype(np.int64, copy=False))
 
 
+def _scene_diverse_stratified_units(
+    raw_units: list[tuple[int, int, int, int]],
+    strata: Mapping[tuple[int, int, int, int], str],
+    quota: Mapping[str, int],
+    seed: int,
+) -> list[tuple[int, int, int, int]]:
+    """Select a deterministic no-replacement subset, round-robin over scenes."""
+
+    rng = np.random.default_rng(seed)
+    selected: list[tuple[int, int, int, int]] = []
+    for stratum, requested in quota.items():
+        requested = int(requested)
+        if requested <= 0:
+            continue
+        by_scene: dict[int, list[tuple[int, int, int, int]]] = defaultdict(list)
+        for unit in raw_units:
+            if strata.get(unit, "unclassified") == stratum:
+                by_scene[int(unit[0])].append(unit)
+        available = sum(len(values) for values in by_scene.values())
+        if available < requested:
+            raise ValueError(
+                f"Validation stratum {stratum!r} requests {requested} groups but only "
+                f"{available} are available"
+            )
+        scenes = list(by_scene)
+        rng.shuffle(scenes)
+        for scene_id in scenes:
+            order = rng.permutation(len(by_scene[scene_id]))
+            by_scene[scene_id] = [by_scene[scene_id][int(i)] for i in order]
+        offsets = {scene_id: 0 for scene_id in scenes}
+        taken = 0
+        while taken < requested:
+            progressed = False
+            for scene_id in scenes:
+                offset = offsets[scene_id]
+                values = by_scene[scene_id]
+                if offset >= len(values):
+                    continue
+                selected.append(values[offset])
+                offsets[scene_id] = offset + 1
+                taken += 1
+                progressed = True
+                if taken >= requested:
+                    break
+            if not progressed:
+                raise RuntimeError(f"Unable to fill validation quota for {stratum}")
+    return selected
+
+
+def _load_or_create_validation_subset(
+    raw_units: list[tuple[int, int, int, int]],
+    strata: Mapping[tuple[int, int, int, int], str],
+    quota: Mapping[str, int],
+    seed: int,
+    manifest_path: str | Path | None,
+) -> list[tuple[int, int, int, int]]:
+    """Use an existing manifest on resume, otherwise create one deterministically."""
+
+    path = Path(manifest_path) if manifest_path is not None else None
+    expected_count = sum(int(value) for value in quota.values())
+    raw_map = {unit: strata.get(unit, "unclassified") for unit in raw_units}
+    if path is not None and path.is_file():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if int(payload.get("seed", -1)) != int(seed):
+            raise ValueError("validation_subset.json seed does not match current config")
+        if payload.get("quota") != {key: int(value) for key, value in quota.items()}:
+            raise ValueError("validation_subset.json quota does not match current config")
+        if int(payload.get("source_group_count", -1)) != len(raw_units):
+            raise ValueError(
+                "validation_subset.json source group count does not match current split"
+            )
+        entries = payload.get("groups", [])
+        if len(entries) != expected_count:
+            raise ValueError("validation_subset.json group count does not match configured quota")
+        selected: list[tuple[int, int, int, int]] = []
+        for entry in entries:
+            unit = (
+                int(entry["scene_id"]),
+                int(entry["state_id"]),
+                int(entry["task_index"]),
+                int(entry["group_index"]),
+            )
+            if unit not in raw_map:
+                raise ValueError(f"validation_subset.json references unavailable group {unit}")
+            if str(entry["stratum"]) != raw_map[unit]:
+                raise ValueError(f"validation_subset.json stratum drift for group {unit}")
+            selected.append(unit)
+        return selected
+
+    selected = _scene_diverse_stratified_units(raw_units, strata, quota, seed)
+    if path is not None:
+        is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        if is_primary:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "schema_version": 1,
+                "seed": int(seed),
+                "quota": {key: int(value) for key, value in quota.items()},
+                "source_group_count": len(raw_units),
+                "groups": [
+                    {
+                        "scene_id": unit[0],
+                        "state_id": unit[1],
+                        "task_index": unit[2],
+                        "group_index": unit[3],
+                        "stratum": strata.get(unit, "unclassified"),
+                    }
+                    for unit in selected
+                ],
+            }
+            temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(temporary, path)
+    return selected
+
+
 class ActionStateGroupDataset(Dataset[UnifiedSample]):
     """Immutable snapshot of completed action-state groups."""
 
@@ -52,40 +177,140 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
         include_strata: bool = True,
         fraction: float = 1.0,
         subset_seed: int = 2026,
+        global_grasp_mode: str = "representative",
+        stratified_max_groups: bool = False,
+        stratum_quota: Mapping[str, int] | None = None,
+        subset_manifest_path: str | Path | None = None,
     ) -> None:
         self.adapter = adapter
+        self.split = split
         if not 0.0 < fraction <= 1.0:
             raise ValueError("fraction must be in (0,1]")
         if max_groups is not None and max_groups <= 0:
             raise ValueError("max_groups must be positive")
+        if global_grasp_mode not in {"representative", "always", "never"}:
+            raise ValueError("global_grasp_mode must be representative, always or never")
+        if stratified_max_groups and max_groups is None:
+            raise ValueError("stratified_max_groups requires max_groups")
+        if stratified_max_groups and not stratum_quota:
+            raise ValueError("stratified_max_groups requires stratum_quota")
+
         iterator = adapter.iter_action_groups(split)
-        if fraction == 1.0:
-            if max_groups is not None:
-                raw_units = list(islice(iterator, max_groups))
-                self.source_group_count: int | None = None
-            else:
-                raw_units = list(iterator)
-                self.source_group_count = len(raw_units)
+        if fraction == 1.0 and max_groups is not None and not stratified_max_groups:
+            raw_units = list(islice(iterator, max_groups))
+            self.source_group_count: int | None = None
         else:
             raw_units = list(iterator)
             self.source_group_count = len(raw_units)
-            selected = _deterministic_fraction_indices(
-                len(raw_units), fraction, subset_seed
-            )
-            raw_units = [raw_units[int(index)] for index in selected]
-            if max_groups is not None:
+            if fraction < 1.0:
+                selected = _deterministic_fraction_indices(len(raw_units), fraction, subset_seed)
+                raw_units = [raw_units[int(index)] for index in selected]
+            if max_groups is not None and not stratified_max_groups:
                 raw_units = raw_units[:max_groups]
+
         self.requested_fraction = float(fraction)
-        self.selected_group_count = len(raw_units)
         strata_method = getattr(adapter, "action_group_strata", None)
         strata = strata_method(raw_units) if include_strata and strata_method else {}
+        if stratified_max_groups:
+            assert stratum_quota is not None
+            if sum(int(value) for value in stratum_quota.values()) != int(max_groups):
+                raise ValueError("validation stratum quota must sum to max_groups")
+            raw_units = _load_or_create_validation_subset(
+                raw_units, strata, stratum_quota, subset_seed, subset_manifest_path
+            )
+            strata = {unit: strata.get(unit, "unclassified") for unit in raw_units}
+        self.selected_group_count = len(raw_units)
         self.units = tuple(
             StateGroupUnit(*unit, stratum=strata.get(unit, "unclassified")) for unit in raw_units
         )
+        self.global_grasp_mode = global_grasp_mode
         representatives: dict[tuple[int, int], int] = {}
         for index, unit in enumerate(self.units):
             representatives.setdefault((unit.scene_id, unit.state_id), index)
         self._global_grasp_representatives = frozenset(representatives.values())
+
+    def __len__(self) -> int:
+        return len(self.units)
+
+    def __getitem__(self, index: int) -> UnifiedSample:
+        unit = self.units[index]
+        include_global = self.global_grasp_mode == "always" or (
+            self.global_grasp_mode == "representative"
+            and index in self._global_grasp_representatives
+        )
+        return self.adapter.load_sample(
+            unit.scene_id,
+            unit.state_id,
+            unit.task_index,
+            unit.group_index,
+            include_global_grasps=include_global,
+        )
+
+    def balanced_sampler(
+        self, seed: int = 2026, samples: int | None = None
+    ) -> DistributedWeightedStateSampler:
+        """Legacy inverse-frequency weighted ordering kept for compatibility.
+
+        Formal training no longer uses this method; use
+        :class:`DistributedTaskStateBatchSampler` for formal task/state-first sampling.
+        """
+
+        counts = Counter(unit.stratum for unit in self.units)
+        if not counts:
+            raise ValueError("Cannot sample an empty dataset")
+        weights = torch.tensor(
+            [1.0 / counts[unit.stratum] for unit in self.units], dtype=torch.double
+        )
+        return DistributedWeightedStateSampler(
+            weights,
+            rank=0,
+            world_size=1,
+            total_samples=samples or len(self.units),
+            seed=seed,
+        )
+
+    def distributed_balanced_sampler(
+        self, rank: int, world_size: int, seed: int = 2026, samples: int | None = None
+    ) -> DistributedWeightedStateSampler:
+        counts = Counter(unit.stratum for unit in self.units)
+        weights = torch.tensor(
+            [1.0 / counts[unit.stratum] for unit in self.units], dtype=torch.double
+        )
+        return DistributedWeightedStateSampler(
+            weights, rank, world_size, samples or len(self.units), seed
+        )
+
+    @property
+    def stratum_counts(self) -> dict[str, int]:
+        return dict(Counter(unit.stratum for unit in self.units))
+
+
+class GlobalStateDataset(Dataset[UnifiedSample]):
+    """Unique scene-state stream containing only states with certified Global labels."""
+
+    def __init__(self, action_dataset: ActionStateGroupDataset) -> None:
+        self.adapter = action_dataset.adapter
+        representative: dict[tuple[int, int], StateGroupUnit] = {}
+        for unit in action_dataset.units:
+            representative.setdefault((unit.scene_id, unit.state_id), unit)
+        supervised_method = getattr(self.adapter, "global_grasp_supervised_states", None)
+        if supervised_method is not None:
+            supervised = supervised_method(action_dataset.split)
+            units = [unit for key, unit in representative.items() if key in supervised]
+        else:
+            available = getattr(self.adapter, "has_global_grasp_supervision", None)
+            if available is None:
+                raise AttributeError(
+                    "GlobalStateDataset requires a Global Grasp supervision index method"
+                )
+            units = [
+                unit
+                for unit in representative.values()
+                if bool(available(unit.scene_id, unit.state_id))
+            ]
+        self.units = tuple(units)
+        if not self.units:
+            raise ValueError("No scene-state has certified Global Grasp supervision")
 
     def __len__(self) -> int:
         return len(self.units)
@@ -97,42 +322,215 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
             unit.state_id,
             unit.task_index,
             unit.group_index,
-            include_global_grasps=index in self._global_grasp_representatives,
+            include_global_grasps=True,
         )
 
-    def balanced_sampler(
-        self, seed: int = 2026, samples: int | None = None
-    ) -> "DistributedWeightedStateSampler":
-        """Inverse-frequency sampler without duplicate groups within an epoch."""
 
-        counts = Counter(unit.stratum for unit in self.units)
-        if not counts:
+class DistributedTaskStateBatchSampler(Sampler[list[int]]):
+    """Task-first, unique-state sampling with best-effort supervision coverage.
+
+    The sampling hierarchy is:
+
+    1. choose ``(scene_id, task_index)`` approximately uniformly;
+    2. cycle through unique ``state_id`` values inside that task;
+    3. choose exactly one complete ``action_state_group`` for the selected state.
+
+    A task with many successful paths/action groups therefore does not receive a
+    larger sampling probability merely because it generated more groups.  If a
+    selected state owns several groups, ``coverage_strata`` may prefer a group
+    that fills a currently missing local-batch supervision type.  Crucially, that
+    preference is *not allowed* to replace the already selected task/state.
+
+    The yielded integer is still an ``ActionStateGroupDataset`` index, so no
+    action row or trajectory fragment is ever exposed as an independent sample.
+    Policy supervision continues to see the complete candidate set stored in the
+    chosen action-state group.
+    """
+
+    def __init__(
+        self,
+        units: tuple[StateGroupUnit, ...] | list[StateGroupUnit],
+        batch_size: int,
+        coverage_strata: tuple[str, ...] | list[str],
+        rank: int,
+        world_size: int,
+        seed: int = 2026,
+    ) -> None:
+        if not units:
             raise ValueError("Cannot sample an empty dataset")
-        weights = torch.tensor([1.0 / counts[unit.stratum] for unit in self.units], dtype=torch.double)
-        return DistributedWeightedStateSampler(
-            weights, rank=0, world_size=1,
-            total_samples=samples or len(self.units), seed=seed,
-        )
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if not 0 <= rank < world_size:
+            raise ValueError("rank must be in [0, world_size)")
+        if len(set(coverage_strata)) != len(tuple(coverage_strata)):
+            raise ValueError("coverage_strata must not contain duplicates")
 
-    def distributed_balanced_sampler(
-        self, rank: int, world_size: int, seed: int = 2026, samples: int | None = None
-    ) -> "DistributedWeightedStateSampler":
-        counts = Counter(unit.stratum for unit in self.units)
-        weights = torch.tensor([1.0 / counts[unit.stratum] for unit in self.units], dtype=torch.double)
-        return DistributedWeightedStateSampler(
-            weights, rank, world_size, samples or len(self.units), seed
-        )
+        self.units = tuple(units)
+        self.local_batch_size = int(batch_size)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.global_batch_size = self.local_batch_size * self.world_size
+        self.coverage_strata = tuple(str(value) for value in coverage_strata)
+        self.seed = int(seed)
+        self.epoch = 0
 
-    @property
-    def stratum_counts(self) -> dict[str, int]:
-        return dict(Counter(unit.stratum for unit in self.units))
+        groups_by_state: dict[tuple[int, int, int], list[int]] = defaultdict(list)
+        for index, unit in enumerate(self.units):
+            key = (int(unit.scene_id), int(unit.task_index), int(unit.state_id))
+            groups_by_state[key].append(index)
+        self.groups_by_state = {key: tuple(indices) for key, indices in groups_by_state.items()}
+
+        states_by_task: dict[tuple[int, int], list[tuple[int, int, int]]] = defaultdict(list)
+        for state_key in self.groups_by_state:
+            task_key = (state_key[0], state_key[1])
+            states_by_task[task_key].append(state_key)
+        self.states_by_task = {key: tuple(sorted(values)) for key, values in states_by_task.items()}
+        self.task_keys = tuple(sorted(self.states_by_task))
+        self.task_count = len(self.task_keys)
+        self.unique_state_count = len(self.groups_by_state)
+        if self.unique_state_count < self.global_batch_size:
+            raise ValueError(
+                "Task/state sampler needs at least one unique decision state per "
+                f"global mini-batch: states={self.unique_state_count}, "
+                f"global_batch={self.global_batch_size}"
+            )
+
+        # Keep one sampler epoch close to one pass over unique decision states,
+        # not one pass over action groups. Extra groups from alternative paths do
+        # not make an epoch longer or increase that task's statistical weight.
+        self.batches_per_epoch = max(1, math.ceil(self.unique_state_count / self.global_batch_size))
+        self.global_samples_per_epoch = self.batches_per_epoch * self.global_batch_size
+
+    def __len__(self) -> int:
+        return self.batches_per_epoch
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    @staticmethod
+    def _next_from_cycle(
+        source: tuple[object, ...],
+        generator: torch.Generator,
+        state: dict[str, object],
+    ) -> object:
+        order = state.get("order")
+        position = int(state.get("position", 0))
+        if order is None or position >= len(order):
+            permutation = torch.randperm(len(source), generator=generator).tolist()
+            order = [source[int(index)] for index in permutation]
+            position = 0
+            state["order"] = order
+        assert isinstance(order, list)
+        value = order[position]
+        state["position"] = position + 1
+        return value
+
+    def _draw_state(
+        self,
+        task_key: tuple[int, int],
+        generator: torch.Generator,
+        state_cycles: dict[tuple[int, int], dict[str, object]],
+        forbidden: set[tuple[int, int, int]],
+    ) -> tuple[int, int, int] | None:
+        states = self.states_by_task[task_key]
+        cycle = state_cycles[task_key]
+        # A task can be revisited inside one global batch only when there are
+        # fewer tasks than slots. Never duplicate a decision state when another
+        # state of this task is available.
+        for _ in range(max(1, len(states) * 2)):
+            candidate = self._next_from_cycle(states, generator, cycle)
+            assert isinstance(candidate, tuple)
+            if candidate not in forbidden:
+                return candidate
+        return None
+
+    def _select_group_for_state(
+        self,
+        state_key: tuple[int, int, int],
+        missing_coverage: set[str],
+        generator: torch.Generator,
+        usage: dict[int, int],
+    ) -> int:
+        candidates = self.groups_by_state[state_key]
+        preferred = tuple(
+            index for index in candidates if self.units[index].stratum in missing_coverage
+        )
+        pool = preferred or candidates
+        minimum_usage = min(usage[index] for index in pool)
+        least_used = [index for index in pool if usage[index] == minimum_usage]
+        chosen = least_used[int(torch.randint(len(least_used), (1,), generator=generator).item())]
+        usage[chosen] += 1
+        missing_coverage.discard(self.units[chosen].stratum)
+        return chosen
+
+    def __iter__(self):
+        # Schedule RNG must stay identical across ranks so every rank sees the
+        # same global task/state schedule before deterministic rank slicing.
+        schedule_generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        group_generator = torch.Generator().manual_seed(
+            self.seed + self.epoch + 1_000_003 * (self.rank + 1)
+        )
+        task_cycle: dict[str, object] = {}
+        state_cycles = {task: {} for task in self.task_keys}
+        group_usage: dict[int, int] = defaultdict(int)
+
+        for _ in range(self.batches_per_epoch):
+            selected_states: list[tuple[int, int, int]] = []
+            selected_set: set[tuple[int, int, int]] = set()
+            attempts = 0
+            maximum_attempts = max(
+                self.global_batch_size * max(4, self.task_count * 2),
+                self.unique_state_count * 2,
+            )
+            while len(selected_states) < self.global_batch_size:
+                attempts += 1
+                if attempts > maximum_attempts:
+                    raise RuntimeError(
+                        "Unable to construct a duplicate-free global task/state batch"
+                    )
+                task = self._next_from_cycle(self.task_keys, schedule_generator, task_cycle)
+                assert isinstance(task, tuple)
+                state_key = self._draw_state(task, schedule_generator, state_cycles, selected_set)
+                if state_key is None:
+                    continue
+                selected_states.append(state_key)
+                selected_set.add(state_key)
+
+            # Randomize rank assignment without altering the selected state set.
+            permutation = torch.randperm(
+                len(selected_states), generator=schedule_generator
+            ).tolist()
+            selected_states = [selected_states[int(index)] for index in permutation]
+            start = self.rank * self.local_batch_size
+            local_states = selected_states[start : start + self.local_batch_size]
+
+            # Coverage is local and best-effort. It may only choose among groups
+            # belonging to an already selected state; it cannot swap tasks/states.
+            missing = set(self.coverage_strata)
+            local_groups = [
+                self._select_group_for_state(state_key, missing, group_generator, group_usage)
+                for state_key in local_states
+            ]
+            order = torch.randperm(len(local_groups), generator=group_generator).tolist()
+            yield [local_groups[int(index)] for index in order]
 
 
 class DistributedWeightedStateSampler(Sampler[int]):
-    """Deterministic inverse-frequency sampler sharded without rank overlap."""
+    """Legacy deterministic inverse-frequency weighted ordering.
 
-    def __init__(self, weights: torch.Tensor, rank: int, world_size: int,
-                 total_samples: int, seed: int = 2026) -> None:
+    Kept to avoid breaking external scripts. Formal training uses
+    ``DistributedTaskStateBatchSampler`` so action-group multiplicity from
+    alternative paths cannot silently weight a task more heavily.
+    """
+
+    def __init__(
+        self,
+        weights: torch.Tensor,
+        rank: int,
+        world_size: int,
+        total_samples: int,
+        seed: int = 2026,
+    ) -> None:
         if weights.numel() == 0:
             raise ValueError("weights must not be empty")
         if total_samples <= 0:

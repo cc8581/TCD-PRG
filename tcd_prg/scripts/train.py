@@ -9,17 +9,25 @@ import math
 import os
 import shutil
 from dataclasses import asdict
+from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from tcd_prg.config import load_config
-from tcd_prg.datasets import ActionStateGroupDataset, DistributedEvaluationSampler
+from tcd_prg.datasets import (
+    ActionStateGroupDataset,
+    DistributedEvaluationSampler,
+    DistributedTaskStateBatchSampler,
+    GlobalStateDataset,
+)
 from tcd_prg.datasets.policy_candidates import (
     checkpoint_sha256,
     validate_cache_manifest,
     validate_generated_policy_coverage,
 )
+from tcd_prg.diagnostics import GraspDiagnosticAccumulator
 from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import TCDPRGModel
@@ -148,24 +156,31 @@ def main() -> None:
         adapter,
         split="train",
         max_groups=config.training.max_train_groups,
+        global_grasp_mode="never",
+    )
+    global_dataset = (
+        GlobalStateDataset(train_dataset)
+        if float(config.losses.global_grasp) > 0 and adapter.capabilities.has_global_grasps
+        else None
     )
     validation_dataset = (
         ActionStateGroupDataset(
             adapter,
             split="val",
             max_groups=config.training.max_validation_groups,
+            stratified_max_groups=config.training.max_validation_groups is not None,
+            stratum_quota=config.training.validation_stratum_quota,
+            subset_manifest_path=(
+                os.path.join(config.output_dir, "validation_subset.json")
+                if config.training.max_validation_groups is not None
+                else None
+            ),
         )
         if config.training.validation_interval > 0
         else None
     )
     if not len(train_dataset):
         raise RuntimeError("The completed-file snapshot contains no training groups")
-    if world_size > 1 and len(train_dataset) % world_size != 0:
-        raise ValueError(
-            "Multi-GPU training requires the number of training groups to be divisible "
-            f"by the GPU count: groups={len(train_dataset)}, gpus={world_size}. "
-            "Adjust training.data_fraction or the completed dataset snapshot."
-        )
     if rank == 0:
         print(
             f"[observation-cache] {json.dumps(observation_cache, ensure_ascii=False)}", flush=True
@@ -175,6 +190,15 @@ def main() -> None:
             f"split_ratios={list(config.training.split_ratios)} "
             f"scenes={len(adapter.scene_splits['train'])} groups={len(train_dataset)} "
             f"source_groups={train_dataset.source_group_count}",
+            flush=True,
+        )
+        if global_dataset is not None:
+            print(
+                f"[global-data] unique_supervised_scene_states={len(global_dataset)}",
+                flush=True,
+            )
+        print(
+            f"[train-strata] {json.dumps(train_dataset.stratum_counts, ensure_ascii=False)}",
             flush=True,
         )
         if validation_dataset is not None:
@@ -201,20 +225,41 @@ def main() -> None:
             gripper = create_gripper_provider(config, allow_generate=False)
     train_collator = UnifiedBatchCollator(config, gripper, training=True)
     validation_collator = UnifiedBatchCollator(config, gripper, training=False)
-    train_sampler = (
-        train_dataset.distributed_balanced_sampler(rank, world_size, config.training.seed)
-        if world_size > 1
-        else train_dataset.balanced_sampler(config.training.seed)
+    train_batch_sampler = DistributedTaskStateBatchSampler(
+        train_dataset.units,
+        batch_size=config.training.batch_size,
+        coverage_strata=config.training.action_batch_coverage_strata,
+        rank=rank,
+        world_size=world_size,
+        seed=config.training.seed,
     )
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.training.batch_size,
-        sampler=train_sampler,
+        batch_sampler=train_batch_sampler,
         num_workers=config.training.num_workers,
         pin_memory=config.training.pin_memory,
         persistent_workers=config.training.num_workers > 0,
         collate_fn=train_collator,
     )
+    global_loader = None
+    if global_dataset is not None:
+        global_sampler = DistributedSampler(
+            global_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=config.training.seed + 100_003,
+            drop_last=False,
+        )
+        global_loader = DataLoader(
+            global_dataset,
+            batch_size=config.training.batch_size,
+            sampler=global_sampler,
+            num_workers=config.training.num_workers,
+            pin_memory=config.training.pin_memory,
+            persistent_workers=config.training.num_workers > 0,
+            collate_fn=train_collator,
+        )
     validation_sampler = (
         DistributedEvaluationSampler(len(validation_dataset), rank, world_size)
         if world_size > 1
@@ -368,6 +413,12 @@ def main() -> None:
                     "dataset_capabilities": asdict(adapter.capabilities),
                     "enabled": enabled,
                     "family_weights": objective.total.weights,
+                    "global_supervision_stream": "unique_scene_state",
+                    "global_stream_weight": config.training.global_stream_weight,
+                    "action_sampling": "task_state_first_best_effort_stratum_coverage",
+                    "action_batch_coverage_strata": list(
+                        config.training.action_batch_coverage_strata
+                    ),
                     "disabled": {
                         name: "dataset capability or ablation"
                         for name, value in enabled.items()
@@ -403,6 +454,7 @@ def main() -> None:
             config.graph,
             config.evaluation,
         )
+        grasp_diagnostics = GraspDiagnosticAccumulator(config.model, config.evaluation)
         validation_batches = len(validation_loader)
         validation_groups = len(validation_loader.sampler)
         with torch.no_grad():
@@ -410,6 +462,7 @@ def main() -> None:
                 batch = trainer._move(raw, trainer.device)
                 _, terms, model_output = objective(module, batch, return_output=True)
                 evaluator.update(batch, model_output, terms)
+                grasp_diagnostics.update(batch, model_output)
                 score = sum(
                     weight * float(terms[f"loss_{family}"])
                     for family, weight in config.training.validation_family_weights.items()
@@ -433,6 +486,59 @@ def main() -> None:
                         f"score={total / max(1, count):.6f}",
                         flush=True,
                     )
+        diagnostic_payload = grasp_diagnostics.payload()
+        # Preserve per-validation-sample diagnostics without gathering the
+        # potentially large record list across ranks.  DDP ranks write
+        # disjoint files; aggregate means below still use a small all-gather.
+        if grasp_diagnostics.records:
+            sample_path = (
+                Path(config.output_dir) / "validation_grasp_diagnostic_samples.jsonl"
+                if not torch.distributed.is_initialized()
+                else Path(config.output_dir)
+                / f"validation_grasp_diagnostic_samples.rank{rank:03d}.jsonl"
+            )
+            for sample_record in grasp_diagnostics.records:
+                trainer._append_jsonl(
+                    sample_path,
+                    {
+                        "schema_version": 1,
+                        "timestamp_utc": trainer._timestamp(),
+                        "optimizer_step": trainer.state.optimizer_steps,
+                        **sample_record,
+                        "scope": "training_diagnostic_only_not_for_paper",
+                    },
+                )
+        if torch.distributed.is_initialized():
+            gathered_diagnostics: list[dict[str, object] | None] = [
+                None for _ in range(torch.distributed.get_world_size())
+            ]
+            torch.distributed.all_gather_object(gathered_diagnostics, diagnostic_payload)
+            diagnostic_payloads = [item for item in gathered_diagnostics if item is not None]
+        else:
+            diagnostic_payloads = [diagnostic_payload]
+        if rank == 0:
+            diagnostic_sums: dict[str, float] = {}
+            diagnostic_counts: dict[str, int] = {}
+            for payload in diagnostic_payloads:
+                for key, value in payload.get("sums", {}).items():
+                    diagnostic_sums[key] = diagnostic_sums.get(key, 0.0) + float(value)
+                for key, value in payload.get("counts", {}).items():
+                    diagnostic_counts[key] = diagnostic_counts.get(key, 0) + int(value)
+            diagnostic_means = {
+                key: value / max(1, diagnostic_counts.get(key, 0))
+                for key, value in diagnostic_sums.items()
+            }
+            trainer._append_jsonl(
+                Path(config.output_dir) / "validation_grasp_diagnostics.jsonl",
+                {
+                    "schema_version": 1,
+                    "timestamp_utc": trainer._timestamp(),
+                    "optimizer_step": trainer.state.optimizer_steps,
+                    **diagnostic_means,
+                    "counts": diagnostic_counts,
+                    "scope": "training_diagnostic_only_not_for_paper",
+                },
+            )
         module.train()
         return {
             "score_sum": total,
@@ -445,7 +551,12 @@ def main() -> None:
     state = trainer.train(
         train_loader,
         validate=validate if validation_loader is not None else None,
-        groups_per_effective_epoch=len(train_dataset),
+        groups_per_effective_epoch=train_batch_sampler.global_samples_per_epoch,
+        auxiliary_loader=(global_loader if objective.total.enabled("global_grasp") else None),
+        auxiliary_loss_step=(
+            objective.global_grasp_stream if objective.total.enabled("global_grasp") else None
+        ),
+        auxiliary_weight=config.training.global_stream_weight,
     )
     final_checkpoint = os.path.join(config.output_dir, "last.pt")
     trainer.save_checkpoint(final_checkpoint)

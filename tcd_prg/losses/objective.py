@@ -33,14 +33,25 @@ class TCDPRGObjective(nn.Module):
     """Construct labels lazily and combine the eleven module objectives."""
 
     MODULE_OBJECTIVES = (
-        "region", "task_grasp", "global_grasp", "physical_edge", "task_edge",
-        "verify_overall", "push_object", "push_contact", "push_direction",
-        "push_potential", "policy_candidate",
+        "region",
+        "task_grasp",
+        "global_grasp",
+        "physical_edge",
+        "task_edge",
+        "verify_overall",
+        "push_object",
+        "push_contact",
+        "push_direction",
+        "push_potential",
+        "policy_candidate",
     )
 
     def __init__(
-        self, capabilities: DatasetCapabilities, model_config: ModelConfig,
-        ablation: AblationConfig, loss_config: LossConfig | None = None,
+        self,
+        capabilities: DatasetCapabilities,
+        model_config: ModelConfig,
+        ablation: AblationConfig,
+        loss_config: LossConfig | None = None,
         region_config: RegionHeadConfig | None = None,
         generated_policy_candidate_ratio: float = 0.0,
     ) -> None:
@@ -100,7 +111,10 @@ class TCDPRGObjective(nn.Module):
             weight = float(self.internal_weights.get(name, 1.0))
             numerator = numerator + weight * value * flag.to(value.dtype)
             denominator = denominator + weight * flag.to(value.dtype)
-        return {"loss": numerator / denominator.clamp_min(torch.finfo(reference.dtype).eps), **values}
+        return {
+            "loss": numerator / denominator.clamp_min(torch.finfo(reference.dtype).eps),
+            **values,
+        }
 
     @staticmethod
     def _named_grasp_terms(values: dict[str, Tensor], prefix: str) -> dict[str, Tensor]:
@@ -111,8 +125,38 @@ class TCDPRGObjective(nn.Module):
             for name, value in values.items()
         }
 
+    def global_grasp_stream(
+        self, model: nn.Module, batch: dict[str, Any]
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Direct Global Grasp loss for the independent unique scene-state stream."""
+
+        if not self.total.enabled("global_grasp"):
+            raise RuntimeError("Global Grasp stream requested while global_grasp loss is disabled")
+        output = model(batch, forward_mode="global_grasp")
+        labels = build_global_grasp_labels(batch, self.model_config)
+        if labels is None or not bool(labels["sample_valid"].all()):
+            raise RuntimeError(
+                "GlobalStateDataset yielded a row without certified Global Grasp supervision"
+            )
+        values = self._named_grasp_terms(
+            self.global_grasp(output["global_grasp"], labels), "global_grasp"
+        )
+        raw_loss = values.pop("loss")
+        weighted = float(self.total.weights["global_grasp"]) * raw_loss
+        terms = {
+            "loss_global_grasp": raw_loss.detach(),
+            "weighted_loss_global_grasp": weighted.detach(),
+            "active_loss_global_grasp": labels["sample_valid"].float().mean().detach(),
+            **{name: value.detach() for name, value in values.items()},
+        }
+        return weighted, terms
+
     def forward(
-        self, model: nn.Module, batch: dict[str, Any], *, return_output: bool = False,
+        self,
+        model: nn.Module,
+        batch: dict[str, Any],
+        *,
+        return_output: bool = False,
         return_family_losses: bool = False,
     ) -> Any:
         if bool((batch["required_grasp_count"] > self.model_config.task_grasp_candidates).any()):
@@ -127,28 +171,37 @@ class TCDPRGObjective(nn.Module):
             and self.total.enabled("policy_candidate")
             and not any(
                 self.total.enabled(name)
-                for name in self.MODULE_OBJECTIVES if name != "policy_candidate"
+                for name in self.MODULE_OBJECTIVES
+                if name != "policy_candidate"
             )
         )
         output = model(batch, forward_mode="generated_policy" if generated_only else "full")
         families: dict[str, dict[str, Tensor]] = {}
         activity: dict[str, Tensor] = {
             f"active_loss_{name}": batch["xyz"].new_zeros(())
-            for name in self.MODULE_OBJECTIVES if self.total.enabled(name)
+            for name in self.MODULE_OBJECTIVES
+            if self.total.enabled(name)
         }
 
         region_labels = build_region_labels(batch)
         if region_labels is not None and self.total.enabled("region"):
             region_losses = self.region(output["region"], region_labels)
-            families["region"] = self._subtotal(region_losses, {
-                "region_focal": region_labels["region_valid"].any(),
-                "region_dice": region_labels["region_valid"].any(),
-                "region_visibility": region_labels["visibility_valid"].any(),
-            })
+            families["region"] = self._subtotal(
+                region_losses,
+                {
+                    "region_focal": region_labels["region_valid"].any(),
+                    "region_dice": region_labels["region_valid"].any(),
+                    "region_visibility": region_labels["visibility_valid"].any(),
+                },
+            )
             activity["active_loss_region"] = (
-                self._row_active(region_labels["region_valid"])
-                | self._row_active(region_labels["visibility_valid"])
-            ).float().mean()
+                (
+                    self._row_active(region_labels["region_valid"])
+                    | self._row_active(region_labels["visibility_valid"])
+                )
+                .float()
+                .mean()
+            )
 
         if self.total.enabled("task_grasp"):
             task_labels = build_grasp_proposal_labels(batch, self.model_config)
@@ -171,19 +224,27 @@ class TCDPRGObjective(nn.Module):
             graph_losses = self.graph(output["graph"], graph_labels)
             families["physical_edge"] = {"loss": graph_losses["physical_edge"]}
             families["task_edge"] = {"loss": graph_losses["task_edge"]}
-            activity["active_loss_physical_edge"] = graph_labels[
-                "physical_edge_valid"
-            ].reshape(graph_labels["physical_edge_valid"].shape[0], -1).any(-1).float().mean()
-            activity["active_loss_task_edge"] = self._row_active(
-                graph_labels["task_edge_valid"]
-            ).float().mean()
+            activity["active_loss_physical_edge"] = (
+                graph_labels["physical_edge_valid"]
+                .reshape(graph_labels["physical_edge_valid"].shape[0], -1)
+                .any(-1)
+                .float()
+                .mean()
+            )
+            activity["active_loss_task_edge"] = (
+                self._row_active(graph_labels["task_edge_valid"]).float().mean()
+            )
 
         if output["verifier"] is not None and self.total.enabled("verify_overall"):
             verifier_labels = build_verifier_labels(batch)
             families["verify_overall"] = self.verify(output["verifier"], verifier_labels)
-            activity["active_loss_verify_overall"] = verifier_labels[
-                "overall_valid"
-            ].reshape(verifier_labels["overall_valid"].shape[0], -1).any(-1).float().mean()
+            activity["active_loss_verify_overall"] = (
+                verifier_labels["overall_valid"]
+                .reshape(verifier_labels["overall_valid"].shape[0], -1)
+                .any(-1)
+                .float()
+                .mean()
+            )
 
         if self.total.enabled("push_object"):
             push_output, push_labels = build_push_supervision(
@@ -203,11 +264,11 @@ class TCDPRGObjective(nn.Module):
             families["push_direction"] = {
                 "loss": push_losses["push_direction"],
                 "push_direction_bin_diagnostic": push_losses["push_direction_bin_diagnostic"],
-                "push_direction_residual_diagnostic": push_losses["push_direction_residual_diagnostic"],
-                "push_direction_effective_rows": push_losses["push_direction_effective_rows"],
-                "push_direction_residual_targets": push_losses[
-                    "push_direction_residual_targets"
+                "push_direction_residual_diagnostic": push_losses[
+                    "push_direction_residual_diagnostic"
                 ],
+                "push_direction_effective_rows": push_losses["push_direction_effective_rows"],
+                "push_direction_residual_targets": push_losses["push_direction_residual_targets"],
             }
             if self.total.enabled("push_potential"):
                 families["push_potential"] = {
@@ -222,20 +283,24 @@ class TCDPRGObjective(nn.Module):
             direction_rank_rows = self._listwise_active_rows(
                 push_labels["direction_positive"], push_labels["direction_evaluated"]
             )
-            activity.update({
-                "active_loss_push_object": object_active_rows.float().mean(),
-                "active_loss_push_contact": self._row_active(
-                    push_labels["contact_valid"]
-                ).float().mean(),
-                "active_loss_push_direction": (
-                    direction_rank_rows
-                    | self._row_active(push_labels["direction_residual_valid"])
-                ).float().mean(),
-            })
+            activity.update(
+                {
+                    "active_loss_push_object": object_active_rows.float().mean(),
+                    "active_loss_push_contact": self._row_active(push_labels["contact_valid"])
+                    .float()
+                    .mean(),
+                    "active_loss_push_direction": (
+                        direction_rank_rows
+                        | self._row_active(push_labels["direction_residual_valid"])
+                    )
+                    .float()
+                    .mean(),
+                }
+            )
             if self.total.enabled("push_potential"):
-                activity["active_loss_push_potential"] = self._row_active(
-                    push_labels["utility_valid"]
-                ).float().mean()
+                activity["active_loss_push_potential"] = (
+                    self._row_active(push_labels["utility_valid"]).float().mean()
+                )
 
         if self.total.enabled("policy_candidate") and self.ablation.router_type != "fixed_priority":
             teacher_loss = None
@@ -247,19 +312,18 @@ class TCDPRGObjective(nn.Module):
                 teacher_loss = self.policy(
                     output["router"], batch["policy_success_mask"], evaluated
                 )
-                teacher_active = self._listwise_active_rows(
-                    batch["policy_success_mask"], evaluated
-                )
+                teacher_active = self._listwise_active_rows(batch["policy_success_mask"], evaluated)
             generated_loss = None
             generated_active = None
             generated = batch.get("generated_policy_candidates")
             if "generated_router" in output and generated is not None:
                 # 三态标签：UNKNOWN 不进入分母；只有认证后的正/负候选参与排序损失。
-                generated_evaluated = (
-                    generated["label_status"] != int(CandidateStatus.UNKNOWN_UNTESTED)
+                generated_evaluated = generated["label_status"] != int(
+                    CandidateStatus.UNKNOWN_UNTESTED
                 )
                 generated_loss = self.policy(
-                    output["generated_router"], generated["policy_success"],
+                    output["generated_router"],
+                    generated["policy_success"],
                     generated_evaluated,
                 )
                 generated_active = self._listwise_active_rows(
@@ -291,31 +355,32 @@ class TCDPRGObjective(nn.Module):
         terms.update(activity)
         weighted_family_losses = {
             name: float(self.total.weights[name]) * values["loss"]
-            for name, values in families.items() if self.total.enabled(name)
+            for name, values in families.items()
+            if self.total.enabled(name)
         }
         generated = batch.get("generated_policy_candidates")
         if generated is not None:
             valid = generated["valid"]
             positive = valid & generated["policy_success"]
-            negative = valid & (
-                generated["label_status"] == int(CandidateStatus.NEGATIVE)
-            )
+            negative = valid & (generated["label_status"] == int(CandidateStatus.NEGATIVE))
             positive_rows = positive.any(-1)
             negative_rows = negative.any(-1)
-            terms.update({
-                "generated_states": valid.new_tensor(valid.shape[0], dtype=torch.float32),
-                "generated_states_with_positive": positive_rows.sum().float(),
-                "generated_effective_policy_rows": (
-                    positive_rows & negative_rows
-                ).sum().float(),
-                "generated_known_candidates": (positive | negative).sum().float(),
-                "generated_unknown_candidates": (
-                    valid & ~positive & ~negative
-                ).sum().float(),
-                "generated_conflict_candidates": generated.get(
-                    "match_conflict", torch.zeros_like(valid)
-                ).sum().float(),
-            })
+            terms.update(
+                {
+                    "generated_states": valid.new_tensor(valid.shape[0], dtype=torch.float32),
+                    "generated_states_with_positive": positive_rows.sum().float(),
+                    "generated_effective_policy_rows": (positive_rows & negative_rows)
+                    .sum()
+                    .float(),
+                    "generated_known_candidates": (positive | negative).sum().float(),
+                    "generated_unknown_candidates": (valid & ~positive & ~negative).sum().float(),
+                    "generated_conflict_candidates": generated.get(
+                        "match_conflict", torch.zeros_like(valid)
+                    )
+                    .sum()
+                    .float(),
+                }
+            )
         if return_output and return_family_losses:
             return total, terms, output, weighted_family_losses
         if return_output:

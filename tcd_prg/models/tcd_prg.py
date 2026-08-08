@@ -381,49 +381,9 @@ class TCDPRGModel(nn.Module):
         )
         return encoded, physical_active
 
-    def forward_generated_policy(self, batch: dict[str, Tensor]) -> dict[str, Any]:
-        """Router-only stage: shared encoder plus cached generated candidates."""
-
-        generated = batch.get("generated_policy_candidates")
-        if generated is None:
-            raise RuntimeError("Generated-policy forward requires cached generated candidates")
-        # Policy-only 阶段若冻结场景编码器，则关闭其 autograd，避免保存无用激活。
-        encoder_frozen = not any(parameter.requires_grad for parameter in self.encoder.parameters())
-        if encoder_frozen:
-            with torch.no_grad():
-                encoded, _ = self._encode_scene(batch)
-        else:
-            encoded, _ = self._encode_scene(batch)
-        result: dict[str, Any] = {"encoded": encoded, "verifier": None}
-        generated_inputs = self._external_candidate_inputs(encoded, generated)
-        result["generated_router"] = self.route_cached(batch, result, generated_inputs)
-        return result
-
-    def forward(
-        self, batch: dict[str, Tensor], candidate_inputs: dict[str, Tensor] | None = None,
-        *, forward_mode: str = "full",
-    ) -> dict[str, Any]:
-        if forward_mode == "generated_policy":
-            return self.forward_generated_policy(batch)
-        if forward_mode != "full":
-            raise ValueError(f"Unsupported forward_mode={forward_mode}")
-        # PTv3/场景编码仅执行一次，后续所有 head 复用同一组点、物体和任务特征。
-        encoded, physical_active = self._encode_scene(batch)
-        region = self.region_head(
-            encoded.point_features, encoded.target_token, encoded.task_token, batch["target_mask"]
-        )
-        task_grasp = self.task_grasp(
-            encoded.point_features,
-            batch["xyz"],
-            encoded.target_token,
-            encoded.task_token,
-            region["region_probability"],
-            batch["target_mask"],
-            self.grasp_decoder,
-        )
-        task_grasp["width_m"] = self.task_grasp.decode_width(
-            task_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m
-        )
+    def _forward_global_grasp(
+        self, encoded: Any, batch: dict[str, Tensor], physical_active: Tensor
+    ) -> dict[str, Tensor]:
         if self.config.global_grasp_input_mode == "scene_only":
             global_mask = batch["point_mask"]
         else:
@@ -448,8 +408,66 @@ class TCDPRGModel(nn.Module):
             self.grasp_decoder,
         )
         global_grasp["width_m"] = self.global_grasp.decode_width(
-            global_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m
+            global_grasp["width_raw"],
+            self.config.min_grasp_width_m,
+            self.config.max_grasp_width_m,
         )
+        return global_grasp
+
+    def forward_global_grasp(self, batch: dict[str, Tensor]) -> dict[str, Any]:
+        """Independent unique-scene-state Global Grasp training stream."""
+
+        encoded, physical_active = self._encode_scene(batch)
+        return {
+            "global_grasp": self._forward_global_grasp(encoded, batch, physical_active),
+        }
+
+    def forward_generated_policy(self, batch: dict[str, Tensor]) -> dict[str, Any]:
+        """Router-only stage: shared encoder plus cached generated candidates."""
+
+        generated = batch.get("generated_policy_candidates")
+        if generated is None:
+            raise RuntimeError("Generated-policy forward requires cached generated candidates")
+        # Policy-only 阶段若冻结场景编码器，则关闭其 autograd，避免保存无用激活。
+        encoder_frozen = not any(parameter.requires_grad for parameter in self.encoder.parameters())
+        if encoder_frozen:
+            with torch.no_grad():
+                encoded, _ = self._encode_scene(batch)
+        else:
+            encoded, _ = self._encode_scene(batch)
+        result: dict[str, Any] = {"encoded": encoded, "verifier": None}
+        generated_inputs = self._external_candidate_inputs(encoded, generated)
+        result["generated_router"] = self.route_cached(batch, result, generated_inputs)
+        return result
+
+    def forward(
+        self, batch: dict[str, Tensor], candidate_inputs: dict[str, Tensor] | None = None,
+        *, forward_mode: str = "full",
+    ) -> dict[str, Any]:
+        if forward_mode == "generated_policy":
+            return self.forward_generated_policy(batch)
+        if forward_mode == "global_grasp":
+            return self.forward_global_grasp(batch)
+        if forward_mode != "full":
+            raise ValueError(f"Unsupported forward_mode={forward_mode}")
+        # PTv3/场景编码仅执行一次，后续所有 head 复用同一组点、物体和任务特征。
+        encoded, physical_active = self._encode_scene(batch)
+        region = self.region_head(
+            encoded.point_features, encoded.target_token, encoded.task_token, batch["target_mask"]
+        )
+        task_grasp = self.task_grasp(
+            encoded.point_features,
+            batch["xyz"],
+            encoded.target_token,
+            encoded.task_token,
+            region["region_probability"],
+            batch["target_mask"],
+            self.grasp_decoder,
+        )
+        task_grasp["width_m"] = self.task_grasp.decode_width(
+            task_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m
+        )
+        global_grasp = self._forward_global_grasp(encoded, batch, physical_active)
         if self.ablation.use_dependency_graph:
             graph = self.graph(
                 encoded.object_tokens,

@@ -160,7 +160,7 @@ def test_formal_config_uses_strict_offline_cache_and_scene_splits() -> None:
     assert config.training.scene_start == 0
     assert config.training.scene_count == 2500
     assert tuple(config.training.split_ratios) == (9.0, 1.0)
-    assert config.training.max_validation_groups == 256
+    assert config.training.max_validation_groups is None
     assert config.logging.validation_log_interval == 20
 
 

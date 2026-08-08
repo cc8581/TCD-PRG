@@ -27,7 +27,9 @@ __all__ = [
     "DatasetAdapter",
     "DatasetCapabilities",
     "DistributedEvaluationSampler",
+    "DistributedTaskStateBatchSampler",
     "DistributedWeightedStateSampler",
+    "GlobalStateDataset",
     "DatasetAdapterTemplate",
     "GAPGObservationAdapter",
     "GlobalGraspLabels",
@@ -50,20 +52,26 @@ def __getattr__(name: str) -> Any:
     if name in {
         "ActionStateGroupDataset",
         "DistributedEvaluationSampler",
+        "DistributedTaskStateBatchSampler",
         "DistributedWeightedStateSampler",
+        "GlobalStateDataset",
         "StateGroupUnit",
     }:
         from .torch_dataset import (
             ActionStateGroupDataset,
             DistributedEvaluationSampler,
+            DistributedTaskStateBatchSampler,
             DistributedWeightedStateSampler,
+            GlobalStateDataset,
             StateGroupUnit,
         )
 
         return {
             "ActionStateGroupDataset": ActionStateGroupDataset,
             "DistributedEvaluationSampler": DistributedEvaluationSampler,
+            "DistributedTaskStateBatchSampler": DistributedTaskStateBatchSampler,
             "DistributedWeightedStateSampler": DistributedWeightedStateSampler,
+            "GlobalStateDataset": GlobalStateDataset,
             "StateGroupUnit": StateGroupUnit,
         }[name]
     raise AttributeError(name)

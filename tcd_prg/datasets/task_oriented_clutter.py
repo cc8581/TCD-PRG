@@ -38,6 +38,7 @@ from .types import (
 )
 
 ACTION_GROUP_INDEX_CACHE_VERSION = "tcd_prg_action_group_strata_v1"
+GLOBAL_GRASP_STATE_CACHE_VERSION = "tcd_prg_global_grasp_states_v1"
 ACTION_GROUP_STRATA = (
     "direct_grasp",
     "pick_remove",
@@ -569,6 +570,122 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
                         stratum = "unresolved_or_unknown"
                     result[unit] = stratum
         return result
+
+    def _global_grasp_state_cache_path(self) -> Path:
+        digest = self._strata_cache_path().stem.removeprefix("action_group_strata_")
+        return self.index_cache_dir / f"global_grasp_states_{digest}.npz"
+
+    @staticmethod
+    def _load_global_grasp_state_cache(path: Path) -> np.ndarray | None:
+        if not path.is_file():
+            return None
+        try:
+            with np.load(path, allow_pickle=False) as cached:
+                if str(cached["version"].item()) != GLOBAL_GRASP_STATE_CACHE_VERSION:
+                    return None
+                states = cached["scene_state"].astype(np.int32, copy=False)
+            return states if states.ndim == 2 and states.shape[1] == 2 else None
+        except (OSError, KeyError, ValueError):
+            return None
+
+    def _build_global_grasp_state_cache(self, path: Path) -> np.ndarray:
+        supervised: list[tuple[int, int]] = []
+        for scene_id in tqdm(
+            self._scene_ids,
+            desc="cache Global Grasp states",
+            unit="scene",
+            disable=not _show_index_progress(),
+        ):
+            with h5py.File(self._h5_path(scene_id), "r", swmr=True) as handle:
+                actions = self._scene_group(handle, scene_id)["actions"]
+                action_type = actions["action_type"][:].astype(np.int8)
+                from_state = actions["from_state"][:].astype(np.int64)
+                executed = actions["executed"][:].astype(bool)
+                success = actions["success"][:].astype(bool)
+                candidate = np.flatnonzero(
+                    (action_type == int(ActionType.PICK_REMOVE)) & executed
+                )
+                if not len(candidate):
+                    continue
+                payload = actions["payload_index"][:][candidate].astype(np.int64)
+                pick_remove = actions["pick_remove"]
+                objects = pick_remove["acted_object"][:][payload].astype(np.int64)
+                sources = pick_remove["removal_grasp_source_index"][:][payload].astype(np.int64)
+                states = from_state[candidate]
+                positives = success[candidate]
+            # bit 1 = observed positive, bit 2 = observed negative. A bitmask of
+            # 3 is a conflict and therefore remains UNKNOWN under open-world semantics.
+            known: dict[tuple[int, int, int], int] = {}
+            for state_id, object_id, source_id, positive in zip(
+                states, objects, sources, positives, strict=True
+            ):
+                key = (int(state_id), int(object_id), int(source_id))
+                known[key] = known.get(key, 0) | (1 if bool(positive) else 2)
+            certified_states = {
+                state_id
+                for (state_id, _, _), status_mask in known.items()
+                if status_mask in {1, 2}
+            }
+            supervised.extend((scene_id, state_id) for state_id in certified_states)
+        array = np.asarray(sorted(set(supervised)), np.int32).reshape(-1, 2)
+        temporary = path.with_name(f"{path.stem}.{os.getpid()}.tmp.npz")
+        np.savez_compressed(
+            temporary,
+            version=np.asarray(GLOBAL_GRASP_STATE_CACHE_VERSION),
+            scene_state=array,
+        )
+        os.replace(temporary, path)
+        return array
+
+    @lru_cache(maxsize=4)  # noqa: B019 - adapter lifetime owns this small index cache
+    def global_grasp_supervised_states(
+        self, split: str | None = None
+    ) -> frozenset[tuple[int, int]]:
+        """Return certified Global-Grasp scene-state keys using a persistent index."""
+
+        path = self._global_grasp_state_cache_path()
+        cached = self._load_global_grasp_state_cache(path)
+        if cached is None:
+            lock = path.with_suffix(".lock")
+            if not _show_index_progress():
+                for _ in range(240):
+                    cached = self._load_global_grasp_state_cache(path)
+                    if cached is not None:
+                        break
+                    time.sleep(0.25)
+            while cached is None:
+                try:
+                    descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    os.close(descriptor)
+                    try:
+                        cached = self._load_global_grasp_state_cache(path)
+                        if cached is None:
+                            cached = self._build_global_grasp_state_cache(path)
+                    finally:
+                        lock.unlink(missing_ok=True)
+                    break
+                except FileExistsError:
+                    cached = self._load_global_grasp_state_cache(path)
+                    if cached is not None:
+                        break
+                    try:
+                        lock_age = time.time() - lock.stat().st_mtime
+                    except FileNotFoundError:
+                        continue
+                    if lock_age > 6 * 60 * 60:
+                        lock.unlink(missing_ok=True)
+                    else:
+                        time.sleep(0.25)
+        assert cached is not None
+        if split is not None:
+            if split not in self.scene_splits:
+                raise ValueError(f"Unsupported split: {split}")
+            scene_ids = set(self.scene_splits[split])
+            cached = cached[np.isin(cached[:, 0], np.asarray(sorted(scene_ids), np.int32))]
+        return frozenset((int(scene_id), int(state_id)) for scene_id, state_id in cached)
+
+    def has_global_grasp_supervision(self, scene_id: int, state_id: int) -> bool:
+        return (int(scene_id), int(state_id)) in self.global_grasp_supervised_states(None)
 
     def _object_active(
         self, scene: h5py.Group, state_id: int, task_index: int | None = None

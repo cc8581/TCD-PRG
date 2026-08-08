@@ -20,8 +20,11 @@ class CompleteGraspSetLoss(nn.Module):
     """One equal-budget grasp objective with explicit positive/negative matching."""
 
     def __init__(
-        self, translation_weight: float = 1.0, rotation_weight: float = 1.0,
-        width_weight: float = 0.5, quality_weight: float = 1.0,
+        self,
+        translation_weight: float = 1.0,
+        rotation_weight: float = 1.0,
+        width_weight: float = 0.5,
+        quality_weight: float = 1.0,
         object_weight: float = 1.0,
         negative_translation_m: float = 0.01,
         negative_rotation_deg: float = 12.0,
@@ -31,10 +34,15 @@ class CompleteGraspSetLoss(nn.Module):
     ) -> None:
         super().__init__()
         self.weights = (
-            translation_weight, rotation_weight, width_weight, quality_weight, object_weight
+            translation_weight,
+            rotation_weight,
+            width_weight,
+            quality_weight,
+            object_weight,
         )
         self.negative_thresholds = (
-            float(negative_translation_m), math.radians(float(negative_rotation_deg)),
+            float(negative_translation_m),
+            math.radians(float(negative_rotation_deg)),
             float(negative_width_m),
         )
         self.translation_scale_m = float(translation_scale_m)
@@ -51,8 +59,13 @@ class CompleteGraspSetLoss(nn.Module):
         )
 
     def _geometry_cost(
-        self, prediction_t: Tensor, prediction_r: Tensor, prediction_w: Tensor,
-        target_t: Tensor, target_r: Tensor, target_w: Tensor,
+        self,
+        prediction_t: Tensor,
+        prediction_r: Tensor,
+        prediction_w: Tensor,
+        target_t: Tensor,
+        target_r: Tensor,
+        target_w: Tensor,
     ) -> Tensor:
         translation = torch.cdist(prediction_t, target_t, p=1) / self.translation_scale_m
         pred_rotation = prediction_r[:, None].expand(-1, len(target_r), -1, -1)
@@ -84,7 +97,9 @@ class CompleteGraspSetLoss(nn.Module):
             if not bool(sample_valid[row]) or not len(targets):
                 continue
             cost = self._geometry_cost(
-                prediction_t[row], prediction_r[row], prediction_w[row],
+                prediction_t[row],
+                prediction_r[row],
+                prediction_w[row],
                 labels["translation_world"][row, targets],
                 labels["rotation_matrix"][row, targets],
                 labels["width_m"][row, targets],
@@ -94,8 +109,12 @@ class CompleteGraspSetLoss(nn.Module):
                 cost = cost - F.log_softmax(object_logits[row], -1)[:, object_target[row, targets]]
             pred_index, target_local = self._hungarian(cost, prediction_t.device)
             target_index = targets[target_local]
-            matched_prediction.append(torch.stack((torch.full_like(pred_index, row), pred_index), -1))
-            matched_target.append(torch.stack((torch.full_like(target_index, row), target_index), -1))
+            matched_prediction.append(
+                torch.stack((torch.full_like(pred_index, row), pred_index), -1)
+            )
+            matched_target.append(
+                torch.stack((torch.full_like(target_index, row), target_index), -1)
+            )
             quality_target[row, pred_index] = labels["quality_target"][row, target_index].to(
                 quality_target.dtype
             )
@@ -114,38 +133,77 @@ class CompleteGraspSetLoss(nn.Module):
                 if not len(queries) or not len(negatives):
                     continue
                 negative_cost = self._geometry_cost(
-                    prediction_t[row, queries], prediction_r[row, queries], prediction_w[row, queries],
+                    prediction_t[row, queries],
+                    prediction_r[row, queries],
+                    prediction_w[row, queries],
                     labels["negative_translation_world"][row, negatives],
                     labels["negative_rotation_matrix"][row, negatives],
                     labels["negative_width_m"][row, negatives],
                 )
                 if object_logits is not None and negative_object is not None:
-                    negative_cost = negative_cost - F.log_softmax(
-                        object_logits[row, queries], -1
-                    )[:, negative_object[row, negatives]]
-                query_local, _ = self._hungarian(negative_cost, prediction_t.device)
-                selected_queries = queries[query_local]
-                quality_target[row, selected_queries] = 0.0
-                quality_valid[row, selected_queries] = True
-                matched_query[row, selected_queries] = True
-                negative_matched_query[row, selected_queries] = True
+                    negative_cost = (
+                        negative_cost
+                        - F.log_softmax(object_logits[row, queries], -1)[
+                            :, negative_object[row, negatives]
+                        ]
+                    )
+                query_local, negative_local = self._hungarian(negative_cost, prediction_t.device)
+                candidate_queries = queries[query_local]
+                candidate_negatives = negatives[negative_local]
+                translation_ok = (
+                    torch.linalg.vector_norm(
+                        prediction_t[row, candidate_queries]
+                        - labels["negative_translation_world"][row, candidate_negatives],
+                        dim=-1,
+                    )
+                    <= translation_threshold
+                )
+                rotation_ok = (
+                    parallel_jaw_rotation_distance(
+                        prediction_r[row, candidate_queries],
+                        labels["negative_rotation_matrix"][row, candidate_negatives],
+                    )
+                    <= rotation_threshold
+                )
+                width_ok = (
+                    prediction_w[row, candidate_queries]
+                    - labels["negative_width_m"][row, candidate_negatives]
+                ).abs() <= width_threshold
+                object_ok = torch.ones_like(translation_ok, dtype=torch.bool)
+                if object_logits is not None and negative_object is not None:
+                    object_ok = (
+                        object_logits[row, candidate_queries].argmax(-1)
+                        == negative_object[row, candidate_negatives]
+                    )
+                accepted = translation_ok & rotation_ok & width_ok & object_ok
+                accepted_queries = candidate_queries[accepted]
+                quality_target[row, accepted_queries] = 0.0
+                quality_valid[row, accepted_queries] = True
+                # A rejected Hungarian pair remains UNKNOWN and must remain
+                # eligible for the all-negative threshold association below.
+                matched_query[row, accepted_queries] = True
+                negative_matched_query[row, accepted_queries] = True
 
                 remaining = torch.nonzero(~matched_query[row], as_tuple=False).flatten()
                 if not len(remaining):
                     continue
-                translation_close = torch.cdist(
-                    prediction_t[row, remaining],
-                    labels["negative_translation_world"][row, negatives],
-                ) <= translation_threshold
+                translation_close = (
+                    torch.cdist(
+                        prediction_t[row, remaining],
+                        labels["negative_translation_world"][row, negatives],
+                    )
+                    <= translation_threshold
+                )
                 pred_rotation = prediction_r[row, remaining, None].expand(
                     -1, len(negatives), -1, -1
                 )
                 target_rotation = labels["negative_rotation_matrix"][row, negatives][None].expand(
                     len(remaining), -1, -1, -1
                 )
-                rotation_close = parallel_jaw_rotation_distance(
-                    pred_rotation, target_rotation
-                ) <= rotation_threshold
+                rotation_close = (
+                    parallel_jaw_rotation_distance(pred_rotation, target_rotation)
+                    <= rotation_threshold
+                )
                 width_close = (
                     prediction_w[row, remaining, None]
                     - labels["negative_width_m"][row, negatives][None]
@@ -170,14 +228,10 @@ class CompleteGraspSetLoss(nn.Module):
             rotation = parallel_jaw_rotation_chordal_loss(
                 prediction_r[pr, pq], labels["rotation_matrix"][tr, tq]
             ).mean()
-            width_error = (
-                prediction_w[pr, pq] - labels["width_m"][tr, tq]
-            ) / self.width_scale_m
+            width_error = (prediction_w[pr, pq] - labels["width_m"][tr, tq]) / self.width_scale_m
             width = F.smooth_l1_loss(width_error, torch.zeros_like(width_error), beta=0.25)
             if object_logits is not None and object_target is not None:
-                object_assignment = F.cross_entropy(
-                    object_logits[pr, pq], object_target[tr, tq]
-                )
+                object_assignment = F.cross_entropy(object_logits[pr, pq], object_target[tr, tq])
                 object_active = True
             else:
                 object_assignment = translation.new_zeros(())

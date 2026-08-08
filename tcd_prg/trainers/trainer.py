@@ -30,6 +30,7 @@ class TrainerState:
     samples_seen: int = 0
     states_seen: int = 0
     candidate_groups_seen: int = 0
+    global_states_seen: int = 0
     generated_states_seen: int = 0
     generated_positive_states_seen: int = 0
     effective_policy_rows_seen: int = 0
@@ -142,9 +143,7 @@ class Trainer:
         )
         source_model = self.model.module if hasattr(self.model, "module") else self.model
         self.ema = (
-            ModelEMA(source_model, config.training.ema_decay)
-            if config.training.ema_decay
-            else None
+            ModelEMA(source_model, config.training.ema_decay) if config.training.ema_decay else None
         )
         if self.is_primary:
             self._save_run_metadata()
@@ -170,12 +169,15 @@ class Trainer:
 
     def _write_event(self, event: str, **values: Any) -> None:
         if self.is_primary:
-            self._append_jsonl(self.events_path, {
-                "timestamp_utc": self._timestamp(),
-                "event": event,
-                "optimizer_step": self.state.optimizer_steps,
-                **values,
-            })
+            self._append_jsonl(
+                self.events_path,
+                {
+                    "timestamp_utc": self._timestamp(),
+                    "event": event,
+                    "optimizer_step": self.state.optimizer_steps,
+                    **values,
+                },
+            )
 
     @classmethod
     def _aggregate_window_terms(
@@ -188,9 +190,7 @@ class Trainer:
             for key, value in sums.items()
         }
 
-    def _reduce_distributed_terms(
-        self, terms: Mapping[str, float]
-    ) -> dict[str, float]:
+    def _reduce_distributed_terms(self, terms: Mapping[str, float]) -> dict[str, float]:
         """Return world-mean metrics and world-sum counters on every rank."""
 
         # loss/速率在 rank 间取均值，样本和候选数量在 rank 间求和。
@@ -247,14 +247,13 @@ class Trainer:
     def _group_coverage(record: Mapping[str, Any], keys: tuple[str, ...]) -> float | None:
         values = [
             float(record[f"active_{key.removeprefix('weighted_')}"])
-            for key in keys if f"active_{key.removeprefix('weighted_')}" in record
+            for key in keys
+            if f"active_{key.removeprefix('weighted_')}" in record
         ]
         return sum(values) / len(values) if values else None
 
     @classmethod
-    def _summarize_terminal_window(
-        cls, records: list[Mapping[str, Any]]
-    ) -> dict[str, Any]:
+    def _summarize_terminal_window(cls, records: list[Mapping[str, Any]]) -> dict[str, Any]:
         """Average live metrics while preserving exact counters and latest state."""
 
         summary = dict(records[-1])
@@ -298,18 +297,22 @@ class Trainer:
         if generated:
             positive = float(record.get("generated_states_with_positive", 0.0))
             effective = float(record.get("generated_effective_policy_rows", 0.0))
-            fields.extend((
-                f"pos_cov: {positive / generated:.1%}",
-                f"eff_rows: {effective:.0f}/{generated:.0f}",
-            ))
-        fields.extend((
-            f"lr: {max(record['learning_rates']):.3e}",
-            f"grad: {float(record['gradient_norm']):.3f}"
-            f"->{float(record.get('gradient_norm_after_clip', record['gradient_norm'])):.3f}",
-            f"clip: {float(record.get('gradient_clip_scale', 1.0)):.3f}",
-            f"time: {float(record['optimizer_step_seconds']):.3f}",
-            f"data: {float(record['data_seconds']):.3f}",
-        ))
+            fields.extend(
+                (
+                    f"pos_cov: {positive / generated:.1%}",
+                    f"eff_rows: {effective:.0f}/{generated:.0f}",
+                )
+            )
+        fields.extend(
+            (
+                f"lr: {max(record['learning_rates']):.3e}",
+                f"grad: {float(record['gradient_norm']):.3f}"
+                f"->{float(record.get('gradient_norm_after_clip', record['gradient_norm'])):.3f}",
+                f"clip: {float(record.get('gradient_clip_scale', 1.0)):.3f}",
+                f"time: {float(record['optimizer_step_seconds']):.3f}",
+                f"data: {float(record['data_seconds']):.3f}",
+            )
+        )
         if float(record.get("max_memory_mb", 0.0)) > 0.0:
             fields.append(f"max mem: {float(record['max_memory_mb']):.0f}M")
         print("  ".join(fields), flush=True)
@@ -322,8 +325,7 @@ class Trainer:
             f"best: {float(record['best_validation']):.6f}",
         ]
         fields.extend(
-            f"{label}: {value:.4f}"
-            for label, value in self._grouped_losses(record["metrics"])
+            f"{label}: {value:.4f}" for label, value in self._grouped_losses(record["metrics"])
         )
         metrics = record["metrics"]
         for key, label, percent in (
@@ -338,14 +340,18 @@ class Trainer:
         if generated:
             positive = float(metrics.get("generated_states_with_positive", 0.0))
             effective = float(metrics.get("generated_effective_policy_rows", 0.0))
-            fields.extend((
-                f"pos_cov: {positive / generated:.1%}",
-                f"eff_rows: {effective:.0f}/{generated:.0f}",
-            ))
-        fields.extend((
-            f"items: {int(record['validation_items'])}",
-            f"improved: {'yes' if record['improved'] else 'no'}",
-        ))
+            fields.extend(
+                (
+                    f"pos_cov: {positive / generated:.1%}",
+                    f"eff_rows: {effective:.0f}/{generated:.0f}",
+                )
+            )
+        fields.extend(
+            (
+                f"items: {int(record['validation_items'])}",
+                f"improved: {'yes' if record['improved'] else 'no'}",
+            )
+        )
         print("  ".join(fields), flush=True)
 
     def _set_frozen_modules(self, frozen: bool) -> None:
@@ -383,13 +389,17 @@ class Trainer:
         except (OSError, subprocess.CalledProcessError):
             commit = "uncommitted"
         (self.output_dir / "run_metadata.json").write_text(
-            json.dumps({
-                "git_commit": commit,
-                "torch": torch.__version__,
-                "train_metrics_schema_version": 4,
-                "validation_metrics_schema_version": 3,
-                "training_events_schema_version": 1,
-            }, indent=2),
+            json.dumps(
+                {
+                    "git_commit": commit,
+                    "torch": torch.__version__,
+                    "train_metrics_schema_version": 5,
+                    "grasp_diagnostics_schema_version": 1,
+                    "validation_metrics_schema_version": 3,
+                    "training_events_schema_version": 1,
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )
 
@@ -429,10 +439,15 @@ class Trainer:
                     break
             value = parameter.grad.detach().float().square().sum()
             squared[group] = squared.get(group, value.new_zeros(())) + value
-        return {
-            f"gradient_norm_{group}": float(value.sqrt())
-            for group, value in squared.items()
-        }
+        return {f"gradient_norm_{group}": float(value.sqrt()) for group, value in squared.items()}
+
+    @staticmethod
+    def _set_loader_epoch(loader: Any, epoch: int) -> None:
+        for name in ("batch_sampler", "sampler"):
+            sampler = getattr(loader, name, None)
+            if sampler is not None and hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
+                return
 
     def train(
         self,
@@ -440,7 +455,17 @@ class Trainer:
         validate: Callable[[nn.Module], Any] | None = None,
         groups_per_effective_epoch: int | None = None,
         step_finished: Callable[[int], None] | None = None,
+        auxiliary_loader: Iterable[Mapping[str, Any]] | None = None,
+        auxiliary_loss_step: Callable[
+            [nn.Module, Mapping[str, Any]], tuple[Tensor, Mapping[str, Tensor]]
+        ]
+        | None = None,
+        auxiliary_weight: float = 1.0,
     ) -> TrainerState:
+        if (auxiliary_loader is None) != (auxiliary_loss_step is None):
+            raise ValueError("auxiliary_loader and auxiliary_loss_step must be provided together")
+        if auxiliary_weight <= 0:
+            raise ValueError("auxiliary_weight must be positive")
         accumulation = self.config.training.gradient_accumulation_steps
         unfreeze_step = self.config.training.unfreeze_at_optimizer_step
         self._set_frozen_modules(
@@ -456,37 +481,62 @@ class Trainer:
         window_term_counts: dict[str, int] = {}
         window_micro_batches = 0
         window_samples = 0
+        window_global_states = 0
         window_data_seconds = 0.0
         terminal_records: list[Mapping[str, Any]] = []
         initial_optimizer_step = self.state.optimizer_steps
         batch_finished_time = time.time()
         epoch = 0
+        auxiliary_epoch = 0
+        auxiliary_iterator = None
         self._write_event(
             "training_started",
             max_optimizer_steps=self.config.training.max_optimizer_steps,
             gradient_accumulation_steps=accumulation,
+            global_stream=auxiliary_loader is not None,
+            global_stream_weight=float(auxiliary_weight),
         )
         if self.is_primary:
+            point_count = (
+                "variable"
+                if self.config.dataset.scene_points == 0
+                else str(self.config.dataset.scene_points)
+            )
             print(
                 f"[train-start] output={self.output_dir.resolve()} "
                 f"steps={self.state.optimizer_steps}->{self.config.training.max_optimizer_steps} "
                 f"batch={self.config.training.batch_size} accumulation={accumulation} "
+                f"global_stream={'on' if auxiliary_loader is not None else 'off'} "
                 f"workers={self.config.training.num_workers} "
-                f"points={'variable' if self.config.dataset.scene_points == 0 else self.config.dataset.scene_points} "
+                f"points={point_count} "
                 f"grid={self.config.backbone.grid_size_m:g}m "
                 f"terminal_interval={self.config.logging.log_interval}",
                 flush=True,
             )
         while self.state.optimizer_steps < self.config.training.max_optimizer_steps and not stop:
-            sampler = getattr(loader, "sampler", None)
-            if sampler is not None and hasattr(sampler, "set_epoch"):
-                sampler.set_epoch(epoch)
+            self._set_loader_epoch(loader, epoch)
             epoch += 1
             for raw_batch in loader:
                 window_data_seconds += max(time.time() - batch_finished_time, 0.0)
                 saw_batch = True
                 micro_step += 1
                 batch = self._move(raw_batch, self.device)
+                auxiliary_batch = None
+                if auxiliary_loader is not None:
+                    auxiliary_started = time.time()
+                    if auxiliary_iterator is None:
+                        self._set_loader_epoch(auxiliary_loader, auxiliary_epoch)
+                        auxiliary_epoch += 1
+                        auxiliary_iterator = iter(auxiliary_loader)
+                    try:
+                        raw_auxiliary = next(auxiliary_iterator)
+                    except StopIteration:
+                        self._set_loader_epoch(auxiliary_loader, auxiliary_epoch)
+                        auxiliary_epoch += 1
+                        auxiliary_iterator = iter(auxiliary_loader)
+                        raw_auxiliary = next(auxiliary_iterator)
+                    auxiliary_batch = self._move(raw_auxiliary, self.device)
+                    window_data_seconds += max(time.time() - auxiliary_started, 0.0)
                 autocast_enabled = self.config.training.amp and self.device.type == "cuda"
                 amp_dtype = (
                     torch.bfloat16
@@ -504,15 +554,50 @@ class Trainer:
                     with torch.autocast(
                         device_type=self.device.type, dtype=amp_dtype, enabled=autocast_enabled
                     ):
-                        loss, terms = self.loss_step(self.model, batch)
+                        loss, base_terms = self.loss_step(self.model, batch)
                         scaled_loss = loss / accumulation
                     self.scaler.scale(scaled_loss).backward()
+                    terms = dict(base_terms)
+                    if auxiliary_batch is not None and auxiliary_loss_step is not None:
+                        # Separate forward/backward is intentional: it is the safe
+                        # first implementation and avoids coupling two DDP graphs.
+                        with torch.autocast(
+                            device_type=self.device.type,
+                            dtype=amp_dtype,
+                            enabled=autocast_enabled,
+                        ):
+                            auxiliary_loss, auxiliary_terms = auxiliary_loss_step(
+                                self.model, auxiliary_batch
+                            )
+                            scaled_auxiliary = auxiliary_weight * auxiliary_loss / accumulation
+                        self.scaler.scale(scaled_auxiliary).backward()
+                        for key, value in auxiliary_terms.items():
+                            if key in terms and key != "loss_total":
+                                replace_zero_activity = (
+                                    key == "active_loss_global_grasp"
+                                    and not bool(terms[key].detach().bool().any())
+                                )
+                                if not replace_zero_activity:
+                                    raise KeyError(
+                                        f"Auxiliary loss term collides with main stream: {key}"
+                                    )
+                            if key.startswith("weighted_loss_"):
+                                value = auxiliary_weight * value
+                            terms[key] = value
+                        loss = loss + auxiliary_weight * auxiliary_loss
+                        terms["loss_total"] = loss.detach()
                 if "generated_states" in terms:
-                    generated_counts = torch.stack([
-                        terms["generated_states"],
-                        terms["generated_states_with_positive"],
-                        terms["generated_effective_policy_rows"],
-                    ]).detach().to(dtype=torch.long)
+                    generated_counts = (
+                        torch.stack(
+                            [
+                                terms["generated_states"],
+                                terms["generated_states_with_positive"],
+                                terms["generated_effective_policy_rows"],
+                            ]
+                        )
+                        .detach()
+                        .to(dtype=torch.long)
+                    )
                     if torch.distributed.is_initialized():
                         torch.distributed.all_reduce(
                             generated_counts, op=torch.distributed.ReduceOp.SUM
@@ -522,21 +607,28 @@ class Trainer:
                     self.state.effective_policy_rows_seen += int(generated_counts[2])
                 batch_size = self._batch_size(batch)
                 global_batch_size = batch_size * (
-                    torch.distributed.get_world_size()
-                    if torch.distributed.is_initialized() else 1
+                    torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
                 )
                 self.state.samples_seen += global_batch_size
                 self.state.states_seen += global_batch_size
                 self.state.candidate_groups_seen += global_batch_size
+                if auxiliary_batch is not None:
+                    auxiliary_size = self._batch_size(auxiliary_batch) * (
+                        torch.distributed.get_world_size()
+                        if torch.distributed.is_initialized()
+                        else 1
+                    )
+                    self.state.global_states_seen += auxiliary_size
+                    window_global_states += auxiliary_size
                 window_micro_batches += 1
                 window_samples += global_batch_size
                 window_values = dict(terms)
                 window_values.setdefault("loss_total", loss.detach())
                 for key, value in window_values.items():
                     detached = value.detach().float()
-                    window_term_sums[key] = window_term_sums.get(
-                        key, torch.zeros_like(detached)
-                    ) + detached
+                    window_term_sums[key] = (
+                        window_term_sums.get(key, torch.zeros_like(detached)) + detached
+                    )
                     window_term_counts[key] = window_term_counts.get(key, 0) + 1
                 if not synchronize:
                     batch_finished_time = time.time()
@@ -544,9 +636,10 @@ class Trainer:
                 self.scaler.unscale_(self.optimizer)
                 diagnostics: dict[str, float] = {}
                 diagnostics_interval = self.config.logging.gradient_diagnostics_interval
-                if diagnostics_interval > 0 and (
-                    self.state.optimizer_steps + 1
-                ) % diagnostics_interval == 0:
+                if (
+                    diagnostics_interval > 0
+                    and (self.state.optimizer_steps + 1) % diagnostics_interval == 0
+                ):
                     diagnostics = self._gradient_group_norms(self.model)
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), self.config.training.gradient_clip_norm
@@ -565,9 +658,7 @@ class Trainer:
                 if self.scaler.is_enabled() and current_scale < previous_scale:
                     self.state.amp_skipped_steps += 1
                     skipped_terms = self._reduce_distributed_terms(
-                        self._aggregate_window_terms(
-                            window_term_sums, window_term_counts
-                        )
+                        self._aggregate_window_terms(window_term_sums, window_term_counts)
                     )
                     self._write_event(
                         "amp_step_skipped",
@@ -589,7 +680,8 @@ class Trainer:
                         )
                     if self.tensorboard is not None:
                         self.tensorboard.add_scalar(
-                            "amp/skipped_steps", self.state.amp_skipped_steps,
+                            "amp/skipped_steps",
+                            self.state.amp_skipped_steps,
                             self.state.optimizer_steps,
                         )
                         self.tensorboard.add_scalar(
@@ -599,6 +691,7 @@ class Trainer:
                     window_term_counts.clear()
                     window_micro_batches = 0
                     window_samples = 0
+                    window_global_states = 0
                     window_data_seconds = 0.0
                     last_optimizer_time = time.time()
                     batch_finished_time = last_optimizer_time
@@ -626,17 +719,13 @@ class Trainer:
                 step_seconds = max(now - last_optimizer_time, 1e-12)
                 completed_this_run = step - initial_optimizer_step
                 remaining_steps = self.config.training.max_optimizer_steps - step
-                eta_seconds = (
-                    (now - started) / max(1, completed_this_run) * remaining_steps
-                )
+                eta_seconds = (now - started) / max(1, completed_this_run) * remaining_steps
                 aggregated_terms = self._reduce_distributed_terms(
-                    self._aggregate_window_terms(
-                        window_term_sums, window_term_counts
-                    )
+                    self._aggregate_window_terms(window_term_sums, window_term_counts)
                 )
                 if self.is_primary:
                     record = {
-                        "schema_version": 4,
+                        "schema_version": 5,
                         "timestamp_utc": self._timestamp(),
                         "optimizer_step": step,
                         "amp_skipped_steps": self.state.amp_skipped_steps,
@@ -644,6 +733,7 @@ class Trainer:
                         "samples_seen": self.state.samples_seen,
                         "states_seen": self.state.states_seen,
                         "candidate_groups_seen": self.state.candidate_groups_seen,
+                        "global_states_seen": self.state.global_states_seen,
                         "generated_states_seen": self.state.generated_states_seen,
                         "generated_positive_states_seen": self.state.generated_positive_states_seen,
                         "effective_policy_rows_seen": self.state.effective_policy_rows_seen,
@@ -659,14 +749,14 @@ class Trainer:
                         "samples_per_second": window_samples / step_seconds,
                         "max_memory_mb": (
                             torch.cuda.max_memory_allocated(self.device) / (1024.0 * 1024.0)
-                            if self.device.type == "cuda" else 0.0
+                            if self.device.type == "cuda"
+                            else 0.0
                         ),
                         "micro_batches": window_micro_batches,
                         "window_samples": window_samples,
+                        "window_global_states": window_global_states,
                         "metric_scope": (
-                            "global"
-                            if torch.distributed.is_initialized()
-                            else "local"
+                            "global" if torch.distributed.is_initialized() else "local"
                         ),
                         "learning_rates": [group["lr"] for group in self.optimizer.param_groups],
                         **diagnostics,
@@ -686,14 +776,13 @@ class Trainer:
                         or step == 1
                         or step == self.config.training.max_optimizer_steps
                     ):
-                        self._print_train_summary(
-                            self._summarize_terminal_window(terminal_records)
-                        )
+                        self._print_train_summary(self._summarize_terminal_window(terminal_records))
                         terminal_records.clear()
                 window_term_sums.clear()
                 window_term_counts.clear()
                 window_micro_batches = 0
                 window_samples = 0
+                window_global_states = 0
                 window_data_seconds = 0.0
                 if step_finished is not None:
                     step_finished(step)
@@ -704,7 +793,9 @@ class Trainer:
                     validation_items = 1
                     validation_details: dict[str, float] = {}
                     performance_summary: dict[str, Any] = {
-                        "count": 0, "scene_count": 0, "metrics": {}
+                        "count": 0,
+                        "scene_count": 0,
+                        "metrics": {},
                     }
                     if isinstance(validation, Mapping):
                         summaries: list[Mapping[str, Any]] = [validation]
@@ -715,9 +806,7 @@ class Trainer:
                             torch.distributed.all_gather_object(gathered, validation)
                             summaries = [item for item in gathered if item is not None]
                         score_sum = sum(float(item["score_sum"]) for item in summaries)
-                        validation_items = sum(
-                            int(item["score_count"]) for item in summaries
-                        )
+                        validation_items = sum(int(item["score_count"]) for item in summaries)
                         score = score_sum / max(1, validation_items)
                         metric_sums: dict[str, float] = {}
                         metric_counts: dict[str, int] = {}
@@ -749,11 +838,13 @@ class Trainer:
                             )
                             evaluator.evaluator.records = evaluation_records
                             performance_summary = evaluator.summarize()
-                            validation_details.update({
-                                key: float(payload["mean"])
-                                for key, payload in performance_summary["metrics"].items()
-                                if payload.get("mean") is not None
-                            })
+                            validation_details.update(
+                                {
+                                    key: float(payload["mean"])
+                                    for key, payload in performance_summary["metrics"].items()
+                                    if payload.get("mean") is not None
+                                }
+                            )
                     elif torch.distributed.is_initialized():
                         if isinstance(validation, tuple):
                             value = torch.tensor(
@@ -800,20 +891,14 @@ class Trainer:
                         validation_record["training_stage"] = self._training_stage(
                             validation_details
                         )
-                        self._append_jsonl(
-                            self.validation_metrics_path, validation_record
-                        )
+                        self._append_jsonl(self.validation_metrics_path, validation_record)
                         if self.tensorboard is not None:
-                            self.tensorboard.add_scalar(
-                                "validation/score", score, step
-                            )
+                            self.tensorboard.add_scalar("validation/score", score, step)
                             self.tensorboard.add_scalar(
                                 "validation/best", self.state.best_validation, step
                             )
                             for key, value in validation_details.items():
-                                self.tensorboard.add_scalar(
-                                    f"validation/{key}", value, step
-                                )
+                                self.tensorboard.add_scalar(f"validation/{key}", value, step)
                         self._print_validation_summary(validation_record)
                     self._write_event(
                         "validation_completed",
@@ -849,9 +934,7 @@ class Trainer:
             if not saw_batch:
                 raise RuntimeError("Training loader yielded no batches")
         if self.is_primary and terminal_records:
-            self._print_train_summary(
-                self._summarize_terminal_window(terminal_records)
-            )
+            self._print_train_summary(self._summarize_terminal_window(terminal_records))
         if self.tensorboard is not None:
             self.tensorboard.flush()
             self.tensorboard.close()
@@ -859,9 +942,7 @@ class Trainer:
             "training_completed",
             best_validation=self.state.best_validation,
             stopped_early=(
-                stop
-                and self.state.optimizer_steps
-                < self.config.training.max_optimizer_steps
+                stop and self.state.optimizer_steps < self.config.training.max_optimizer_steps
             ),
         )
         if self.is_primary:
@@ -877,8 +958,7 @@ class Trainer:
         local_rng = {
             "cpu": torch.get_rng_state().cpu(),
             "cuda": (
-                torch.cuda.get_rng_state(self.device).cpu()
-                if self.device.type == "cuda" else None
+                torch.cuda.get_rng_state(self.device).cpu() if self.device.type == "cuda" else None
             ),
         }
         rng_by_rank: list[dict[str, Tensor]] | None = None
