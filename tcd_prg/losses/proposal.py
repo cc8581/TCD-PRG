@@ -52,11 +52,39 @@ class CompleteGraspSetLoss(nn.Module):
 
     @staticmethod
     def _hungarian(cost: Tensor, device: torch.device) -> tuple[Tensor, Tensor]:
-        row, column = linear_sum_assignment(np.asarray(cost.detach().float().cpu()))
-        return (
-            torch.as_tensor(row, dtype=torch.long, device=device),
-            torch.as_tensor(column, dtype=torch.long, device=device),
-        )
+        return CompleteGraspSetLoss._hungarian_many([cost], device)[0]
+
+    @staticmethod
+    def _hungarian_many(
+        costs: list[Tensor], device: torch.device
+    ) -> list[tuple[Tensor, Tensor]]:
+        """Exact SciPy Hungarian with one device-to-host sync per stage.
+
+        Every matrix is still passed independently to ``linear_sum_assignment``
+        with the same float32 values and original shape.  Only the transfer of
+        those matrices is coalesced.
+        """
+
+        if not costs:
+            return []
+        shapes = [tuple(int(value) for value in cost.shape) for cost in costs]
+        sizes = [int(cost.numel()) for cost in costs]
+        flat = torch.cat(
+            [cost.detach().float().reshape(-1) for cost in costs], dim=0
+        ).cpu().numpy()
+        assignments: list[tuple[Tensor, Tensor]] = []
+        offset = 0
+        for shape, size in zip(shapes, sizes, strict=True):
+            matrix = np.asarray(flat[offset : offset + size]).reshape(shape)
+            row, column = linear_sum_assignment(matrix)
+            assignments.append(
+                (
+                    torch.as_tensor(row, dtype=torch.long, device=device),
+                    torch.as_tensor(column, dtype=torch.long, device=device),
+                )
+            )
+            offset += size
+        return assignments
 
     def _geometry_cost(
         self,
@@ -92,6 +120,7 @@ class CompleteGraspSetLoss(nn.Module):
         matched_query = torch.zeros_like(quality_logit, dtype=torch.bool)
         negative_matched_query = torch.zeros_like(matched_query)
 
+        positive_jobs: list[tuple[int, Tensor, Tensor]] = []
         for row in range(prediction_t.shape[0]):
             targets = torch.nonzero(labels["target_valid"][row], as_tuple=False).flatten()
             if not bool(sample_valid[row]) or not len(targets):
@@ -107,7 +136,14 @@ class CompleteGraspSetLoss(nn.Module):
             cost = cost - F.logsigmoid(quality_logit[row])[:, None]
             if object_logits is not None and object_target is not None:
                 cost = cost - F.log_softmax(object_logits[row], -1)[:, object_target[row, targets]]
-            pred_index, target_local = self._hungarian(cost, prediction_t.device)
+            positive_jobs.append((row, targets, cost.detach().float()))
+
+        positive_assignments = self._hungarian_many(
+            [job[2] for job in positive_jobs], prediction_t.device
+        )
+        for (row, targets, _), (pred_index, target_local) in zip(
+            positive_jobs, positive_assignments, strict=True
+        ):
             target_index = targets[target_local]
             matched_prediction.append(
                 torch.stack((torch.full_like(pred_index, row), pred_index), -1)
@@ -125,6 +161,7 @@ class CompleteGraspSetLoss(nn.Module):
         if negative_valid is not None:
             negative_object = labels.get("negative_object_index")
             translation_threshold, rotation_threshold, width_threshold = self.negative_thresholds
+            negative_jobs: list[tuple[int, Tensor, Tensor, Tensor]] = []
             for row in range(prediction_t.shape[0]):
                 if not bool(sample_valid[row]):
                     continue
@@ -147,7 +184,16 @@ class CompleteGraspSetLoss(nn.Module):
                             :, negative_object[row, negatives]
                         ]
                     )
-                query_local, negative_local = self._hungarian(negative_cost, prediction_t.device)
+                negative_jobs.append(
+                    (row, queries, negatives, negative_cost.detach().float())
+                )
+
+            negative_assignments = self._hungarian_many(
+                [job[3] for job in negative_jobs], prediction_t.device
+            )
+            for (row, queries, negatives, _), (query_local, negative_local) in zip(
+                negative_jobs, negative_assignments, strict=True
+            ):
                 candidate_queries = queries[query_local]
                 candidate_negatives = negatives[negative_local]
                 translation_ok = (

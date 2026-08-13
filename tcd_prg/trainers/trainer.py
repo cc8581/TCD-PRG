@@ -509,6 +509,7 @@ class Trainer:
                 f"batch={self.config.training.batch_size} accumulation={accumulation} "
                 f"global_stream={'on' if auxiliary_loader is not None else 'off'} "
                 f"workers={self.config.training.num_workers} "
+                f"validation_workers={self.config.training.validation_num_workers} "
                 f"points={point_count} "
                 f"grid={self.config.backbone.grid_size_m:g}m "
                 f"terminal_interval={self.config.logging.log_interval}",
@@ -788,6 +789,11 @@ class Trainer:
                 if step_finished is not None:
                     step_finished(step)
                 if validate and step % self.config.training.validation_interval == 0:
+                    # Persist progress BEFORE validation: validation runs the full
+                    # loader alongside the persistent training loaders and is the
+                    # highest-memory moment of the loop; a crash here must not
+                    # lose the training since the previous validation cycle.
+                    self.save_checkpoint(self.output_dir / "last.pt")
                     validation = validate(self.ema.model if self.ema else self.model)
                     self.model.train()
                     self._apply_frozen_module_modes()

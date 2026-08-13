@@ -1,0 +1,67 @@
+tcd_prg:
+  config: ../../configs/config.yaml
+  paths_config: ../../configs/local_paths.yaml
+  checkpoint: ../../outputs/ptv3_full_20260808_214241/best.pt
+  device: cuda
+  allow_gripper_generate: false
+
+cameras:
+  - id: camera_0
+    enabled: true
+    ip: ""
+    camera_to_robot_base: null  # calibrated 4x4 matrix; translation in metres
+  - id: camera_1
+    enabled: false
+    ip: ""
+    camera_to_robot_base: null
+
+fusion:
+  workspace_min_m: [0.10, -0.50, -0.05]
+  workspace_max_m: [0.95, 0.50, 0.65]
+  voxel_size_m: 0.005
+  instance_association_distance_m: 0.06
+  instance_association_color_distance: 0.35
+  temporal_instance_distance_m: 0.10
+  depth_min_mm: 150
+  depth_max_mm: 1500
+
+segmentation:
+  backend: external_command
+  command: []    # append --input INPUT.npz --output OUTPUT.npz
+  minimum_pixels: 200
+
+robot:
+  sdk_windows_root: ../../../fairino-python-sdk-3.7.6/windows
+  ip: 192.168.58.2
+  tool_id: 1
+  user_id: 0
+  model_tcp_to_robot_tcp:
+    xyz_mm_rpy_deg: [0, 0, 0, 0, 0, 0]
+  pregrasp_distance_m: 0.10
+  lift_distance_m: 0.10
+  push_distance_m: 0.15
+  push_retreat_m: 0.05
+  gripper_max_width_m: 0.095
+  gripper_close_margin_m: 0.003
+  gripper_index: 1
+  gripper_company: 4
+  gripper_device: 0
+  gripper_softversion: 0
+  gripper_bus: 0
+  gripper_config_on_connect: true
+  gripper_reset_on_connect: true
+  gripper_activate_on_connect: true
+  gripper_activate_delay_s: 3.0
+  gripper_open_position: 100
+  gripper_closed_position: 5
+  gripper_speed: 48
+  gripper_force: 30
+  gripper_open_force: 50
+  gripper_max_time_ms: 30000
+  speed_percent: 10
+  removal_pose_mm_rpy_deg: [-354.9, 387.9, 181.6, -4.0, 3.5, -120.0]
+
+task:
+  default_category_id: 0
+  default_region_id: 0
+  required_grasp_count: 1

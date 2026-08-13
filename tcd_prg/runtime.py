@@ -8,6 +8,7 @@ from typing import Any
 
 from tcd_prg.config import TCDPRGConfig
 from tcd_prg.datasets import TaskOrientedClutterAdapter, collate_unified, load_candidate_batch
+from tcd_prg.datasets.collate import collate_global_grasp
 from tcd_prg.execution import ExternalFR5AG16095Certifier
 from tcd_prg.geometry.gripper_provider import ExactAG16095GeometryProvider
 from tcd_prg.models.grasp_verifier import build_verifier_inputs
@@ -154,3 +155,22 @@ class UnifiedBatchCollator:
                 local_radius_m=self.config.model.verifier_local_radius_m,
             )
         return batch
+
+
+@dataclass(slots=True)
+class GlobalGraspBatchCollator:
+    """Pickle-safe minimal collator for direct Global Grasp supervision."""
+
+    config: TCDPRGConfig
+    training: bool = True
+
+    def __call__(self, samples: list[Any]) -> dict[str, Any]:
+        grid_size = (
+            self.config.backbone.grid_size_m
+            if self.config.backbone.backend == "point_transformer_v3"
+            else None
+        )
+        return collate_global_grasp(
+            samples, grid_size_m=grid_size, training=self.training
+        )
+

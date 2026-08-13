@@ -381,8 +381,34 @@ class TCDPRGModel(nn.Module):
         )
         return encoded, physical_active
 
-    def _forward_global_grasp(
-        self, encoded: Any, batch: dict[str, Tensor], physical_active: Tensor
+    def _encode_scene_geometry(
+        self, batch: dict[str, Tensor]
+    ) -> tuple[Any, Tensor]:
+        """Neutral scene geometry for Global-only training.
+
+        This is the exact scene representation stored in ``EncoderOutput.scene_*``
+        by the full encoder, without evaluating the unused task adapter.
+        """
+
+        object_present = batch.get("object_present", batch["object_mask"])
+        physical_active = object_present & batch["object_active"]
+        scene = self.encoder.forward_scene_geometry(
+            batch["xyz"],
+            batch["rgb"],
+            batch["instance_id"],
+            batch["point_mask"],
+            physical_active,
+            grid_coord=batch.get("grid_coord"),
+        )
+        return scene, physical_active
+
+    def _forward_global_grasp_neutral(
+        self,
+        scene_point_features: Tensor,
+        scene_object_tokens: Tensor,
+        scene_global_token: Tensor,
+        batch: dict[str, Tensor],
+        physical_active: Tensor,
     ) -> dict[str, Tensor]:
         if self.config.global_grasp_input_mode == "scene_only":
             global_mask = batch["point_mask"]
@@ -398,10 +424,10 @@ class TCDPRGModel(nn.Module):
                 )
             )
         global_grasp = self.global_grasp(
-            encoded.scene_point_features,
+            scene_point_features,
             batch["xyz"],
-            encoded.scene_object_tokens,
-            encoded.scene_global_token,
+            scene_object_tokens,
+            scene_global_token,
             batch["instance_id"],
             global_mask,
             physical_active,
@@ -414,13 +440,31 @@ class TCDPRGModel(nn.Module):
         )
         return global_grasp
 
-    def forward_global_grasp(self, batch: dict[str, Tensor]) -> dict[str, Any]:
-        """Independent unique-scene-state Global Grasp training stream."""
+    def _forward_global_grasp(
+        self, encoded: Any, batch: dict[str, Tensor], physical_active: Tensor
+    ) -> dict[str, Tensor]:
+        return self._forward_global_grasp_neutral(
+            encoded.scene_point_features,
+            encoded.scene_object_tokens,
+            encoded.scene_global_token,
+            batch,
+            physical_active,
+        )
 
-        encoded, physical_active = self._encode_scene(batch)
+    def forward_global_grasp(self, batch: dict[str, Tensor]) -> dict[str, Any]:
+        """Independent Global stream using the exact neutral scene backbone."""
+
+        scene, physical_active = self._encode_scene_geometry(batch)
         return {
-            "global_grasp": self._forward_global_grasp(encoded, batch, physical_active),
+            "global_grasp": self._forward_global_grasp_neutral(
+                scene.point_features,
+                scene.object_tokens,
+                scene.global_scene_token,
+                batch,
+                physical_active,
+            ),
         }
+
 
     def forward_generated_policy(self, batch: dict[str, Tensor]) -> dict[str, Any]:
         """Router-only stage: shared encoder plus cached generated candidates."""

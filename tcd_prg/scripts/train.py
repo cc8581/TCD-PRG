@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import hashlib
 import json
 import math
 import os
@@ -11,6 +12,7 @@ import shutil
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -33,7 +35,12 @@ from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.observation.cached import CachedObservationProvider
 from tcd_prg.pretrained import load_pretrained_backbone, prepare_pretrained_checkpoint
-from tcd_prg.runtime import UnifiedBatchCollator, create_adapter, create_gripper_provider
+from tcd_prg.runtime import (
+    GlobalGraspBatchCollator,
+    UnifiedBatchCollator,
+    create_adapter,
+    create_gripper_provider,
+)
 from tcd_prg.trainers import Trainer
 
 
@@ -57,6 +64,68 @@ def validate_read_through_observation_cache(adapter) -> dict[str, object]:
         "free_gb": round(usage.free / (1 << 30), 3),
         "missing": "error" if strict else "render-on-demand",
     }
+
+
+def load_or_create_validation_scene_subset(
+    scene_ids: list[int] | tuple[int, ...],
+    count: int | None,
+    seed: int,
+    manifest_path: str | Path,
+) -> tuple[int, ...]:
+    """Select complete validation scenes once and reuse the audited manifest."""
+
+    available = tuple(sorted({int(scene_id) for scene_id in scene_ids}))
+    if not available:
+        raise ValueError("The validation split contains no scenes")
+    if count is None:
+        return available
+    if count <= 0 or count > len(available):
+        raise ValueError(
+            f"training.validation_scene_count={count} must be in [1,{len(available)}]"
+        )
+    path = Path(manifest_path)
+    fingerprint = hashlib.sha256(
+        json.dumps(available, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if path.is_file():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if int(payload.get("seed", -1)) != int(seed):
+            raise ValueError("validation scene subset seed does not match the manifest")
+        if int(payload.get("selected_scene_count", -1)) != int(count):
+            raise ValueError("validation scene subset count does not match the manifest")
+        if payload.get("source_scene_fingerprint") != fingerprint:
+            raise ValueError("validation split scenes have changed since the manifest was written")
+        selected = tuple(int(value) for value in payload.get("scene_ids", []))
+        if len(selected) != count or len(set(selected)) != count:
+            raise ValueError("validation scene subset manifest has invalid scene IDs")
+        if not set(selected).issubset(available):
+            raise ValueError("validation scene subset contains a scene outside the split")
+        return selected
+
+    selected = tuple(
+        sorted(
+            int(value)
+            for value in np.random.default_rng(seed).choice(
+                np.asarray(available, dtype=np.int64), size=count, replace=False
+            )
+        )
+    )
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "seed": int(seed),
+            "source_scene_count": len(available),
+            "source_scene_fingerprint": fingerprint,
+            "selected_scene_count": int(count),
+            "scene_ids": list(selected),
+        }
+        temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.replace(temporary, path)
+    return selected
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,10 +236,21 @@ def main() -> None:
         if float(config.losses.global_grasp) > 0 and adapter.capabilities.has_global_grasps
         else None
     )
+    validation_scene_ids = (
+        load_or_create_validation_scene_subset(
+            adapter.scene_splits["val"],
+            config.training.validation_scene_count,
+            config.training.validation_scene_seed,
+            os.path.join(config.output_dir, "validation_scene_subset.json"),
+        )
+        if config.training.validation_interval > 0
+        else ()
+    )
     validation_dataset = (
         ActionStateGroupDataset(
             adapter,
             split="val",
+            scene_ids=frozenset(validation_scene_ids),
             max_groups=config.training.max_validation_groups,
             stratified_max_groups=config.training.max_validation_groups is not None,
             stratum_quota=config.training.validation_stratum_quota,
@@ -211,7 +291,8 @@ def main() -> None:
         )
         if validation_dataset is not None:
             print(
-                f"[val-data] scenes={len(adapter.scene_splits['val'])} "
+                f"[val-data] scenes={len(validation_scene_ids)}/"
+                f"{len(adapter.scene_splits['val'])} "
                 f"groups={len(validation_dataset)}",
                 flush=True,
             )
@@ -232,6 +313,7 @@ def main() -> None:
         if rank != 0:
             gripper = create_gripper_provider(config, allow_generate=False)
     train_collator = UnifiedBatchCollator(config, gripper, training=True)
+    global_collator = GlobalGraspBatchCollator(config, training=True)
     validation_collator = UnifiedBatchCollator(config, gripper, training=False)
     train_batch_sampler = DistributedTaskStateBatchSampler(
         train_dataset.units,
@@ -266,7 +348,7 @@ def main() -> None:
             num_workers=config.training.num_workers,
             pin_memory=config.training.pin_memory,
             persistent_workers=config.training.num_workers > 0,
-            collate_fn=train_collator,
+            collate_fn=global_collator,
         )
     validation_sampler = (
         DistributedEvaluationSampler(len(validation_dataset), rank, world_size)
@@ -279,9 +361,12 @@ def main() -> None:
             batch_size=config.training.batch_size,
             shuffle=False,
             sampler=validation_sampler,
-            num_workers=config.training.num_workers,
+            # Validation starts while both persistent training loaders remain
+            # alive.  A separate setting prevents a third Windows worker pool
+            # and its prefetched queue copies from exhausting commit memory.
+            num_workers=config.training.validation_num_workers,
             pin_memory=config.training.pin_memory,
-            persistent_workers=config.training.num_workers > 0,
+            persistent_workers=config.training.validation_num_workers > 0,
             collate_fn=validation_collator,
         )
         if validation_dataset is not None and len(validation_dataset)
@@ -290,15 +375,44 @@ def main() -> None:
     model = TCDPRGModel(config.model, config.ablation, config.graph, config.router, config.backbone)
     pretrained_report = None
     resume_pretrained_names: list[str] = []
+    resume_validation_protocol_changed = False
     if args.resume:
         resume_payload = torch.load(args.resume, map_location="cpu", weights_only=False)
         resume_config = resume_payload.get("config", {})
         resume_extra = resume_config.get("extra", {}) if isinstance(resume_config, dict) else {}
         resume_pretrained_names = list(resume_extra.get("pretrained_matched_parameter_names", []))
+        # Older schema-10 checkpoints may have been written before the
+        # pre-trained parameter-name list was copied into ``config.extra``.
+        # The optimizer still contains the original split, so falling back to
+        # every encoder parameter changes the parameter-group sizes and makes
+        # optimizer state restoration fail.  The run artifact contains the
+        # exact audited list used to construct that optimizer.
+        if not resume_pretrained_names:
+            pretrained_report_path = Path(config.output_dir) / "pretrained_backbone.json"
+            if pretrained_report_path.is_file():
+                persisted_report = json.loads(
+                    pretrained_report_path.read_text(encoding="utf-8")
+                )
+                resume_pretrained_names = list(
+                    persisted_report.get("matched_parameter_names", [])
+                )
         resume_training = (
             resume_config.get("training", {}) if isinstance(resume_config, dict) else {}
         )
         if isinstance(resume_training, dict):
+            old_validation_signature = (
+                resume_training.get("validation_scene_count"),
+                int(resume_training.get("validation_scene_seed", 2026)),
+                resume_training.get("max_validation_groups"),
+            )
+            current_validation_signature = (
+                config.training.validation_scene_count,
+                int(config.training.validation_scene_seed),
+                config.training.max_validation_groups,
+            )
+            resume_validation_protocol_changed = (
+                old_validation_signature != current_validation_signature
+            )
             config.training.frozen_modules = tuple(
                 resume_training.get("frozen_modules", config.training.frozen_modules)
             )
@@ -442,6 +556,23 @@ def main() -> None:
     )
     if args.resume:
         trainer.load_checkpoint(args.resume)
+        if resume_validation_protocol_changed:
+            previous_best = trainer.state.best_validation
+            trainer.state.best_validation = float("inf")
+            trainer.state.validation_without_improvement = 0
+            trainer._write_event(
+                "validation_protocol_reset",
+                previous_best_validation=previous_best,
+                validation_scene_count=config.training.validation_scene_count,
+                validation_scene_seed=config.training.validation_scene_seed,
+                max_validation_groups=config.training.max_validation_groups,
+            )
+            if rank == 0:
+                print(
+                    "[validation-protocol] subset changed on resume; reset best "
+                    f"validation from {previous_best:.6f} and early-stopping counter",
+                    flush=True,
+                )
 
     def validate(module: torch.nn.Module) -> dict[str, object]:
         if validation_loader is None:

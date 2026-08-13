@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from tcd_prg.datasets.torch_dataset import ActionStateGroupDataset
+from tcd_prg.scripts.train import load_or_create_validation_scene_subset
 
 STRATA = (
     "direct_grasp",
@@ -70,3 +73,29 @@ def test_validation_subset_is_scene_diverse_persisted_and_reused(tmp_path):
     assert [(u.scene_id, u.state_id, u.task_index, u.group_index) for u in first.units] == [
         (u.scene_id, u.state_id, u.task_index, u.group_index) for u in second.units
     ]
+
+
+def test_validation_scene_subset_is_random_fixed_and_complete(tmp_path):
+    manifest = tmp_path / "validation_scene_subset.json"
+    selected = load_or_create_validation_scene_subset(
+        tuple(range(30)), 20, 2026, manifest
+    )
+    assert len(selected) == 20
+    assert selected != tuple(range(20))
+
+    dataset = ActionStateGroupDataset(_Adapter(False), split="val", scene_ids=frozenset({0, 2}))
+    assert {unit.scene_id for unit in dataset.units} == {0, 2}
+    assert len(dataset) == 20
+
+    # Input ordering does not change the saved or deterministic subset.
+    reused = load_or_create_validation_scene_subset(
+        tuple(reversed(range(30))), 20, 2026, manifest
+    )
+    assert reused == selected
+
+
+def test_validation_scene_subset_rejects_manifest_drift(tmp_path):
+    manifest = tmp_path / "validation_scene_subset.json"
+    load_or_create_validation_scene_subset(tuple(range(30)), 20, 2026, manifest)
+    with pytest.raises(ValueError, match="seed"):
+        load_or_create_validation_scene_subset(tuple(range(30)), 20, 7, manifest)

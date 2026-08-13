@@ -200,8 +200,16 @@ class TrainingConfig:
     early_stopping_patience: int = 20
     deterministic: bool = True
     num_workers: int = 4
+    # Validation runs while the train/global persistent workers are still
+    # alive.  Keep it synchronous by default to avoid a third worker pool and
+    # multiprocessing queue copies exhausting Windows commit memory.
+    validation_num_workers: int = 0
     pin_memory: bool = True
     max_train_groups: int | None = None
+    # Randomly select this many complete scenes from the already-created
+    # validation split.  The deterministic selection is persisted and reused.
+    validation_scene_count: int | None = None
+    validation_scene_seed: int = 2026
     max_validation_groups: int | None = None
     # Used only when max_validation_groups is finite.  The resulting exact
     # subset is persisted to validation_subset.json and reused on resume.
@@ -409,6 +417,10 @@ class TCDPRGConfig:
     def validate(self) -> None:
         if self.training.gradient_accumulation_steps <= 0:
             raise ValueError("training.gradient_accumulation_steps must be positive")
+        if self.training.num_workers < 0:
+            raise ValueError("training.num_workers must be non-negative")
+        if self.training.validation_num_workers < 0:
+            raise ValueError("training.validation_num_workers must be non-negative")
         expected_strata = {
             "direct_grasp", "pick_remove", "push", "push_failure",
             "unresolved_or_unknown",
@@ -428,6 +440,11 @@ class TCDPRGConfig:
             raise ValueError("training.scene_start must be non-negative")
         if self.training.scene_count is not None and self.training.scene_count <= 0:
             raise ValueError("training.scene_count must be positive when configured")
+        if (
+            self.training.validation_scene_count is not None
+            and self.training.validation_scene_count <= 0
+        ):
+            raise ValueError("training.validation_scene_count must be positive")
         if (
             self.training.max_validation_groups is not None
             and self.training.max_validation_groups <= 0

@@ -201,18 +201,25 @@ training:
     [direct_grasp, pick_remove, push, push_failure, unresolved_or_unknown]
   # 独立 unique scene-state Global Grasp stream；不按当前 loss 人工放大。
   global_stream_weight: 1.0
-  gradient_accumulation_steps: 3  # 有效 batch 更稳定，不增加单步显存
+  gradient_accumulation_steps: 3  # 梯度累积
   max_optimizer_steps: 30000
-  validation_interval: 100     # 周期验证。
+  validation_interval: 2000     # 周期验证。
   gradient_clip_norm: 20.0 # 梯度裁剪，避免梯度爆炸；PTv3 前向可能产生极端梯度。
   ema_decay: 0.999
   early_stopping_patience: 15
   deterministic: False
-  num_workers: 6
+  num_workers: 8  # train/global 两路常驻 worker；按吞吐和主机内存调整
+  # Windows 验证时 train/global worker 仍常驻。设为 0 可避免再启动第三组
+  # worker 以及预取、进程间序列化造成的提交内存峰值。
+  validation_num_workers: 0
   pin_memory: true
   max_train_groups: null
-  # 正式实验使用完整 validation split。若设为 256/512 等有限值，必须同时
-  # 配置对应 quota；子集会固定写入 outputs/.../validation_subset.json。
+  # 从划分后的 validation split 随机抽取一次并固定复用20个完整场景。
+  # 场景清单写入 output_dir/validation_scene_subset.json，resume 时严格复用。
+  validation_scene_count: 20
+  validation_scene_seed: 2026
+  # 可选的二级 group 上限，作用于上述20个场景内部。若设为256/512等有限值，
+  # 必须同时配置对应 quota；group 清单写入 outputs/.../validation_subset.json。
   max_validation_groups: null
   validation_stratum_quota:
     direct_grasp: 64

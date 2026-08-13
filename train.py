@@ -140,6 +140,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override training.num_workers.",
     )
     parser.add_argument(
+        "--validation-num-workers", "--validation_num_workers",
+        dest="validation_num_workers", type=int, default=None,
+        help="Override training.validation_num_workers (0 avoids a validation worker pool).",
+    )
+    parser.add_argument(
         "--gradient-accumulation-steps", "--gradient_accumulation_steps",
         dest="gradient_accumulation_steps", type=int, default=None,
         help="Override training.gradient_accumulation_steps.",
@@ -194,6 +199,7 @@ def _training_arguments(
     named_training_overrides = {
         "batch_size": "batch_size",
         "num_workers": "num_workers",
+        "validation_num_workers": "validation_num_workers",
         "gradient_accumulation_steps": "gradient_accumulation_steps",
         "max_optimizer_steps": "max_optimizer_steps",
         "validation_interval": "validation_interval",

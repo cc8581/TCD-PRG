@@ -290,3 +290,119 @@ def collate_unified(
             ),
         }
     return result
+
+
+def collate_global_grasp(
+    samples: list[Any], *, grid_size_m: float | None = None, training: bool = False
+) -> dict[str, Any]:
+    """Minimal collator for the independent Global Grasp stream.
+
+    The tensor values consumed by the neutral scene backbone and
+    ``build_global_grasp_labels`` are constructed with the same helpers and
+    dtypes as ``collate_unified``.  Policy, graph, Push and Verifier-only fields
+    are intentionally not materialized.
+    """
+
+    if not samples:
+        raise ValueError("Cannot collate an empty Global Grasp batch")
+    observations = [sample.observation for sample in samples]
+    packed = [sample.global_grasps for sample in samples]
+    if any(label is None for label in packed):
+        raise RuntimeError("Global-only batch contains a sample without Global labels")
+
+    if grid_size_m is not None:
+        point_samples = [
+            grid_sample(obs.xyz, float(grid_size_m), training) for obs in observations
+        ]
+        point_indices = [item[0] for item in point_samples]
+        grid_coord, _ = _pad([item[1] for item in point_samples])
+    else:
+        point_indices = [np.arange(len(obs.xyz), dtype=np.int64) for obs in observations]
+        grid_coord = None
+
+    xyz, point_mask = _pad(
+        [obs.xyz[index] for obs, index in zip(observations, point_indices, strict=True)]
+    )
+    rgb, _ = _pad(
+        [obs.rgb[index] for obs, index in zip(observations, point_indices, strict=True)]
+    )
+    instance_id, _ = _pad(
+        [obs.instance_id[index] for obs, index in zip(observations, point_indices, strict=True)],
+        -1,
+    )
+    target_mask, _ = _pad(
+        [obs.target_mask[index] for obs, index in zip(observations, point_indices, strict=True)],
+        False,
+    )
+    object_present, object_mask = _pad(
+        [obs.object_present for obs in observations], False
+    )
+    object_active, _ = _pad([obs.object_active for obs in observations], False)
+
+    # ``packed`` was checked above; keep the local alias type-agnostic so this
+    # remains compatible with both GlobalGraspSample and legacy UnifiedSample.
+    labels = packed
+    global_valid, _ = _pad([label.valid_mask for label in labels], False)
+    scene_executable, _ = _pad([label.scene_executable for label in labels], -1)
+    result: dict[str, Any] = {
+        "xyz": xyz.float(),
+        "rgb": rgb.float(),
+        "point_mask": point_mask.bool(),
+        "instance_id": instance_id.long(),
+        "target_mask": target_mask.bool(),
+        "target_object": torch.tensor(
+            [obs.target_object for obs in observations], dtype=torch.long
+        ),
+        "task_region_id": torch.tensor(
+            [obs.task_region_id for obs in observations], dtype=torch.long
+        ),
+        "task_category_id": torch.tensor(
+            [obs.object_category_id[obs.target_object] for obs in observations],
+            dtype=torch.long,
+        ),
+        "object_mask": object_mask.bool(),
+        "object_present": object_present.bool(),
+        "object_active": object_active.bool(),
+        "global_loss_sample_valid": torch.tensor(
+            [
+                bool(getattr(sample, "global_loss_valid", True))
+                and sample.global_grasps is not None
+                for sample in samples
+            ],
+            dtype=torch.bool,
+        ),
+        "global_grasp_labels": {
+            "object_index": _pad([label.object_index for label in labels], -1)[0].long(),
+            "source_grasp_index": _pad(
+                [label.source_grasp_index for label in labels], -1
+            )[0].long(),
+            "contact_point_world": _pad(
+                [label.contact_point_world for label in labels], np.nan
+            )[0].float(),
+            "grasp_pose_world": _pad(
+                [label.grasp_pose_world for label in labels], np.nan
+            )[0].float(),
+            "approach_direction_world": _pad(
+                [label.approach_direction_world for label in labels], np.nan
+            )[0].float(),
+            "width_m": _pad([label.width_m for label in labels], np.nan)[0].float(),
+            "intrinsic_stable": _pad(
+                [label.intrinsic_stable for label in labels], False
+            )[0].bool(),
+            "scene_executable": scene_executable.to(torch.int8),
+            "anchor_visible_distance_m": _pad(
+                [label.anchor_visible_distance_m for label in labels], np.nan
+            )[0].float(),
+            "valid_mask": global_valid.bool(),
+            "label_set_complete": torch.tensor(
+                [label.label_set_complete for label in labels], dtype=torch.bool
+            ),
+        },
+        # Retained only for precise error diagnostics; Trainer._move leaves
+        # these dataclass objects on CPU.
+        "samples": samples,
+    }
+    if grid_coord is not None:
+        result["grid_coord"] = grid_coord.to(torch.int32)
+    return result
+

@@ -22,7 +22,7 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 from .base import DatasetAdapter
-from .types import UnifiedSample
+from .types import GlobalGraspSample, UnifiedSample
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +177,7 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
         include_strata: bool = True,
         fraction: float = 1.0,
         subset_seed: int = 2026,
+        scene_ids: set[int] | frozenset[int] | None = None,
         global_grasp_mode: str = "representative",
         stratified_max_groups: bool = False,
         stratum_quota: Mapping[str, int] | None = None,
@@ -197,6 +198,11 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
             raise ValueError("stratified_max_groups requires stratum_quota")
 
         iterator = adapter.iter_action_groups(split)
+        if scene_ids is not None:
+            allowed_scenes = frozenset(int(scene_id) for scene_id in scene_ids)
+            if not allowed_scenes:
+                raise ValueError("scene_ids must not be empty")
+            iterator = (unit for unit in iterator if int(unit[0]) in allowed_scenes)
         if fraction == 1.0 and max_groups is not None and not stratified_max_groups:
             raw_units = list(islice(iterator, max_groups))
             self.source_group_count: int | None = None
@@ -380,8 +386,13 @@ class GlobalStateDataset(Dataset[UnifiedSample]):
     def __len__(self) -> int:
         return len(self.units)
 
-    def __getitem__(self, index: int) -> UnifiedSample:
+    def __getitem__(self, index: int) -> UnifiedSample | GlobalGraspSample:
         unit = self.units[index]
+        lightweight = getattr(self.adapter, "load_global_sample", None)
+        if lightweight is not None:
+            return lightweight(unit.scene_id, unit.state_id, unit.task_index)
+        # Compatibility path for external test/adapters that do not inherit the
+        # DatasetAdapter lightweight Global-stream method.
         return self.adapter.load_sample(
             unit.scene_id,
             unit.state_id,

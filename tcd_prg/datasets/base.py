@@ -7,8 +7,8 @@ from collections.abc import Iterable
 
 from .capabilities import DatasetCapabilities
 from .types import (
-    ActionCandidateGroup, GlobalGraspLabels, SceneObservation, SequenceLabels,
-    StateLabels, UnifiedSample,
+    ActionCandidateGroup, GlobalGraspLabels, GlobalGraspSample, SceneObservation,
+    SequenceLabels, StateLabels, UnifiedSample,
 )
 
 
@@ -47,6 +47,35 @@ class DatasetAdapter(ABC):
         """Optional task-free grasp supervision supplied by capable datasets."""
 
         return None
+
+    def load_global_sample(
+        self,
+        scene_id: int,
+        state_id: int,
+        task_index: int,
+    ) -> GlobalGraspSample:
+        """Load only fields consumed by the independent Global Grasp stream.
+
+        This is semantically equivalent to the Global portion of ``load_sample``
+        but intentionally skips state-graph labels, action groups and sequences.
+        """
+
+        observation = self.load_observation(scene_id, state_id, task_index)
+        global_grasps = self.load_global_grasps(
+            scene_id, state_id, observation, training=True
+        )
+        if global_grasps is None:
+            raise RuntimeError(
+                f"Global Grasp supervision unavailable for scene={scene_id} "
+                f"state={state_id} task={task_index}"
+            )
+        observation.validate()
+        global_grasps.validate()
+        return GlobalGraspSample(
+            observation=observation,
+            global_grasps=global_grasps,
+            global_loss_valid=True,
+        )
 
     def load_sample(
         self,

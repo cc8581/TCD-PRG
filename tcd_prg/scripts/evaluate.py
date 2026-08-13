@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+import time
 
 import torch
 from torch.utils.data import DataLoader
@@ -21,12 +22,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--split", default="test", choices=("train", "val", "test"))
     parser.add_argument("--output-dir", default="outputs/evaluation")
+    parser.add_argument(
+        "--log-interval-groups",
+        type=int,
+        default=320,
+        help="Print progress after approximately this many evaluated groups.",
+    )
     parser.add_argument("overrides", nargs="*")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.log_interval_groups <= 0:
+        raise ValueError("--log-interval-groups must be positive")
     config = load_config(args.config, args.overrides)
     adapter = create_adapter(config, allow_render=False)
     dataset = ActionStateGroupDataset(
@@ -68,6 +77,14 @@ def main() -> None:
         config.graph,
         config.evaluation,
     )
+    evaluated_groups = 0
+    next_log = args.log_interval_groups
+    started = time.time()
+    print(
+        f"[evaluation-start] split={args.split} groups={len(dataset)} "
+        f"batch={config.training.batch_size} workers={config.training.num_workers}",
+        flush=True,
+    )
     with torch.no_grad():
         for raw in loader:
             batch = {
@@ -85,7 +102,25 @@ def main() -> None:
                     for key, value in raw["verifier_inputs"].items()
                 }
             evaluator.update(batch, model(batch))
+            batch_groups = int(batch["xyz"].shape[0])
+            evaluated_groups += batch_groups
+            if evaluated_groups >= next_log or evaluated_groups == len(dataset):
+                elapsed = max(time.time() - started, 1e-9)
+                rate = evaluated_groups / elapsed
+                remaining = max(len(dataset) - evaluated_groups, 0)
+                print(
+                    f"[evaluation] groups={evaluated_groups}/{len(dataset)} "
+                    f"rate={rate:.2f}/s eta={remaining / max(rate, 1e-9):.0f}s",
+                    flush=True,
+                )
+                while next_log <= evaluated_groups:
+                    next_log += args.log_interval_groups
     evaluator.export(args.output_dir, asdict(config))
+    print(
+        f"[evaluation-done] groups={evaluated_groups} "
+        f"elapsed={time.time() - started:.1f}s output={args.output_dir}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

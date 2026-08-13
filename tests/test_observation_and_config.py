@@ -161,7 +161,17 @@ def test_formal_config_uses_strict_offline_cache_and_scene_splits() -> None:
     assert config.training.scene_count == 2500
     assert tuple(config.training.split_ratios) == (9.0, 1.0)
     assert config.training.max_validation_groups is None
+    assert config.training.validation_scene_count == 20
+    assert config.training.validation_scene_seed == 2026
+    assert config.training.validation_num_workers == 0
     assert config.logging.validation_log_interval == 20
+
+
+def test_validation_worker_count_must_be_non_negative() -> None:
+    config = TCDPRGConfig()
+    config.training.validation_num_workers = -1
+    with pytest.raises(ValueError, match="validation_num_workers"):
+        config.validate()
 
 
 def test_saved_state_zero_is_resized_to_formal_render_resolution() -> None:

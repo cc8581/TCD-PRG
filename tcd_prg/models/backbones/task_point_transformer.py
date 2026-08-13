@@ -304,6 +304,27 @@ class TaskConditionedPointTransformer(nn.Module):
         )
         self.task_adapter = TaskConditioningAdapter(dim, task_dim, num_categories, num_regions)
 
+    def forward_scene_geometry(
+        self,
+        xyz: Tensor,
+        rgb: Tensor,
+        instance_id: Tensor,
+        point_mask: Tensor,
+        object_mask: Tensor,
+        grid_coord: Tensor | None = None,
+    ) -> SceneGeometryOutput:
+        """Run only the task-free scene backbone.
+
+        Global Grasp consumes these neutral features directly, so executing the
+        TaskConditioningAdapter in its auxiliary stream is redundant.
+        """
+
+        if grid_coord is None:
+            return self.scene_backbone(xyz, rgb, instance_id, point_mask, object_mask)
+        return self.scene_backbone(
+            xyz, rgb, instance_id, point_mask, object_mask, grid_coord=grid_coord
+        )
+
     def forward(
         self, xyz: Tensor, rgb: Tensor, instance_id: Tensor, point_mask: Tensor,
         target_mask: Tensor, object_mask: Tensor, task_category_id: Tensor,
@@ -311,13 +332,9 @@ class TaskConditionedPointTransformer(nn.Module):
         target_object: Tensor | None = None, grid_coord: Tensor | None = None,
     ) -> EncoderOutput:
         # scene_backbone 每次 forward 只运行一次，Task/Global/Graph/Push 全部复用其输出。
-        if grid_coord is None:
-            # Preserve compatibility with lightweight/custom backbones used by tests.
-            scene = self.scene_backbone(xyz, rgb, instance_id, point_mask, object_mask)
-        else:
-            scene = self.scene_backbone(
-                xyz, rgb, instance_id, point_mask, object_mask, grid_coord=grid_coord
-            )
+        scene = self.forward_scene_geometry(
+            xyz, rgb, instance_id, point_mask, object_mask, grid_coord=grid_coord
+        )
         if target_object is None:
             counts = torch.stack([
                 (target_mask & (instance_id == index)).sum(-1)

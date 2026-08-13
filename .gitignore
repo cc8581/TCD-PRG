@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .vscode/
+.idea/
 data/tiny_task_push_grasp_v0/
 data/manual_function_regions/
 data/task_grasp_matches/

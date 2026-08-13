@@ -32,6 +32,7 @@ def test_launcher_path_arguments_have_local_config_defaults(tmp_path) -> None:
     assert args.initialize is None
     assert args.batch_size is None
     assert args.num_workers is None
+    assert args.validation_num_workers is None
     assert args.gradient_accumulation_steps is None
     assert args.max_optimizer_steps is None
     assert args.validation_interval is None
@@ -75,6 +76,16 @@ def test_launcher_only_forwards_explicit_named_training_overrides(tmp_path) -> N
     assert "training.batch_size=3" in arguments
     assert "training.max_optimizer_steps=17" in arguments
     assert not any(argument.startswith("training.num_workers=") for argument in arguments)
+
+
+def test_launcher_forwards_validation_worker_override(tmp_path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("name: test\n", encoding="utf-8")
+    args = _parse_args([
+        "--config", str(config), "--validation-num-workers", "1",
+    ])
+    arguments = _training_arguments(args)
+    assert "training.validation_num_workers=1" in arguments
 
 
 def test_windows_worker_passes_ddp_state_explicitly(monkeypatch) -> None:

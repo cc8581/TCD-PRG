@@ -223,6 +223,19 @@ class GlobalGraspLabels:
 
 
 @dataclass(slots=True)
+class GlobalGraspSample:
+    """Minimal sample for the independent Global Grasp supervision stream.
+
+    It deliberately omits action candidates, graph labels and successful
+    sequences because the Global-only forward/loss never consumes them.
+    """
+
+    observation: SceneObservation
+    global_grasps: GlobalGraspLabels
+    global_loss_valid: bool = True
+
+
+@dataclass(slots=True)
 class UnifiedSample:
     observation: SceneObservation
     state_labels: StateLabels
