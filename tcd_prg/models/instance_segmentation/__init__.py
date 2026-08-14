@@ -1,3 +1,3 @@
-from .head import InstanceQueryHead, InstanceQueryOutput
+from .decoder import InstanceAuxOutput, InstanceMaskDecoder, InstanceQueryOutput
 
-__all__ = ["InstanceQueryHead", "InstanceQueryOutput"]
+__all__ = ["InstanceAuxOutput", "InstanceMaskDecoder", "InstanceQueryOutput"]

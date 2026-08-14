@@ -13,23 +13,20 @@ from tcd_prg.constants import ActionType, CandidateStatus
 from tcd_prg.datasets.capabilities import DatasetCapabilities
 
 from .actions import PushLoss
-from .global_grasp import GlobalGraspLoss
 from .graph import DependencyGraphLoss
 from .instance import (
     InstanceSetLoss,
     build_instance_targets,
     build_object_query_push_supervision,
-    remap_global_grasp_labels,
     remap_graph_targets,
 )
 from .labels import (
-    build_global_grasp_labels,
     build_grasp_proposal_labels,
     build_region_labels,
     build_verifier_labels,
 )
 from .policy import HierarchicalSetPolicyLoss
-from .proposal import GraspProposalLoss
+from .task_grasp_score import TaskGraspScoringLoss
 from .region import TaskRegionLoss
 from .total import MultiTaskLoss
 from .verifier import GraspVerifierLoss
@@ -42,7 +39,6 @@ class TCDPRGObjective(nn.Module):
         "instance",
         "region",
         "task_grasp",
-        "global_grasp",
         "physical_edge",
         "task_edge",
         "verify_overall",
@@ -97,27 +93,19 @@ class TCDPRGObjective(nn.Module):
                 )
             ),
             same_category_target_weight=model_config.target_same_category_loss_boost,
+            auxiliary_weight=float(
+                self.internal_weights.get("instance_auxiliary", 0.5)
+            ),
         )
         self.region = TaskRegionLoss(
             region_config.focal_alpha,
             region_config.focal_gamma,
             region_config.dice_weight,
         )
-        self.task_grasp = GraspProposalLoss(
-            negative_translation_m=model_config.grasp_nms_translation_m,
-            negative_rotation_deg=model_config.grasp_nms_rotation_deg,
-            negative_width_m=model_config.grasp_nms_width_m,
-        )
-        self.global_grasp = GlobalGraspLoss(
-            negative_translation_m=(
-                model_config.global_grasp_nms_translation_m
-            ),
-            negative_rotation_deg=(
-                model_config.global_grasp_nms_rotation_deg
-            ),
-            negative_width_m=(
-                model_config.global_grasp_nms_width_m
-            ),
+        self.task_grasp = TaskGraspScoringLoss(
+            translation_m=model_config.policy_grasp_match_translation_m,
+            rotation_deg=model_config.policy_grasp_match_rotation_deg,
+            width_m=model_config.policy_grasp_match_width_m,
         )
         self.graph = DependencyGraphLoss()
         self.push = PushLoss()
@@ -185,19 +173,6 @@ class TCDPRGObjective(nn.Module):
                 torch.finfo(reference.dtype).eps
             ),
             **values,
-        }
-
-    @staticmethod
-    def _named_grasp_terms(
-        values: dict[str, Tensor], prefix: str
-    ) -> dict[str, Tensor]:
-        return {
-            (
-                "loss"
-                if name == "loss"
-                else f"{prefix}_{name.removeprefix('grasp_')}"
-            ): value
-            for name, value in values.items()
         }
 
     def _synthesize_target_prompt(
@@ -333,75 +308,6 @@ class TCDPRGObjective(nn.Module):
             target_query_logits=target_query_logits,
         )
         return values, match, targets
-
-    def global_grasp_stream(
-        self,
-        model: nn.Module,
-        batch: dict[str, Any],
-    ) -> tuple[Tensor, dict[str, Tensor]]:
-        if not self.total.enabled("global_grasp"):
-            raise RuntimeError(
-                "Global Grasp stream requested while "
-                "global_grasp loss is disabled"
-            )
-        model_view = self._model_view(batch)
-        output = model(model_view, forward_mode="global_grasp")
-        _, match, _ = self._match_instances(
-            output["instance"], batch, None
-        )
-        labels = remap_global_grasp_labels(
-            build_global_grasp_labels(
-                batch, self.model_config
-            ),
-            match,
-        )
-        if labels is None:
-            raise RuntimeError(
-                "GlobalStateDataset batch has no "
-                "Global Grasp label tensor"
-            )
-        sample_valid = labels["sample_valid"].bool()
-        if not bool(sample_valid.any()):
-            identities = [
-                (
-                    int(sample.observation.scene_id),
-                    int(sample.observation.state_id),
-                    int(sample.observation.task_index),
-                )
-                for sample in batch.get("samples", [])
-            ]
-            raise RuntimeError(
-                "GlobalStateDataset has no mapped certified "
-                f"supervision; scene/state/task={identities}"
-            )
-        values = self._named_grasp_terms(
-            self.global_grasp(
-                output["global_grasp"], labels
-            ),
-            "global_grasp",
-        )
-        raw_loss = values.pop("loss")
-        weighted = (
-            float(self.total.weights["global_grasp"])
-            * raw_loss
-        )
-        terms = {
-            "loss_global_grasp": raw_loss.detach(),
-            "weighted_loss_global_grasp": (
-                weighted.detach()
-            ),
-            "active_loss_global_grasp": (
-                sample_valid.float().mean().detach()
-            ),
-            "global_grasp_invalid_rows": (
-                (~sample_valid).sum().float().detach()
-            ),
-            **{
-                name: value.detach()
-                for name, value in values.items()
-            },
-        }
-        return weighted, terms
 
     def forward(
         self,
@@ -546,57 +452,20 @@ class TCDPRGObjective(nn.Module):
                 )
 
             if self.total.enabled("task_grasp"):
-                task_labels = (
-                    build_grasp_proposal_labels(
-                        batch, self.model_config
-                    )
+                task_labels = build_grasp_proposal_labels(
+                    batch, self.model_config
                 )
                 if task_labels["sample_valid"].any():
-                    families[
-                        "task_grasp"
-                    ] = self._named_grasp_terms(
-                        self.task_grasp(
-                            output["task_grasp"],
-                            task_labels,
-                        ),
-                        "task_grasp",
+                    score_losses = self.task_grasp(
+                        output["task_grasp"], task_labels
                     )
-                    activity[
-                        "active_loss_task_grasp"
-                    ] = (
-                        task_labels["sample_valid"]
-                        .float()
-                        .mean()
-                    )
-
-            if self.total.enabled("global_grasp"):
-                global_labels = remap_global_grasp_labels(
-                    build_global_grasp_labels(
-                        batch, self.model_config
-                    ),
-                    match,
-                )
-                if (
-                    global_labels is not None
-                    and global_labels[
-                        "sample_valid"
-                    ].any()
-                ):
-                    families[
-                        "global_grasp"
-                    ] = self._named_grasp_terms(
-                        self.global_grasp(
-                            output["global_grasp"],
-                            global_labels,
-                        ),
-                        "global_grasp",
-                    )
-                    activity[
-                        "active_loss_global_grasp"
-                    ] = (
-                        global_labels["sample_valid"]
-                        .float()
-                        .mean()
+                    families["task_grasp"] = score_losses
+                    supervised_rows = score_losses[
+                        "task_grasp_supervised_rows"
+                    ]
+                    activity["active_loss_task_grasp"] = (
+                        supervised_rows
+                        / max(1, output["task_grasp"]["quality_logit"].shape[0])
                     )
 
             if (

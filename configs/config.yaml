@@ -64,6 +64,22 @@ backbone:
   patch_size: 128
   attention_points: 1024
 
+graspnet:
+  # Frozen official graspnet-baseline; external to TCD-PRG checkpoint/EMA.
+  source_root: .deps/graspnet-baseline
+  checkpoint: .deps/checkpoints/graspnet-rs.tar
+  freeze: true
+  scene_input_points: 20000
+  target_input_points: 20000
+  global_proposals: 128
+  target_proposals: 128
+  num_view: 300
+  num_angle: 12
+  num_depth: 4
+  cylinder_radius: 0.05
+  hmin: -0.02
+  hmax_list: [0.01, 0.02, 0.03, 0.04]
+
 region_head:
   enabled: true
   focal_alpha: 0.25
@@ -79,7 +95,7 @@ model:
   num_task_regions: 64
   # Lightweight query-based instance decomposition on shared PTv3 features.
   instance_queries: 32
-  instance_decoder_layers: 2
+  instance_decoder_layers: 6
   instance_decoder_heads: 8
   instance_objectness_threshold: 0.5
   instance_matching_points: 2048
@@ -107,9 +123,11 @@ model:
   candidate_topk: 64
   task_grasp_candidates: 32
   global_grasp_candidates: 32
-  # Task/Global Grasp 共用一个 M2T2 风格解码器，但使用两组独立 query。
-  grasp_decoder_layers: 2
-  grasp_decoder_heads: 8
+  # GraspNet 产生 6DoF proposal；任务评分器只学习任务残差。
+  task_grasp_scorer_layers: 2
+  task_grasp_scorer_heads: 8
+  task_grasp_local_radius_m: 0.08
+  task_grasp_residual_scale: 1.0
   pick_remove_candidates: 16
   push_candidates: 16
   push_directions_per_contact: 2  # 每个接触点展开 Top-2 方向
@@ -179,7 +197,6 @@ losses:
   instance: 1.0
   region: 1.0
   task_grasp: 1.0
-  global_grasp: 1.0
   physical_edge: 0.5
   task_edge: 0.5
   verify_overall: 1.0
@@ -194,6 +211,7 @@ losses:
     instance_dice: 2.0
     instance_category: 1.0
     target_query: 1.0
+    instance_auxiliary: 0.5
     region_focal: 1.0
     region_dice: 1.0
     region_visibility: 0.2
@@ -229,8 +247,6 @@ training:
   # targets when an already-selected state has multiple action groups.
   action_batch_coverage_strata:
     [direct_grasp, pick_remove, push, push_failure, unresolved_or_unknown]
-  # 独立 unique scene-state Global Grasp stream；不按当前 loss 人工放大。
-  global_stream_weight: 1.0
   gradient_accumulation_steps: 3  # 梯度累积
   max_optimizer_steps: 30000
   validation_interval: 2000     # 周期验证。
@@ -278,7 +294,6 @@ training:
     physical_edge: 0.25
     task_edge: 0.25
     task_grasp: 0.25
-    global_grasp: 0.25
     region: 0.1
     push_object: 0.1
     push_contact: 0.05

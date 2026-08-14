@@ -29,6 +29,9 @@ from tcd_prg.observation.saved import SavedObservationProvider
 from tcd_prg.trainers import Trainer
 
 
+pytestmark = pytest.mark.usefixtures("fake_graspnet")
+
+
 class _SkipOnceScaler:
     """CPU test double matching the GradScaler methods used by Trainer."""
 

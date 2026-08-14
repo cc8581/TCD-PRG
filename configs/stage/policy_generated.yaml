@@ -5,7 +5,7 @@ defaults:
 
 training:
   # ratio=1 会触发 generated coverage 启动检查，并走精简的 policy-only forward。
-  frozen_modules: [encoder, region_head, task_grasp, global_grasp, verifier, graph, push]
+  frozen_modules: [encoder, region_head, task_grasp, verifier, graph, push]
   generated_policy_candidate_cache: runtime/cache/policy_candidates
   generated_policy_candidate_ratio: 1.0
   generated_policy_checkpoint_sha256: ""
@@ -14,7 +14,6 @@ losses:
   instance: 0.0
   region: 0.0
   task_grasp: 0.0
-  global_grasp: 0.0
   physical_edge: 0.0
   task_edge: 0.0
   verify_overall: 0.0

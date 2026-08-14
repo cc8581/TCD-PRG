@@ -7,7 +7,7 @@ import torch
 from torch import Tensor, nn
 
 from tcd_prg.config import (
-    AblationConfig, BackboneConfig, GraphConfig, ModelConfig, RouterConfig
+    AblationConfig, BackboneConfig, GraphConfig, GraspNetConfig, ModelConfig, RouterConfig
 )
 from tcd_prg.constants import ActionType
 
@@ -17,9 +17,7 @@ from .backbones import (
 )
 from .common import ActionCandidateEncoder
 from .dependency_graph import TaskConditionedDependencyGraph
-from .grasp_proposal import (
-    GlobalGraspProposalHead, M2T2GraspDecoder, TaskGraspProposalHead,
-)
+from .graspnet import FrozenGraspNetProposalGenerator
 from .grasp_verifier import GripperSceneTaskVerifier
 from .policy import (
     FlatCandidateClassifier, MaskedHierarchicalCandidateRouter,
@@ -27,6 +25,7 @@ from .policy import (
 )
 from .push import PushHead
 from .region import TaskRegionHead
+from .task_grasp import TaskGraspScorer
 
 
 SENSOR_KEYS = frozenset({"xyz", "rgb", "point_mask", "grid_coord"})
@@ -59,6 +58,7 @@ class TCDPRGModel(nn.Module):
         graph_config: GraphConfig | None = None,
         router_config: RouterConfig | None = None,
         backbone_config: BackboneConfig | None = None,
+        graspnet_config: GraspNetConfig | None = None,
     ) -> None:
         super().__init__()
         self.config = config or ModelConfig()
@@ -66,6 +66,7 @@ class TCDPRGModel(nn.Module):
         graph_config = graph_config or GraphConfig()
         router_config = router_config or RouterConfig()
         backbone_config = backbone_config or BackboneConfig(backend="legacy")
+        graspnet_config = graspnet_config or GraspNetConfig()
         c = self.config
 
         scene_backbone = None
@@ -104,14 +105,30 @@ class TCDPRGModel(nn.Module):
             target_reid_max_center_distance_m=c.target_reid_max_center_distance_m,
         )
         self.region_head = TaskRegionHead(c.feature_dim)
-        self.grasp_decoder = M2T2GraspDecoder(
-            c.feature_dim, c.grasp_decoder_layers, c.grasp_decoder_heads
+        self.graspnet = FrozenGraspNetProposalGenerator(
+            source_root=graspnet_config.source_root,
+            checkpoint=graspnet_config.checkpoint,
+            proposal_count=max(
+                graspnet_config.global_proposals, graspnet_config.target_proposals
+            ),
+            input_points=max(
+                graspnet_config.scene_input_points, graspnet_config.target_input_points
+            ),
+            freeze=graspnet_config.freeze,
+            num_view=graspnet_config.num_view,
+            num_angle=graspnet_config.num_angle,
+            num_depth=graspnet_config.num_depth,
+            cylinder_radius=graspnet_config.cylinder_radius,
+            hmin=graspnet_config.hmin,
+            hmax_list=graspnet_config.hmax_list,
         )
-        self.task_grasp = TaskGraspProposalHead(
-            c.feature_dim, c.task_grasp_candidates
-        )
-        self.global_grasp = GlobalGraspProposalHead(
-            c.feature_dim, c.global_grasp_candidates, c.global_grasp_input_mode
+        self.graspnet_config = graspnet_config
+        self.task_grasp = TaskGraspScorer(
+            c.feature_dim,
+            layers=c.task_grasp_scorer_layers,
+            heads=c.task_grasp_scorer_heads,
+            local_radius_m=c.task_grasp_local_radius_m,
+            residual_scale=c.task_grasp_residual_scale,
         )
         self.verifier = GripperSceneTaskVerifier(
             c.feature_dim, c.feature_dim,
@@ -210,22 +227,14 @@ class TCDPRGModel(nn.Module):
     def _forward_global_grasp_neutral(
         self, scene: Any, instance: Any, sensor: dict[str, Tensor]
     ) -> dict[str, Tensor]:
-        global_grasp = self.global_grasp(
-            scene.point_features,
+        del scene
+        return self.graspnet(
             sensor["xyz"],
-            instance.object_tokens,
-            scene.global_scene_token,
-            instance.mask_probability,
             sensor["point_mask"],
-            instance.object_mask,
-            self.grasp_decoder,
+            instance_probability=instance.mask_probability,
+            proposal_count=self.graspnet_config.global_proposals,
+            input_points=self.graspnet_config.scene_input_points,
         )
-        global_grasp["width_m"] = self.global_grasp.decode_width(
-            global_grasp["width_raw"],
-            self.config.min_grasp_width_m,
-            self.config.max_grasp_width_m,
-        )
-        return global_grasp
 
     def _forward_global_grasp(
         self, encoded: Any, sensor: dict[str, Tensor]
@@ -627,20 +636,23 @@ class TCDPRGModel(nn.Module):
             encoded.target_probability,
             sensor["point_mask"],
         )
+        target_proposals = self.graspnet(
+            sensor["xyz"],
+            sensor["point_mask"],
+            importance=encoded.target_probability,
+            instance_probability=encoded.instance.mask_probability,
+            proposal_count=self.graspnet_config.target_proposals,
+            input_points=self.graspnet_config.target_input_points,
+        )
         task_grasp = self.task_grasp(
+            target_proposals,
             encoded.point_features,
             sensor["xyz"],
-            encoded.target_token,
-            encoded.task_token,
+            sensor["point_mask"],
             region["region_probability"],
             encoded.target_probability,
-            sensor["point_mask"],
-            self.grasp_decoder,
-        )
-        task_grasp["width_m"] = self.task_grasp.decode_width(
-            task_grasp["width_raw"],
-            self.config.min_grasp_width_m,
-            self.config.max_grasp_width_m,
+            encoded.task_token,
+            encoded.target_token,
         )
         global_grasp = self._forward_global_grasp(encoded, sensor)
 

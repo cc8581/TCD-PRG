@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from tcd_prg.config import ModelConfig
-from tcd_prg.models.instance_segmentation import InstanceQueryHead
+from tcd_prg.models.instance_segmentation import InstanceMaskDecoder
 from tcd_prg.losses.instance import InstanceSetLoss, build_instance_targets
 
 
@@ -17,7 +17,7 @@ def test_instance_head_uses_sensor_features_only():
         instance_decoder_heads=4,
         instance_decoder_layers=1,
     )
-    head = InstanceQueryHead(
+    head = InstanceMaskDecoder(
         32, config.instance_queries, config.num_categories,
         layers=config.instance_decoder_layers,
         heads=config.instance_decoder_heads,
@@ -46,7 +46,7 @@ def test_instance_gt_is_loss_side_only(tiny_batch):
         instance_decoder_heads=4,
         instance_decoder_layers=1,
     )
-    head = InstanceQueryHead(
+    head = InstanceMaskDecoder(
         32, 8, 20, layers=1, heads=4, objectness_threshold=0.5
     )
     pred = head(

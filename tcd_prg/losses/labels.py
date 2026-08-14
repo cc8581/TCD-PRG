@@ -183,49 +183,6 @@ def build_grasp_proposal_labels(
     return labels
 
 
-def build_global_grasp_labels(
-    batch: dict[str, Tensor], config: ModelConfig
-) -> dict[str, Tensor] | None:
-    """Build task-free sets from known native PICK_REMOVE execution outcomes."""
-
-    source = batch.get("global_grasp_labels")
-    if source is None:
-        return None
-    # scene_executable=-1 是 UNKNOWN；只有 0/1 才属于已认证监督。
-    certified = source["scene_executable"] >= 0
-    positive = source["scene_executable"] == 1
-    pose = source["grasp_pose_world"]
-    width = source["width_m"]
-    valid = (
-        source["valid_mask"] & positive & torch.isfinite(pose).all(-1) & torch.isfinite(width)
-        & (width >= config.min_grasp_width_m) & (width <= config.max_grasp_width_m)
-    )
-    quality = positive.float()
-    known_negative = (
-        source["valid_mask"] & (source["scene_executable"] == 0)
-        & torch.isfinite(pose).all(-1) & torch.isfinite(width)
-        & (width >= config.min_grasp_width_m) & (width <= config.max_grasp_width_m)
-    )
-    labels = _pack_grasp_set(
-        pose, width, valid, quality, certified, config.global_grasp_candidates,
-        object_index=source["object_index"],
-    )
-    _attach_negative_grasp_set(
-        labels, pose, width, known_negative, object_index=source["object_index"]
-    )
-    # 代表掩码是安全关键字段：缺失时报错，绝不默认全部有效。
-    representative = batch["global_loss_sample_valid"].bool()
-    label_set_complete = source.get(
-        "label_set_complete", torch.zeros_like(representative)
-    ).bool() & ~(source["valid_mask"] & ~certified).any(-1)
-    labels["label_set_complete"] = label_set_complete
-    labels["sample_valid"] = representative & (
-        valid.any(-1) | known_negative.any(-1) | label_set_complete
-    )
-    labels["unmatched_quality_valid"] = representative & label_set_complete
-    return labels
-
-
 def build_graph_labels(batch: dict[str, Tensor]) -> dict[str, Tensor]:
     # 图损失只覆盖当前物理活跃物体之间的边，padding 和已移除物体全部 ignore。
     object_mask = batch["object_mask"] & batch["object_active"]

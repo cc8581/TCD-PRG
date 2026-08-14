@@ -7,6 +7,52 @@ import torch
 
 
 @pytest.fixture
+def fake_graspnet(monkeypatch):
+    """Deterministic CPU contract double for full-model unit tests."""
+    from tcd_prg.models.graspnet import FrozenGraspNetProposalGenerator
+
+    def forward(
+        self,
+        xyz,
+        point_mask,
+        *,
+        importance=None,
+        instance_probability=None,
+        proposal_count=None,
+        input_points=None,
+    ):
+        del importance, input_points
+        batch, points, _ = xyz.shape
+        count = int(proposal_count or self.proposal_count)
+        base = torch.arange(count, device=xyz.device) % points
+        index = base[None].expand(batch, -1)
+        rows = torch.arange(batch, device=xyz.device)[:, None]
+        valid = point_mask[rows, index].bool()
+        translation = xyz[rows, index]
+        rotation = torch.eye(3, device=xyz.device, dtype=xyz.dtype)
+        rotation = rotation.reshape(1, 1, 3, 3).expand(batch, count, -1, -1)
+        score = torch.linspace(0.8, 0.2, count, device=xyz.device, dtype=xyz.dtype)
+        score = score[None].expand(batch, -1)
+        if instance_probability is None:
+            object_logits = xyz.new_zeros((batch, count, 1))
+        else:
+            object_logits = instance_probability[rows, :, index].clamp_min(1e-6).log()
+        return {
+            "translation_world": translation,
+            "rotation_matrix": rotation,
+            "width_m": xyz.new_full((batch, count), 0.04),
+            "depth_m": xyz.new_full((batch, count), 0.02),
+            "quality_logit": torch.logit(score.clamp(1e-5, 1 - 1e-5)),
+            "graspnet_score": score,
+            "attention_point_index": index,
+            "object_logits": object_logits,
+            "valid": valid,
+        }
+
+    monkeypatch.setattr(FrozenGraspNetProposalGenerator, "forward", forward)
+
+
+@pytest.fixture
 def dataset_root() -> Path:
     import yaml
 

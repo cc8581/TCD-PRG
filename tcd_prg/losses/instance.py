@@ -61,10 +61,12 @@ class InstanceSetLoss(nn.Module):
         category_weight: float = 1.0,
         target_weight: float = 1.0,
         same_category_target_weight: float = 2.0,
+        auxiliary_weight: float = 0.5,
     ) -> None:
         super().__init__()
         self.matching_points = int(matching_points)
         self.same_category_target_weight = float(same_category_target_weight)
+        self.auxiliary_weight = float(auxiliary_weight)
         if self.same_category_target_weight < 1.0:
             raise ValueError("same_category_target_weight must be >= 1")
         self.weights = {
@@ -230,9 +232,58 @@ class InstanceSetLoss(nn.Module):
         }
         numerator = sum(self.weights[k] * v for k, v in values.items())
         denominator = sum(self.weights.values())
+        final_loss = numerator / denominator
+
+        # Deep supervision for the stronger query decoder. Hungarian assignment is
+        # fixed from the final decoder output; auxiliary layers learn the same
+        # instance decomposition instead of running additional CPU matchers.
+        auxiliary_terms = []
+        for auxiliary in getattr(output, "aux_outputs", ()):
+            aux_objectness = torch.nn.functional.binary_cross_entropy_with_logits(
+                auxiliary.objectness_logits, objectness_target
+            )
+            if len(matched):
+                aux_logits = auxiliary.mask_logits[rows, queries]
+                aux_mask = torch.nn.functional.binary_cross_entropy_with_logits(
+                    aux_logits, target
+                )
+                aux_prob = torch.sigmoid(aux_logits)
+                aux_intersection = (aux_prob * target).sum(-1)
+                aux_dice = (
+                    1.0 - (2.0 * aux_intersection + 1.0)
+                    / (aux_prob.sum(-1) + target.sum(-1) + 1.0)
+                ).mean()
+                aux_category = torch.nn.functional.cross_entropy(
+                    auxiliary.category_logits[rows, queries],
+                    targets["category"][rows, gt],
+                )
+            else:
+                zero = auxiliary.mask_logits.sum() * 0.0
+                aux_mask = aux_dice = aux_category = zero
+            auxiliary_terms.append(
+                (
+                    self.weights["instance_objectness"] * aux_objectness
+                    + self.weights["instance_mask"] * aux_mask
+                    + self.weights["instance_dice"] * aux_dice
+                    + self.weights["instance_category"] * aux_category
+                )
+                / (
+                    self.weights["instance_objectness"]
+                    + self.weights["instance_mask"]
+                    + self.weights["instance_dice"]
+                    + self.weights["instance_category"]
+                )
+            )
+        auxiliary_loss = (
+            torch.stack(auxiliary_terms).mean()
+            if auxiliary_terms
+            else final_loss.detach() * 0.0
+        )
+        loss = final_loss + self.auxiliary_weight * auxiliary_loss
         return {
-            "loss": numerator / denominator,
+            "loss": loss,
             **values,
+            "instance_auxiliary": auxiliary_loss,
             "target_ambiguous_rows": ambiguous_rows.float().sum(),
         }, match
 
@@ -281,50 +332,6 @@ def remap_graph_targets(
         "task_edge_target": task_target,
         "task_edge_valid": task_valid,
     }
-
-
-def remap_global_grasp_labels(
-    labels: dict[str, Tensor] | None,
-    match: InstanceMatch,
-) -> dict[str, Tensor] | None:
-    """Map GT simulator object ids in Global-Grasp labels to predicted query ids."""
-    if labels is None:
-        return None
-    result = dict(labels)
-    if "object_index" in result:
-        mapped, valid = map_gt_object_indices(
-            result["object_index"], match
-        )
-        result["object_index"] = mapped
-        result["target_valid"] = result["target_valid"] & valid
-        result["quality_valid"] = result["quality_valid"] & valid
-    if "negative_object_index" in result:
-        mapped, valid = map_gt_object_indices(
-            result["negative_object_index"], match
-        )
-        result["negative_object_index"] = mapped
-        result["negative_valid"] = result["negative_valid"] & valid
-
-    # With predicted instance queries, an unmatched object must remain UNKNOWN.
-    # Do not use "complete label set" to turn unmatched prediction queries into
-    # negatives; that would punish instance errors through the grasp-quality head.
-    if "label_set_complete" in result:
-        result["label_set_complete"] = torch.zeros_like(
-            result["label_set_complete"], dtype=torch.bool
-        )
-    if "unmatched_quality_valid" in result:
-        result["unmatched_quality_valid"] = torch.zeros_like(
-            result["unmatched_quality_valid"], dtype=torch.bool
-        )
-    positive = result["target_valid"].any(-1)
-    negative = result.get(
-        "negative_valid",
-        torch.zeros_like(result["target_valid"]),
-    ).any(-1)
-    result["sample_valid"] = result["sample_valid"] & (
-        positive | negative
-    )
-    return result
 
 
 def gather_query_logits_to_gt_objects(

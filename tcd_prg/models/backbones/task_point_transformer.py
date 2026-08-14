@@ -13,7 +13,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from ..common import MaskedAttentionPool, masked_softmax
-from ..instance_segmentation import InstanceQueryHead, InstanceQueryOutput
+from ..instance_segmentation import InstanceMaskDecoder, InstanceQueryOutput
 from ..target_prompt import TargetPromptSelector
 
 
@@ -419,7 +419,7 @@ class TaskConditionedPointTransformer(nn.Module):
         activation_checkpointing: bool = True,
         scene_backbone: nn.Module | None = None,
         instance_queries: int = 32,
-        instance_decoder_layers: int = 2,
+        instance_decoder_layers: int = 6,
         instance_decoder_heads: int = 8,
         instance_objectness_threshold: float = 0.5,
         target_temperature: float = 0.25,
@@ -438,11 +438,12 @@ class TaskConditionedPointTransformer(nn.Module):
         self.scene_backbone = scene_backbone or TaskFreeSceneGeometryBackbone(
             dim, blocks, heads, neighbors, attention_points, activation_checkpointing
         )
-        self.instance_head = InstanceQueryHead(
+        self.instance_head = InstanceMaskDecoder(
             dim, instance_queries, num_categories,
             layers=instance_decoder_layers,
             heads=instance_decoder_heads,
             objectness_threshold=instance_objectness_threshold,
+            auxiliary_loss=True,
         )
         self.task_adapter = TaskConditioningAdapter(
             dim, task_dim, num_categories, num_regions,

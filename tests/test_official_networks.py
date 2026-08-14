@@ -8,6 +8,7 @@ from torch import nn
 from tcd_prg.config import ModelConfig
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.models.backbones import point_transformer_v3 as ptv3_adapter
+from tcd_prg.models.graspnet import FrozenGraspNetProposalGenerator
 
 
 class _FakeOfficialPTv3(nn.Module):
@@ -74,16 +75,49 @@ def test_ptv3_adapter_packs_variable_scene_lengths_after_grid_sample(monkeypatch
     assert torch.equal(data["coord"][0], xyz[0, 0])
 
 
-def test_task_and_global_grasp_use_one_shared_decoder() -> None:
+def test_task_and_global_grasp_use_one_shared_frozen_graspnet_adapter() -> None:
     model = TCDPRGModel(
         ModelConfig(
             feature_dim=16,
             task_dim=8,
-            grasp_decoder_heads=8,
+            task_grasp_scorer_heads=8,
             verifier_transformer_heads=8,
         )
     )
-    decoder_keys = [key for key in model.state_dict() if "grasp_decoder.decoder" in key]
-    assert decoder_keys
-    assert not any("task_grasp.decoder" in key for key in model.state_dict())
-    assert not any("global_grasp.decoder" in key for key in model.state_dict())
+    keys = tuple(model.state_dict())
+    assert any(key.startswith("task_grasp.candidate_transformer") for key in keys)
+    assert not any(key.startswith("graspnet.") for key in keys)
+    assert model.graspnet.network is None
+
+
+def test_frozen_graspnet_stays_fp32_inside_outer_autocast(monkeypatch) -> None:
+    class DtypeCheckingNetwork(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.projection = nn.Linear(3, 3)
+
+        def forward(self, inputs):
+            points = inputs["point_clouds"]
+            assert points.dtype == torch.float32
+            assert self.projection(points).dtype == torch.float32
+            return {}
+
+    generator = FrozenGraspNetProposalGenerator(
+        source_root="unused", checkpoint="unused", proposal_count=1, input_points=4
+    )
+    network = DtypeCheckingNetwork()
+    monkeypatch.setattr(generator, "_ensure_loaded", lambda device: network)
+    prediction = torch.zeros(1, 17)
+    prediction[:, 0] = 0.5
+    prediction[:, 1] = 0.04
+    prediction[:, 4:13] = torch.eye(3).reshape(1, 9)
+    generator.pred_decode = lambda _: [prediction]
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = generator(
+            torch.randn(1, 8, 3),
+            torch.ones(1, 8, dtype=torch.bool),
+        )
+
+    assert output["translation_world"].dtype == torch.float32
+    assert output["valid"].all()

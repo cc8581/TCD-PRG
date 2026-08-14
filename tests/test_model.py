@@ -15,6 +15,9 @@ from tcd_prg.models.policy import MaskedHierarchicalCandidateRouter
 from tcd_prg.models.push import PushHead
 
 
+pytestmark = pytest.mark.usefixtures("fake_graspnet")
+
+
 def _config() -> ModelConfig:
     return ModelConfig(
         feature_dim=32,
@@ -294,12 +297,18 @@ def test_policy_heads_match_training_contract(tiny_batch) -> None:
     assert set(output["task_grasp"]) == {
         "translation_world",
         "rotation_matrix",
-        "rotation_6d",
-        "width_raw",
         "width_m",
+        "depth_m",
         "quality_logit",
+        "graspnet_score",
         "attention_point_index",
-        "point_attention",
+        "object_logits",
+        "valid",
+        "graspnet_quality_logit",
+        "task_residual_logit",
+        "task_probability",
+        "local_support",
+        "region_support",
     }
     assert "object_logits" in output["global_grasp"]
     assert output["push"]["utility_delta"].shape[-1] == _config().num_direction_bins

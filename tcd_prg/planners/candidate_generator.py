@@ -204,6 +204,8 @@ class DenseCandidateGenerator:
             selected = self._nms_indices(
                 pose, width, score, objects, amount, global_grasp=True
             )
+            if "valid" in head:
+                selected = selected[head["valid"][row, selected]]
             rows.append({
                 "object": objects[selected],
                 "contact_world": translation[selected],
@@ -294,6 +296,8 @@ class DenseCandidateGenerator:
                 self.config.task_grasp_candidates,
                 global_grasp=False,
             )
+            if "valid" in task:
+                selected = selected[task["valid"][batch_row, selected]]
             if not bool(active[target_object]):
                 selected = selected[:0]
             if len(selected):
@@ -378,6 +382,8 @@ class DenseCandidateGenerator:
                     global_object.clamp(0, len(active) - 1)
                 ]
             )
+            if "valid" in global_head:
+                valid_remove &= global_head["valid"][batch_row]
             candidates = torch.nonzero(
                 valid_remove, as_tuple=False
             ).flatten()

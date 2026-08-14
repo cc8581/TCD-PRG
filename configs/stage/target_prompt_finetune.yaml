@@ -17,7 +17,6 @@ losses:
   instance: 1.0
   region: 0.25
   task_grasp: 0.25
-  global_grasp: 0.0
   physical_edge: 0.0
   task_edge: 0.0
   verify_overall: 0.0

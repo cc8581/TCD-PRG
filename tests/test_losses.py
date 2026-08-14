@@ -6,14 +6,11 @@ from tcd_prg.constants import ActionType, CandidateStatus
 from tcd_prg.datasets.capabilities import DatasetCapabilities
 from tcd_prg.diagnostics import family_gradient_norms
 from tcd_prg.losses.labels import (
-    _pack_grasp_set,
-    build_global_grasp_labels,
     build_grasp_proposal_labels,
     build_push_supervision,
 )
 from tcd_prg.losses.masked import multi_positive_listwise_loss, safe_smooth_l1
 from tcd_prg.losses.objective import TCDPRGObjective
-from tcd_prg.losses.proposal import CompleteGraspSetLoss
 from tcd_prg.losses.total import MultiTaskLoss
 from tcd_prg.losses.verifier import GraspVerifierLoss
 
@@ -92,11 +89,12 @@ def test_family_subtotal_is_weighted_mean_of_active_children_only() -> None:
     assert inactive.grad == 0
 
 
-def test_exactly_twelve_paper_level_objectives() -> None:
-    assert len(TCDPRGObjective.MODULE_OBJECTIVES) == 12
+def test_exactly_eleven_proposal_v2_objectives() -> None:
+    assert len(TCDPRGObjective.MODULE_OBJECTIVES) == 11
     assert tuple(MultiTaskLoss.DEFAULT_WEIGHTS) == TCDPRGObjective.MODULE_OBJECTIVES
     capabilities = DatasetCapabilities(
-        has_task_regions=True, has_task_grasps=True, has_global_grasps=True,
+        has_instance_masks=True, has_task_regions=True, has_task_grasps=True,
+        has_global_grasps=True,
         has_push_actions=True, has_pick_remove_actions=True, has_sequences=True,
         has_relation_graph=True,
     )
@@ -106,116 +104,6 @@ def test_exactly_twelve_paper_level_objectives() -> None:
     })
     assert total == 11
     assert len([name for name in terms if name.startswith("loss_") and name != "loss_total"]) == 11
-
-
-def test_complete_grasp_hungarian_matching_keeps_two_modes_distinct() -> None:
-    identity = torch.eye(3)
-    output = {
-        "translation_world": torch.tensor([[[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], requires_grad=True),
-        "rotation_matrix": identity.expand(1, 2, 3, 3).clone().requires_grad_(),
-        "width_m": torch.tensor([[0.06, 0.04]], requires_grad=True),
-        "quality_logit": torch.zeros(1, 2, requires_grad=True),
-    }
-    labels = {
-        "translation_world": torch.tensor([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]]),
-        "rotation_matrix": identity.expand(1, 2, 3, 3).clone(),
-        "width_m": torch.tensor([[0.04, 0.06]]),
-        "quality_target": torch.ones(1, 2),
-        "target_valid": torch.ones(1, 2, dtype=torch.bool),
-        "quality_valid": torch.ones(1, 2, dtype=torch.bool),
-        "sample_valid": torch.tensor([True]),
-    }
-    losses = CompleteGraspSetLoss()(output, labels)
-    assert losses["grasp_translation"] < 1e-7
-    assert losses["grasp_width"] < 1e-7
-    assert losses["grasp_quality_positive_queries"] == 2
-    assert losses["grasp_quality_negative_queries"] == 0
-    assert losses["grasp_ignored_unmatched_queries"] == 0
-    assert losses["grasp_supervised_rows"] == 1
-    losses["loss"].backward()
-
-
-def test_parallel_jaw_symmetric_rotation_has_zero_set_loss() -> None:
-    identity = torch.eye(3)
-    swapped = torch.diag(torch.tensor([-1.0, -1.0, 1.0]))
-    output = {
-        "translation_world": torch.zeros(1, 1, 3, requires_grad=True),
-        "rotation_matrix": swapped.expand(1, 1, 3, 3).clone().requires_grad_(),
-        "width_m": torch.full((1, 1), 0.05, requires_grad=True),
-        "quality_logit": torch.zeros(1, 1, requires_grad=True),
-    }
-    labels = {
-        "translation_world": torch.zeros(1, 1, 3),
-        "rotation_matrix": identity.expand(1, 1, 3, 3).clone(),
-        "width_m": torch.full((1, 1), 0.05),
-        "quality_target": torch.ones(1, 1),
-        "target_valid": torch.ones(1, 1, dtype=torch.bool),
-        "quality_valid": torch.ones(1, 1, dtype=torch.bool),
-        "sample_valid": torch.tensor([True]),
-    }
-    loss = CompleteGraspSetLoss()(output, labels)
-    assert loss["grasp_rotation"] < 1e-7
-    loss["loss"].backward()
-    assert torch.isfinite(output["rotation_matrix"].grad).all()
-
-
-def test_partial_grasp_set_does_not_make_unmatched_queries_negative() -> None:
-    identity = torch.eye(3)
-    output = {
-        "translation_world": torch.tensor(
-            [[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]]], requires_grad=True
-        ),
-        "rotation_matrix": identity.expand(1, 2, 3, 3).clone().requires_grad_(),
-        "width_m": torch.full((1, 2), 0.05, requires_grad=True),
-        "quality_logit": torch.tensor([[0.0, 100.0]], requires_grad=True),
-    }
-    labels = {
-        "translation_world": torch.zeros(1, 2, 3),
-        "rotation_matrix": identity.expand(1, 2, 3, 3).clone(),
-        "width_m": torch.full((1, 2), 0.05),
-        "quality_target": torch.tensor([[1.0, 0.0]]),
-        "target_valid": torch.tensor([[True, False]]),
-        "quality_valid": torch.tensor([[True, False]]),
-        "sample_valid": torch.tensor([True]),
-        "unmatched_quality_valid": torch.tensor([False]),
-    }
-    losses = CompleteGraspSetLoss()(output, labels)
-    assert torch.allclose(losses["grasp_quality"], torch.log(torch.tensor(2.0)))
-    assert losses["grasp_quality_positive_queries"] == 1
-    assert losses["grasp_quality_negative_queries"] == 0
-    assert losses["grasp_ignored_unmatched_queries"] == 1
-
-
-def test_only_queries_near_explicit_negatives_receive_negative_supervision() -> None:
-    identity = torch.eye(3)
-    output = {
-        "translation_world": torch.tensor([[
-            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [10.0, 0.0, 0.0]
-        ]]),
-        "rotation_matrix": identity.expand(1, 3, 3, 3).clone(),
-        "width_m": torch.full((1, 3), 0.05),
-        # The far open-world query must be ignored despite its high score.
-        "quality_logit": torch.tensor([[0.0, 0.0, 100.0]]),
-    }
-    labels = {
-        "translation_world": torch.tensor([[[0.0, 0.0, 0.0]]]),
-        "rotation_matrix": identity.expand(1, 1, 3, 3).clone(),
-        "width_m": torch.full((1, 1), 0.05),
-        "quality_target": torch.ones(1, 1),
-        "target_valid": torch.ones(1, 1, dtype=torch.bool),
-        "quality_valid": torch.ones(1, 1, dtype=torch.bool),
-        "sample_valid": torch.tensor([True]),
-        "unmatched_quality_valid": torch.tensor([False]),
-        "negative_translation_world": torch.tensor([[[1.0, 0.0, 0.0]]]),
-        "negative_rotation_matrix": identity.expand(1, 1, 3, 3).clone(),
-        "negative_width_m": torch.full((1, 1), 0.05),
-        "negative_valid": torch.ones(1, 1, dtype=torch.bool),
-    }
-    losses = CompleteGraspSetLoss()(output, labels)
-    assert torch.allclose(losses["grasp_quality"], torch.log(torch.tensor(2.0)))
-    assert losses["grasp_quality_positive_queries"] == 1
-    assert losses["grasp_quality_negative_queries"] == 1
-    assert losses["grasp_ignored_unmatched_queries"] == 1
 
 
 def test_verifier_reports_class_balance_and_prior_baseline() -> None:
@@ -301,86 +189,6 @@ def test_grasp_proposal_labels_require_verifier_contract() -> None:
     # verifier 字段是硬契约：缺失必须报错而非静默改变监督语义。
     with pytest.raises(KeyError):
         build_grasp_proposal_labels(batch, ModelConfig(task_grasp_candidates=1))
-
-
-def test_global_grasp_labels_require_sample_valid_mask() -> None:
-    pose = torch.zeros(1, 1, 7)
-    pose[..., 6] = 1.0
-    batch = {
-        "global_grasp_labels": {
-            "object_index": torch.zeros(1, 1, dtype=torch.long),
-            "grasp_pose_world": pose,
-            "width_m": torch.full((1, 1), 0.05),
-            "scene_executable": torch.tensor([[1]], dtype=torch.int8),
-            "valid_mask": torch.ones(1, 1, dtype=torch.bool),
-            "label_set_complete": torch.tensor([False]),
-        },
-    }
-    # global_loss_sample_valid 缺失时报错，绝不默认全部有效。
-    with pytest.raises(KeyError):
-        build_global_grasp_labels(batch, ModelConfig(global_grasp_candidates=1))
-
-
-def test_sampled_global_labels_never_imply_complete_unmatched_negatives() -> None:
-    pose = torch.zeros(1, 3, 7)
-    pose[..., 6] = 1.0
-    batch = {
-        "global_loss_sample_valid": torch.tensor([True]),
-        "global_grasp_labels": {
-            "object_index": torch.zeros(1, 3, dtype=torch.long),
-            "grasp_pose_world": pose,
-            "width_m": torch.full((1, 3), 0.05),
-            "scene_executable": torch.tensor([[1, 0, -1]], dtype=torch.int8),
-            "valid_mask": torch.ones(1, 3, dtype=torch.bool),
-            "label_set_complete": torch.tensor([False]),
-        },
-    }
-    labels = build_global_grasp_labels(batch, ModelConfig(global_grasp_candidates=3))
-    assert labels is not None
-    assert labels["target_valid"].sum().item() == 1
-    assert labels["negative_valid"].sum().item() == 1
-    assert not labels["unmatched_quality_valid"].item()
-
-
-def test_global_grasp_packing_balances_objects_before_truncation() -> None:
-    pose = torch.zeros(1, 8, 7)
-    pose[..., 6] = 1.0
-    packed = _pack_grasp_set(
-        pose, torch.full((1, 8), 0.05), torch.ones(1, 8, dtype=torch.bool),
-        torch.ones(1, 8), torch.ones(1, 8, dtype=torch.bool), 4,
-        object_index=torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]]),
-    )
-    assert packed["object_index"].tolist() == [[0, 1, 0, 1]]
-
-
-def test_global_grasp_object_assignment_is_an_internal_set_term() -> None:
-    identity = torch.eye(3)
-    object_logits = torch.tensor(
-        [[[10.0, -10.0], [-10.0, 10.0]]], requires_grad=True
-    )
-    output = {
-        "translation_world": torch.tensor(
-            [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]], requires_grad=True
-        ),
-        "rotation_matrix": identity.expand(1, 2, 3, 3).clone().requires_grad_(),
-        "width_m": torch.full((1, 2), 0.05, requires_grad=True),
-        "quality_logit": torch.full((1, 2), 10.0, requires_grad=True),
-        "object_logits": object_logits,
-    }
-    labels = {
-        "translation_world": output["translation_world"].detach().clone(),
-        "rotation_matrix": output["rotation_matrix"].detach().clone(),
-        "width_m": output["width_m"].detach().clone(),
-        "quality_target": torch.ones(1, 2),
-        "target_valid": torch.ones(1, 2, dtype=torch.bool),
-        "quality_valid": torch.ones(1, 2, dtype=torch.bool),
-        "object_index": torch.tensor([[0, 1]]),
-        "sample_valid": torch.tensor([True]),
-    }
-    loss = CompleteGraspSetLoss()(output, labels)
-    assert loss["grasp_object"] < 1e-6
-    loss["loss"].backward()
-    assert torch.isfinite(object_logits.grad).all()
 
 
 def test_push_utility_uses_ground_truth_direction_and_keeps_failed_transition() -> None:

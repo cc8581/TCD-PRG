@@ -79,6 +79,24 @@ class BackboneConfig:
 
 
 @dataclass(slots=True)
+class GraspNetConfig:
+    # Official graspnet-baseline is installed from the pinned third_party.lock.yaml entry.
+    source_root: str = ".deps/graspnet-baseline"
+    checkpoint: str = ".deps/checkpoints/graspnet-rs.tar"
+    freeze: bool = True
+    scene_input_points: int = 20_000
+    target_input_points: int = 20_000
+    global_proposals: int = 128
+    target_proposals: int = 128
+    num_view: int = 300
+    num_angle: int = 12
+    num_depth: int = 4
+    cylinder_radius: float = 0.05
+    hmin: float = -0.02
+    hmax_list: tuple[float, ...] = (0.01, 0.02, 0.03, 0.04)
+
+
+@dataclass(slots=True)
 class RegionHeadConfig:
     enabled: bool = True
     focal_alpha: float = 0.25
@@ -110,7 +128,7 @@ class ModelConfig:
     num_task_regions: int = 64
     # Sensor-only object decomposition. Q is a capacity, not a GT object index.
     instance_queries: int = 32
-    instance_decoder_layers: int = 2
+    instance_decoder_layers: int = 6
     instance_decoder_heads: int = 8
     instance_objectness_threshold: float = 0.5
     instance_matching_points: int = 2048
@@ -140,8 +158,10 @@ class ModelConfig:
     candidate_topk: int = 64
     task_grasp_candidates: int = 64
     global_grasp_candidates: int = 64
-    grasp_decoder_layers: int = 3
-    grasp_decoder_heads: int = 8
+    task_grasp_scorer_layers: int = 2
+    task_grasp_scorer_heads: int = 8
+    task_grasp_local_radius_m: float = 0.08
+    task_grasp_residual_scale: float = 1.0
     pick_remove_candidates: int = 16
     push_candidates: int = 16
     # push_candidates 是接触点预算；每个点再展开多个方向，最终总量受 max_push_candidates 限制。
@@ -215,7 +235,6 @@ class TrainingConfig:
         "unresolved_or_unknown",
     )
     # Unique scene-state Global Grasp stream is added once per action batch.
-    global_stream_weight: float = 1.0
     gradient_accumulation_steps: int = 1
     max_optimizer_steps: int = 100_000
     # validation_interval=0 仅用于没有验证集的启动阶段，正式实验不应关闭验证。
@@ -271,7 +290,6 @@ class TrainingConfig:
         "physical_edge": 0.25,
         "task_edge": 0.25,
         "task_grasp": 0.25,
-        "global_grasp": 0.25,
         "region": 0.1,
         "push_object": 0.1,
         "push_contact": 0.05,
@@ -353,7 +371,6 @@ class LossConfig:
     instance: float = 1.0
     region: float = 1.0
     task_grasp: float = 1.0
-    global_grasp: float = 1.0
     physical_edge: float = 0.5
     task_edge: float = 0.5
     verify_overall: float = 1.0
@@ -368,6 +385,7 @@ class LossConfig:
         "instance_dice": 2.0,
         "instance_category": 1.0,
         "target_query": 1.0,
+        "instance_auxiliary": 0.5,
         "region_focal": 1.0,
         "region_dice": 1.0,
         "region_visibility": 0.2,
@@ -377,7 +395,7 @@ class LossConfig:
         return {
             name: float(getattr(self, name))
             for name in (
-                "instance", "region", "task_grasp", "global_grasp", "physical_edge", "task_edge",
+                "instance", "region", "task_grasp", "physical_edge", "task_edge",
                 "verify_overall", "push_object", "push_contact", "push_direction",
                 "push_potential", "policy_candidate",
             )
@@ -426,6 +444,7 @@ class TCDPRGConfig:
     observation: ObservationConfig = field(default_factory=ObservationConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
     backbone: BackboneConfig = field(default_factory=BackboneConfig)
+    graspnet: GraspNetConfig = field(default_factory=GraspNetConfig)
     region_head: RegionHeadConfig = field(default_factory=RegionHeadConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     ablation: AblationConfig = field(default_factory=AblationConfig)
@@ -473,8 +492,6 @@ class TCDPRGConfig:
             raise ValueError(
                 "training.action_batch_coverage_strata contains an unknown action stratum"
             )
-        if self.training.global_stream_weight <= 0:
-            raise ValueError("training.global_stream_weight must be positive")
         if not 0.0 < self.training.data_fraction <= 1.0:
             raise ValueError("training.data_fraction must be in (0,1]")
         if self.training.scene_start < 0:
@@ -716,10 +733,23 @@ class TCDPRGConfig:
             raise ValueError("target_prompt_min_margin must be non-negative")
         if self.model.target_same_category_loss_boost < 1.0:
             raise ValueError("target_same_category_loss_boost must be >= 1")
-        if self.model.grasp_decoder_layers <= 0 or self.model.grasp_decoder_heads <= 0:
-            raise ValueError("Grasp decoder layers and heads must be positive")
-        if self.model.feature_dim % self.model.grasp_decoder_heads:
-            raise ValueError("feature_dim must be divisible by grasp_decoder_heads")
+        if (
+            self.model.task_grasp_scorer_layers <= 0
+            or self.model.task_grasp_scorer_heads <= 0
+        ):
+            raise ValueError("Task grasp scorer layers and heads must be positive")
+        if self.model.feature_dim % self.model.task_grasp_scorer_heads:
+            raise ValueError("feature_dim must be divisible by task_grasp_scorer_heads")
+        if min(
+            self.graspnet.scene_input_points,
+            self.graspnet.target_input_points,
+            self.graspnet.global_proposals,
+            self.graspnet.target_proposals,
+            self.graspnet.num_view,
+            self.graspnet.num_angle,
+            self.graspnet.num_depth,
+        ) <= 0:
+            raise ValueError("GraspNet point/proposal/discretization counts must be positive")
         if self.model.verifier_transformer_layers <= 0:
             raise ValueError("verifier_transformer_layers must be positive")
         if self.model.feature_dim % self.model.verifier_transformer_heads:
