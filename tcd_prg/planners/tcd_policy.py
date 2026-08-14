@@ -99,12 +99,22 @@ class TCDPRGPolicy(ManipulationPolicy):
         task_region_id: int,
         required_grasp_count: int,
         point_valid: np.ndarray | None = None,
+        source_view: np.ndarray | None = None,
+        camera_parameters: tuple[Any, ...] | None = None,
         target_prompt_xyz: np.ndarray | None = None,
         target_prompt_label: np.ndarray | None = None,
         continue_target: bool = False,
     ) -> dict[str, Any]:
         if point_valid is None:
             point_valid = np.ones(len(xyz), dtype=bool)
+        else:
+            point_valid = np.asarray(point_valid, dtype=bool)
+            if point_valid.shape != (len(xyz),):
+                raise ValueError("point_valid must be [N]")
+        if source_view is not None:
+            source_view = np.asarray(source_view)
+            if source_view.shape != (len(xyz),):
+                raise ValueError("source_view must be [N]")
         valid_index = np.flatnonzero(point_valid)
         if not len(valid_index):
             raise ValueError("Sensor observation contains no valid points")
@@ -134,6 +144,61 @@ class TCDPRGPolicy(ManipulationPolicy):
                 1, len(selected), dtype=torch.bool
             ),
         }
+        camera_index = self.config.graspnet.camera_view_index
+        camera_usable = (
+            source_view is not None
+            and camera_parameters is not None
+            and camera_index < len(camera_parameters)
+        )
+        camera_indices = (
+            np.flatnonzero(point_valid & (source_view == camera_index))
+            if camera_usable
+            else np.empty((0,), np.int64)
+        )
+        if len(camera_indices):
+            local = grid_sample_indices(
+                xyz[camera_indices], self.config.backbone.grid_size_m, training=False
+            )
+            camera_indices = camera_indices[local]
+            limit = max(
+                self.config.graspnet.scene_input_points,
+                self.config.graspnet.target_input_points,
+            )
+            if len(camera_indices) > limit:
+                camera_indices = camera_indices[
+                    np.linspace(0, len(camera_indices) - 1, limit, dtype=np.int64)
+                ]
+        camera_xyz = (
+            xyz[camera_indices]
+            if len(camera_indices)
+            else np.zeros((1, 3), np.float32)
+        )
+        model_inputs["graspnet_xyz_world"] = torch.from_numpy(camera_xyz)[None].float()
+        model_inputs["graspnet_point_mask"] = torch.tensor(
+            [[True] * len(camera_indices)] if len(camera_indices) else [[False]],
+            dtype=torch.bool,
+        )
+        model_inputs["source_view"] = torch.from_numpy(
+            source_view[selected] if source_view is not None else np.full(len(selected), -1)
+        )[None].long()
+        if camera_usable:
+            camera = camera_parameters[camera_index]
+            model_inputs["camera2_eye_world"] = torch.from_numpy(
+                np.asarray(camera.eye_world, np.float32)
+            )[None]
+            model_inputs["camera2_target_world"] = torch.from_numpy(
+                np.asarray(camera.target_world, np.float32)
+            )[None]
+            model_inputs["camera2_up_world"] = torch.from_numpy(
+                np.asarray(camera.up_world, np.float32)
+            )[None]
+        else:
+            model_inputs["camera2_eye_world"] = torch.zeros(1, 3)
+            model_inputs["camera2_target_world"] = torch.tensor([[0.0, 0.0, 1.0]])
+            model_inputs["camera2_up_world"] = torch.tensor([[0.0, -1.0, 0.0]])
+        model_inputs["camera2_valid"] = torch.tensor(
+            [bool(camera_usable and len(camera_indices))], dtype=torch.bool
+        )
         task_inputs = {
             "task_category_id": torch.tensor(
                 [int(task_category_id)], dtype=torch.long
@@ -251,6 +316,8 @@ class TCDPRGPolicy(ManipulationPolicy):
             int(observation.task_region_id),
             required,
             point_valid=observation.point_valid,
+            source_view=observation.source_view,
+            camera_parameters=observation.camera_parameters,
             target_prompt_xyz=prompt,
         )
 
@@ -369,6 +436,9 @@ class TCDPRGPolicy(ManipulationPolicy):
         task_region_id: int,
         required_grasp_count: int = 1,
         *,
+        point_valid: np.ndarray | None = None,
+        source_view: np.ndarray | None = None,
+        camera_parameters: tuple[Any, ...] | None = None,
         target_prompt_xyz: np.ndarray | None = None,
         target_prompt_label: np.ndarray | None = None,
         continue_target: bool = False,
@@ -381,6 +451,9 @@ class TCDPRGPolicy(ManipulationPolicy):
             int(task_category_id),
             int(task_region_id),
             int(required_grasp_count),
+            point_valid=point_valid,
+            source_view=source_view,
+            camera_parameters=camera_parameters,
             target_prompt_xyz=target_prompt_xyz,
             target_prompt_label=target_prompt_label,
             continue_target=continue_target,

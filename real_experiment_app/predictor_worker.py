@@ -44,6 +44,14 @@ def load_scene(path: str) -> FusedScene:
             data["instance_id"].copy(),
             data["source_view"].copy(),
             mapping,
+            tuple(
+                matrix.copy()
+                for matrix in (
+                    data["camera_to_world"]
+                    if "camera_to_world" in data.files
+                    else np.empty((0, 4, 4), np.float32)
+                )
+            ),
         )
 
 

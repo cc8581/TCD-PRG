@@ -4,6 +4,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -82,6 +83,22 @@ class TCDPRGPredictor:
         scene.category_by_instance = dict(result["category_by_instance"])
         return scene
 
+    @staticmethod
+    def _camera_parameters(scene: FusedScene) -> tuple[SimpleNamespace, ...]:
+        result = []
+        for transform in scene.camera_to_world:
+            value = np.asarray(transform, np.float32)
+            if value.shape != (4, 4) or not np.isfinite(value).all():
+                raise ValueError("camera_to_world must contain finite 4x4 transforms")
+            eye = value[:3, 3]
+            result.append(SimpleNamespace(
+                eye_world=eye,
+                target_world=eye + value[:3, 2],
+                # RGB-D camera Y points down; calibration up is its negative.
+                up_world=-value[:3, 1],
+            ))
+        return tuple(result)
+
     def predict(
         self,
         scene: FusedScene,
@@ -103,6 +120,8 @@ class TCDPRGPredictor:
                 int(category),
                 int(region),
                 int(required),
+                source_view=scene.source_view,
+                camera_parameters=self._camera_parameters(scene),
                 target_prompt_xyz=prompt,
                 continue_target=False,
                 enforce_target_confidence=True,
@@ -116,6 +135,8 @@ class TCDPRGPredictor:
                 int(category),
                 int(region),
                 int(required),
+                source_view=scene.source_view,
+                camera_parameters=self._camera_parameters(scene),
                 continue_target=True,
                 enforce_target_confidence=True,
             )

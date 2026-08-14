@@ -525,39 +525,27 @@ def build_object_query_push_supervision(
                     ) * neighborhood,
                 )
 
-    object_positive = torch.zeros_like(
-        gt_object_logits, dtype=torch.bool
-    )
-    object_evaluated = torch.zeros_like(
-        gt_object_logits, dtype=torch.bool
-    )
-    # Map each evaluated GT acted-object to its matched query, then gather back
-    # to GT axis by using the GT-space logits above.  Existing PushLoss therefore
-    # keeps its stable listwise semantics.
-    gt_object_count = match.gt_to_query.shape[1]
-    for batch_row in range(action_type.shape[0]):
-        eval_objects = batch["acted_object"][
-            batch_row, evaluated_push[batch_row]
-        ]
-        eval_objects = eval_objects[
-            (eval_objects >= 0)
-            & (eval_objects < gt_object_count)
-        ]
-        if len(eval_objects):
-            object_evaluated[
-                batch_row, torch.unique(eval_objects)
-            ] = True
-        pos_objects = batch["acted_object"][
-            batch_row, positive[batch_row]
-        ]
-        pos_objects = pos_objects[
-            (pos_objects >= 0)
-            & (pos_objects < gt_object_count)
-        ]
-        if len(pos_objects):
-            object_positive[
-                batch_row, torch.unique(pos_objects)
-            ] = True
+    if "push_object_known" in batch and "push_object_positive" in batch:
+        object_evaluated = batch["push_object_known"].bool().clone()
+        object_positive = batch["push_object_positive"].bool().clone()
+    else:
+        object_positive = torch.zeros_like(gt_object_logits, dtype=torch.bool)
+        object_evaluated = torch.zeros_like(gt_object_logits, dtype=torch.bool)
+        # Compatibility path for external action-group batches.
+        gt_object_count = match.gt_to_query.shape[1]
+        for batch_row in range(action_type.shape[0]):
+            eval_objects = batch["acted_object"][batch_row, evaluated_push[batch_row]]
+            eval_objects = eval_objects[
+                (eval_objects >= 0) & (eval_objects < gt_object_count)
+            ]
+            if len(eval_objects):
+                object_evaluated[batch_row, torch.unique(eval_objects)] = True
+            pos_objects = batch["acted_object"][batch_row, positive[batch_row]]
+            pos_objects = pos_objects[
+                (pos_objects >= 0) & (pos_objects < gt_object_count)
+            ]
+            if len(pos_objects):
+                object_positive[batch_row, torch.unique(pos_objects)] = True
 
     direction_positive = torch.zeros(
         (*candidate.shape, bins),

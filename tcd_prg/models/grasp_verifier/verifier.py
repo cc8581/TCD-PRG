@@ -13,7 +13,7 @@ class GripperSceneTaskVerifier(nn.Module):
     ``[B,K,L,C]``; output heads ``[B,K]``.
     """
 
-    HEADS = ("overall",)
+    HEADS = ("overall", "collision", "approach")
 
     def __init__(
         self,
@@ -50,6 +50,8 @@ class GripperSceneTaskVerifier(nn.Module):
             layer, layers, norm=nn.LayerNorm(hidden_dim)
         )
         self.overall = nn.Linear(hidden_dim, 1)
+        self.collision = nn.Linear(hidden_dim, 1)
+        self.approach = nn.Linear(hidden_dim, 1)
 
     def forward(
         self,
@@ -97,4 +99,7 @@ class GripperSceneTaskVerifier(nn.Module):
         flat_padding = padding.flatten(0, 1)
         encoded = self.transformer(flat_tokens, src_key_padding_mask=flat_padding)
         fused = encoded[:, 0].reshape(batch_size, candidates, -1)
-        return {"overall_logit": self.overall(fused).squeeze(-1)}
+        return {
+            f"{head}_logit": getattr(self, head)(fused).squeeze(-1)
+            for head in self.HEADS
+        }

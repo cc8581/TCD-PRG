@@ -81,7 +81,7 @@ class TaskGraspScorer(nn.Module):
     ) -> dict[str, Tensor]:
         translation = proposals["translation_world"]
         rotation = proposals["rotation_matrix"]
-        width = proposals["width_m"]
+        width = proposals.get("graspnet_width_m", proposals["width_m"])
         depth = proposals.get("depth_m", torch.zeros_like(width))
         valid = proposals.get("valid", torch.ones_like(width, dtype=torch.bool)).bool()
         gn_logit = proposals["quality_logit"]

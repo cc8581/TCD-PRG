@@ -28,6 +28,8 @@ class FusedScene:
     instance_id: np.ndarray
     source_view: np.ndarray
     category_by_instance: dict[int, int]
+    # Per-view camera XYZ -> robot-base/world homogeneous transforms.
+    camera_to_world: tuple[np.ndarray, ...] = ()
 
     @property
     def instance_ids(self) -> list[int]:
@@ -38,4 +40,3 @@ class FusedScene:
 class Prediction:
     action: dict[str, Any]
     inference_seconds: float
-

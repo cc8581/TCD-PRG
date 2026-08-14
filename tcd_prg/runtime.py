@@ -141,6 +141,11 @@ class UnifiedBatchCollator:
             grid_size_m=grid_size,
             training=self.training,
             point_count=self.config.dataset.scene_points,
+            graspnet_point_count=max(
+                self.config.graspnet.scene_input_points,
+                self.config.graspnet.target_input_points,
+            ),
+            graspnet_view_index=self.config.graspnet.camera_view_index,
         )
         # generated candidate manifest 每个 worker 只验证一次，单条 entry 仍逐样本校验来源签名。
         if self.config.training.generated_policy_candidate_cache:
@@ -188,4 +193,9 @@ class GlobalGraspBatchCollator:
             grid_size_m=grid_size,
             training=self.training,
             point_count=self.config.dataset.scene_points,
+            graspnet_point_count=max(
+                self.config.graspnet.scene_input_points,
+                self.config.graspnet.target_input_points,
+            ),
+            graspnet_view_index=self.config.graspnet.camera_view_index,
         )

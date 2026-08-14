@@ -141,7 +141,7 @@ def _attach_negative_grasp_set(
 def build_grasp_proposal_labels(
     batch: dict[str, Tensor], config: ModelConfig
 ) -> dict[str, Tensor]:
-    """Build the complete task-grasp set from final executable grasps."""
+    """Build sparse task-positive and explicit wrong-region grasp sets."""
 
     parameters = batch["action_parameters"]
     candidate = batch["candidate_mask"] & (batch["action_type"] == int(ActionType.TASK_GRASP))
@@ -152,21 +152,57 @@ def build_grasp_proposal_labels(
     overall_valid = parameters["verifier_overall_valid"].bool()
     overall = parameters["verifier_overall_target"].float()
     successful = torch.where(overall_valid, overall > 0.5, batch["action_improves_state"])
-    valid = (
-        candidate & successful & torch.isfinite(pose).all(-1) & torch.isfinite(width)
-        & (width >= config.min_grasp_width_m) & (width <= config.max_grasp_width_m)
-    )
     quality = torch.where(
         overall_valid, torch.nan_to_num(overall),
         torch.nan_to_num(parameters["grasp_confidence"], nan=1.0),
     ).clamp(0.0, 1.0)
-    known_negative = (
+    task_compatibility_valid = parameters.get(
+        "verifier_task_compatibility_valid", torch.zeros_like(candidate)
+    ).bool()
+    task_compatibility_target = parameters.get(
+        "verifier_task_compatibility_target", torch.zeros_like(width)
+    )
+    collision_valid = parameters.get(
+        "verifier_collision_valid", torch.zeros_like(candidate)
+    ).bool()
+    collision_target = parameters.get(
+        "verifier_collision_target", torch.zeros_like(width)
+    )
+    approach_valid = parameters.get(
+        "verifier_approach_valid", torch.zeros_like(candidate)
+    ).bool()
+    approach_target = parameters.get(
+        "verifier_approach_target", torch.zeros_like(width)
+    )
+    collision_diverted = (
+        candidate
+        & collision_valid
+        & (collision_target > 0.5)
+    )
+    approach_diverted = (
+        candidate
+        & approach_valid
+        & (approach_target < 0.5)
+    )
+    wrong_region = (
         candidate
         & (batch["evaluation_status"] == int(CandidateStatus.NEGATIVE))
         & torch.isfinite(pose).all(-1)
-        & torch.isfinite(width)
-        & (width >= config.min_grasp_width_m)
-        & (width <= config.max_grasp_width_m)
+        & task_compatibility_valid
+        & (task_compatibility_target < 0.5)
+        & ~collision_diverted
+        & ~approach_diverted
+    )
+    # Physical success alone is insufficient when an explicit task-incompatible
+    # annotation exists. Keep legacy positives without the optional task field,
+    # but make all three routed label sets mutually exclusive.
+    valid = (
+        candidate
+        & successful
+        & torch.isfinite(pose).all(-1)
+        & ~wrong_region
+        & ~collision_diverted
+        & ~approach_diverted
     )
     # 不再通过“已采样候选均已评价”推断完备性，只信任数据生产者的显式字段。
     label_set_complete = batch.get(
@@ -176,10 +212,26 @@ def build_grasp_proposal_labels(
     labels = _pack_grasp_set(
         pose, width, valid, quality, torch.ones_like(candidate), config.task_grasp_candidates
     )
-    _attach_negative_grasp_set(labels, pose, width, known_negative)
+    _attach_negative_grasp_set(labels, pose, width, wrong_region)
+    labels["wrong_region_translation_world"] = labels.pop(
+        "negative_translation_world"
+    )
+    labels["wrong_region_rotation_matrix"] = labels.pop(
+        "negative_rotation_matrix"
+    )
+    labels["wrong_region_width_m"] = labels.pop("negative_width_m")
+    labels["wrong_region_valid"] = labels.pop("negative_valid")
+    labels["width_valid"] = (
+        labels["target_valid"]
+        & torch.isfinite(labels["width_m"])
+        & (labels["width_m"] >= config.min_grasp_width_m)
+        & (labels["width_m"] <= config.max_grasp_width_m)
+    )
+    labels["collision_diverted_to_verifier"] = collision_diverted.sum(-1)
+    labels["approach_diverted_to_verifier"] = approach_diverted.sum(-1)
     labels["label_set_complete"] = label_set_complete
-    labels["sample_valid"] = valid.any(-1) | known_negative.any(-1) | label_set_complete
-    labels["unmatched_quality_valid"] = label_set_complete
+    labels["sample_valid"] = valid.any(-1) | wrong_region.any(-1)
+    labels["unmatched_quality_valid"] = torch.zeros_like(label_set_complete)
     return labels
 
 
@@ -340,10 +392,16 @@ def build_verifier_labels(batch: dict[str, Tensor]) -> dict[str, Tensor]:
     candidate_valid = batch["verifier_inputs"]["candidate_valid"]
     target = batch["action_parameters"]["verifier_overall_target"]
     valid = batch["action_parameters"]["verifier_overall_valid"] & candidate_valid
-    return {
+    result = {
         "overall_target": torch.nan_to_num(target),
         "overall_valid": valid & torch.isfinite(target),
     }
+    for head in ("collision", "approach"):
+        head_target = batch["action_parameters"][f"verifier_{head}_target"]
+        head_valid = batch["action_parameters"][f"verifier_{head}_valid"] & candidate_valid
+        result[f"{head}_target"] = torch.nan_to_num(head_target)
+        result[f"{head}_valid"] = head_valid & torch.isfinite(head_target)
+    return result
 
 
 def build_region_labels(batch: dict[str, Tensor]) -> dict[str, Tensor] | None:

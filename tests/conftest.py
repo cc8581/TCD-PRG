@@ -72,12 +72,20 @@ def dataset_root() -> Path:
 def tiny_batch() -> dict[str, torch.Tensor]:
     torch.manual_seed(7)
     b, n, o = 1, 24, 3
+    xyz = torch.randn(b, n, 3)
     instance = torch.arange(n)[None] % o
     relation = torch.zeros(b, o, o, 5)
     relation[:, 0, 1, 2] = 1
     return {
-        "xyz": torch.randn(b, n, 3),
+        "xyz": xyz,
         "rgb": torch.rand(b, n, 3),
+        "source_view": torch.full((b, n), 2, dtype=torch.long),
+        "graspnet_xyz_world": xyz.clone(),
+        "graspnet_point_mask": torch.ones(b, n, dtype=torch.bool),
+        "camera2_eye_world": torch.zeros(b, 3),
+        "camera2_target_world": torch.tensor([[0.0, 0.0, 1.0]]),
+        "camera2_up_world": torch.tensor([[0.0, -1.0, 0.0]]),
+        "camera2_valid": torch.ones(b, dtype=torch.bool),
         "instance_id": instance,
         "point_mask": torch.ones(b, n, dtype=torch.bool),
         "target_mask": instance == 1,

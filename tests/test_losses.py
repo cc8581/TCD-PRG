@@ -191,6 +191,48 @@ def test_grasp_proposal_labels_require_verifier_contract() -> None:
         build_grasp_proposal_labels(batch, ModelConfig(task_grasp_candidates=1))
 
 
+def test_task_grasp_label_routes_are_mutually_exclusive() -> None:
+    pose = torch.zeros(1, 4, 7)
+    pose[..., 6] = 1.0
+    batch = {
+        "candidate_mask": torch.ones(1, 4, dtype=torch.bool),
+        "action_type": torch.full((1, 4), int(ActionType.TASK_GRASP)),
+        "evaluation_status": torch.tensor([[
+            int(CandidateStatus.POSITIVE),
+            int(CandidateStatus.NEGATIVE),
+            int(CandidateStatus.NEGATIVE),
+            int(CandidateStatus.NEGATIVE),
+        ]]),
+        "action_improves_state": torch.tensor([[True, False, False, False]]),
+        "action_parameters": {
+            "task_grasp_pose_world": pose,
+            "grasp_width_m": torch.full((1, 4), 0.05),
+            "grasp_confidence": torch.ones(1, 4),
+            "verifier_overall_valid": torch.ones(1, 4, dtype=torch.bool),
+            # Deliberately mark every pose physically executable: explicit subtype
+            # routing must still prevent wrong/collision/approach from becoming positive.
+            "verifier_overall_target": torch.ones(1, 4),
+            "verifier_task_compatibility_valid": torch.tensor(
+                [[True, True, False, False]]
+            ),
+            "verifier_task_compatibility_target": torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0]]
+            ),
+            "verifier_collision_valid": torch.tensor([[False, False, True, False]]),
+            "verifier_collision_target": torch.tensor([[0.0, 0.0, 1.0, 0.0]]),
+            "verifier_approach_valid": torch.tensor([[False, False, False, True]]),
+            "verifier_approach_target": torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+        },
+    }
+    labels = build_grasp_proposal_labels(
+        batch, ModelConfig(task_grasp_candidates=4)
+    )
+    assert labels["target_valid"].sum().item() == 1
+    assert labels["wrong_region_valid"].sum().item() == 1
+    assert labels["collision_diverted_to_verifier"].item() == 1
+    assert labels["approach_diverted_to_verifier"].item() == 1
+
+
 def test_push_utility_uses_ground_truth_direction_and_keeps_failed_transition() -> None:
     output = {
         "object_logits": torch.zeros(1, 1),

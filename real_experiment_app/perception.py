@@ -126,4 +126,11 @@ def fuse_frames(frames: list[RGBDFrame], segments, settings: dict) -> FusedScene
 
     # -1 means "not assigned yet". The integrated InstanceQueryHead fills it.
     instance = np.full(len(xyz), -1, np.int64)
-    return FusedScene(xyz, rgb, instance, source, {})
+    return FusedScene(
+        xyz,
+        rgb,
+        instance,
+        source,
+        {},
+        tuple(np.asarray(frame.camera_to_base, np.float32) for frame in frames),
+    )

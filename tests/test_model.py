@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tcd_prg.config import AblationConfig, ModelConfig
+from tcd_prg.config import AblationConfig, GraspNetConfig, ModelConfig
+from tcd_prg.constants import ActionType
 from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.models.common import ActionCandidateEncoder
@@ -13,6 +14,7 @@ from tcd_prg.models.dependency_graph.hgt import derive_dependency_masks
 from tcd_prg.models.grasp_verifier import GripperSceneTaskVerifier
 from tcd_prg.models.policy import MaskedHierarchicalCandidateRouter
 from tcd_prg.models.push import PushHead
+from tcd_prg.planners import DenseCandidateGenerator
 
 
 pytestmark = pytest.mark.usefixtures("fake_graspnet")
@@ -294,7 +296,7 @@ def test_network_features_do_not_depend_on_simulation_object_pose(tiny_batch) ->
 
 def test_policy_heads_match_training_contract(tiny_batch) -> None:
     output = TCDPRGModel(_config()).eval()(tiny_batch)
-    assert set(output["task_grasp"]) == {
+    assert {
         "translation_world",
         "rotation_matrix",
         "width_m",
@@ -309,12 +311,50 @@ def test_policy_heads_match_training_contract(tiny_batch) -> None:
         "task_probability",
         "local_support",
         "region_support",
-    }
+        "graspnet_width_m",
+        "ag_width_m",
+        "target_grasp_valid",
+        "target_crop_points",
+    } <= set(output["task_grasp"])
+    assert torch.equal(
+        output["task_grasp"]["width_m"], output["task_grasp"]["ag_width_m"]
+    )
     assert "object_logits" in output["global_grasp"]
     assert output["push"]["utility_delta"].shape[-1] == _config().num_direction_bins
     assert "approach_logits" not in output["push"]
     assert "risk_logits" not in output["push"]
     assert "pick_remove" not in output
+
+
+def test_camera2_to_ag_width_to_dense_candidate_end_to_end(tiny_batch) -> None:
+    config = _config()
+    config.instance_objectness_threshold = 0.0
+    graspnet = GraspNetConfig(
+        target_crop_probability=0.0,
+        target_min_crop_points=1,
+        target_proposals=8,
+        global_proposals=8,
+    )
+    model = TCDPRGModel(config, graspnet_config=graspnet).eval()
+    with torch.no_grad():
+        output = model(tiny_batch)
+        candidates = DenseCandidateGenerator(config).generate(
+            model, tiny_batch, output
+        )
+
+    task = output["task_grasp"]
+    assert task["target_grasp_valid"].all()
+    assert task["valid"].any()
+    assert torch.equal(task["width_m"], task["ag_width_m"])
+    assert torch.all((task["ag_width_m"] >= 0.0) & (task["ag_width_m"] <= 0.095))
+    task_candidates = candidates["valid"] & (
+        candidates["type"] == int(ActionType.TASK_GRASP)
+    )
+    assert task_candidates.any()
+    assert torch.all(
+        (candidates["width_m"][task_candidates] >= 0.0)
+        & (candidates["width_m"][task_candidates] <= 0.095)
+    )
 
 
 def test_default_task_query_capacity_has_certification_margin() -> None:

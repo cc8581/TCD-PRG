@@ -79,8 +79,13 @@ class SceneObservation:
             raise ValueError("object arrays disagree")
         if any(c.sensor_type.lower() == "oracle" for c in self.camera_parameters):
             raise ValueError("Oracle camera leakage in formal SceneObservation")
-        if self.source_view is not None and np.any(self.source_view >= len(self.camera_parameters)):
-            raise ValueError("source_view references a disallowed camera")
+        if self.source_view is not None:
+            if self.source_view.shape != (n,):
+                raise ValueError("source_view must be [N]")
+            if np.any(self.source_view < 0) or np.any(
+                self.source_view >= len(self.camera_parameters)
+            ):
+                raise ValueError("source_view references a disallowed camera")
         if self.region_target is not None and self.region_target.shape != (n,):
             raise ValueError("region_target must be [N]")
         if self.region_valid is not None and self.region_valid.shape != (n,):
@@ -183,6 +188,17 @@ class SequenceLabels:
 
 
 @dataclass(slots=True)
+class PushObjectStateGroup:
+    """Known Push object outcomes aggregated at one scene/state/task key."""
+
+    scene_id: int
+    state_id: int
+    task_index: int
+    evaluated_object: np.ndarray
+    positive_object: np.ndarray
+
+
+@dataclass(slots=True)
 class GlobalGraspLabels:
     # scene_executable: 1=正、0=负、-1=未认证；UNKNOWN 不能当作负样本。
     """Task-free grasps with a visible-surface anchor and contact-centre pose.
@@ -241,6 +257,7 @@ class UnifiedSample:
     state_labels: StateLabels
     candidates: ActionCandidateGroup
     sequences: tuple[SequenceLabels, ...]
+    push_object_state: PushObjectStateGroup | None = None
     global_grasps: GlobalGraspLabels | None = None
     # A state can occur in several task/action groups.  Only one representative
     # group carries task-free global-grasp supervision so a state is not

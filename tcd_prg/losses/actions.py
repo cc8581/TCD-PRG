@@ -20,6 +20,7 @@ class PushLoss(nn.Module):
         object_positive = labels["object_positive"].bool() & labels["object_valid_mask"].bool()
         object_negative = labels["object_valid_mask"].bool() & ~object_positive
         object_effective = object_positive.any(-1) & object_negative.any(-1)
+        known_per_state = labels["object_valid_mask"].sum(-1).float()
         direction_positive = (
             labels["direction_positive"].bool() & labels["direction_evaluated"].bool()
         )
@@ -38,6 +39,10 @@ class PushLoss(nn.Module):
             "push_direction_bin_diagnostic": direction_bin,
             "push_direction_residual_diagnostic": direction_residual,
             "push_object_effective_rows": object_effective.sum().float(),
+            "push_known_objects_per_state": known_per_state.mean(),
+            "push_multiobject_states": (known_per_state >= 2).sum().float(),
+            "push_positive_objects": object_positive.sum().float(),
+            "push_negative_objects": object_negative.sum().float(),
             "push_contact_positive_points": contact_positive.sum().float(),
             "push_contact_negative_points": contact_negative.sum().float(),
             "push_contact_valid_points": labels["contact_valid"].sum().float(),

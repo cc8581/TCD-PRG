@@ -67,8 +67,32 @@ class GraspVerifierLoss(nn.Module):
         auroc, average_precision, ranking_metrics_valid = self._ranking_metrics(
             logits, positive, negative
         )
+        head_losses = [loss] if valid.any() else []
+        auxiliary_metrics: dict[str, Tensor] = {}
+        for head in ("collision", "approach"):
+            head_logits = output.get(f"{head}_logit", logits.new_zeros(logits.shape))
+            head_target = labels.get(
+                f"{head}_target", logits.new_zeros(logits.shape)
+            ).float()
+            head_valid = labels.get(
+                f"{head}_valid", torch.zeros_like(valid)
+            ).bool() & torch.isfinite(head_target)
+            if head_valid.any():
+                head_loss = F.binary_cross_entropy_with_logits(
+                    head_logits[head_valid], head_target[head_valid]
+                )
+                head_losses.append(head_loss)
+            else:
+                head_loss = head_logits.sum() * 0.0
+            auxiliary_metrics[f"verifier_{head}_loss"] = head_loss.detach()
+            auxiliary_metrics[f"verifier_{head}_valid_candidates"] = (
+                head_valid.sum().float().detach()
+            )
+        joint_loss = (
+            torch.stack(head_losses).mean() if head_losses else logits.sum() * 0.0
+        )
         return {
-            "loss": loss,
+            "loss": joint_loss,
             "verifier_valid_candidates": valid_count,
             "verifier_supervised_rows": valid.reshape(valid.shape[0], -1).any(-1).sum().float(),
             "verifier_positive_candidates": positive.sum().float(),
@@ -82,4 +106,5 @@ class GraspVerifierLoss(nn.Module):
             "verifier_auroc": auroc,
             "verifier_average_precision": average_precision,
             "verifier_ranking_metrics_valid": ranking_metrics_valid,
+            **auxiliary_metrics,
         }

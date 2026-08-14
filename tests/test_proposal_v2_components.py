@@ -54,10 +54,10 @@ def test_task_grasp_score_loss_has_proposal_metrics():
         "rotation_matrix": eye.reshape(1,1,3,3).repeat(b,m,1,1),
         "width_m": torch.full((b,m), .04),
         "target_valid": torch.tensor([[True,False]]),
-        "negative_translation_world": torch.tensor([[[.1,0,0.],[0.,0.,0.]]]),
-        "negative_rotation_matrix": eye.reshape(1,1,3,3).repeat(b,m,1,1),
-        "negative_width_m": torch.full((b,m), .04),
-        "negative_valid": torch.tensor([[True,False]]),
+        "wrong_region_translation_world": torch.tensor([[[.1,0,0.],[0.,0.,0.]]]),
+        "wrong_region_rotation_matrix": eye.reshape(1,1,3,3).repeat(b,m,1,1),
+        "wrong_region_width_m": torch.full((b,m), .04),
+        "wrong_region_valid": torch.tensor([[True,False]]),
         "label_set_complete": torch.tensor([False]),
     }
     out = loss_fn(pred, labels)
@@ -89,3 +89,45 @@ def test_task_grasp_matching_respects_parallel_jaw_symmetry():
 
     assert float(output["task_grasp_positive_proposals"]) == 1.0
     assert float(output["task_proposal_recall_at_16"]) == 1.0
+
+
+def test_ag_width_is_not_part_of_proposal_identity():
+    loss_fn = TaskGraspScoringLoss(translation_m=0.02, rotation_deg=20)
+    eye = torch.eye(3).reshape(1, 1, 3, 3)
+    prediction = {
+        "translation_world": torch.zeros(1, 1, 3),
+        "rotation_matrix": eye,
+        "width_m": torch.tensor([[0.095]]),
+        "quality_logit": torch.zeros(1, 1, requires_grad=True),
+        "valid": torch.ones(1, 1, dtype=torch.bool),
+    }
+    labels = {
+        "translation_world": torch.zeros(1, 1, 3),
+        "rotation_matrix": eye,
+        "width_m": torch.tensor([[0.005]]),
+        "target_valid": torch.ones(1, 1, dtype=torch.bool),
+    }
+    output = loss_fn(prediction, labels)
+    assert float(output["task_grasp_positive_proposals"]) == 1.0
+
+
+def test_unknown_only_task_row_has_zero_scorer_gradient():
+    logits = torch.tensor([[0.7, -0.3]], requires_grad=True)
+    eye = torch.eye(3).reshape(1, 1, 3, 3)
+    prediction = {
+        "translation_world": torch.zeros(1, 2, 3),
+        "rotation_matrix": eye.repeat(1, 2, 1, 1),
+        "quality_logit": logits,
+        "valid": torch.ones(1, 2, dtype=torch.bool),
+    }
+    labels = {
+        "translation_world": torch.zeros(1, 1, 3),
+        "rotation_matrix": eye,
+        "target_valid": torch.zeros(1, 1, dtype=torch.bool),
+        "wrong_region_translation_world": torch.zeros(1, 1, 3),
+        "wrong_region_rotation_matrix": eye,
+        "wrong_region_valid": torch.zeros(1, 1, dtype=torch.bool),
+    }
+    output = TaskGraspScoringLoss()(prediction, labels)
+    output["loss"].backward()
+    assert torch.equal(logits.grad, torch.zeros_like(logits))

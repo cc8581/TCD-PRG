@@ -72,6 +72,11 @@ class PredictorClient:
             rgb=scene.rgb,
             instance_id=scene.instance_id,
             source_view=scene.source_view,
+            camera_to_world=(
+                np.stack(scene.camera_to_world).astype(np.float32)
+                if scene.camera_to_world
+                else np.empty((0, 4, 4), np.float32)
+            ),
             category_keys=np.asarray(
                 list(scene.category_by_instance.keys()), np.int64
             ),

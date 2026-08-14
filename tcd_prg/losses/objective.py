@@ -13,6 +13,7 @@ from tcd_prg.constants import ActionType, CandidateStatus
 from tcd_prg.datasets.capabilities import DatasetCapabilities
 
 from .actions import PushLoss
+from .ag_width import AGWidthLoss
 from .graph import DependencyGraphLoss
 from .instance import (
     InstanceSetLoss,
@@ -106,6 +107,10 @@ class TCDPRGObjective(nn.Module):
             translation_m=model_config.policy_grasp_match_translation_m,
             rotation_deg=model_config.policy_grasp_match_rotation_deg,
             width_m=model_config.policy_grasp_match_width_m,
+        )
+        self.ag_width = AGWidthLoss(
+            translation_m=model_config.policy_grasp_match_translation_m,
+            rotation_deg=model_config.policy_grasp_match_rotation_deg,
         )
         self.graph = DependencyGraphLoss()
         self.push = PushLoss()
@@ -219,6 +224,13 @@ class TCDPRGObjective(nn.Module):
             "rgb": batch["rgb"],
             "point_mask": batch["point_mask"],
         }
+        for key in (
+            "source_view", "graspnet_xyz_world", "graspnet_point_mask",
+            "camera2_eye_world", "camera2_target_world", "camera2_up_world",
+            "camera2_valid",
+        ):
+            if key in batch:
+                model_inputs[key] = batch[key]
         if "grid_coord" in batch:
             model_inputs["grid_coord"] = batch["grid_coord"]
         view: dict[str, Any] = {"model_inputs": model_inputs}
@@ -455,18 +467,57 @@ class TCDPRGObjective(nn.Module):
                 task_labels = build_grasp_proposal_labels(
                     batch, self.model_config
                 )
-                if task_labels["sample_valid"].any():
-                    score_losses = self.task_grasp(
-                        output["task_grasp"], task_labels
-                    )
-                    families["task_grasp"] = score_losses
-                    supervised_rows = score_losses[
-                        "task_grasp_supervised_rows"
-                    ]
-                    activity["active_loss_task_grasp"] = (
-                        supervised_rows
-                        / max(1, output["task_grasp"]["quality_logit"].shape[0])
-                    )
+                # Run even when the sparse label set has no match. This keeps
+                # crop/proposal health metrics present on every task batch while
+                # the loss remains a connected zero for UNKNOWN-only rows.
+                score_losses = self.task_grasp(
+                    output["task_grasp"], task_labels
+                )
+                width_losses = self.ag_width(output["task_grasp"], task_labels)
+                score_losses["task_grasp_score_loss"] = score_losses[
+                    "loss"
+                ].detach()
+                score_losses["ag_width_loss"] = width_losses["loss"].detach()
+                score_losses["loss"] = score_losses["loss"] + width_losses["loss"]
+                score_losses.update({
+                    key: value
+                    for key, value in width_losses.items()
+                    if key != "loss"
+                })
+                task_output = output["task_grasp"]
+                score_losses["graspnet_valid_proposals_per_row"] = (
+                    task_output["valid"].float().sum(-1).mean().detach()
+                )
+                score_losses["target_crop_points"] = task_output[
+                    "target_crop_points"
+                ].float().mean().detach()
+                if "graspnet_instance_id" in batch:
+                    crop = task_output["target_crop_mask"].bool()
+                    instance = batch["graspnet_instance_id"]
+                    target_object = batch["target_object"][:, None]
+                    score_losses["target_crop_purity"] = (
+                        ((instance == target_object) & crop).float().sum()
+                        / crop.float().sum().clamp_min(1.0)
+                    ).detach()
+                    attention = task_output["graspnet_attention_point_index"]
+                    rows = torch.arange(
+                        attention.shape[0], device=attention.device
+                    )[:, None]
+                    proposal_target = (
+                        instance[rows, attention] == target_object
+                    ) & task_output["valid"].bool()
+                    score_losses["target_proposal_ratio"] = (
+                        proposal_target.float().sum()
+                        / task_output["valid"].float().sum().clamp_min(1.0)
+                    ).detach()
+                families["task_grasp"] = score_losses
+                supervised_rows = score_losses[
+                    "task_grasp_supervised_rows"
+                ]
+                activity["active_loss_task_grasp"] = (
+                    supervised_rows
+                    / max(1, output["task_grasp"]["quality_logit"].shape[0])
+                )
 
             if (
                 output["graph"] is not None
@@ -573,6 +624,18 @@ class TCDPRGObjective(nn.Module):
                             "push_object_effective_rows"
                         ]
                     ),
+                    "push_known_objects_per_state": push_losses[
+                        "push_known_objects_per_state"
+                    ],
+                    "push_multiobject_states": push_losses[
+                        "push_multiobject_states"
+                    ],
+                    "push_positive_objects": push_losses[
+                        "push_positive_objects"
+                    ],
+                    "push_negative_objects": push_losses[
+                        "push_negative_objects"
+                    ],
                 }
                 families["push_contact"] = {
                     "loss": push_losses["push_contact"],

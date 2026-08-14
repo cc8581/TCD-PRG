@@ -73,6 +73,10 @@ def test_fusion_removes_table_before_integrated_instance_perception():
     assert np.all(scene.instance_id == -1)
     assert scene.instance_ids == []
     assert set(scene.source_view.tolist()) == {0, 1}
+    assert len(scene.camera_to_world) == 2
+    assert np.allclose(
+        scene.camera_to_world[1], synthetic_frame("b", 1).camera_to_base
+    )
 
 
 def test_capture_fails_closed_without_table_calibration():

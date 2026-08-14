@@ -88,6 +88,9 @@ class GraspNetConfig:
     target_input_points: int = 20_000
     global_proposals: int = 128
     target_proposals: int = 128
+    camera_view_index: int = 2
+    target_crop_probability: float = 0.5
+    target_min_crop_points: int = 32
     num_view: int = 300
     num_angle: int = 12
     num_depth: int = 4
@@ -748,8 +751,13 @@ class TCDPRGConfig:
             self.graspnet.num_view,
             self.graspnet.num_angle,
             self.graspnet.num_depth,
+            self.graspnet.target_min_crop_points,
         ) <= 0:
             raise ValueError("GraspNet point/proposal/discretization counts must be positive")
+        if self.graspnet.camera_view_index < 0:
+            raise ValueError("GraspNet camera_view_index must be non-negative")
+        if not 0.0 < self.graspnet.target_crop_probability < 1.0:
+            raise ValueError("GraspNet target_crop_probability must lie in (0,1)")
         if self.model.verifier_transformer_layers <= 0:
             raise ValueError("verifier_transformer_layers must be positive")
         if self.model.feature_dim % self.model.verifier_transformer_heads:

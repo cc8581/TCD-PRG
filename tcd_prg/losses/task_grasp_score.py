@@ -17,23 +17,24 @@ def _rotation_error_deg(first: Tensor, second: Tensor) -> Tensor:
 class TaskGraspScoringLoss(nn.Module):
     """Match frozen GraspNet proposals to task-grasp labels, then learn ranking.
 
-    Unknown unmatched proposals remain ignored unless the producer explicitly marks
-    the label set complete. Physically plausible but task-incompatible labeled
-    grasps therefore become useful hard negatives without inventing negatives.
+    Identity uses translation plus parallel-jaw-symmetric rotation only. Explicit
+    wrong-region labels are the sole task negatives; every unmatched proposal stays
+    UNKNOWN because the stored grasp sets are intentionally incomplete.
     """
 
     def __init__(
         self,
         translation_m: float = 0.02,
         rotation_deg: float = 20.0,
-        width_m: float = 0.01,
+        width_m: float | None = None,
         bce_weight: float = 1.0,
         ranking_weight: float = 1.0,
     ) -> None:
         super().__init__()
+        # Compatibility-only argument: width is intentionally not proposal identity.
+        del width_m
         self.translation_m = float(translation_m)
         self.rotation_deg = float(rotation_deg)
-        self.width_m = float(width_m)
         self.bce_weight = float(bce_weight)
         self.ranking_weight = float(ranking_weight)
 
@@ -41,11 +42,9 @@ class TaskGraspScoringLoss(nn.Module):
         self,
         translation: Tensor,
         rotation: Tensor,
-        width: Tensor,
         valid: Tensor,
         target_translation: Tensor,
         target_rotation: Tensor,
-        target_width: Tensor,
         target_valid: Tensor,
     ) -> Tensor:
         result = torch.zeros_like(valid)
@@ -57,11 +56,9 @@ class TaskGraspScoringLoss(nn.Module):
             translation[candidates].float(), target_translation[targets].float()
         )
         r = _rotation_error_deg(rotation[candidates].float(), target_rotation[targets].float())
-        w = (width[candidates, None] - target_width[targets][None]).abs()
         compatible = (
             (t <= self.translation_m)
             & (r <= self.rotation_deg)
-            & (w <= self.width_m)
         )
         result[candidates] = compatible.any(-1)
         return result
@@ -75,31 +72,28 @@ class TaskGraspScoringLoss(nn.Module):
         valid = prediction.get("valid", torch.ones_like(logits, dtype=torch.bool)).bool()
         positive = torch.zeros_like(valid)
         negative = torch.zeros_like(valid)
+        positive_wrong_region_overlap = torch.zeros_like(valid)
 
         for row in range(logits.shape[0]):
             positive[row] = self._match_set(
                 prediction["translation_world"][row],
                 prediction["rotation_matrix"][row],
-                prediction["width_m"][row],
                 valid[row],
                 labels["translation_world"][row],
                 labels["rotation_matrix"][row],
-                labels["width_m"][row],
                 labels["target_valid"][row],
             )
-            if "negative_valid" in labels:
-                negative[row] = self._match_set(
+            if "wrong_region_valid" in labels:
+                raw_negative = self._match_set(
                     prediction["translation_world"][row],
                     prediction["rotation_matrix"][row],
-                    prediction["width_m"][row],
-                    valid[row] & ~positive[row],
-                    labels["negative_translation_world"][row],
-                    labels["negative_rotation_matrix"][row],
-                    labels["negative_width_m"][row],
-                    labels["negative_valid"][row],
+                    valid[row],
+                    labels["wrong_region_translation_world"][row],
+                    labels["wrong_region_rotation_matrix"][row],
+                    labels["wrong_region_valid"][row],
                 )
-            if bool(labels.get("label_set_complete", torch.zeros((), device=logits.device))[row]):
-                negative[row] |= valid[row] & ~positive[row]
+                positive_wrong_region_overlap[row] = raw_negative & positive[row]
+                negative[row] = raw_negative & ~positive[row]
 
         known = valid & (positive | negative)
         target = positive.to(logits.dtype)
@@ -127,7 +121,8 @@ class TaskGraspScoringLoss(nn.Module):
         base_logit = prediction.get("graspnet_quality_logit", prediction["quality_logit"])
         recalls: dict[str, Tensor] = {}
         for amount in (16, 32, 64):
-            hit = logits.new_zeros((logits.shape[0],))
+            translation_hit = logits.new_zeros((logits.shape[0],))
+            translation_rotation_hit = logits.new_zeros((logits.shape[0],))
             applicable = labels["target_valid"].any(-1)
             for row in range(logits.shape[0]):
                 candidates = torch.nonzero(valid[row], as_tuple=False).flatten()
@@ -136,11 +131,29 @@ class TaskGraspScoringLoss(nn.Module):
                 order = candidates[
                     base_logit[row, candidates].argsort(descending=True, stable=True)
                 ][:amount]
-                hit[row] = positive[row, order].any().to(hit.dtype)
+                targets = torch.nonzero(
+                    labels["target_valid"][row], as_tuple=False
+                ).flatten()
+                distance = torch.cdist(
+                    prediction["translation_world"][row, order].float(),
+                    labels["translation_world"][row, targets].float(),
+                )
+                translation_hit[row] = (distance <= self.translation_m).any().to(
+                    translation_hit.dtype
+                )
+                translation_rotation_hit[row] = positive[row, order].any().to(
+                    translation_rotation_hit.dtype
+                )
             denom = applicable.float().sum().clamp_min(1.0)
-            recalls[f"task_proposal_recall_at_{amount}"] = (
-                (hit * applicable.float()).sum() / denom
+            recalls[f"proposal_translation_recall_at_{amount}"] = (
+                (translation_hit * applicable.float()).sum() / denom
             )
+            recalls[f"proposal_translation_rotation_recall_at_{amount}"] = (
+                (translation_rotation_hit * applicable.float()).sum() / denom
+            )
+            recalls[f"task_proposal_recall_at_{amount}"] = recalls[
+                f"proposal_translation_rotation_recall_at_{amount}"
+            ]
 
         top1_positive = logits.new_zeros((logits.shape[0],))
         has_candidate = valid.any(-1)
@@ -150,20 +163,45 @@ class TaskGraspScoringLoss(nn.Module):
             rows = torch.arange(logits.shape[0], device=logits.device)
             top1_positive = positive[rows, top1].float()
         supervised = known.any(-1)
+        unknown = valid & ~known
         top1_metric = (
             (top1_positive * supervised.float()).sum()
             / supervised.float().sum().clamp_min(1.0)
         )
 
+        positive_count = positive.float().sum().detach()
+        wrong_region_count = negative.float().sum().detach()
+        unknown_count = unknown.float().sum().detach()
+        supervised_rows = supervised.float().sum().detach()
+        effective_rows = row_effective.float().sum().detach()
         return {
             "loss": loss,
             "task_grasp_score_bce": bce.detach(),
             "task_grasp_score_ranking": ranking.detach(),
-            "task_grasp_effective_rows": row_effective.float().sum().detach(),
-            "task_grasp_supervised_rows": supervised.float().sum().detach(),
-            "task_grasp_positive_proposals": positive.float().sum().detach(),
-            "task_grasp_negative_proposals": negative.float().sum().detach(),
+            "task_grasp_effective_rows": effective_rows,
+            "task_grasp_supervised_rows": supervised_rows,
+            "task_grasp_positive_proposals": positive_count,
+            "task_grasp_wrong_region_negative_proposals": wrong_region_count,
+            "task_grasp_negative_proposals": wrong_region_count,
             "task_grasp_known_proposals": known.float().sum().detach(),
+            "task_grasp_unknown_proposals": unknown_count,
+            "task_grasp_effective_ranking_rows": effective_rows,
+            # Stable protocol names used by training dashboards.
+            "task_positive_proposals": positive_count,
+            "task_wrong_region_negative_proposals": wrong_region_count,
+            "task_unknown_proposals": unknown_count,
+            "task_supervised_rows": supervised_rows,
+            "task_effective_ranking_rows": effective_rows,
+            "positive_wrong_region_overlap": (
+                positive_wrong_region_overlap.float().sum().detach()
+            ),
+            "collision_diverted_to_verifier": labels.get(
+                "collision_diverted_to_verifier", logits.new_zeros(logits.shape[0])
+            ).float().sum().detach(),
+            "approach_diverted_to_verifier": labels.get(
+                "approach_diverted_to_verifier", logits.new_zeros(logits.shape[0])
+            ).float().sum().detach(),
             "task_grasp_top1_positive": top1_metric.detach(),
+            "task_top1_positive": top1_metric.detach(),
             **{key: value.detach() for key, value in recalls.items()},
         }

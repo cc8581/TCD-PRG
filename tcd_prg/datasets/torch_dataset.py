@@ -13,7 +13,7 @@ import math
 import os
 from collections import Counter, defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import islice
 from pathlib import Path
 
@@ -21,8 +21,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler
 
+from tcd_prg.constants import ActionType, CandidateStatus
+
 from .base import DatasetAdapter
-from .types import GlobalGraspSample, UnifiedSample
+from .types import GlobalGraspSample, PushObjectStateGroup, UnifiedSample
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +232,24 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
         self.units = tuple(
             StateGroupUnit(*unit, stratum=strata.get(unit, "unclassified")) for unit in raw_units
         )
+        # Push-object labels describe the whole (scene,state,task), not whichever
+        # action group happened to survive a train/validation subset. Re-read the
+        # immutable published index so UNKNOWN/excluded groups cannot silently turn
+        # known objects into unsupervised objects.
+        push_iterator = adapter.iter_action_groups(split)
+        if scene_ids is not None:
+            allowed_push_scenes = frozenset(int(scene_id) for scene_id in scene_ids)
+            push_iterator = (
+                item for item in push_iterator if int(item[0]) in allowed_push_scenes
+            )
+        push_state_units: dict[tuple[int, int, int], list[StateGroupUnit]] = defaultdict(list)
+        for raw_unit in push_iterator:
+            unit = StateGroupUnit(*raw_unit)
+            push_state_units[(unit.scene_id, unit.state_id, unit.task_index)].append(unit)
+        self._push_state_units = {
+            key: tuple(values) for key, values in push_state_units.items()
+        }
+        self._push_state_cache: dict[tuple[int, int, int], PushObjectStateGroup] = {}
         self.global_grasp_mode = global_grasp_mode
         representatives: dict[tuple[int, int], int] = {}
         certified: frozenset[tuple[int, int, int]] | None = None
@@ -270,13 +290,48 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
             self.global_grasp_mode == "representative"
             and index in self._global_grasp_representatives
         )
-        return self.adapter.load_sample(
+        sample = self.adapter.load_sample(
             unit.scene_id,
             unit.state_id,
             unit.task_index,
             unit.group_index,
             include_global_grasps=include_global,
         )
+        key = (unit.scene_id, unit.state_id, unit.task_index)
+        push_state = self._push_state_cache.get(key)
+        if push_state is None:
+            evaluated_objects: set[int] = set()
+            positive_objects: set[int] = set()
+            for state_unit in self._push_state_units[key]:
+                if state_unit.group_index == unit.group_index:
+                    group = sample.candidates
+                else:
+                    group = self.adapter.load_action_group(
+                        state_unit.scene_id, state_unit.group_index
+                    )
+                push = group.valid_mask & (
+                    group.action_type == int(ActionType.PUSH)
+                )
+                evaluated = push & (
+                    group.evaluation_status != int(CandidateStatus.UNKNOWN_UNTESTED)
+                )
+                evaluated_objects.update(
+                    int(value) for value in group.acted_object[evaluated] if int(value) >= 0
+                )
+                positive_objects.update(
+                    int(value)
+                    for value in group.acted_object[evaluated & group.success_mask]
+                    if int(value) >= 0
+                )
+            push_state = PushObjectStateGroup(
+                scene_id=unit.scene_id,
+                state_id=unit.state_id,
+                task_index=unit.task_index,
+                evaluated_object=np.asarray(sorted(evaluated_objects), np.int64),
+                positive_object=np.asarray(sorted(positive_objects), np.int64),
+            )
+            self._push_state_cache[key] = push_state
+        return replace(sample, push_object_state=push_state)
 
     def balanced_sampler(
         self, seed: int = 2026, samples: int | None = None

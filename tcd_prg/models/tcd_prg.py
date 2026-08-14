@@ -10,6 +10,13 @@ from tcd_prg.config import (
     AblationConfig, BackboneConfig, GraphConfig, GraspNetConfig, ModelConfig, RouterConfig
 )
 from tcd_prg.constants import ActionType
+from tcd_prg.geometry.camera import (
+    camera_to_world_points,
+    camera_to_world_rotations,
+    graspnet_to_tcd_rotation,
+    look_at_rotation_world_camera,
+    world_to_camera_points,
+)
 
 from .backbones import (
     PointTransformerV3SceneGeometryBackbone,
@@ -25,10 +32,15 @@ from .policy import (
 )
 from .push import PushHead
 from .region import TaskRegionHead
-from .task_grasp import TaskGraspScorer
+from .task_grasp import AGWidthAdapter, TaskGraspScorer
 
 
-SENSOR_KEYS = frozenset({"xyz", "rgb", "point_mask", "grid_coord"})
+SENSOR_KEYS = frozenset({
+    "xyz", "rgb", "point_mask", "grid_coord", "source_view",
+    "graspnet_xyz_world", "graspnet_point_mask",
+    "camera2_eye_world", "camera2_target_world", "camera2_up_world",
+    "camera2_valid",
+})
 TASK_KEYS = frozenset({
     "task_category_id", "task_region_id", "remaining_steps",
     "required_grasp_count",
@@ -130,6 +142,11 @@ class TCDPRGModel(nn.Module):
             local_radius_m=c.task_grasp_local_radius_m,
             residual_scale=c.task_grasp_residual_scale,
         )
+        self.ag_width = AGWidthAdapter(
+            c.feature_dim,
+            max_width_m=c.max_grasp_width_m,
+            local_radius_m=c.task_grasp_local_radius_m,
+        )
         self.verifier = GripperSceneTaskVerifier(
             c.feature_dim, c.feature_dim,
             c.verifier_transformer_layers, c.verifier_transformer_heads,
@@ -227,14 +244,128 @@ class TCDPRGModel(nn.Module):
     def _forward_global_grasp_neutral(
         self, scene: Any, instance: Any, sensor: dict[str, Tensor]
     ) -> dict[str, Tensor]:
-        del scene
-        return self.graspnet(
-            sensor["xyz"],
-            sensor["point_mask"],
+        proposals = self._forward_camera_graspnet(
+            sensor,
+            target_probability=None,
             instance_probability=instance.mask_probability,
+            strict_target_crop=False,
             proposal_count=self.graspnet_config.global_proposals,
             input_points=self.graspnet_config.scene_input_points,
         )
+        width = self.ag_width(
+            proposals,
+            scene.point_features,
+            sensor["xyz"],
+            sensor["point_mask"],
+            sensor["point_mask"].to(sensor["xyz"].dtype),
+        )
+        return {**proposals, **width}
+
+    def _forward_camera_graspnet(
+        self,
+        sensor: dict[str, Tensor],
+        *,
+        target_probability: Tensor | None,
+        instance_probability: Tensor,
+        strict_target_crop: bool,
+        proposal_count: int,
+        input_points: int,
+    ) -> dict[str, Tensor]:
+        """Run official GraspNet on the independent Camera2 cloud."""
+
+        required = {
+            "graspnet_xyz_world", "graspnet_point_mask", "camera2_eye_world",
+            "camera2_target_world", "camera2_up_world", "camera2_valid",
+        }
+        missing = required - sensor.keys()
+        if missing:
+            raise KeyError(f"Missing Camera2 GraspNet sensor inputs: {sorted(missing)}")
+        camera_xyz_world = sensor["graspnet_xyz_world"]
+        camera_point_mask = sensor["graspnet_point_mask"].bool()
+        rotation_world_camera = look_at_rotation_world_camera(
+            sensor["camera2_eye_world"],
+            sensor["camera2_target_world"],
+            sensor["camera2_up_world"],
+        )
+        camera_xyz = world_to_camera_points(
+            camera_xyz_world, rotation_world_camera, sensor["camera2_eye_world"]
+        )
+
+        nearest_scene = self._nearest_reference_index(
+            camera_xyz_world,
+            camera_point_mask,
+            sensor["xyz"],
+            sensor["point_mask"],
+        )
+        camera_instance_probability = torch.gather(
+            instance_probability,
+            2,
+            nearest_scene[:, None].expand(-1, instance_probability.shape[1], -1),
+        )
+        if strict_target_crop:
+            if target_probability is None:
+                raise ValueError("strict target crop requires predicted target_probability")
+            camera_target_probability = target_probability.gather(1, nearest_scene)
+            crop_mask = camera_point_mask & (
+                camera_target_probability >= self.graspnet_config.target_crop_probability
+            )
+            crop_count = crop_mask.sum(-1)
+            target_grasp_valid = (
+                sensor["camera2_valid"].bool()
+                & (crop_count >= self.graspnet_config.target_min_crop_points)
+            )
+            crop_mask = crop_mask & target_grasp_valid[:, None]
+        else:
+            camera_target_probability = camera_point_mask.to(camera_xyz.dtype)
+            crop_mask = camera_point_mask & sensor["camera2_valid"][:, None].bool()
+            crop_count = crop_mask.sum(-1)
+            target_grasp_valid = sensor["camera2_valid"].bool() & crop_mask.any(-1)
+
+        proposal = self.graspnet(
+            camera_xyz,
+            crop_mask,
+            instance_probability=camera_instance_probability,
+            proposal_count=proposal_count,
+            input_points=input_points,
+        )
+        translation_camera = proposal["translation_world"]
+        rotation_camera_graspnet = proposal["rotation_matrix"]
+        rotation_camera_tcd = graspnet_to_tcd_rotation(rotation_camera_graspnet)
+        translation_world = camera_to_world_points(
+            translation_camera, rotation_world_camera, sensor["camera2_eye_world"]
+        )
+        rotation_world_tcd = camera_to_world_rotations(
+            rotation_camera_tcd, rotation_world_camera
+        )
+        valid = proposal["valid"].bool() & target_grasp_valid[:, None]
+        scene_attention, scene_found = self._nearest_scene_point(
+            sensor["xyz"], sensor["point_mask"], translation_world, valid
+        )
+        scene_membership = torch.gather(
+            instance_probability,
+            2,
+            scene_attention[:, None].expand(-1, instance_probability.shape[1], -1),
+        ).transpose(1, 2)
+        graspnet_width = proposal["width_m"]
+        return {
+            **proposal,
+            "translation_camera": translation_camera,
+            "rotation_matrix_camera_graspnet": rotation_camera_graspnet,
+            "rotation_matrix_camera_tcd": rotation_camera_tcd,
+            "translation_world": translation_world,
+            "rotation_matrix": rotation_world_tcd,
+            "graspnet_width_m": graspnet_width,
+            "width_m": graspnet_width,
+            "graspnet_attention_point_index": proposal["attention_point_index"],
+            "attention_point_index": scene_attention,
+            "object_logits": scene_membership.clamp_min(1e-6).log(),
+            "valid": valid & scene_found,
+            "target_grasp_valid": target_grasp_valid,
+            "target_crop_mask": crop_mask,
+            "target_crop_probability": camera_target_probability,
+            "target_crop_points": crop_count,
+            "graspnet_valid_proposals_per_row": valid.sum(-1),
+        }
 
     def _forward_global_grasp(
         self, encoded: Any, sensor: dict[str, Tensor]
@@ -260,6 +391,35 @@ class TCDPRGModel(nn.Module):
                 scene, instance, sensor
             ),
         }
+
+    @staticmethod
+    @torch.no_grad()
+    def _nearest_reference_index(
+        query: Tensor,
+        query_mask: Tensor,
+        reference: Tensor,
+        reference_mask: Tensor,
+        chunk_size: int = 1024,
+    ) -> Tensor:
+        """Nearest reference point without materializing an N-by-M matrix."""
+
+        result = torch.zeros(
+            query.shape[:2], dtype=torch.long, device=query.device
+        )
+        for row in range(query.shape[0]):
+            queries = torch.nonzero(query_mask[row], as_tuple=False).flatten()
+            references = torch.nonzero(
+                reference_mask[row], as_tuple=False
+            ).flatten()
+            if not len(queries) or not len(references):
+                continue
+            for start in range(0, len(queries), chunk_size):
+                local = queries[start : start + chunk_size]
+                distance = torch.cdist(
+                    query[row, local].float(), reference[row, references].float()
+                )
+                result[row, local] = references[distance.argmin(-1)]
+        return result
 
     @staticmethod
     @torch.no_grad()
@@ -368,7 +528,10 @@ class TCDPRGModel(nn.Module):
                     result[head_name]["translation_world"].detach().float(),
                 )
                 nearest = distance.argmin(-1)
-            quality = result[head_name]["quality_logit"].gather(1, nearest)
+            # Router consumes grasp quality as evidence; it must not redefine the
+            # Task Scorer objective. In particular, an UNKNOWN-only task row must
+            # not train the scorer indirectly through the policy loss.
+            quality = result[head_name]["quality_logit"].gather(1, nearest).detach()
             evidence[..., 1] = torch.where(
                 eligible, torch.sigmoid(quality), evidence[..., 1]
             )
@@ -636,14 +799,22 @@ class TCDPRGModel(nn.Module):
             encoded.target_probability,
             sensor["point_mask"],
         )
-        target_proposals = self.graspnet(
-            sensor["xyz"],
-            sensor["point_mask"],
-            importance=encoded.target_probability,
+        target_proposals = self._forward_camera_graspnet(
+            sensor,
+            target_probability=encoded.target_probability,
             instance_probability=encoded.instance.mask_probability,
+            strict_target_crop=True,
             proposal_count=self.graspnet_config.target_proposals,
             input_points=self.graspnet_config.target_input_points,
         )
+        target_width = self.ag_width(
+            target_proposals,
+            encoded.point_features,
+            sensor["xyz"],
+            sensor["point_mask"],
+            encoded.target_probability,
+        )
+        target_proposals = {**target_proposals, **target_width}
         task_grasp = self.task_grasp(
             target_proposals,
             encoded.point_features,

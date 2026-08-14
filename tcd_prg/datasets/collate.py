@@ -104,9 +104,77 @@ def _limit_point_sample(
     return indices[selected], None if grid_coord is None else grid_coord[selected]
 
 
+def _camera_view_payload(
+    observations: list[Any],
+    *,
+    view_index: int,
+    grid_size_m: float | None,
+    training: bool,
+    point_count: int,
+) -> dict[str, Tensor]:
+    """Build an independently sampled real-camera cloud and calibration payload."""
+
+    xyz_arrays: list[np.ndarray] = []
+    instance_arrays: list[np.ndarray] = []
+    eye, target, up, camera_valid = [], [], [], []
+    for observation in observations:
+        source_view = observation.source_view
+        usable = (
+            source_view is not None
+            and view_index < len(observation.camera_parameters)
+        )
+        if usable:
+            source_indices = np.flatnonzero(source_view == view_index)
+        else:
+            source_indices = np.empty((0,), dtype=np.int64)
+        if len(source_indices) and grid_size_m is not None:
+            selected, grid = grid_sample(
+                observation.xyz[source_indices], float(grid_size_m), training
+            )
+            selected, _ = _limit_point_sample(
+                selected, grid, point_count, training
+            )
+            source_indices = source_indices[selected]
+        elif len(source_indices):
+            local = np.arange(len(source_indices), dtype=np.int64)
+            selected, _ = _limit_point_sample(local, None, point_count, training)
+            source_indices = source_indices[selected]
+        xyz_arrays.append(observation.xyz[source_indices])
+        instance_arrays.append(observation.instance_id[source_indices])
+        if usable:
+            camera = observation.camera_parameters[view_index]
+            eye.append(np.asarray(camera.eye_world, np.float32))
+            target.append(np.asarray(camera.target_world, np.float32))
+            up.append(np.asarray(camera.up_world, np.float32))
+            camera_valid.append(bool(len(source_indices)))
+        else:
+            eye.append(np.zeros(3, np.float32))
+            target.append(np.asarray([0.0, 0.0, 1.0], np.float32))
+            up.append(np.asarray([0.0, -1.0, 0.0], np.float32))
+            camera_valid.append(False)
+
+    xyz, point_mask = _pad(xyz_arrays)
+    instance_id, _ = _pad(instance_arrays, -1)
+    if xyz.shape[1] == 0:
+        xyz = torch.zeros((len(observations), 1, 3), dtype=torch.float32)
+        point_mask = torch.zeros((len(observations), 1), dtype=torch.bool)
+        instance_id = torch.full((len(observations), 1), -1, dtype=torch.long)
+    return {
+        "graspnet_xyz_world": xyz.float(),
+        "graspnet_point_mask": point_mask.bool(),
+        # Loss/metrics only. TCDPRGModel.SENSOR_KEYS intentionally excludes it.
+        "graspnet_instance_id": instance_id.long(),
+        "camera2_eye_world": torch.from_numpy(np.stack(eye)).float(),
+        "camera2_target_world": torch.from_numpy(np.stack(target)).float(),
+        "camera2_up_world": torch.from_numpy(np.stack(up)).float(),
+        "camera2_valid": torch.tensor(camera_valid, dtype=torch.bool),
+    }
+
+
 def collate_unified(
     samples: list[UnifiedSample], *, grid_size_m: float | None = None,
     training: bool = False, point_count: int = 0,
+    graspnet_point_count: int = 0, graspnet_view_index: int = 2,
 ) -> dict[str, Any]:
     if not samples:
         raise ValueError("Cannot collate an empty batch")
@@ -184,6 +252,22 @@ def collate_unified(
     indirect_blocker, _ = _pad([x.state_labels.indirect_blocker_mask for x in samples], False)
     actionable_blocker, _ = _pad([x.state_labels.actionable_blocker_mask for x in samples], False)
     object_count = object_pose.shape[1]
+    push_object_known = torch.zeros(
+        (len(samples), object_count), dtype=torch.bool
+    )
+    push_object_positive = torch.zeros_like(push_object_known)
+    for row, sample in enumerate(samples):
+        state_group = sample.push_object_state
+        if state_group is None:
+            continue
+        known = torch.from_numpy(state_group.evaluated_object).long()
+        positive_objects = torch.from_numpy(state_group.positive_object).long()
+        known = known[(known >= 0) & (known < object_count)]
+        positive_objects = positive_objects[
+            (positive_objects >= 0) & (positive_objects < object_count)
+        ]
+        push_object_known[row, known] = True
+        push_object_positive[row, positive_objects] = True
     # prerequisite_object_order 转成有向先后关系，仅对有明确顺序的物体对监督。
     topology_target = torch.zeros(
         (len(samples), object_count, object_count), dtype=torch.bool
@@ -207,10 +291,29 @@ def collate_unified(
                 candidates_remaining.append(max(0, len(sequence.policy_action_ids) - int(position)))
         remaining_steps_valid.append(bool(candidates_remaining))
         remaining_steps_target.append(min(candidates_remaining) if candidates_remaining else 0)
+    camera_payload = _camera_view_payload(
+        observations,
+        view_index=graspnet_view_index,
+        grid_size_m=grid_size_m,
+        training=training,
+        point_count=graspnet_point_count,
+    )
+    source_view, _ = _pad(
+        [
+            (
+                x.source_view[i]
+                if x.source_view is not None
+                else np.full(len(i), -1, np.int16)
+            )
+            for x, i in zip(observations, point_indices, strict=True)
+        ],
+        -1,
+    )
     result = {
         "xyz": xyz.float(),
         "rgb": rgb.float(),
         "point_mask": point_mask,
+        "source_view": source_view.long(),
         "instance_id": instance.long(),
         "target_mask": target_mask.bool(),
         "target_object": torch.tensor([x.target_object for x in observations], dtype=torch.long),
@@ -220,6 +323,8 @@ def collate_unified(
         "object_present": object_present.bool(),
         "object_active": object_active.bool(),
         "object_category_id": object_category_id.long(),
+        "push_object_known": push_object_known,
+        "push_object_positive": push_object_positive,
         "task_category_id": torch.tensor(
             [x.object_category_id[x.target_object] for x in observations], dtype=torch.long
         ),
@@ -269,6 +374,7 @@ def collate_unified(
         "remaining_steps_target": torch.tensor(remaining_steps_target, dtype=torch.float32),
         "remaining_steps_valid": torch.tensor(remaining_steps_valid, dtype=torch.bool),
         "samples": samples,
+        **camera_payload,
     }
     if grid_coord is not None:
         # These are the coordinates used for representative selection.  Passing
@@ -323,6 +429,7 @@ def collate_unified(
 def collate_global_grasp(
     samples: list[Any], *, grid_size_m: float | None = None,
     training: bool = False, point_count: int = 0,
+    graspnet_point_count: int = 0, graspnet_view_index: int = 2,
 ) -> dict[str, Any]:
     """Minimal collator for the independent Global Grasp stream.
 
@@ -445,6 +552,17 @@ def collate_global_grasp(
         # these dataclass objects on CPU.
         "samples": samples,
     }
+    # The neutral PTv3 stream still consumes the fused world cloud above, while
+    # every GraspNet forward receives an independently sampled real-camera view.
+    result.update(
+        _camera_view_payload(
+            observations,
+            view_index=graspnet_view_index,
+            grid_size_m=grid_size_m,
+            training=training,
+            point_count=graspnet_point_count,
+        )
+    )
     if grid_coord is not None:
         result["grid_coord"] = grid_coord.to(torch.int32)
     return result
