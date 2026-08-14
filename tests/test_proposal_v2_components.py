@@ -64,3 +64,28 @@ def test_task_grasp_score_loss_has_proposal_metrics():
     assert out["loss"].requires_grad
     assert float(out["task_proposal_recall_at_16"]) == 1.0
     assert float(out["task_grasp_top1_positive"]) == 1.0
+
+
+def test_task_grasp_matching_respects_parallel_jaw_symmetry():
+    loss_fn = TaskGraspScoringLoss()
+    eye = torch.eye(3)
+    jaw_swap = torch.diag(torch.tensor([-1.0, -1.0, 1.0]))
+    prediction = {
+        "translation_world": torch.zeros(1, 1, 3),
+        "rotation_matrix": jaw_swap.reshape(1, 1, 3, 3),
+        "width_m": torch.full((1, 1), 0.04),
+        "quality_logit": torch.zeros(1, 1, requires_grad=True),
+        "valid": torch.ones(1, 1, dtype=torch.bool),
+    }
+    labels = {
+        "translation_world": torch.zeros(1, 1, 3),
+        "rotation_matrix": eye.reshape(1, 1, 3, 3),
+        "width_m": torch.full((1, 1), 0.04),
+        "target_valid": torch.ones(1, 1, dtype=torch.bool),
+        "label_set_complete": torch.zeros(1, dtype=torch.bool),
+    }
+
+    output = loss_fn(prediction, labels)
+
+    assert float(output["task_grasp_positive_proposals"]) == 1.0
+    assert float(output["task_proposal_recall_at_16"]) == 1.0

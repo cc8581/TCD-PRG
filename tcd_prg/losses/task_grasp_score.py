@@ -1,18 +1,17 @@
 """Proposal-level supervision for the task-region residual grasp scorer."""
 from __future__ import annotations
 
-import math
-
 import torch
 from torch import Tensor, nn
+
+from tcd_prg.geometry.se3 import parallel_jaw_rotation_distance
 
 
 def _rotation_error_deg(first: Tensor, second: Tensor) -> Tensor:
     # first [K,3,3], second [M,3,3] -> [K,M]
-    relative = torch.einsum("kij,mjl->kmil", first.transpose(-1, -2), second)
-    trace = relative.diagonal(dim1=-2, dim2=-1).sum(-1)
-    cosine = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
-    return torch.rad2deg(torch.acos(cosine))
+    return torch.rad2deg(
+        parallel_jaw_rotation_distance(first[:, None], second[None])
+    )
 
 
 class TaskGraspScoringLoss(nn.Module):
