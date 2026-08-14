@@ -57,7 +57,9 @@ class OfflineModelEvaluator:
         # inserted into the performance evaluator, whose output is standard-only.
         del loss_terms
         batch_size = batch["xyz"].shape[0]
-        graph_labels = build_graph_labels(batch) if output.get("graph") is not None else None
+        # Predicted object queries are unordered. Objective stores labels already
+        # remapped through the Hungarian instance assignment.
+        graph_labels = output.get("graph_labels_aligned")
         verifier_labels = (
             build_verifier_labels(batch) if output.get("verifier") is not None else None
         )

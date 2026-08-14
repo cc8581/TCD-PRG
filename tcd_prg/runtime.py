@@ -60,10 +60,18 @@ def create_observation_provider(config: TCDPRGConfig, allow_render: bool = False
 def create_adapter(config: TCDPRGConfig, allow_render: bool = False):
     if config.dataset.adapter != "task_oriented_clutter":
         raise ValueError(f"No registered adapter named {config.dataset.adapter}")
+    # Legacy cached observations were keyed with point_count=0 (the complete
+    # rendered cloud).  Keep that request contract unchanged and apply the
+    # configured model point budget in the collator after the cache read.
+    # Otherwise changing dataset.scene_points would turn every strict-cache
+    # lookup into a miss and incorrectly require regenerating the cache.
+    cache_point_count = (
+        0 if config.observation.provider == "cached" else config.dataset.scene_points
+    )
     return TaskOrientedClutterAdapter(
         config.dataset.root,
         observation_provider=create_observation_provider(config, allow_render),
-        point_count=config.dataset.scene_points,
+        point_count=cache_point_count,
         renderer_version=config.observation.renderer_version,
         camera_profile=config.observation.camera_profile,
         functional_region_root=config.dataset.functional_region_root,
@@ -128,7 +136,12 @@ class UnifiedBatchCollator:
             if self.config.backbone.backend == "point_transformer_v3"
             else None
         )
-        batch = collate_unified(samples, grid_size_m=grid_size, training=self.training)
+        batch = collate_unified(
+            samples,
+            grid_size_m=grid_size,
+            training=self.training,
+            point_count=self.config.dataset.scene_points,
+        )
         # generated candidate manifest 每个 worker 只验证一次，单条 entry 仍逐样本校验来源签名。
         if self.config.training.generated_policy_candidate_cache:
             batch["generated_policy_candidates"] = load_candidate_batch(
@@ -171,6 +184,8 @@ class GlobalGraspBatchCollator:
             else None
         )
         return collate_global_grasp(
-            samples, grid_size_m=grid_size, training=self.training
+            samples,
+            grid_size_m=grid_size,
+            training=self.training,
+            point_count=self.config.dataset.scene_points,
         )
-

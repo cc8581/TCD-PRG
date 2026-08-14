@@ -1,0 +1,28 @@
+# V2 prompt-target fine-tuning: existing HDF5 labels are reused; the Objective
+# synthesizes one observable 3D positive point per target instance online.
+defaults:
+  - ../config.yaml
+  - _self_
+
+optimizer:
+  learning_rate: 0.00005
+  backbone_learning_rate: 0.000005
+
+training:
+  max_optimizer_steps: 6000
+  generated_policy_candidate_ratio: 0.0
+  frozen_modules: [encoder.scene_backbone]
+
+losses:
+  instance: 1.0
+  region: 0.25
+  task_grasp: 0.25
+  global_grasp: 0.0
+  physical_edge: 0.0
+  task_edge: 0.0
+  verify_overall: 0.0
+  push_object: 0.0
+  push_contact: 0.0
+  push_direction: 0.0
+  push_potential: 0.0
+  policy_candidate: 0.0

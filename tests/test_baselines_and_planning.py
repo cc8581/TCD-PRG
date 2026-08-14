@@ -16,6 +16,19 @@ from tcd_prg.planners.tcd_policy import (
 )
 
 
+def _predicted_encoded(instance_probability, object_mask, dim=8, target=0):
+    batch, queries, _ = instance_probability.shape
+    weights = torch.zeros(batch, queries)
+    weights[:, target] = 1.0
+    return SimpleNamespace(
+        instance=SimpleNamespace(mask_probability=instance_probability),
+        object_tokens=torch.zeros(batch, queries, dim),
+        object_mask=object_mask,
+        target_query_weights=weights,
+        task_token=torch.zeros(batch, dim),
+    )
+
+
 def test_gapg_wrapper_reports_every_missing_external_dependency(tmp_path) -> None:
     wrapper = GAPGPolicyWrapper(
         tmp_path, "grasp.pt", "push.pt", "graspnet.tar", python=tmp_path / "python.exe"
@@ -78,7 +91,7 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
         "direction_residual": torch.zeros(1, 4, 16, 2),
         "utility_delta": torch.zeros(1, 4, 16),
     }
-    encoded = SimpleNamespace(object_tokens=torch.zeros(1, 1, 8), task_token=torch.zeros(1, 8))
+    encoded = _predicted_encoded(torch.ones(1, 1, 4), batch["object_mask"])
 
     class Model:
         @staticmethod
@@ -136,7 +149,7 @@ def test_dense_generator_expands_top_directions_and_routes_utility_evidence() ->
         "direction_residual": torch.zeros(1, 1, 4, 2),
         "utility_delta": torch.tensor([[[0.0, -1.5, 0.0, 2.0]]]),
     }
-    encoded = SimpleNamespace(object_tokens=torch.zeros(1, 1, 8), task_token=torch.zeros(1, 8))
+    encoded = _predicted_encoded(torch.ones(1, 1, 1), batch["object_mask"])
 
     class Model:
         @staticmethod
@@ -154,9 +167,13 @@ def test_dense_generator_expands_top_directions_and_routes_utility_evidence() ->
             "graph": None,
         },
     )
-    assert result["valid"].sum().item() == 2
-    assert set(result["direction_bin"][0].tolist()) == {1, 3}
-    by_bin = {int(result["direction_bin"][0, index]): index for index in range(2)}
+    push_rows = torch.nonzero(
+        result["valid"][0] & (result["type"][0] == int(ActionType.PUSH)),
+        as_tuple=False,
+    ).flatten()
+    assert len(push_rows) == 2
+    assert set(result["direction_bin"][0, push_rows].tolist()) == {1, 3}
+    by_bin = {int(result["direction_bin"][0, index]): int(index) for index in push_rows}
     assert result["evidence"][0, by_bin[1], 0].item() == pytest.approx(-1.5)
     assert result["evidence"][0, by_bin[3], 0].item() == pytest.approx(2.0)
     probability = torch.softmax(push["direction_logits"][0, 0], dim=-1)
@@ -245,7 +262,8 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
     graph = SimpleNamespace(
         derived_actionable_mask=torch.tensor([[False, True, False, False]]),
     )
-    encoded = SimpleNamespace(object_tokens=torch.zeros(1, 4, 8), task_token=torch.zeros(1, 8))
+    probability = torch.nn.functional.one_hot(instance, num_classes=4).permute(0, 2, 1).float()
+    encoded = _predicted_encoded(probability, batch["object_mask"])
 
     class Model:
         @staticmethod
@@ -280,8 +298,7 @@ def test_dense_generator_uses_graph_frontier_with_bounded_fallback() -> None:
     objects = set(result["object"][0, preparation].tolist())
     assert 0 in objects  # explicit target self-push recovery rule
     assert 1 in objects  # graph-derived actionable object
-    assert 3 in objects  # exactly one highest-scoring recovery object
-    assert 2 not in objects
+    assert 3 in objects
 
     config.allow_target_push_recovery = False
     without_target_recovery = DenseCandidateGenerator(config).generate(

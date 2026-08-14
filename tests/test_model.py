@@ -56,6 +56,7 @@ def test_cached_verifier_only_runs_valid_candidates() -> None:
             "encoded": SimpleNamespace(
                 point_features=torch.randn(b, n, config.feature_dim),
                 task_token=torch.randn(b, config.feature_dim),
+                target_probability=torch.ones(b, n),
             ),
             "region": {"region_probability": torch.rand(b, n)},
         },
@@ -79,7 +80,7 @@ def test_cached_verifier_only_runs_valid_candidates() -> None:
     assert model.verifier.overall.weight.grad is not None
 
 
-def test_push_direction_sparse_points_include_forced_supervision() -> None:
+def test_push_direction_sparse_points_are_prediction_only() -> None:
     torch.manual_seed(9)
     b, n, objects, dim = 1, 8, 2, 16
     head = PushHead(
@@ -102,14 +103,10 @@ def test_push_direction_sparse_points_include_forced_supervision() -> None:
         torch.randn(b, objects, dim),
         torch.tensor([3]),
     )
-    baseline = head(*inputs)
-    forced_point = torch.nonzero(~baseline["direction_point_mask"][0], as_tuple=False).flatten()[:1]
-    output = head(*inputs, forced_direction_points=(forced_point,))
+    output = head(*inputs)
     assert output["direction_logits"].shape == (b, n, 4)
     assert output["direction_residual"].shape == (b, n, 4, 2)
-    assert output["direction_point_mask"].sum().item() == 5
-    assert output["direction_point_mask"][0, forced_point].all()
-    assert torch.isfinite(output["direction_logits"][0, forced_point]).all()
+    assert output["direction_point_mask"].sum().item() <= objects * 2
     assert (output["direction_logits"][~output["direction_point_mask"]] == -30.0).all()
 
 
@@ -302,6 +299,7 @@ def test_policy_heads_match_training_contract(tiny_batch) -> None:
         "width_m",
         "quality_logit",
         "attention_point_index",
+        "point_attention",
     }
     assert "object_logits" in output["global_grasp"]
     assert output["push"]["utility_delta"].shape[-1] == _config().num_direction_bins

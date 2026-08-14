@@ -18,7 +18,15 @@ cameras:
 fusion:
   workspace_min_m: [0.10, -0.50, -0.05]
   workspace_max_m: [0.95, 0.50, 0.65]
+  # Required tabletop calibration in robot-base coordinates:
+  # normal dot xyz + offset_m = 0. The normal must point upward.
+  table_plane_base: null
+  table_clearance_m: 0.003
   voxel_size_m: 0.005
+  # Legacy training caches are variable-length (median about 62,076 points).
+  # Cap dense captures to the median; never duplicate points from sparse captures.
+  target_scene_points: 62076
+  point_sample_seed: 20260813
   instance_association_distance_m: 0.06
   instance_association_color_distance: 0.35
   temporal_instance_distance_m: 0.10

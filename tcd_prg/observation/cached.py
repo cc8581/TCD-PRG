@@ -43,8 +43,10 @@ class CachedObservationProvider(ObservationProvider):
     def __init__(self, cache_dir: str | Path, fallback: ObservationProvider | None = None,
                  max_bytes: int = 15 << 30, min_free_bytes: int = 20 << 30):
         self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.fallback = fallback
+        self.read_only = fallback is None
+        if not self.read_only:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_bytes
         self.min_free_bytes = min_free_bytes
         self._writes_since_eviction = 0
@@ -62,7 +64,10 @@ class CachedObservationProvider(ObservationProvider):
         path = self._path(key)
         if path.exists():
             try:
-                os.utime(path, None)
+                # Strict cache-only training must not mutate legacy entries,
+                # including their access/modified timestamps.
+                if not self.read_only:
+                    os.utime(path, None)
                 with np.load(path, allow_pickle=False) as data:
                     return PointObservation(
                         data["xyz"], data["rgb"], data["instance_id"], data["source_view"]
@@ -114,6 +119,8 @@ class CachedObservationProvider(ObservationProvider):
         return observation
 
     def evict(self, reserve_bytes: int = 0) -> None:
+        if self.read_only:
+            raise RuntimeError("Read-only observation cache cannot evict entries")
         entries: list[tuple[Path, int, float]] = []
         for path in self.cache_dir.glob("*/*.npz"):
             if path.name.endswith(".tmp.npz"):
@@ -145,6 +152,9 @@ class CachedObservationProvider(ObservationProvider):
 
     def clear_completed(self) -> dict[str, int]:
         """Remove completed observations while tolerating active worker readers."""
+
+        if self.read_only:
+            raise RuntimeError("Read-only observation cache cannot delete entries")
 
         removed_files = 0
         removed_bytes = 0

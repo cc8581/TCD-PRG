@@ -11,6 +11,7 @@ training:
   generated_policy_checkpoint_sha256: ""
 
 losses:
+  instance: 0.0
   region: 0.0
   task_grasp: 0.0
   global_grasp: 0.0

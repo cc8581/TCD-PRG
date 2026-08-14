@@ -33,7 +33,7 @@ class ObservationConfig:
     render_width: int = 320
     render_height: int = 200
     camera_profile: str = "mecheye_pro_s_three_view"
-    renderer_version: str = "tcd_prg_pybullet_v2_variable_grid"
+    renderer_version: str = "tcd_prg_pybullet_v3_sensor_only_instance_query"
     pybullet_python: str = "python"
     worker_script: str = "scripts/render_observation_worker_py38.py"
     runtime_mesh_root: str = "runtime/cache/meshes"
@@ -42,6 +42,9 @@ class ObservationConfig:
     certification_worker_script: str = "scripts/certify_actions_worker_py38.py"
     render_temporary_root: str = "runtime/tmp/render_requests"
     certification_temporary_root: str = "runtime/tmp/certification"
+
+
+LEGACY_READ_ONLY_RENDERER = "tcd_prg_pybullet_v2_variable_grid"
 
 
 @dataclass(slots=True)
@@ -105,6 +108,29 @@ class ModelConfig:
     task_dim: int = 128
     num_categories: int = 64
     num_task_regions: int = 64
+    # Sensor-only object decomposition. Q is a capacity, not a GT object index.
+    instance_queries: int = 32
+    instance_decoder_layers: int = 2
+    instance_decoder_heads: int = 8
+    instance_objectness_threshold: float = 0.5
+    instance_matching_points: int = 2048
+    target_query_temperature: float = 0.25
+    # V2: observable 3D target identity prompt. Region semantics never identify
+    # which same-category physical instance is requested.
+    target_prompt_radius_m: float = 0.030
+    target_prompt_sigma_m: float = 0.012
+    target_prompt_jitter_std_m: float = 0.003
+    target_prompt_weight: float = 4.0
+    target_category_weight: float = 1.0
+    target_objectness_weight: float = 0.5
+    target_center_weight: float = 0.5
+    target_learned_weight: float = 0.20
+    target_reid_weight: float = 0.75
+    target_reid_center_weight: float = 0.35
+    target_reid_max_center_distance_m: float = 0.15
+    target_prompt_min_support: float = 0.20
+    target_prompt_min_margin: float = 0.25
+    target_same_category_loss_boost: float = 2.0
     num_relation_types: int = 8
     num_direction_bins: int = 16
     # 每个抓取 query 直接预测平移、连续 SO(3)、夹爪宽度和条件化质量。
@@ -121,7 +147,7 @@ class ModelConfig:
     # push_candidates 是接触点预算；每个点再展开多个方向，最终总量受 max_push_candidates 限制。
     push_directions_per_contact: int = 2
     max_push_candidates: int = 32
-    # 每个活动物体只在高分接触点计算方向和效用；训练时显式补入全部 GT 接触点。
+    # 每个预测实例只在高分接触点计算方向和效用；GT 接触点不进入 forward。
     push_direction_contact_topk: int = 32
     push_direction_feature_dim: int = 64
     push_direction_transformer_layers: int = 1
@@ -240,6 +266,7 @@ class TrainingConfig:
     generated_policy_min_effective_coverage: float = 0.01
     validation_family_weights: dict[str, float] = field(default_factory=lambda: {
         "policy_candidate": 1.0,
+        "instance": 0.1,
         "verify_overall": 0.5,
         "physical_edge": 0.25,
         "task_edge": 0.25,
@@ -322,7 +349,8 @@ class RouterConfig:
 
 @dataclass(slots=True)
 class LossConfig:
-    # 七个任务模块等预算：Graph 两项各占 1/2，Push 四项各占 1/4。
+    # 实例真值仅用于该 loss family，不进入模型 forward。
+    instance: float = 1.0
     region: float = 1.0
     task_grasp: float = 1.0
     global_grasp: float = 1.0
@@ -335,6 +363,11 @@ class LossConfig:
     push_potential: float = 0.25
     policy_candidate: float = 1.0
     internal: dict[str, float] = field(default_factory=lambda: {
+        "instance_objectness": 1.0,
+        "instance_mask": 2.0,
+        "instance_dice": 2.0,
+        "instance_category": 1.0,
+        "target_query": 1.0,
         "region_focal": 1.0,
         "region_dice": 1.0,
         "region_visibility": 0.2,
@@ -344,7 +377,7 @@ class LossConfig:
         return {
             name: float(getattr(self, name))
             for name in (
-                "region", "task_grasp", "global_grasp", "physical_edge", "task_edge",
+                "instance", "region", "task_grasp", "global_grasp", "physical_edge", "task_edge",
                 "verify_overall", "push_object", "push_contact", "push_direction",
                 "push_potential", "policy_candidate",
             )
@@ -415,6 +448,14 @@ class TCDPRGConfig:
     name: str = "tcd-prg"
 
     def validate(self) -> None:
+        if (
+            self.observation.renderer_version == LEGACY_READ_ONLY_RENDERER
+            and self.observation.allow_render_on_miss
+        ):
+            raise ValueError(
+                "The legacy v2 observation cache is read-only; "
+                "observation.allow_render_on_miss must be false"
+            )
         if self.training.gradient_accumulation_steps <= 0:
             raise ValueError("training.gradient_accumulation_steps must be positive")
         if self.training.num_workers < 0:
@@ -641,6 +682,40 @@ class TCDPRGConfig:
             raise ValueError("Global grasp training requires positive samples")
         if self.model.global_grasp_candidates <= 0:
             raise ValueError("global_grasp_candidates must be positive")
+        if self.model.instance_queries <= 0:
+            raise ValueError("instance_queries must be positive")
+        if self.model.instance_decoder_layers <= 0 or self.model.instance_decoder_heads <= 0:
+            raise ValueError("instance decoder layers/heads must be positive")
+        if self.model.feature_dim % self.model.instance_decoder_heads:
+            raise ValueError("feature_dim must be divisible by instance_decoder_heads")
+        if not 0.0 < self.model.instance_objectness_threshold < 1.0:
+            raise ValueError("instance_objectness_threshold must be in (0,1)")
+        if self.model.instance_matching_points <= 0:
+            raise ValueError("instance_matching_points must be positive")
+        if self.model.target_query_temperature <= 0:
+            raise ValueError("target_query_temperature must be positive")
+        if self.model.target_prompt_radius_m <= 0 or self.model.target_prompt_sigma_m <= 0:
+            raise ValueError("target prompt radius/sigma must be positive")
+        if self.model.target_prompt_jitter_std_m < 0:
+            raise ValueError("target_prompt_jitter_std_m must be non-negative")
+        if min(
+            self.model.target_prompt_weight,
+            self.model.target_category_weight,
+            self.model.target_objectness_weight,
+            self.model.target_center_weight,
+            self.model.target_learned_weight,
+            self.model.target_reid_weight,
+            self.model.target_reid_center_weight,
+        ) < 0:
+            raise ValueError("target selector weights must be non-negative")
+        if self.model.target_reid_max_center_distance_m <= 0:
+            raise ValueError("target_reid_max_center_distance_m must be positive")
+        if not 0.0 <= self.model.target_prompt_min_support <= 1.0:
+            raise ValueError("target_prompt_min_support must be in [0,1]")
+        if self.model.target_prompt_min_margin < 0:
+            raise ValueError("target_prompt_min_margin must be non-negative")
+        if self.model.target_same_category_loss_boost < 1.0:
+            raise ValueError("target_same_category_loss_boost must be >= 1")
         if self.model.grasp_decoder_layers <= 0 or self.model.grasp_decoder_heads <= 0:
             raise ValueError("Grasp decoder layers and heads must be positive")
         if self.model.feature_dim % self.model.grasp_decoder_heads:

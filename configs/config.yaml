@@ -12,7 +12,7 @@ dataset:
   step_labels_subdir: task_training_labels
   action_labels_subdir: task_positive_multistep_sequences
   # 0 表示保留三视角融合后的全部有效点；PTv3 内部使用 5 mm GridSample 变长打包。
-  scene_points: 0
+  scene_points: 16384
   target_points: 4096  # 目标物体最多保留的点数
 
 observation:
@@ -24,6 +24,8 @@ observation:
   render_width: 320
   render_height: 200
   camera_profile: mecheye_pro_s_three_view
+  # Foreground-only legacy cache contract. Real deployment must apply the same
+  # workspace crop and table/background removal before model inference.
   renderer_version: tcd_prg_pybullet_v2_variable_grid
   pybullet_python: python
   worker_script: scripts/render_observation_worker_py38.py
@@ -75,6 +77,28 @@ model:
   task_dim: 128
   num_categories: 64
   num_task_regions: 64
+  # Lightweight query-based instance decomposition on shared PTv3 features.
+  instance_queries: 32
+  instance_decoder_layers: 2
+  instance_decoder_heads: 8
+  instance_objectness_threshold: 0.5
+  instance_matching_points: 2048
+  target_query_temperature: 0.25
+  # V2 target identity: one positive 3D point by default; P>1 supports future negatives.
+  target_prompt_radius_m: 0.030
+  target_prompt_sigma_m: 0.012
+  target_prompt_jitter_std_m: 0.003
+  target_prompt_weight: 4.0
+  target_category_weight: 1.0
+  target_objectness_weight: 0.5
+  target_center_weight: 0.5
+  target_learned_weight: 0.20
+  target_reid_weight: 0.75
+  target_reid_center_weight: 0.35
+  target_reid_max_center_distance_m: 0.15
+  target_prompt_min_support: 0.20
+  target_prompt_min_margin: 0.25
+  target_same_category_loss_boost: 2.0
   num_relation_types: 8
   num_direction_bins: 16
   contact_heatmap_sigma_m: 0.008
@@ -90,7 +114,7 @@ model:
   push_candidates: 16
   push_directions_per_contact: 2  # 每个接触点展开 Top-2 方向
   max_push_candidates: 32         # 展开后进入 Router 前的 PUSH 上限
-  push_direction_contact_topk: 32 # 每个活动物体仅对 Top-K 接触点和 GT 点计算方向/utility
+  push_direction_contact_topk: 32 # 每个预测实例仅对 Top-K 预测接触点计算方向/utility
   push_direction_feature_dim: 64
   push_direction_transformer_layers: 1
   push_direction_transformer_heads: 4
@@ -151,7 +175,8 @@ router:
   max_preparation_actions: 5
 
 losses:
-  # 七个任务模块等预算：Graph 两项各 1/2，Push 四项各 1/4。
+  # Instance GT is supervision-only; no instance/target mask enters forward.
+  instance: 1.0
   region: 1.0
   task_grasp: 1.0
   global_grasp: 1.0
@@ -164,6 +189,11 @@ losses:
   push_potential: 0.25
   policy_candidate: 1.0
   internal:
+    instance_objectness: 1.0
+    instance_mask: 2.0
+    instance_dice: 2.0
+    instance_category: 1.0
+    target_query: 1.0
     region_focal: 1.0
     region_dice: 1.0
     region_visibility: 0.2
@@ -243,6 +273,7 @@ training:
   generated_policy_min_effective_coverage: 0.01  # 同时含已知正负、可形成排序损失的状态比例
   validation_family_weights:
     policy_candidate: 1.0
+    instance: 0.1
     verify_overall: 0.5
     physical_edge: 0.25
     task_edge: 0.25

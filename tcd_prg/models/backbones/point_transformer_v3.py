@@ -1,10 +1,8 @@
 """Adapter for the official Pointcept Point Transformer V3 implementation.
 
-The upstream source is kept as a pinned git submodule.  This module only
-adapts TCD-PRG's padded scene tensors to Pointcept's packed point dictionary;
-the PTv3 architecture itself is not reimplemented here.
+Only fused XYZRGB and point validity enter the backbone. Instance membership is
+predicted later by InstanceQueryHead.
 """
-
 from __future__ import annotations
 
 import importlib
@@ -17,13 +15,11 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from tcd_prg.paths import project_path
-
 from ..common import MaskedAttentionPool
 from .task_point_transformer import SceneGeometryOutput
 
 
 def _load_official_model(source_root: str | Path) -> type[nn.Module]:
-    # 只做动态加载和接口适配，官方 PTv3 源码由固定 submodule 版本提供，不在本项目重写。
     root = Path(source_root)
     if not root.is_absolute():
         root = project_path(root)
@@ -47,15 +43,6 @@ def _load_official_model(source_root: str | Path) -> type[nn.Module]:
 
 
 class PointTransformerV3SceneGeometryBackbone(nn.Module):
-    """Produce padded TCD-PRG features with one official PTv3 pass per scene.
-
-    The formal collator applies Pointcept GridSample before padding and passes
-    the exact selected voxel coordinates.  The fast path therefore packs those
-    representatives directly, avoiding a second CUDA ``unique``/``argsort``.
-    Direct callers that omit ``grid_coord`` retain the defensive voxelization
-    fallback and inverse map.
-    """
-
     def __init__(
         self,
         dim: int,
@@ -79,11 +66,9 @@ class PointTransformerV3SceneGeometryBackbone(nn.Module):
             upcast_attention=not enable_flash_attention,
             upcast_softmax=not enable_flash_attention,
         )
-        # 官方分割解码器输出 64 维，再投影到项目统一的 feature_dim。
         self.output_projection = nn.Sequential(nn.Linear(64, dim), nn.LayerNorm(dim))
         self.pool_query = nn.Parameter(torch.empty(dim))
         nn.init.normal_(self.pool_query, std=0.02)
-        self.object_pool = MaskedAttentionPool(dim, dim)
         self.global_pool = MaskedAttentionPool(dim, dim)
 
     def _voxelize(
@@ -98,27 +83,20 @@ class PointTransformerV3SceneGeometryBackbone(nn.Module):
         flat_rgb = rgb.reshape(-1, 3)[flat_valid]
         flat_batch = (
             torch.arange(batch_size, device=xyz.device)[:, None]
-            .expand(-1, point_count)
-            .reshape(-1)[flat_valid]
+            .expand(-1, point_count).reshape(-1)[flat_valid]
         )
         if grid_coord is not None:
             if grid_coord.shape != xyz.shape:
                 raise ValueError("grid_coord must have the same [B,N,3] shape as xyz")
-            # Formal DataLoader path: GridSample already selected one point per
-            # coordinate. Preserve those exact coordinates; recomputing the
-            # origin after randomized representative selection can shift voxel
-            # boundaries and would require another unique/sort operation.
             flat_grid = grid_coord.reshape(-1, 3)[flat_valid].to(torch.int32)
             inverse = torch.arange(flat_xyz.shape[0], device=xyz.device)
-            data = {
+            return {
                 "coord": flat_xyz,
                 "grid_coord": flat_grid,
                 "feat": torch.cat((flat_xyz, flat_rgb), -1),
-                "batch": flat_batch.to(torch.long),
-            }
-            return data, inverse, flat_valid
+                "batch": flat_batch.long(),
+            }, inverse, flat_valid
 
-        # Defensive fallback for direct callers that did not use collate_unified.
         grid_rows = []
         for row in range(batch_size):
             selected = flat_batch == row
@@ -126,12 +104,16 @@ class PointTransformerV3SceneGeometryBackbone(nn.Module):
                 raise ValueError(f"Scene batch row {row} contains no valid points")
             lower = flat_xyz[selected].amin(0)
             grid_rows.append(
-                torch.div(flat_xyz[selected] - lower, self.grid_size_m, rounding_mode="floor")
-                .to(torch.long)
+                torch.div(
+                    flat_xyz[selected] - lower, self.grid_size_m,
+                    rounding_mode="floor"
+                ).long()
             )
         grid = torch.cat(grid_rows, 0)
         voxel_key = torch.cat((flat_batch[:, None], grid), -1)
-        unique_key, inverse = torch.unique(voxel_key, dim=0, sorted=True, return_inverse=True)
+        unique_key, inverse = torch.unique(
+            voxel_key, dim=0, sorted=True, return_inverse=True
+        )
         voxel_count = unique_key.shape[0]
         counts = torch.bincount(inverse, minlength=voxel_count)
         order = torch.argsort(inverse, stable=True)
@@ -143,55 +125,48 @@ class PointTransformerV3SceneGeometryBackbone(nn.Module):
         else:
             offsets = torch.zeros(voxel_count, dtype=torch.long, device=xyz.device)
         representative = order[starts + offsets]
-        voxel_xyz = flat_xyz[representative]
-        voxel_rgb = flat_rgb[representative]
-        data = {
-            "coord": voxel_xyz,
+        return {
+            "coord": flat_xyz[representative],
             "grid_coord": unique_key[:, 1:].to(torch.int32),
-            "feat": torch.cat((voxel_xyz, voxel_rgb), -1),
-            "batch": unique_key[:, 0].to(torch.long),
-        }
-        return data, inverse, flat_valid
+            "feat": torch.cat(
+                (flat_xyz[representative], flat_rgb[representative]), -1
+            ),
+            "batch": unique_key[:, 0].long(),
+        }, inverse, flat_valid
 
     def forward(
-        self, xyz: Tensor, rgb: Tensor, instance_id: Tensor, point_mask: Tensor,
-        object_mask: Tensor, grid_coord: Tensor | None = None,
+        self,
+        xyz: Tensor,
+        rgb: Tensor,
+        point_mask: Tensor,
+        grid_coord: Tensor | None = None,
     ) -> SceneGeometryOutput:
         data, inverse, flat_valid = self._voxelize(
             xyz, rgb, point_mask, grid_coord=grid_coord
         )
         if self.activation_checkpointing and self.training:
             def encode(
-                coord: Tensor, grid_coord: Tensor, feat: Tensor, batch: Tensor
+                coord: Tensor, grid: Tensor, feat: Tensor, batch: Tensor
             ) -> Tensor:
                 return self.backbone({
-                    "coord": coord,
-                    "grid_coord": grid_coord,
-                    "feat": feat,
-                    "batch": batch,
+                    "coord": coord, "grid_coord": grid,
+                    "feat": feat, "batch": batch,
                 }).feat
 
             encoded_features = checkpoint(
-                encode,
-                data["coord"],
-                data["grid_coord"],
-                data["feat"],
-                data["batch"],
+                encode, data["coord"], data["grid_coord"], data["feat"], data["batch"],
                 use_reentrant=False,
             )
         else:
             encoded_features = self.backbone(data).feat
-        # 同体素原始点共享 PTv3 特征，再按 inverse 映射回稠密点顺序供各预测头使用。
+
         voxel_features = self.output_projection(encoded_features)
-        point_features = xyz.new_zeros((*point_mask.shape, voxel_features.shape[-1]))
-        point_features.view(-1, voxel_features.shape[-1])[flat_valid] = voxel_features[inverse]
-        query = self.pool_query[None].expand(xyz.shape[0], -1)
-        object_index = torch.arange(object_mask.shape[1], device=instance_id.device)
-        object_point_mask = point_mask[:, None] & (
-            instance_id[:, None] == object_index[None, :, None]
+        point_features = xyz.new_zeros(
+            (*point_mask.shape, voxel_features.shape[-1])
         )
-        object_tokens = self.object_pool.forward_grouped(
-            point_features, object_point_mask, query
-        ) * object_mask.unsqueeze(-1)
+        point_features.view(-1, voxel_features.shape[-1])[flat_valid] = (
+            voxel_features[inverse]
+        )
+        query = self.pool_query[None].expand(xyz.shape[0], -1)
         global_token = self.global_pool(point_features, point_mask, query)
-        return SceneGeometryOutput(point_features, object_tokens, object_mask, global_token)
+        return SceneGeometryOutput(point_features, global_token)

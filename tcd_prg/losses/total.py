@@ -1,5 +1,4 @@
-"""Capability-aware aggregation of the eleven paper-level objectives."""
-
+"""Capability-aware aggregation of object-centric paper-level objectives."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -12,6 +11,7 @@ from tcd_prg.datasets.capabilities import DatasetCapabilities
 
 class MultiTaskLoss(nn.Module):
     DEFAULT_WEIGHTS = {
+        "instance": 1.0,
         "region": 1.0,
         "task_grasp": 1.0,
         "global_grasp": 1.0,
@@ -26,7 +26,9 @@ class MultiTaskLoss(nn.Module):
     }
 
     def __init__(
-        self, capabilities: DatasetCapabilities, ablation: AblationConfig,
+        self,
+        capabilities: DatasetCapabilities,
+        ablation: AblationConfig,
         weights: Mapping[str, float] | None = None,
     ) -> None:
         super().__init__()
@@ -39,6 +41,7 @@ class MultiTaskLoss(nn.Module):
         if float(self.weights[family]) == 0.0:
             return False
         requirement = {
+            "instance": "instance",
             "region": "region",
             "task_grasp": "proposal",
             "global_grasp": "global_grasp",
@@ -53,11 +56,16 @@ class MultiTaskLoss(nn.Module):
         }[family]
         if requirement == "graph" and not self.ablation.use_dependency_graph:
             return False
-        if family == "push_potential" and not self.ablation.use_push_potential:
+        if (
+            family == "push_potential"
+            and not self.ablation.use_push_potential
+        ):
             return False
         return self.capabilities.loss_available(requirement)
 
-    def forward(self, families: Mapping[str, Mapping[str, Tensor]]) -> tuple[Tensor, dict[str, Tensor]]:
+    def forward(
+        self, families: Mapping[str, Mapping[str, Tensor]]
+    ) -> tuple[Tensor, dict[str, Tensor]]:
         selected: dict[str, Tensor] = {}
         total: Tensor | None = None
         for family, values in families.items():
@@ -72,6 +80,8 @@ class MultiTaskLoss(nn.Module):
             selected[f"weighted_loss_{family}"] = weighted.detach()
             total = weighted if total is None else total + weighted
         if total is None:
-            raise ValueError("No applicable loss objective for this dataset/configuration")
+            raise ValueError(
+                "No applicable loss objective for this dataset/configuration"
+            )
         selected["loss_total"] = total
         return total, selected

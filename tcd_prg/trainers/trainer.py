@@ -77,6 +77,7 @@ class Trainer:
         "policy_effective_rows",
     }
     LOSS_GROUPS = (
+        ("instance", ("weighted_loss_instance",)),
         ("region", ("weighted_loss_region",)),
         ("task_g", ("weighted_loss_task_grasp",)),
         ("global_g", ("weighted_loss_global_grasp",)),

@@ -39,12 +39,9 @@ def test_ptv3_adapter_voxelizes_and_restores_dense_point_alignment(monkeypatch) 
     output = backbone(
         xyz,
         torch.rand(1, 3, 3),
-        torch.tensor([[0, 0, 1]]),
         torch.ones(1, 3, dtype=torch.bool),
-        torch.ones(1, 2, dtype=torch.bool),
     )
     assert output.point_features.shape == (1, 3, 16)
-    assert output.object_tokens.shape == (1, 2, 16)
     # The first two samples share one voxel and therefore one PTv3 feature.
     assert torch.equal(output.point_features[:, 0], output.point_features[:, 1])
 

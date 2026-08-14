@@ -45,6 +45,29 @@ class AppConfig:
                 pass
             raise
 
+    def record_table_plane(
+        self, normal: list[float] | np.ndarray, point_m: list[float] | np.ndarray
+    ) -> None:
+        """Record a calibrated tabletop plane in robot-base coordinates."""
+        normal_value = np.asarray(normal, dtype=np.float64)
+        point_value = np.asarray(point_m, dtype=np.float64)
+        if normal_value.shape != (3,) or point_value.shape != (3,):
+            raise ValueError("Table normal and point must each contain three values")
+        if not np.isfinite(normal_value).all() or not np.isfinite(point_value).all():
+            raise ValueError("Table calibration values must be finite")
+        length = float(np.linalg.norm(normal_value))
+        if length < 1e-8:
+            raise ValueError("Table normal must be non-zero")
+        normal_value /= length
+        if normal_value[2] <= 0:
+            raise ValueError("Table normal must point upward in robot-base coordinates")
+        fusion = self.raw.setdefault("fusion", {})
+        fusion["table_plane_base"] = {
+            "normal": normal_value.tolist(),
+            "offset_m": -float(normal_value @ point_value),
+        }
+        self.save()
+
     @property
     def tcp_transform(self) -> np.ndarray:
         tcp = self.raw["robot"]["model_tcp_to_robot_tcp"]

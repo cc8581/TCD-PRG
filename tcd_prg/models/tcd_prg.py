@@ -1,13 +1,14 @@
-"""Complete shared-feature TCD-PRG model assembly."""
-
+"""Complete object-centric TCD-PRG model with sensor-only perception input."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 from torch import Tensor, nn
 
-from tcd_prg.config import AblationConfig, BackboneConfig, GraphConfig, ModelConfig, RouterConfig
+from tcd_prg.config import (
+    AblationConfig, BackboneConfig, GraphConfig, ModelConfig, RouterConfig
+)
 from tcd_prg.constants import ActionType
 
 from .backbones import (
@@ -17,36 +18,56 @@ from .backbones import (
 from .common import ActionCandidateEncoder
 from .dependency_graph import TaskConditionedDependencyGraph
 from .grasp_proposal import (
-    GlobalGraspProposalHead,
-    M2T2GraspDecoder,
-    TaskGraspProposalHead,
+    GlobalGraspProposalHead, M2T2GraspDecoder, TaskGraspProposalHead,
 )
 from .grasp_verifier import GripperSceneTaskVerifier
 from .policy import (
-    FlatCandidateClassifier,
-    MaskedHierarchicalCandidateRouter,
+    FlatCandidateClassifier, MaskedHierarchicalCandidateRouter,
     fixed_priority_output,
 )
 from .push import PushHead
 from .region import TaskRegionHead
 
 
-class TCDPRGModel(nn.Module):
-    """All learned modules; the global point backbone is evaluated exactly once."""
+SENSOR_KEYS = frozenset({"xyz", "rgb", "point_mask", "grid_coord"})
+TASK_KEYS = frozenset({
+    "task_category_id", "task_region_id", "remaining_steps",
+    "required_grasp_count",
+    "target_prompt_xyz", "target_prompt_label", "target_prompt_valid",
+    "target_reid_token", "target_reid_center", "target_reid_valid",
+})
+FORBIDDEN_PERCEPTION_KEYS = frozenset({
+    "instance_id", "instance_id_gt", "target_mask", "target_mask_gt",
+    "target_object", "object_pose", "object_present", "object_active",
+    "object_category_id", "object_category_id_gt", "relation_graph",
+    "task_block_graph",
+})
 
-    def __init__(self, config: ModelConfig | None = None,
-                 ablation: AblationConfig | None = None,
-                 graph_config: GraphConfig | None = None,
-                 router_config: RouterConfig | None = None,
-                 backbone_config: BackboneConfig | None = None) -> None:
+
+class TCDPRGModel(nn.Module):
+    """One PTv3 pass, predicted instances, then all manipulation heads.
+
+    `batch` may still contain GT fields for loss construction, but this class
+    whitelists perception/task fields and never reads GT instance/target/graph
+    tensors during its scene forward.
+    """
+
+    def __init__(
+        self,
+        config: ModelConfig | None = None,
+        ablation: AblationConfig | None = None,
+        graph_config: GraphConfig | None = None,
+        router_config: RouterConfig | None = None,
+        backbone_config: BackboneConfig | None = None,
+    ) -> None:
         super().__init__()
         self.config = config or ModelConfig()
         self.ablation = ablation or AblationConfig()
         graph_config = graph_config or GraphConfig()
         router_config = router_config or RouterConfig()
-        # 单元测试可使用轻量 legacy 骨干；正式训练入口始终显式传入 PTv3 配置。
         backbone_config = backbone_config or BackboneConfig(backend="legacy")
         c = self.config
+
         scene_backbone = None
         if backbone_config.backend == "point_transformer_v3":
             scene_backbone = PointTransformerV3SceneGeometryBackbone(
@@ -57,6 +78,7 @@ class TCDPRGModel(nn.Module):
                 patch_size=backbone_config.patch_size,
                 activation_checkpointing=c.activation_checkpointing,
             )
+
         self.encoder = TaskConditionedPointTransformer(
             dim=c.feature_dim,
             task_dim=c.task_dim,
@@ -65,27 +87,43 @@ class TCDPRGModel(nn.Module):
             attention_points=backbone_config.attention_points,
             activation_checkpointing=c.activation_checkpointing,
             scene_backbone=scene_backbone,
+            instance_queries=c.instance_queries,
+            instance_decoder_layers=c.instance_decoder_layers,
+            instance_decoder_heads=c.instance_decoder_heads,
+            instance_objectness_threshold=c.instance_objectness_threshold,
+            target_temperature=c.target_query_temperature,
+            target_prompt_radius_m=c.target_prompt_radius_m,
+            target_prompt_sigma_m=c.target_prompt_sigma_m,
+            target_prompt_weight=c.target_prompt_weight,
+            target_category_weight=c.target_category_weight,
+            target_objectness_weight=c.target_objectness_weight,
+            target_center_weight=c.target_center_weight,
+            target_learned_weight=c.target_learned_weight,
+            target_reid_weight=c.target_reid_weight,
+            target_reid_center_weight=c.target_reid_center_weight,
+            target_reid_max_center_distance_m=c.target_reid_max_center_distance_m,
         )
         self.region_head = TaskRegionHead(c.feature_dim)
-        # Task/Global Grasp 共享同一个 M2T2 解码器参数，但各自保留独立 query 与输出头。
-        # 这样只做一次场景编码，也不会把“任务抓取”和“移除抓取”的查询语义混在一起。
         self.grasp_decoder = M2T2GraspDecoder(
             c.feature_dim, c.grasp_decoder_layers, c.grasp_decoder_heads
         )
-        self.task_grasp = TaskGraspProposalHead(c.feature_dim, c.task_grasp_candidates)
+        self.task_grasp = TaskGraspProposalHead(
+            c.feature_dim, c.task_grasp_candidates
+        )
         self.global_grasp = GlobalGraspProposalHead(
-            c.feature_dim, c.global_grasp_candidates, c.global_grasp_input_mode,
+            c.feature_dim, c.global_grasp_candidates, c.global_grasp_input_mode
         )
         self.verifier = GripperSceneTaskVerifier(
-            c.feature_dim,
-            c.feature_dim,
-            c.verifier_transformer_layers,
-            c.verifier_transformer_heads,
+            c.feature_dim, c.feature_dim,
+            c.verifier_transformer_layers, c.verifier_transformer_heads,
         )
         self.graph = TaskConditionedDependencyGraph(
-            c.feature_dim, physical_relations=len(graph_config.physical_relations),
-            task_relations=len(graph_config.task_relations), layers=graph_config.layers,
-            heads=graph_config.heads, edge_threshold=c.graph_edge_threshold,
+            c.feature_dim,
+            physical_relations=len(graph_config.physical_relations),
+            task_relations=len(graph_config.task_relations),
+            layers=graph_config.layers,
+            heads=graph_config.heads,
+            edge_threshold=c.graph_edge_threshold,
         )
         self.push = PushHead(
             c.feature_dim,
@@ -103,147 +141,293 @@ class TCDPRGModel(nn.Module):
         )
         self.candidate_encoder = ActionCandidateEncoder(c.feature_dim)
         self.candidate_evidence = nn.Sequential(
-            nn.Linear(7, c.feature_dim), nn.GELU(), nn.Linear(c.feature_dim, c.feature_dim)
+            nn.Linear(7, c.feature_dim), nn.GELU(),
+            nn.Linear(c.feature_dim, c.feature_dim),
         )
 
     @staticmethod
+    def _sensor(batch: Mapping[str, Any]) -> dict[str, Tensor]:
+        source = batch.get("model_inputs", batch)
+        sensor = {key: source[key] for key in SENSOR_KEYS if key in source}
+        missing = {"xyz", "rgb", "point_mask"} - sensor.keys()
+        if missing:
+            raise KeyError(f"Missing sensor model inputs: {sorted(missing)}")
+        return sensor
+
+    @staticmethod
+    def _task(batch: Mapping[str, Any]) -> dict[str, Tensor]:
+        source = batch.get("task_inputs", batch)
+        required = {"task_category_id", "task_region_id", "remaining_steps"}
+        missing = required - source.keys()
+        if missing:
+            raise KeyError(f"Missing task inputs: {sorted(missing)}")
+        return {key: source[key] for key in TASK_KEYS if key in source}
+
+    @staticmethod
+    def assert_no_gt_in_model_inputs(batch: Mapping[str, Any]) -> None:
+        """Hard guard used by tests/real inference for nested formal inputs."""
+        if "model_inputs" not in batch:
+            return
+        leaked = FORBIDDEN_PERCEPTION_KEYS & set(batch["model_inputs"])
+        if leaked:
+            raise RuntimeError(
+                "Ground-truth fields leaked into model_inputs: "
+                + ", ".join(sorted(leaked))
+            )
+
+    def _encode_scene(self, batch: Mapping[str, Any]) -> tuple[Any, dict[str, Tensor], dict[str, Tensor]]:
+        self.assert_no_gt_in_model_inputs(batch)
+        sensor = self._sensor(batch)
+        task = self._task(batch)
+        encoded = self.encoder(
+            sensor["xyz"],
+            sensor["rgb"],
+            sensor["point_mask"],
+            task["task_category_id"],
+            task["task_region_id"],
+            use_task_region_condition=self.ablation.use_task_region_condition,
+            grid_coord=sensor.get("grid_coord"),
+            target_prompt_xyz=task.get("target_prompt_xyz"),
+            target_prompt_label=task.get("target_prompt_label"),
+            target_prompt_valid=task.get("target_prompt_valid"),
+            target_reid_token=task.get("target_reid_token"),
+            target_reid_center=task.get("target_reid_center"),
+            target_reid_valid=task.get("target_reid_valid"),
+        )
+        return encoded, sensor, task
+
+    def _encode_scene_instances(
+        self, batch: Mapping[str, Any]
+    ) -> tuple[Any, Any, dict[str, Tensor]]:
+        self.assert_no_gt_in_model_inputs(batch)
+        sensor = self._sensor(batch)
+        scene, instance = self.encoder.forward_scene_instances(
+            sensor["xyz"], sensor["rgb"], sensor["point_mask"],
+            grid_coord=sensor.get("grid_coord"),
+        )
+        return scene, instance, sensor
+
+    def _forward_global_grasp_neutral(
+        self, scene: Any, instance: Any, sensor: dict[str, Tensor]
+    ) -> dict[str, Tensor]:
+        global_grasp = self.global_grasp(
+            scene.point_features,
+            sensor["xyz"],
+            instance.object_tokens,
+            scene.global_scene_token,
+            instance.mask_probability,
+            sensor["point_mask"],
+            instance.object_mask,
+            self.grasp_decoder,
+        )
+        global_grasp["width_m"] = self.global_grasp.decode_width(
+            global_grasp["width_raw"],
+            self.config.min_grasp_width_m,
+            self.config.max_grasp_width_m,
+        )
+        return global_grasp
+
+    def _forward_global_grasp(
+        self, encoded: Any, sensor: dict[str, Tensor]
+    ) -> dict[str, Tensor]:
+        # Reuse the exact neutral features/instances produced before task FiLM.
+        class _Scene:
+            pass
+        scene = _Scene()
+        scene.point_features = encoded.scene_point_features
+        scene.global_scene_token = encoded.scene_global_token
+        return self._forward_global_grasp_neutral(
+            scene, encoded.instance, sensor
+        )
+
+    def forward_global_grasp(
+        self, batch: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        scene, instance, sensor = self._encode_scene_instances(batch)
+        return {
+            "scene": scene,
+            "instance": instance,
+            "global_grasp": self._forward_global_grasp_neutral(
+                scene, instance, sensor
+            ),
+        }
+
+    @staticmethod
     @torch.no_grad()
-    def _nearest_object_point_indices(
-        xyz: Tensor, point_mask: Tensor, instance_id: Tensor,
-        object_index: Tensor, query: Tensor, valid: Tensor,
-        chunk_size: int = 16,
+    def _nearest_scene_point(
+        xyz: Tensor, point_mask: Tensor, query: Tensor, valid: Tensor
     ) -> tuple[Tensor, Tensor]:
-        """Find nearest same-instance points without per-candidate CUDA syncs."""
+        """Nearest visible sensor point for candidate reference positions."""
+        safe = torch.nan_to_num(query, nan=0.0, posinf=0.0, neginf=0.0).float()
+        distance = torch.cdist(safe, xyz.float())
+        domain = point_mask[:, None] & valid[:, :, None]
+        distance = distance.masked_fill(~domain, float("inf"))
+        found = domain.any(-1)
+        return distance.argmin(-1), found
 
-        if query.ndim != 3 or query.shape[-1] != 3:
-            raise ValueError("query must be [B,K,3]")
-        batch_size, candidates = query.shape[:2]
-        nearest = torch.zeros(
-            (batch_size, candidates), dtype=torch.long, device=xyz.device
-        )
-        found = torch.zeros_like(nearest, dtype=torch.bool)
-        valid = valid.bool() & torch.isfinite(query).all(-1) & (object_index >= 0)
-        safe_query = torch.nan_to_num(query, nan=0.0, posinf=0.0, neginf=0.0).float()
-        reference = xyz.float()
-        for start in range(0, candidates, chunk_size):
-            end = min(candidates, start + chunk_size)
-            current_valid = valid[:, start:end]
-            domain = current_valid[:, :, None] & point_mask[:, None] & (
-                instance_id[:, None] == object_index[:, start:end, None]
-            )
-            distance = torch.cdist(safe_query[:, start:end], reference)
-            distance = distance.masked_fill(~domain, float("inf"))
-            nearest[:, start:end] = distance.argmin(-1)
-            found[:, start:end] = domain.any(-1)
-        return nearest, found
-
-    @classmethod
     @torch.no_grad()
-    def _push_candidate_point_cache(
-        cls, batch: dict[str, Tensor]
-    ) -> tuple[Tensor, Tensor] | None:
-        """Compute labelled PUSH nearest points once for the complete forward pass."""
-
-        required = {"action_parameters", "action_type", "candidate_mask", "acted_object"}
-        if not required.issubset(batch):
-            return None
-        contacts = batch["action_parameters"]["push_contact_world"]
-        push_candidates = (
-            batch["candidate_mask"]
-            & (batch["action_type"] == int(ActionType.PUSH))
-            & torch.isfinite(contacts).all(-1)
+    def infer_candidate_objects(
+        self,
+        encoded: Any,
+        sensor: dict[str, Tensor],
+        candidates: Mapping[str, Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        """Infer candidate object query ids from candidate geometry and predicted masks."""
+        kind = candidates["type"].long()
+        pose = candidates["pose_world"]
+        contact = candidates["contact_world"]
+        reference = torch.where(
+            (kind == int(ActionType.PUSH)).unsqueeze(-1), contact, pose[..., :3]
         )
-        return cls._nearest_object_point_indices(
-            batch["xyz"], batch["point_mask"], batch["instance_id"],
-            batch["acted_object"], contacts, push_candidates,
+        valid = candidates["valid"].bool() & torch.isfinite(reference).all(-1)
+        point, found = self._nearest_scene_point(
+            sensor["xyz"], sensor["point_mask"], reference, valid
         )
+        b, k = point.shape
+        row = torch.arange(b, device=point.device)[:, None]
+        membership = encoded.instance.mask_probability[
+            row, :, point
+        ]  # [B,K,Q]
+        object_index = membership.argmax(-1)
+        object_valid = encoded.object_mask.gather(1, object_index)
+        return object_index, found & object_valid
 
-    def _candidate_evidence_from_batch(
-        self, batch: dict[str, Tensor], result: dict[str, Any], kind: Tensor,
-        acted_object: Tensor, pose: Tensor,
-        push_point_cache: tuple[Tensor, Tensor] | None = None,
+    def _candidate_evidence(
+        self,
+        result: dict[str, Any],
+        sensor: dict[str, Tensor],
+        candidate_inputs: Mapping[str, Tensor],
     ) -> Tensor:
-        """Gather proposal/PUSH evidence without Python loops over CUDA candidates."""
+        kind = candidate_inputs["type"]
+        valid = candidate_inputs["valid"].bool()
+        b, k = kind.shape
+        evidence = sensor["xyz"].new_zeros((b, k, 7))
 
-        batch_size, candidates = kind.shape
-        evidence = torch.zeros((batch_size, candidates, 7), device=kind.device)
-        parameters = batch["action_parameters"]
-        candidate_valid = batch["candidate_mask"].bool()
-
-        object_count = batch["object_mask"].shape[1]
-        object_index = torch.arange(object_count, device=kind.device)
-        visible_object = (
-            batch["point_mask"][:, None]
-            & (batch["instance_id"][:, None] == object_index[None, :, None])
-        ).any(-1)
-        object_in_range = (acted_object >= 0) & (acted_object < object_count)
-        candidate_has_points = object_in_range & visible_object.gather(
-            1, acted_object.clamp(0, object_count - 1)
-        )
-
-        push_contact = parameters["push_contact_world"]
-        push_direction = parameters["push_direction_world"]
-        if push_point_cache is None:
-            push_valid = (
-                candidate_valid
+        # PUSH evidence.
+        if result.get("push") is not None:
+            push_mask = (
+                valid
                 & (kind == int(ActionType.PUSH))
-                & torch.isfinite(push_contact).all(-1)
-                & torch.isfinite(push_direction).all(-1)
+                & torch.isfinite(candidate_inputs["contact_world"]).all(-1)
+                & torch.isfinite(candidate_inputs["direction_world"]).all(-1)
             )
-            push_point, push_found = self._nearest_object_point_indices(
-                batch["xyz"], batch["point_mask"], batch["instance_id"],
-                acted_object, push_contact, push_valid,
+            point, found = self._nearest_scene_point(
+                sensor["xyz"], sensor["point_mask"],
+                candidate_inputs["contact_world"], push_mask,
             )
-        else:
-            push_point, push_found = push_point_cache
-            push_found = push_found & torch.isfinite(push_direction).all(-1)
-        push_rows, push_candidates = torch.nonzero(push_found, as_tuple=True)
-        if push_rows.numel():
-            points = push_point[push_rows, push_candidates]
-            directions = push_direction[push_rows, push_candidates]
-            angles = torch.atan2(directions[:, 1], directions[:, 0]).remainder(2 * torch.pi)
-            direction_bin = torch.floor(
-                angles * self.config.num_direction_bins / (2 * torch.pi)
-            ).long().remainder(self.config.num_direction_bins)
-            evidence[push_rows, push_candidates, 0] = result["push"]["utility_delta"][
-                push_rows, points, direction_bin
-            ].to(evidence.dtype)
-            evidence[push_rows, push_candidates, 1] = torch.sigmoid(
-                result["push"]["contact_logits"][push_rows, points]
-            ).to(evidence.dtype)
-            selected_logits = result["push"]["direction_logits"][push_rows, points]
-            evidence[push_rows, push_candidates, 3] = torch.softmax(
-                selected_logits, dim=-1
-            ).gather(1, direction_bin[:, None]).squeeze(1).to(evidence.dtype)
+            rows, cand = torch.nonzero(found, as_tuple=True)
+            if rows.numel():
+                directions = candidate_inputs["direction_world"][rows, cand]
+                angles = torch.atan2(
+                    directions[:, 1], directions[:, 0]
+                ).remainder(2 * torch.pi)
+                direction_bin = torch.floor(
+                    angles * self.config.num_direction_bins / (2 * torch.pi)
+                ).long().remainder(self.config.num_direction_bins)
+                p = point[rows, cand]
+                push = result["push"]
+                evidence[rows, cand, 0] = push["utility_delta"][
+                    rows, p, direction_bin
+                ].to(evidence.dtype)
+                evidence[rows, cand, 1] = torch.sigmoid(
+                    push["contact_logits"][rows, p]
+                ).to(evidence.dtype)
+                direction_logits = push["direction_logits"][rows, p]
+                evidence[rows, cand, 3] = torch.softmax(
+                    direction_logits, -1
+                ).gather(1, direction_bin[:, None]).squeeze(1).to(
+                    evidence.dtype
+                )
 
-        finite_pose = torch.isfinite(pose[..., :3]).all(-1)
+        # Grasp proposal quality evidence.
+        finite_pose = torch.isfinite(candidate_inputs["pose_world"][..., :3]).all(-1)
         for action_type, head_name in (
             (ActionType.PICK_REMOVE, "global_grasp"),
             (ActionType.TASK_GRASP, "task_grasp"),
         ):
-            eligible = (
-                candidate_valid & (kind == int(action_type))
-                & finite_pose & candidate_has_points
-            )
+            if result.get(head_name) is None:
+                continue
+            eligible = valid & (kind == int(action_type)) & finite_pose
+            if not eligible.any():
+                continue
             with torch.no_grad():
-                nearest_query = torch.cdist(
+                distance = torch.cdist(
                     torch.nan_to_num(
-                        pose[..., :3], nan=0.0, posinf=0.0, neginf=0.0
+                        candidate_inputs["pose_world"][..., :3],
+                        nan=0.0, posinf=0.0, neginf=0.0,
                     ).float(),
                     result[head_name]["translation_world"].detach().float(),
-                ).argmin(-1)
-            quality = result[head_name]["quality_logit"].gather(1, nearest_query)
+                )
+                nearest = distance.argmin(-1)
+            quality = result[head_name]["quality_logit"].gather(1, nearest)
             evidence[..., 1] = torch.where(
                 eligible, torch.sigmoid(quality), evidence[..., 1]
             )
         return evidence
 
-    def verify_cached(
-        self, batch: dict[str, Tensor], result: dict[str, Any], verifier_inputs: dict[str, Tensor]
-    ) -> dict[str, Tensor]:
-        """Verify candidates from cached shared features without a second backbone pass."""
+    def prepare_candidate_inputs(
+        self,
+        result: dict[str, Any],
+        candidates: Mapping[str, Tensor],
+        *,
+        evidence: Tensor | None = None,
+        verifier_evidence_cached: bool = False,
+    ) -> dict[str, Any]:
+        encoded = result["encoded"]
+        sensor = result["sensor"]
+        object_index = candidates.get("object")
+        object_valid = candidates["valid"].bool()
+        if object_index is None:
+            object_index, inferred_valid = self.infer_candidate_objects(
+                encoded, sensor, candidates
+            )
+            object_valid &= inferred_valid
+        else:
+            object_index = object_index.long()
+            object_valid &= (
+                (object_index >= 0)
+                & (object_index < encoded.object_tokens.shape[1])
+            )
+        flags = torch.stack(
+            (
+                torch.isfinite(candidates["contact_world"]).all(-1),
+                torch.isfinite(candidates["direction_world"]).all(-1),
+                torch.isfinite(candidates["pose_world"]).all(-1),
+                torch.isfinite(candidates["destination_world"]).all(-1),
+                torch.isfinite(candidates["width_m"]),
+            ),
+            -1,
+        )
+        if evidence is None:
+            evidence = self._candidate_evidence(result, sensor, {
+                **candidates, "valid": object_valid
+            })
+        return {
+            **candidates,
+            "object": object_index,
+            "valid": object_valid,
+            "evidence": evidence,
+            "verifier_evidence_cached": verifier_evidence_cached,
+            "tokens": self.candidate_encoder(
+                encoded.object_tokens,
+                candidates["type"],
+                object_index,
+                candidates["contact_world"],
+                candidates["direction_world"],
+                candidates["pose_world"],
+                candidates["destination_world"],
+                flags,
+                encoded.task_token,
+            ),
+        }
 
-        encoded, region = result["encoded"], result["region"]
+    def verify_cached(
+        self,
+        batch: Mapping[str, Any],
+        result: dict[str, Any],
+        verifier_inputs: dict[str, Tensor],
+    ) -> dict[str, Tensor]:
+        encoded = result["encoded"]
         candidate_valid = verifier_inputs["candidate_valid"].bool()
         coordinates = torch.nonzero(candidate_valid, as_tuple=False)
         batch_size, candidates = candidate_valid.shape
@@ -256,24 +440,39 @@ class TCDPRGModel(nn.Module):
         if not coordinates.numel():
             return outputs
 
-        # 只打包真实抓取候选；PUSH 和 padding 不再进入局部 Transformer。
         micro = self.config.verifier_candidate_micro_batch
         for start in range(0, coordinates.shape[0], micro):
             selected = coordinates[start:start + micro]
             rows, candidate_indices = selected[:, 0], selected[:, 1]
-            point_index = verifier_inputs["scene_point_index"][rows, candidate_indices]
-            verifier_features = encoded.point_features[rows[:, None], point_index]
-            verifier_target = batch["target_mask"][rows[:, None], point_index]
-            verifier_region = region["region_probability"][rows[:, None], point_index]
+            point_index = verifier_inputs["scene_point_index"][
+                rows, candidate_indices
+            ]
+            verifier_features = encoded.point_features[
+                rows[:, None], point_index
+            ]
+            verifier_target = encoded.target_probability[
+                rows[:, None], point_index
+            ]
+            verifier_region = result["region"]["region_probability"][
+                rows[:, None], point_index
+            ]
             chunk = self.verifier(
-                verifier_inputs["scene_xyz_grasp"][rows, candidate_indices][:, None],
-                verifier_inputs["gripper_xyz_grasp"][rows, candidate_indices][:, None],
+                verifier_inputs["scene_xyz_grasp"][
+                    rows, candidate_indices
+                ][:, None],
+                verifier_inputs["gripper_xyz_grasp"][
+                    rows, candidate_indices
+                ][:, None],
                 verifier_features[:, None],
                 verifier_target[:, None],
                 verifier_region[:, None],
                 encoded.task_token[rows],
-                verifier_inputs["scene_valid"][rows, candidate_indices][:, None],
-                verifier_inputs["gripper_valid"][rows, candidate_indices][:, None],
+                verifier_inputs["scene_valid"][
+                    rows, candidate_indices
+                ][:, None],
+                verifier_inputs["gripper_valid"][
+                    rows, candidate_indices
+                ][:, None],
             )
             for key, value in chunk.items():
                 outputs[key] = outputs[key].index_put(
@@ -281,29 +480,14 @@ class TCDPRGModel(nn.Module):
                 )
         return outputs
 
-    @torch.no_grad()
-    def _push_supervision_point_indices(
-        self, batch: dict[str, Tensor],
-        point_cache: tuple[Tensor, Tensor] | None = None,
-    ) -> tuple[Tensor, ...] | None:
-        """Return nearest scene points for every labelled PUSH candidate."""
-
-        if point_cache is None:
-            point_cache = self._push_candidate_point_cache(batch)
-        if point_cache is None:
-            return None
-        point_index, found = point_cache
-        return tuple(
-            torch.unique(point_index[row, found[row]], sorted=True)
-            for row in range(batch["xyz"].shape[0])
-        )
-
     def route_cached(
-        self, batch: dict[str, Tensor], result: dict[str, Any], candidate_inputs: dict[str, Any]
+        self,
+        batch: Mapping[str, Any],
+        result: dict[str, Any],
+        candidate_inputs: dict[str, Any],
     ) -> Any:
-        """Route externally generated candidates using the already encoded scene."""
-
         encoded = result["encoded"]
+        task = result.get("task") or self._task(batch)
         evidence = candidate_inputs.get("evidence")
         if evidence is None:
             evidence = torch.zeros(
@@ -316,18 +500,22 @@ class TCDPRGModel(nn.Module):
             result.get("verifier") is not None
             and not candidate_inputs.get("verifier_evidence_cached", False)
         ):
-            evidence[..., 2] = torch.sigmoid(result["verifier"]["overall_logit"])
-        routed_tokens = candidate_inputs["tokens"] + self.candidate_evidence(evidence)
+            evidence[..., 2] = torch.sigmoid(
+                result["verifier"]["overall_logit"]
+            )
+        routed_tokens = (
+            candidate_inputs["tokens"] + self.candidate_evidence(evidence)
+        )
         router_args = (
             encoded.task_token,
             encoded.global_scene_token,
             encoded.object_tokens,
-            encoded.object_mask & batch["object_active"],
+            encoded.object_mask,
             routed_tokens,
             candidate_inputs["type"],
             candidate_inputs["object"],
             candidate_inputs["valid"],
-            batch["remaining_steps"],
+            task["remaining_steps"],
             candidate_inputs.get("previous_action"),
         )
         if self.ablation.router_type == "hierarchical":
@@ -336,211 +524,158 @@ class TCDPRGModel(nn.Module):
             return self.flat_router(*router_args)
         if self.ablation.router_type == "fixed_priority":
             return fixed_priority_output(
-                candidate_inputs["type"], candidate_inputs["object"],
-                candidate_inputs["valid"], encoded.object_mask & batch["object_active"],
+                candidate_inputs["type"],
+                candidate_inputs["object"],
+                candidate_inputs["valid"],
+                encoded.object_mask,
             )
-        raise ValueError(f"Unsupported router type {self.ablation.router_type}")
+        raise ValueError(
+            f"Unsupported router type {self.ablation.router_type}"
+        )
 
-    def _external_candidate_inputs(
-        self, encoded: Any, candidates: dict[str, Tensor]
+    def forward_instances(
+        self, batch: Mapping[str, Any]
     ) -> dict[str, Any]:
-        flags = torch.stack((
-            torch.isfinite(candidates["contact_world"]).all(-1),
-            torch.isfinite(candidates["direction_world"]).all(-1),
-            torch.isfinite(candidates["pose_world"]).all(-1),
-            torch.isfinite(candidates["destination_world"]).all(-1),
-            torch.isfinite(candidates["width_m"]),
-        ), -1)
+        """Task-free sensor-only instance inference for real-scene acquisition."""
+        scene, instance, sensor = self._encode_scene_instances(batch)
         return {
-            **candidates,
-            "verifier_evidence_cached": True,
-            "tokens": self.candidate_encoder(
-                encoded.object_tokens, candidates["type"], candidates["object"],
-                candidates["contact_world"], candidates["direction_world"],
-                candidates["pose_world"], candidates["destination_world"],
-                flags, encoded.task_token,
-            ),
+            "scene": scene,
+            "instance": instance,
+            "sensor": sensor,
         }
 
-    def _encode_scene(self, batch: dict[str, Tensor]) -> tuple[Any, Tensor]:
-        object_present = batch.get("object_present", batch["object_mask"])
-        # 只有同时存在且尚未被移除的物体才参与点云几何、抓取分配和碰撞语义。
-        physical_active = object_present & batch["object_active"]
-        encoded = self.encoder(
-            batch["xyz"],
-            batch["rgb"],
-            batch["instance_id"],
-            batch["point_mask"],
-            batch["target_mask"],
-            physical_active,
-            batch["task_category_id"],
-            batch["task_region_id"],
-            use_task_region_condition=self.ablation.use_task_region_condition,
-            target_object=batch["target_object"],
-            grid_coord=batch.get("grid_coord"),
-        )
-        return encoded, physical_active
-
-    def _encode_scene_geometry(
-        self, batch: dict[str, Tensor]
-    ) -> tuple[Any, Tensor]:
-        """Neutral scene geometry for Global-only training.
-
-        This is the exact scene representation stored in ``EncoderOutput.scene_*``
-        by the full encoder, without evaluating the unused task adapter.
-        """
-
-        object_present = batch.get("object_present", batch["object_mask"])
-        physical_active = object_present & batch["object_active"]
-        scene = self.encoder.forward_scene_geometry(
-            batch["xyz"],
-            batch["rgb"],
-            batch["instance_id"],
-            batch["point_mask"],
-            physical_active,
-            grid_coord=batch.get("grid_coord"),
-        )
-        return scene, physical_active
-
-    def _forward_global_grasp_neutral(
-        self,
-        scene_point_features: Tensor,
-        scene_object_tokens: Tensor,
-        scene_global_token: Tensor,
-        batch: dict[str, Tensor],
-        physical_active: Tensor,
-    ) -> dict[str, Tensor]:
-        if self.config.global_grasp_input_mode == "scene_only":
-            global_mask = batch["point_mask"]
-        else:
-            valid_instance = (
-                (batch["instance_id"] >= 0)
-                & (batch["instance_id"] < physical_active.shape[1])
-            )
-            global_mask = (
-                batch["point_mask"] & valid_instance
-                & physical_active.gather(
-                    1, batch["instance_id"].clamp(0, physical_active.shape[1] - 1)
-                )
-            )
-        global_grasp = self.global_grasp(
-            scene_point_features,
-            batch["xyz"],
-            scene_object_tokens,
-            scene_global_token,
-            batch["instance_id"],
-            global_mask,
-            physical_active,
-            self.grasp_decoder,
-        )
-        global_grasp["width_m"] = self.global_grasp.decode_width(
-            global_grasp["width_raw"],
-            self.config.min_grasp_width_m,
-            self.config.max_grasp_width_m,
-        )
-        return global_grasp
-
-    def _forward_global_grasp(
-        self, encoded: Any, batch: dict[str, Tensor], physical_active: Tensor
-    ) -> dict[str, Tensor]:
-        return self._forward_global_grasp_neutral(
-            encoded.scene_point_features,
-            encoded.scene_object_tokens,
-            encoded.scene_global_token,
-            batch,
-            physical_active,
-        )
-
-    def forward_global_grasp(self, batch: dict[str, Tensor]) -> dict[str, Any]:
-        """Independent Global stream using the exact neutral scene backbone."""
-
-        scene, physical_active = self._encode_scene_geometry(batch)
+    def forward_perception(
+        self, batch: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Instance/target-only stage; skips every manipulation head."""
+        encoded, sensor, task = self._encode_scene(batch)
         return {
-            "global_grasp": self._forward_global_grasp_neutral(
-                scene.point_features,
-                scene.object_tokens,
-                scene.global_scene_token,
-                batch,
-                physical_active,
-            ),
+            "encoded": encoded,
+            "sensor": sensor,
+            "task": task,
+            "instance": encoded.instance,
         }
 
-
-    def forward_generated_policy(self, batch: dict[str, Tensor]) -> dict[str, Any]:
-        """Router-only stage: shared encoder plus cached generated candidates."""
-
+    def forward_generated_policy(
+        self, batch: Mapping[str, Any]
+    ) -> dict[str, Any]:
         generated = batch.get("generated_policy_candidates")
         if generated is None:
-            raise RuntimeError("Generated-policy forward requires cached generated candidates")
-        # Policy-only 阶段若冻结场景编码器，则关闭其 autograd，避免保存无用激活。
-        encoder_frozen = not any(parameter.requires_grad for parameter in self.encoder.parameters())
-        if encoder_frozen:
-            with torch.no_grad():
-                encoded, _ = self._encode_scene(batch)
-        else:
-            encoded, _ = self._encode_scene(batch)
-        result: dict[str, Any] = {"encoded": encoded, "verifier": None}
-        generated_inputs = self._external_candidate_inputs(encoded, generated)
-        result["generated_router"] = self.route_cached(batch, result, generated_inputs)
+            raise RuntimeError(
+                "Generated-policy forward requires cached generated candidates"
+            )
+        encoded, sensor, task = self._encode_scene(batch)
+        result: dict[str, Any] = {
+            "encoded": encoded,
+            "sensor": sensor,
+            "task": task,
+            "region": {
+                "region_probability": encoded.target_probability.new_zeros(
+                    encoded.target_probability.shape
+                )
+            },
+            "task_grasp": None,
+            "global_grasp": None,
+            "push": None,
+            "verifier": None,
+        }
+        # Generated caches created by the patched model contain geometry/object ids
+        # and may contain cached evidence. Unknown supervision fields are ignored.
+        candidates = {
+            key: generated[key]
+            for key in (
+                "type", "object", "contact_world", "direction_world",
+                "pose_world", "destination_world", "width_m", "valid",
+                "previous_action",
+            )
+            if key in generated
+        }
+        prepared = self.prepare_candidate_inputs(
+            result,
+            candidates,
+            evidence=generated.get("evidence"),
+            verifier_evidence_cached=True,
+        )
+        result["generated_router"] = self.route_cached(
+            batch, result, prepared
+        )
         return result
 
     def forward(
-        self, batch: dict[str, Tensor], candidate_inputs: dict[str, Tensor] | None = None,
-        *, forward_mode: str = "full",
+        self,
+        batch: Mapping[str, Any],
+        candidate_inputs: Mapping[str, Tensor] | None = None,
+        *,
+        forward_mode: str = "full",
     ) -> dict[str, Any]:
         if forward_mode == "generated_policy":
             return self.forward_generated_policy(batch)
+        if forward_mode == "instances":
+            return self.forward_instances(batch)
+        if forward_mode == "perception":
+            return self.forward_perception(batch)
         if forward_mode == "global_grasp":
             return self.forward_global_grasp(batch)
         if forward_mode != "full":
             raise ValueError(f"Unsupported forward_mode={forward_mode}")
-        # PTv3/场景编码仅执行一次，后续所有 head 复用同一组点、物体和任务特征。
-        encoded, physical_active = self._encode_scene(batch)
+
+        encoded, sensor, task = self._encode_scene(batch)
         region = self.region_head(
-            encoded.point_features, encoded.target_token, encoded.task_token, batch["target_mask"]
+            encoded.point_features,
+            encoded.target_token,
+            encoded.task_token,
+            encoded.target_probability,
+            sensor["point_mask"],
         )
         task_grasp = self.task_grasp(
             encoded.point_features,
-            batch["xyz"],
+            sensor["xyz"],
             encoded.target_token,
             encoded.task_token,
             region["region_probability"],
-            batch["target_mask"],
+            encoded.target_probability,
+            sensor["point_mask"],
             self.grasp_decoder,
         )
         task_grasp["width_m"] = self.task_grasp.decode_width(
-            task_grasp["width_raw"], self.config.min_grasp_width_m, self.config.max_grasp_width_m
+            task_grasp["width_raw"],
+            self.config.min_grasp_width_m,
+            self.config.max_grasp_width_m,
         )
-        global_grasp = self._forward_global_grasp(encoded, batch, physical_active)
+        global_grasp = self._forward_global_grasp(encoded, sensor)
+
         if self.ablation.use_dependency_graph:
             graph = self.graph(
                 encoded.object_tokens,
-                encoded.object_mask & batch["object_active"],
+                encoded.object_mask,
                 encoded.task_token,
-                batch["target_object"],
-                batch.get("relation_graph"),
-                self.ablation.use_indirect_dependency_reasoning,
+                target_object=None,
+                relation_graph=None,
+                use_indirect_reasoning=self.ablation.use_indirect_dependency_reasoning,
             )
             graph_context = graph.node_features[:, :-1]
         else:
             graph = None
             graph_context = encoded.object_tokens
-        push_point_cache = self._push_candidate_point_cache(batch)
+
         push = self.push(
             encoded.point_features,
-            batch["xyz"],
-            batch["instance_id"],
-            batch["point_mask"],
+            sensor["xyz"],
+            encoded.instance.mask_probability,
+            sensor["point_mask"],
             encoded.object_tokens,
-            encoded.object_mask & batch["object_active"],
+            encoded.object_mask,
             encoded.task_token,
             encoded.target_token,
             graph_context,
-            batch["remaining_steps"],
-            self._push_supervision_point_indices(batch, push_point_cache),
+            task["remaining_steps"],
         )
+
         result: dict[str, Any] = {
             "encoded": encoded,
+            "sensor": sensor,
+            "task": task,
+            "instance": encoded.instance,
             "region": region,
             "task_grasp": task_grasp,
             "global_grasp": global_grasp,
@@ -548,48 +683,30 @@ class TCDPRGModel(nn.Module):
             "push": push,
             "verifier": None,
         }
-        verifier_inputs = batch.get("verifier_inputs")
-        if verifier_inputs is not None and self.ablation.use_gripper_scene_verifier:
-            result["verifier"] = self.verify_cached(batch, result, verifier_inputs)
-        if candidate_inputs is None and "action_parameters" in batch:
-            parameters = batch["action_parameters"]
-            kind = batch["action_type"]
-            push = kind == 0
-            remove_mask = kind == 1
-            pose = torch.where(
-                remove_mask.unsqueeze(-1), parameters["removal_grasp_pose_world"],
-                parameters["task_grasp_pose_world"]
-            )
-            flags = torch.stack(
-                (
-                    torch.isfinite(parameters["push_contact_world"]).all(-1),
-                    torch.isfinite(parameters["push_direction_world"]).all(-1),
-                    torch.isfinite(pose).all(-1),
-                    torch.isfinite(parameters["removal_destination_world"]).all(-1),
-                    torch.isfinite(parameters["grasp_width_m"]),
-                ),
-                -1,
-            )
-            candidate_inputs = {
-                "tokens": self.candidate_encoder(
-                    encoded.object_tokens, kind, batch["acted_object"],
-                    parameters["push_contact_world"], parameters["push_direction_world"], pose,
-                    parameters["removal_destination_world"], flags, encoded.task_token
-                ),
-                "type": kind,
-                "object": batch["acted_object"],
-                "valid": batch["candidate_mask"],
-            }
-            candidate_inputs["evidence"] = self._candidate_evidence_from_batch(
-                batch, result, kind, batch["acted_object"], pose,
-                push_point_cache=push_point_cache,
-            )
+
         if candidate_inputs is not None:
-            result["router"] = self.route_cached(batch, result, candidate_inputs)
+            prepared = self.prepare_candidate_inputs(result, candidate_inputs)
+            result["candidate_inputs"] = prepared
+            result["router"] = self.route_cached(batch, result, prepared)
+
         generated = batch.get("generated_policy_candidates")
         if generated is not None:
-            generated_inputs = self._external_candidate_inputs(encoded, generated)
+            candidates = {
+                key: generated[key]
+                for key in (
+                    "type", "object", "contact_world", "direction_world",
+                    "pose_world", "destination_world", "width_m", "valid",
+                    "previous_action",
+                )
+                if key in generated
+            }
+            prepared = self.prepare_candidate_inputs(
+                result,
+                candidates,
+                evidence=generated.get("evidence"),
+                verifier_evidence_cached=True,
+            )
             result["generated_router"] = self.route_cached(
-                batch, result, generated_inputs
+                batch, result, prepared
             )
         return result

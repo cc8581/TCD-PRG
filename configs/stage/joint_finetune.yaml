@@ -1,0 +1,27 @@
+# Stage C: low-rate joint fine-tuning before generating policy candidates.
+defaults:
+  - ../config.yaml
+  - _self_
+
+optimizer:
+  learning_rate: 0.00005
+  backbone_learning_rate: 0.000005
+
+training:
+  max_optimizer_steps: 8000
+  generated_policy_candidate_ratio: 0.0
+  frozen_modules: []
+
+losses:
+  instance: 0.5
+  region: 1.0
+  task_grasp: 1.0
+  global_grasp: 1.0
+  physical_edge: 0.5
+  task_edge: 0.5
+  verify_overall: 1.0
+  push_object: 0.25
+  push_contact: 0.25
+  push_direction: 0.25
+  push_potential: 0.25
+  policy_candidate: 0.25

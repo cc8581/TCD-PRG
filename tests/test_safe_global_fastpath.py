@@ -20,18 +20,11 @@ class TinyNeutral(nn.Module):
         super().__init__()
         self.proj = nn.Linear(6, dim)
 
-    def forward(self, xyz, rgb, instance_id, point_mask, object_mask, grid_coord=None):
+    def forward(self, xyz, rgb, point_mask, grid_coord=None):
         del grid_coord
         feat = self.proj(torch.cat((xyz, rgb), -1)) * point_mask.unsqueeze(-1)
-        object_count = object_mask.shape[1]
-        tokens = []
-        for object_index in range(object_count):
-            mask = point_mask & (instance_id == object_index)
-            denom = mask.sum(-1, keepdim=True).clamp_min(1)
-            tokens.append((feat * mask.unsqueeze(-1)).sum(1) / denom)
-        object_tokens = torch.stack(tokens, 1) * object_mask.unsqueeze(-1)
         global_token = feat.sum(1) / point_mask.sum(1, keepdim=True).clamp_min(1)
-        return SceneGeometryOutput(feat, object_tokens, object_mask, global_token)
+        return SceneGeometryOutput(feat, global_token)
 
 
 def test_neutral_fastpath_matches_scene_fields_from_full_encoder():
@@ -53,13 +46,11 @@ def test_neutral_fastpath_matches_scene_fields_from_full_encoder():
     region = torch.tensor([3, 4])
     target_object = torch.tensor([0, 0])
 
-    neutral = encoder.forward_scene_geometry(xyz, rgb, instance, point_mask, object_mask)
+    neutral = encoder.forward_scene_geometry(xyz, rgb, point_mask)
     full = encoder(
-        xyz, rgb, instance, point_mask, target_mask, object_mask,
-        category, region, True, target_object=target_object,
+        xyz, rgb, point_mask, category, region, True,
     )
     assert torch.equal(neutral.point_features, full.scene_point_features)
-    assert torch.equal(neutral.object_tokens, full.scene_object_tokens)
     assert torch.equal(neutral.global_scene_token, full.scene_global_token)
 
 

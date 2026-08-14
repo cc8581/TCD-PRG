@@ -9,10 +9,5 @@ if not exist "%PYTHON%" (
   pause
   exit /b 1
 )
-if not exist "%LAUNCHER%" (
-  echo ERROR: Chinese launcher not found.
-  pause
-  exit /b 1
-)
 "%PYTHON%" "%LAUNCHER%"
 exit /b %ERRORLEVEL%

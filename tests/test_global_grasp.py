@@ -70,7 +70,7 @@ def test_scene_only_geometry_is_invariant_to_posthoc_instance_assignment(tiny_ba
         "attention_point_index",
     ):
         assert torch.equal(one[key], two[key]), key
-    assert not torch.equal(one["object_logits"], two["object_logits"])
+    assert torch.equal(one["object_logits"], two["object_logits"])
 
 
 def test_complete_global_branch_outputs_fixed_grasp_set(tiny_batch) -> None:
@@ -79,18 +79,24 @@ def test_complete_global_branch_outputs_fixed_grasp_set(tiny_batch) -> None:
     assert output["rotation_matrix"].shape == (1, 6, 3, 3)
     assert output["width_m"].shape == (1, 6)
     assert output["quality_logit"].shape == (1, 6)
-    assert output["object_logits"].shape == (1, 6, 3)
+    assert output["object_logits"].shape == (1, 6, 32)
     determinant = torch.det(output["rotation_matrix"])
     assert torch.allclose(determinant, torch.ones_like(determinant), atol=1e-5)
 
 
-def test_global_object_assignment_masks_inactive_objects(tiny_batch) -> None:
+def test_predicted_object_queries_do_not_consume_gt_active_mask(tiny_batch) -> None:
     batch = {key: value.clone() for key, value in tiny_batch.items()}
     batch["object_present"] = torch.ones_like(batch["object_active"])
     batch["object_active"][:, 2] = False
-    output = _small_model()(batch)
-    assert not output["encoded"].object_mask[0, 2]
-    assert torch.all(output["global_grasp"]["object_logits"][0, :, 2] == -30.0)
+    model = _small_model()
+    with torch.no_grad():
+        baseline = model(tiny_batch)
+        output = model(batch)
+    assert torch.equal(baseline["encoded"].object_mask, output["encoded"].object_mask)
+    assert torch.equal(
+        baseline["global_grasp"]["object_logits"],
+        output["global_grasp"]["object_logits"],
+    )
 
 
 def test_global_prediction_uses_complete_pose_and_se3_nms() -> None:

@@ -92,8 +92,8 @@ def test_family_subtotal_is_weighted_mean_of_active_children_only() -> None:
     assert inactive.grad == 0
 
 
-def test_exactly_eleven_paper_level_objectives() -> None:
-    assert len(TCDPRGObjective.MODULE_OBJECTIVES) == 11
+def test_exactly_twelve_paper_level_objectives() -> None:
+    assert len(TCDPRGObjective.MODULE_OBJECTIVES) == 12
     assert tuple(MultiTaskLoss.DEFAULT_WEIGHTS) == TCDPRGObjective.MODULE_OBJECTIVES
     capabilities = DatasetCapabilities(
         has_task_regions=True, has_task_grasps=True, has_global_grasps=True,

@@ -56,13 +56,11 @@ def test_backbone_forward_does_not_materialize_quadratic_distance_matrix(monkeyp
     xyz = torch.randn(2, 24, 3)
     rgb = torch.rand(2, 24, 3)
     point_mask = torch.ones(2, 24, dtype=torch.bool)
-    instance_id = torch.arange(24)[None].expand(2, -1) % 3
-    object_mask = torch.ones(2, 3, dtype=torch.bool)
 
     def reject_cdist(*args, **kwargs):
         raise AssertionError("global torch.cdist must not be used")
 
     monkeypatch.setattr(torch, "cdist", reject_cdist)
     with torch.no_grad():
-        output = backbone(xyz, rgb, instance_id, point_mask, object_mask)
+        output = backbone(xyz, rgb, point_mask)
     assert output.point_features.shape == (2, 24, 16)

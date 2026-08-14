@@ -47,11 +47,20 @@ def test_observation_cache_hash_binds_geometry_camera_seed_and_sampling() -> Non
 
 
 def test_cache_availability_is_read_only(tmp_path) -> None:
-    provider = CachedObservationProvider(tmp_path, fallback=object())
+    missing_cache = tmp_path / "does-not-exist"
+    provider = CachedObservationProvider(missing_cache, fallback=None)
     request = _request()
-    # Renderer availability is distinct from an actual cache hit.
+    # Strict cache-only setup must not even create the configured directory.
     assert not provider.is_available(request)
-    assert list(tmp_path.rglob("*.npz")) == []
+    assert not missing_cache.exists()
+
+
+def test_read_only_cache_cannot_evict_or_clear(tmp_path) -> None:
+    provider = CachedObservationProvider(tmp_path / "legacy", fallback=None)
+    with pytest.raises(RuntimeError, match="Read-only"):
+        provider.evict()
+    with pytest.raises(RuntimeError, match="Read-only"):
+        provider.clear_completed()
 
 
 def test_cache_eviction_skips_entries_locked_by_another_worker(tmp_path, monkeypatch) -> None:
@@ -147,9 +156,9 @@ def test_zero_scene_point_limit_preserves_variable_length_observation() -> None:
     assert sampled.xyz.shape == (7, 3)
 
 
-def test_formal_config_uses_unlimited_variable_length_scenes() -> None:
+def test_formal_config_uses_bounded_variable_length_scenes() -> None:
     config = load_config(PROJECT_ROOT / "configs" / "config.yaml")
-    assert config.dataset.scene_points == 0
+    assert config.dataset.scene_points == 16_384
 
 
 def test_formal_config_uses_strict_offline_cache_and_scene_splits() -> None:
@@ -172,6 +181,27 @@ def test_validation_worker_count_must_be_non_negative() -> None:
     config.training.validation_num_workers = -1
     with pytest.raises(ValueError, match="validation_num_workers"):
         config.validate()
+
+
+def test_legacy_renderer_protocol_forbids_render_fallback() -> None:
+    config = TCDPRGConfig()
+    config.observation.renderer_version = "tcd_prg_pybullet_v2_variable_grid"
+    config.observation.allow_render_on_miss = True
+    with pytest.raises(ValueError, match="read-only"):
+        config.validate()
+
+
+def test_legacy_cache_utility_contains_no_generation_path() -> None:
+    source = (PROJECT_ROOT / "scripts" / "precompute_observation_cache.py").read_text(
+        encoding="utf-8"
+    )
+    forbidden = (
+        "generate_missing",
+        "write_request_npz",
+        "PersistentRendererClient",
+        "match-legacy-counts-from",
+    )
+    assert all(name not in source for name in forbidden)
 
 
 def test_saved_state_zero_is_resized_to_formal_render_resolution() -> None:

@@ -86,8 +86,27 @@ def grid_sample_indices(xyz: np.ndarray, grid_size_m: float, training: bool) -> 
     return grid_sample(xyz, grid_size_m, training)[0]
 
 
+def _limit_point_sample(
+    indices: np.ndarray,
+    grid_coord: np.ndarray | None,
+    point_count: int,
+    training: bool,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Apply a model-side point budget without changing cache request keys."""
+
+    if point_count <= 0 or len(indices) <= point_count:
+        return indices, grid_coord
+    if training:
+        selected = np.random.choice(len(indices), point_count, replace=False)
+    else:
+        # Evenly cover the stable grid order for deterministic validation.
+        selected = np.linspace(0, len(indices) - 1, point_count, dtype=np.int64)
+    return indices[selected], None if grid_coord is None else grid_coord[selected]
+
+
 def collate_unified(
-    samples: list[UnifiedSample], *, grid_size_m: float | None = None, training: bool = False
+    samples: list[UnifiedSample], *, grid_size_m: float | None = None,
+    training: bool = False, point_count: int = 0,
 ) -> dict[str, Any]:
     if not samples:
         raise ValueError("Cannot collate an empty batch")
@@ -97,10 +116,19 @@ def collate_unified(
         point_samples = [
             grid_sample(x.xyz, float(grid_size_m), training) for x in observations
         ]
-        point_indices = [item[0] for item in point_samples]
-        grid_coord, _ = _pad([item[1] for item in point_samples])
+        limited = [
+            _limit_point_sample(item[0], item[1], point_count, training)
+            for item in point_samples
+        ]
+        point_indices = [item[0] for item in limited]
+        grid_coord, _ = _pad([item[1] for item in limited])
     else:
-        point_indices = [np.arange(len(x.xyz), dtype=np.int64) for x in observations]
+        point_indices = [
+            _limit_point_sample(
+                np.arange(len(x.xyz), dtype=np.int64), None, point_count, training
+            )[0]
+            for x in observations
+        ]
         grid_coord = None
     # 所有变长轴都同时生成显式 mask，后续网络不得把 padding 当作真实点或候选。
     xyz, point_mask = _pad([x.xyz[i] for x, i in zip(observations, point_indices, strict=True)])
@@ -293,7 +321,8 @@ def collate_unified(
 
 
 def collate_global_grasp(
-    samples: list[Any], *, grid_size_m: float | None = None, training: bool = False
+    samples: list[Any], *, grid_size_m: float | None = None,
+    training: bool = False, point_count: int = 0,
 ) -> dict[str, Any]:
     """Minimal collator for the independent Global Grasp stream.
 
@@ -314,10 +343,19 @@ def collate_global_grasp(
         point_samples = [
             grid_sample(obs.xyz, float(grid_size_m), training) for obs in observations
         ]
-        point_indices = [item[0] for item in point_samples]
-        grid_coord, _ = _pad([item[1] for item in point_samples])
+        limited = [
+            _limit_point_sample(item[0], item[1], point_count, training)
+            for item in point_samples
+        ]
+        point_indices = [item[0] for item in limited]
+        grid_coord, _ = _pad([item[1] for item in limited])
     else:
-        point_indices = [np.arange(len(obs.xyz), dtype=np.int64) for obs in observations]
+        point_indices = [
+            _limit_point_sample(
+                np.arange(len(obs.xyz), dtype=np.int64), None, point_count, training
+            )[0]
+            for obs in observations
+        ]
         grid_coord = None
 
     xyz, point_mask = _pad(
@@ -338,6 +376,9 @@ def collate_global_grasp(
         [obs.object_present for obs in observations], False
     )
     object_active, _ = _pad([obs.object_active for obs in observations], False)
+    object_category_id, _ = _pad(
+        [obs.object_category_id for obs in observations], -1
+    )
 
     # ``packed`` was checked above; keep the local alias type-agnostic so this
     # remains compatible with both GlobalGraspSample and legacy UnifiedSample.
@@ -363,6 +404,8 @@ def collate_global_grasp(
         "object_mask": object_mask.bool(),
         "object_present": object_present.bool(),
         "object_active": object_active.bool(),
+        # Loss-side category GT is used only for Hungarian instance matching.
+        "object_category_id": object_category_id.long(),
         "global_loss_sample_valid": torch.tensor(
             [
                 bool(getattr(sample, "global_loss_valid", True))

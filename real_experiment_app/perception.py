@@ -1,98 +1,129 @@
 from __future__ import annotations
 
-import subprocess
-import tempfile
-from pathlib import Path
 import numpy as np
 
-from .types import FusedScene, RGBDFrame, SegmentationResult
-
-
-class ExternalCommandSegmenter:
-    """External model contract: output NPZ needs instance_image and optional mapping."""
-
-    def __init__(self, command: list[str]):
-        self.command = [str(x) for x in command]
-
-    def segment(self, frame: RGBDFrame) -> SegmentationResult:
-        if not self.command:
-            raise RuntimeError("尚未配置实例分割程序，请在配置文件中填写 segmentation.command")
-        with tempfile.TemporaryDirectory() as directory:
-            source, output = Path(directory)/"input.npz", Path(directory)/"output.npz"
-            np.savez_compressed(source, color_rgb=frame.color_rgb, depth_mm=frame.depth_mm)
-            completed = subprocess.run(self.command+["--input",str(source),"--output",str(output)],
-                                       capture_output=True, text=True, check=False)
-            if completed.returncode or not output.is_file():
-                raise RuntimeError(f"segmentation failed: {completed.stderr}")
-            with np.load(output, allow_pickle=False) as data:
-                labels = data["instance_image"].astype(np.int32)
-                mapping = ({int(k): int(v) for k,v in zip(
-                    data["category_keys"], data["category_values"], strict=True)}
-                    if "category_keys" in data and "category_values" in data else {})
-            return SegmentationResult(labels, mapping)
+from .types import FusedScene, RGBDFrame
 
 
 def build_segmenter(config):
-    section = config.raw["segmentation"]
-    return ExternalCommandSegmenter(section.get("command", []))
+    """Deprecated compatibility hook.
+
+    Instance perception now runs inside TCD-PRG after fused point-cloud creation.
+    """
+    del config
+    return None
 
 
-def _points(frame: RGBDFrame, segmentation: SegmentationResult,
-            depth_min: float, depth_max: float):
+def _points(frame: RGBDFrame, depth_min: float, depth_max: float):
     depth = frame.depth_mm
-    valid = ((depth >= depth_min) & (depth <= depth_max)
-             & (segmentation.instance_image >= 0))
+    valid = np.isfinite(depth) & (depth >= depth_min) & (depth <= depth_max)
     v, u = np.nonzero(valid)
-    z = depth[v,u].astype(np.float64) * .001
+    z = depth[v, u].astype(np.float64) * 0.001
     intr = frame.intrinsics
-    x = (u-intr["cx"])*z/intr["fx"]; y = (v-intr["cy"])*z/intr["fy"]
-    camera = np.column_stack((x,y,z,np.ones_like(z)))
+    x = (u - intr["cx"]) * z / intr["fx"]
+    y = (v - intr["cy"]) * z / intr["fy"]
+    camera = np.column_stack((x, y, z, np.ones_like(z)))
     base = (frame.camera_to_base @ camera.T).T[:, :3]
-    rgb = frame.color_rgb[v,u].astype(np.float32)/255.
-    return base.astype(np.float32), rgb, segmentation.instance_image[v,u].astype(np.int64)
+    rgb = frame.color_rgb[v, u].astype(np.float32) / 255.0
+    return base.astype(np.float32), rgb
 
 
-def fuse_frames(frames: list[RGBDFrame], segments: list[SegmentationResult],
-                settings: dict) -> FusedScene:
-    xyzs, rgbs, ids, views = [], [], [], []
-    categories: dict[int,int] = {}
-    global_descriptors: list[tuple[np.ndarray,np.ndarray,int]] = []
-    association_distance = float(settings.get("instance_association_distance_m", .06))
-    association_color = float(settings.get("instance_association_color_distance", .35))
-    for view, (frame, result) in enumerate(zip(frames, segments, strict=True)):
-        xyz, rgb, instance = _points(frame, result, settings["depth_min_mm"],
-                                     settings["depth_max_mm"])
-        associated = np.full_like(instance, -1)
-        for local_id in sorted(int(x) for x in np.unique(instance) if int(x) >= 0):
-            rows = instance == local_id
-            centroid, mean_color = xyz[rows].mean(0), rgb[rows].mean(0)
-            match = None; best = float("inf")
-            for global_id, (prior_xyz, prior_rgb, observations) in enumerate(global_descriptors):
-                spatial = float(np.linalg.norm(centroid-prior_xyz))
-                color_distance = float(np.linalg.norm(mean_color-prior_rgb))
-                if spatial <= association_distance and color_distance <= association_color and spatial < best:
-                    match, best = global_id, spatial
-            if match is None:
-                match = len(global_descriptors)
-                global_descriptors.append((centroid,mean_color,1))
-            else:
-                prior_xyz, prior_rgb, observations = global_descriptors[match]
-                count = observations+1
-                global_descriptors[match] = ((prior_xyz*observations+centroid)/count,
-                                             (prior_rgb*observations+mean_color)/count,count)
-            associated[rows] = match
-            categories[match] = int(result.category_by_instance.get(local_id,0))
-        xyzs.append(xyz); rgbs.append(rgb); ids.append(instance)
-        ids[-1] = associated
+def remove_calibrated_table(
+    xyz: np.ndarray, rgb: np.ndarray, source: np.ndarray, settings: dict
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Remove the calibrated tabletop and every point below it.
+
+    The plane is expressed in the robot-base frame as ``normal @ xyz + offset = 0``.
+    ``normal`` must point from the table towards the usable workspace.  A small
+    positive clearance also removes depth noise immediately above the plane.
+    """
+    plane = settings.get("table_plane_base")
+    if not isinstance(plane, dict):
+        raise RuntimeError(
+            "Table plane is not calibrated. Record fusion.table_plane_base before capture."
+        )
+    normal = np.asarray(plane.get("normal"), dtype=np.float64)
+    if normal.shape != (3,) or not np.isfinite(normal).all():
+        raise ValueError("table_plane_base.normal must contain three finite values")
+    length = float(np.linalg.norm(normal))
+    if length < 1e-8:
+        raise ValueError("table plane normal must be non-zero")
+    normal /= length
+    if normal[2] <= 0:
+        raise ValueError("table plane normal must point upward in the robot-base frame")
+    offset = float(plane.get("offset_m")) / length
+    clearance = float(settings.get("table_clearance_m", 0.003))
+    if not np.isfinite(offset) or not 0.0 <= clearance <= 0.03:
+        raise ValueError("table offset must be finite and clearance must be in [0,0.03] m")
+    signed_distance = xyz.astype(np.float64) @ normal + offset
+    keep = signed_distance > clearance
+    xyz, rgb, source = xyz[keep], rgb[keep], source[keep]
+    if not len(xyz):
+        raise RuntimeError("Table removal deleted every point; verify table calibration")
+    return xyz, rgb, source
+
+
+def sample_scene_points(
+    xyz: np.ndarray, rgb: np.ndarray, source: np.ndarray, target: int, seed: int = 0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Downsample to an exact deployment count without inventing duplicate points."""
+    target = int(target)
+    if target <= 0:
+        return xyz, rgb, source
+    if len(xyz) < target:
+        raise RuntimeError(
+            f"Only {len(xyz)} points remain after table removal/voxelization; "
+            f"cannot downsample to the configured training reference {target}. "
+            "Reduce fusion.voxel_size_m or target_scene_points."
+        )
+    if len(xyz) == target:
+        return xyz, rgb, source
+    rng = np.random.default_rng(int(seed))
+    selected = np.sort(rng.choice(len(xyz), target, replace=False))
+    return xyz[selected], rgb[selected], source[selected]
+
+
+def fuse_frames(frames: list[RGBDFrame], segments, settings: dict) -> FusedScene:
+    """Fuse raw RGB-D into XYZRGB without external instance segmentation."""
+    del segments
+    xyzs, rgbs, views = [], [], []
+    for view, frame in enumerate(frames):
+        xyz, rgb = _points(
+            frame, settings["depth_min_mm"], settings["depth_max_mm"]
+        )
+        xyzs.append(xyz)
+        rgbs.append(rgb)
         views.append(np.full(len(xyz), view, np.int16))
-    if not xyzs or not sum(map(len, xyzs)): raise RuntimeError("No segmented 3D points")
-    xyz, rgb, instance, source = map(np.concatenate, (xyzs,rgbs,ids,views))
-    low, high = np.asarray(settings["workspace_min_m"]), np.asarray(settings["workspace_max_m"])
+    if not xyzs or not sum(map(len, xyzs)):
+        raise RuntimeError("No valid RGB-D points")
+    xyz = np.concatenate(xyzs)
+    rgb = np.concatenate(rgbs)
+    source = np.concatenate(views)
+
+    low = np.asarray(settings["workspace_min_m"])
+    high = np.asarray(settings["workspace_max_m"])
     keep = np.all((xyz >= low) & (xyz <= high), axis=1)
-    xyz, rgb, instance, source = xyz[keep],rgb[keep],instance[keep],source[keep]
+    xyz, rgb, source = xyz[keep], rgb[keep], source[keep]
+    if not len(xyz):
+        raise RuntimeError("No fused points remain inside the configured workspace")
+
+    xyz, rgb, source = remove_calibrated_table(xyz, rgb, source, settings)
+
     voxel = float(settings["voxel_size_m"])
-    keys = np.floor(xyz/voxel).astype(np.int64)
-    _, selected = np.unique(keys, axis=0, return_index=True)
-    selected.sort()
-    xyz, rgb, instance, source = xyz[selected],rgb[selected],instance[selected],source[selected]
-    return FusedScene(xyz, rgb, instance.astype(np.int64), source, categories)
+    if voxel > 0:
+        keys = np.floor(xyz / voxel).astype(np.int64)
+        _, selected = np.unique(keys, axis=0, return_index=True)
+        selected.sort()
+        xyz, rgb, source = xyz[selected], rgb[selected], source[selected]
+
+    xyz, rgb, source = sample_scene_points(
+        xyz,
+        rgb,
+        source,
+        int(settings.get("target_scene_points", 62076)),
+        int(settings.get("point_sample_seed", 20260813)),
+    )
+
+    # -1 means "not assigned yet". The integrated InstanceQueryHead fills it.
+    instance = np.full(len(xyz), -1, np.int64)
+    return FusedScene(xyz, rgb, instance, source, {})

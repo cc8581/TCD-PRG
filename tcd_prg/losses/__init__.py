@@ -1,8 +1,7 @@
-"""Independently switchable, validity-masked training losses."""
-
 from .actions import PushLoss
+from .global_grasp import GlobalGraspLoss
 from .graph import DependencyGraphLoss
-from .masked import masked_mean, safe_bce_with_logits, safe_cross_entropy, safe_smooth_l1
+from .instance import InstanceSetLoss
 from .objective import TCDPRGObjective
 from .policy import HierarchicalSetPolicyLoss
 from .proposal import GraspProposalLoss
@@ -11,16 +10,8 @@ from .total import MultiTaskLoss
 from .verifier import GraspVerifierLoss
 
 __all__ = [
-    "DependencyGraphLoss",
-    "GraspProposalLoss",
+    "PushLoss", "GlobalGraspLoss", "DependencyGraphLoss",
+    "InstanceSetLoss", "TCDPRGObjective", "HierarchicalSetPolicyLoss",
+    "GraspProposalLoss", "TaskRegionLoss", "MultiTaskLoss",
     "GraspVerifierLoss",
-    "HierarchicalSetPolicyLoss",
-    "MultiTaskLoss",
-    "PushLoss",
-    "TaskRegionLoss",
-    "TCDPRGObjective",
-    "masked_mean",
-    "safe_bce_with_logits",
-    "safe_cross_entropy",
-    "safe_smooth_l1",
 ]

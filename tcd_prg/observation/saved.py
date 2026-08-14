@@ -30,7 +30,8 @@ def reconstruct_pinhole_world(
     """Project metric axial depth to world coordinates; image v grows downward."""
 
     h, w = depth.shape
-    valid = np.isfinite(depth) & (depth > camera["z_near"]) & (depth < camera["z_far"]) & (instance >= 0)
+    # Sensor validity is geometry-only; instance==-1 is a valid background/table point.
+    valid = np.isfinite(depth) & (depth > camera["z_near"]) & (depth < camera["z_far"])
     v, u = np.nonzero(valid)
     z = depth[v, u].astype(np.float32)
     x = (u.astype(np.float32) - float(camera["cx"])) * z / float(camera["fx"])
@@ -48,37 +49,22 @@ def reconstruct_pinhole_world(
     )
 
 
-def deterministic_stratified_sample(obs: PointObservation, count: int, seed: int) -> PointObservation:
-    """Instance-preserving sampling, or the untouched union when ``count <= 0``."""
+def deterministic_stratified_sample(
+    obs: PointObservation, count: int, seed: int
+) -> PointObservation:
+    """Deterministic sensor-only sampling; never stratify by GT instance id."""
 
     n = len(obs.xyz)
     if n == 0:
-        raise ValueError("Observation contains no object points")
-    # Pointcept/PTv3 accepts variable-length scenes. A non-positive limit keeps
-    # every reconstructed sensor point; padding is introduced only by collation.
-    if count <= 0:
+        raise ValueError("Observation contains no valid sensor points")
+    if count <= 0 or n <= count:
         return obs
     rng = np.random.default_rng(seed)
-    if n <= count:
-        return obs
-    else:
-        groups = np.unique(obs.instance_id)
-        per_group = max(1, count // max(1, len(groups)) // 2)
-        chosen: list[np.ndarray] = []
-        used = np.zeros(n, dtype=bool)
-        for group in groups:
-            candidates = np.flatnonzero(obs.instance_id == group)
-            take = min(per_group, len(candidates))
-            selected = rng.choice(candidates, take, replace=False)
-            chosen.append(selected)
-            used[selected] = True
-        base = np.concatenate(chosen) if chosen else np.empty(0, dtype=np.int64)
-        remaining = count - len(base)
-        pool = np.flatnonzero(~used)
-        fill = rng.choice(pool, remaining, replace=False) if remaining else np.empty(0, np.int64)
-        index = np.concatenate((base, fill))
-        rng.shuffle(index)
-    return PointObservation(obs.xyz[index], obs.rgb[index], obs.instance_id[index], obs.source_view[index])
+    index = rng.choice(n, count, replace=False)
+    rng.shuffle(index)
+    return PointObservation(
+        obs.xyz[index], obs.rgb[index], obs.instance_id[index], obs.source_view[index]
+    )
 
 
 def _resize_view_nearest(

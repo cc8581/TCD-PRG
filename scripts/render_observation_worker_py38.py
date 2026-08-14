@@ -41,7 +41,6 @@ def project_world(depth, rgb, instance, camera, view_index):
         np.isfinite(depth)
         & (depth > float(camera["z_near"]))
         & (depth < float(camera["z_far"]))
-        & (instance >= 0)
     )
     v, u = np.nonzero(valid)
     z = depth[v, u].astype(np.float32)
@@ -63,30 +62,14 @@ def project_world(depth, rgb, instance, camera, view_index):
 
 
 def deterministic_sample(xyz, rgb, instance, source_view, count, seed):
+    """Sensor-only deterministic sampling; GT instance id never affects selection."""
     if not len(xyz):
-        raise RuntimeError("render produced no object pixels")
-    # count <= 0 is the formal variable-length PTv3 protocol: preserve the
-    # complete fused observation and let GridSample reduce it inside the model.
-    if count <= 0:
+        raise RuntimeError("render produced no valid sensor pixels")
+    if count <= 0 or len(xyz) <= count:
         return xyz, rgb, instance, source_view
     rng = np.random.default_rng(int(seed))
-    if len(xyz) <= count:
-        return xyz, rgb, instance, source_view
-    else:
-        groups = np.unique(instance)
-        per_group = max(1, count // max(1, len(groups)) // 2)
-        chosen = []
-        used = np.zeros(len(xyz), dtype=bool)
-        for group in groups:
-            candidates = np.flatnonzero(instance == group)
-            selected = rng.choice(candidates, min(per_group, len(candidates)), replace=False)
-            chosen.append(selected)
-            used[selected] = True
-        base = np.concatenate(chosen) if chosen else np.empty(0, dtype=np.int64)
-        remaining = count - len(base)
-        fill = rng.choice(np.flatnonzero(~used), remaining, replace=False)
-        index = np.concatenate((base, fill))
-        rng.shuffle(index)
+    index = rng.choice(len(xyz), int(count), replace=False)
+    rng.shuffle(index)
     return xyz[index], rgb[index], instance[index], source_view[index]
 
 
@@ -139,6 +122,11 @@ def main():
         scales = request["object_scales"].astype(np.float64)
         point_count = int(request["point_count"])
         render_seed = int(request["render_seed"])
+        renderer_version = str(request["renderer_version"])
+    if renderer_version == "tcd_prg_pybullet_v2_variable_grid":
+        raise RuntimeError(
+            "Legacy v2 observation caches are read-only; rendering new entries is prohibited"
+        )
     client = pb.connect(pb.DIRECT)
     try:
         pb.resetSimulation(physicsClientId=client)

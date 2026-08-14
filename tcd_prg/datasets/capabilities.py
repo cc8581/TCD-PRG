@@ -1,5 +1,4 @@
 """Machine-readable dataset label and execution capabilities."""
-
 from dataclasses import dataclass
 
 
@@ -19,13 +18,20 @@ class DatasetCapabilities:
 
     def loss_available(self, name: str) -> bool:
         requirements = {
+            "instance": self.has_instance_masks,
             "region": self.has_task_regions,
             "proposal": self.has_task_grasps,
             "global_grasp": self.has_global_grasps,
             "verify": self.has_task_grasps,
             "graph": self.has_relation_graph,
             "push": self.has_push_actions,
-            "policy": self.has_sequences and (self.has_push_actions or self.has_pick_remove_actions),
+            "policy": (
+                self.has_sequences
+                and (
+                    self.has_push_actions
+                    or self.has_pick_remove_actions
+                )
+            ),
         }
         if name not in requirements:
             raise KeyError(name)
