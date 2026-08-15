@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from typing import Any
+import json
+from pathlib import Path
 
 import torch
 from torch import Tensor, nn
@@ -11,6 +13,10 @@ from tcd_prg.config import (
 )
 from tcd_prg.constants import ActionType, CandidateStatus
 from tcd_prg.datasets.capabilities import DatasetCapabilities
+from tcd_prg.datasets.acronym_grasp_database import (
+    load_object_grasps, match_object_grasp_priors,
+)
+from tcd_prg.geometry.se3 import quaternion_xyzw_to_matrix
 
 from .actions import PushLoss
 from .ag_width import AGWidthLoss
@@ -58,6 +64,7 @@ class TCDPRGObjective(nn.Module):
         loss_config: LossConfig | None = None,
         region_config: RegionHeadConfig | None = None,
         generated_policy_candidate_ratio: float = 0.0,
+        acronym_object_grasp_database: str = "",
     ) -> None:
         super().__init__()
         self.model_config = model_config
@@ -119,6 +126,14 @@ class TCDPRGObjective(nn.Module):
         self.generated_policy_candidate_ratio = float(
             generated_policy_candidate_ratio
         )
+        self.acronym_database_root = (
+            Path(acronym_object_grasp_database)
+            if acronym_object_grasp_database else None
+        )
+        self._acronym_paths: dict[str, Path] | None = None
+        self._acronym_cache: dict[
+            tuple[str, str], tuple[Tensor, Tensor, Tensor]
+        ] = {}
         self.total = MultiTaskLoss(
             capabilities,
             ablation,
@@ -131,6 +146,86 @@ class TCDPRGObjective(nn.Module):
         if valid.ndim == 0:
             return valid.reshape(1)
         return valid.reshape(valid.shape[0], -1).any(-1)
+
+    def _acronym_path_map(self) -> dict[str, Path]:
+        if self.acronym_database_root is None:
+            return {}
+        if self._acronym_paths is None:
+            manifest = json.loads(
+                (self.acronym_database_root / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self._acronym_paths = {
+                str(record["model_id"]): Path(record["path"])
+                for record in manifest["records"]
+            }
+        return self._acronym_paths
+
+    def _acronym_tensors(
+        self, model_id: str, device: torch.device
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        key = (model_id, str(device))
+        if key not in self._acronym_cache:
+            database = load_object_grasps(self._acronym_path_map()[model_id])
+            self._acronym_cache[key] = (
+                torch.from_numpy(database["translation_object"]).to(device),
+                torch.from_numpy(database["rotation_object"]).to(device),
+                torch.from_numpy(database["status"]).to(device),
+            )
+        return self._acronym_cache[key]
+
+    @torch.no_grad()
+    def _acronym_proposal_status(
+        self, prediction: dict[str, Tensor], batch: dict[str, Any]
+    ) -> Tensor | None:
+        if self.acronym_database_root is None or "target_model_id" not in batch:
+            return None
+        proposal_status = torch.full_like(
+            prediction["valid"], int(CandidateStatus.UNKNOWN_UNTESTED),
+            dtype=torch.int8,
+        )
+        for row, model_id in enumerate(batch["target_model_id"]):
+            pose = batch["object_pose"][row, batch["target_object"][row]]
+            rotation_world_object = quaternion_xyzw_to_matrix(pose[3:])
+            translation_object = torch.einsum(
+                "ij,kj->ki", rotation_world_object.transpose(0, 1),
+                prediction["translation_world"][row] - pose[:3],
+            )
+            rotation_object = torch.einsum(
+                "ij,kjl->kil", rotation_world_object.transpose(0, 1),
+                prediction["rotation_matrix"][row],
+            )
+            intrinsic = match_object_grasp_priors(
+                translation_object, rotation_object, prediction["valid"][row],
+                *self._acronym_tensors(str(model_id), translation_object.device),
+                translation_m=self.task_grasp.translation_m,
+                rotation_deg=self.task_grasp.rotation_deg,
+            )["status"]
+            status = intrinsic.clone()
+            intrinsic_positive = intrinsic == int(CandidateStatus.POSITIVE)
+            if "region_valid" in batch and bool(intrinsic_positive.any()):
+                domain = (
+                    batch["point_mask"][row].bool()
+                    & batch["target_mask"][row].bool()
+                )
+                indices = torch.nonzero(domain, as_tuple=False).flatten()
+                if len(indices):
+                    nearest = torch.cdist(
+                        prediction["translation_world"][row].float(),
+                        batch["xyz"][row, indices].float(),
+                    ).argmin(-1)
+                    point_index = indices[nearest]
+                    region_known = batch["region_valid"][row, point_index].bool()
+                    in_region = batch["region_target"][row, point_index].bool()
+                    status[intrinsic_positive & ~region_known] = int(
+                        CandidateStatus.UNKNOWN_UNTESTED
+                    )
+                    status[intrinsic_positive & region_known & ~in_region] = int(
+                        CandidateStatus.NEGATIVE
+                    )
+            proposal_status[row] = status
+        return proposal_status
 
     @classmethod
     def _listwise_active_rows(
@@ -231,6 +326,18 @@ class TCDPRGObjective(nn.Module):
         ):
             if key in batch:
                 model_inputs[key] = batch[key]
+        if self.training and "graspnet_instance_id" in batch:
+            teacher_crop = (
+                batch["graspnet_point_mask"].bool()
+                & (
+                    batch["graspnet_instance_id"].long()
+                    == batch["target_object"][:, None].long()
+                )
+            )
+            model_inputs["teacher_target_crop_mask"] = teacher_crop
+            model_inputs["teacher_target_identity_valid"] = (
+                teacher_crop.sum(-1) >= 32
+            )
         if "grid_coord" in batch:
             model_inputs["grid_coord"] = batch["grid_coord"]
         view: dict[str, Any] = {"model_inputs": model_inputs}
@@ -467,6 +574,11 @@ class TCDPRGObjective(nn.Module):
                 task_labels = build_grasp_proposal_labels(
                     batch, self.model_config
                 )
+                acronym_status = self._acronym_proposal_status(
+                    output["task_grasp"], batch
+                )
+                if acronym_status is not None:
+                    task_labels["proposal_status"] = acronym_status
                 # Run even when the sparse label set has no match. This keeps
                 # crop/proposal health metrics present on every task batch while
                 # the loss remains a connected zero for UNKNOWN-only rows.
@@ -497,6 +609,10 @@ class TCDPRGObjective(nn.Module):
                 score_losses["target_identity_valid_rate"] = task_output[
                     "target_identity_valid"
                 ].float().mean().detach()
+                score_losses["target_identity_teacher_forced_rate"] = task_output.get(
+                    "target_identity_teacher_forced",
+                    torch.zeros_like(task_output["target_identity_valid"]),
+                ).float().mean().detach()
                 if "target_mask" in batch:
                     hard_target = task_output["target_hard_mask_fused"].bool()
                     target_gt = batch["target_mask"].bool() & batch[

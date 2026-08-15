@@ -492,6 +492,7 @@ def main() -> None:
         config.losses,
         config.region_head,
         config.training.generated_policy_candidate_ratio,
+        config.dataset.acronym_object_grasp_database,
     )
     if rank == 0:
         enabled = {name: objective.total.enabled(name) for name in objective.total.DEFAULT_WEIGHTS}

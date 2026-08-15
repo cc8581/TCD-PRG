@@ -63,3 +63,13 @@ def test_sparse_task_pose_batch_is_rejected_for_graspnet_finetuning():
                 "task_grasp_pose_world": torch.randn(1, 8, 7),
             }
         )
+
+
+def test_tristate_unknown_labels_are_rejected_by_unmasked_official_loss():
+    generator = FrozenGraspNetProposalGenerator(
+        source_root="unused", checkpoint="unused", freeze=False
+    )
+    batch = _dense_batch()
+    batch["grasp_known_mask_list"] = [[]]
+    with pytest.raises(RuntimeError, match="no UNKNOWN state"):
+        generator.official_training_loss(batch)

@@ -38,7 +38,9 @@ def _load_official_graspnet(source_root: str | Path):
 
 
 def _safe_logit(probability: Tensor, eps: float = 1e-5) -> Tensor:
-    probability = probability.clamp(eps, 1.0 - eps)
+    # FP16 cannot represent 1-eps for eps=1e-5 and rounds it back to 1,
+    # producing +inf logits for high-confidence frozen proposals.
+    probability = probability.float().clamp(eps, 1.0 - eps)
     return torch.log(probability) - torch.log1p(-probability)
 
 
@@ -174,6 +176,12 @@ class FrozenGraspNetProposalGenerator(nn.Module):
         requires per-object grasp points, offsets, scores and tolerances.
         """
 
+        if "grasp_known_mask_list" in dense_batch:
+            raise RuntimeError(
+                "The upstream GraspNet loss has no UNKNOWN state and would treat "
+                "uncovered lattice cells as negatives. Tri-state proposal labels "
+                "must use proposal-level masked losses, not official_training_loss."
+            )
         required = {
             "point_clouds",
             "objectness_label",

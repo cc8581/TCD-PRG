@@ -64,6 +64,7 @@ def main() -> None:
     objective = TCDPRGObjective(
         adapter.capabilities, config.model, config.ablation, config.losses,
         config.region_head, config.training.generated_policy_candidate_ratio,
+        config.dataset.acronym_object_grasp_database,
     ).to(device)
     sums: dict[str, float] = {}
     counts: dict[str, int] = {}

@@ -50,7 +50,9 @@ class AGWidthLoss(nn.Module):
             selected = candidates[row_matched]
             if len(selected):
                 matched[row, selected] = True
-                target[row, selected] = labels["width_m"][row, targets[best[row_matched]]]
+                target[row, selected] = labels["width_m"][
+                    row, targets[best[row_matched]]
+                ].to(target.dtype)
 
         if matched.any():
             error = (width[matched] - target[matched]).abs()

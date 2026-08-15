@@ -3,6 +3,7 @@
 from typing import Any
 
 from .base import DatasetAdapter
+from .acronym_grasp_database import load_object_grasps, match_object_grasp_priors
 from .capabilities import DatasetCapabilities
 from .gapg_observation import GAPGObservationAdapter
 from .policy_candidates import (
@@ -40,7 +41,9 @@ __all__ = [
     "StateGroupUnit",
     "TaskOrientedClutterAdapter",
     "load_candidate_batch",
+    "load_object_grasps",
     "match_generated_candidates",
+    "match_object_grasp_priors",
 ]
 
 

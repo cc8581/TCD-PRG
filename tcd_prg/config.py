@@ -24,6 +24,7 @@ class DatasetConfig:
     scene_points: int = 0
     # target_points 仅供独立资源分析器使用，不限制正式 PTv3 输入。
     target_points: int = 4096
+    acronym_object_grasp_database: str = ""
 
 
 @dataclass(slots=True)
@@ -831,6 +832,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> TCDPRGC
         (config.dataset, "root"),
         (config.dataset, "acronym_root"),
         (config.dataset, "functional_region_root"),
+        (config.dataset, "acronym_object_grasp_database"),
         (config.dataset, "fr5_ag_urdf"),
         (config.observation, "worker_script"),
         (config.observation, "runtime_mesh_root"),

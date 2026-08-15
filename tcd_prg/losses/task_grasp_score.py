@@ -5,6 +5,7 @@ import torch
 from torch import Tensor, nn
 
 from tcd_prg.geometry.se3 import parallel_jaw_rotation_distance
+from tcd_prg.constants import CandidateStatus
 
 
 def _rotation_error_deg(first: Tensor, second: Tensor) -> Tensor:
@@ -74,7 +75,13 @@ class TaskGraspScoringLoss(nn.Module):
         negative = torch.zeros_like(valid)
         positive_wrong_region_overlap = torch.zeros_like(valid)
 
+        direct_status = labels.get("proposal_status")
+        if direct_status is not None:
+            positive = valid & (direct_status == int(CandidateStatus.POSITIVE))
+            negative = valid & (direct_status == int(CandidateStatus.NEGATIVE))
         for row in range(logits.shape[0]):
+            if direct_status is not None:
+                continue
             positive[row] = self._match_set(
                 prediction["translation_world"][row],
                 prediction["rotation_matrix"][row],
@@ -93,27 +100,30 @@ class TaskGraspScoringLoss(nn.Module):
                     labels["wrong_region_valid"][row],
                 )
                 positive_wrong_region_overlap[row] = raw_negative & positive[row]
-                negative[row] = raw_negative & ~positive[row]
+                # Explicit negative evidence wins conflicts.
+                negative[row] = raw_negative
+                positive[row] = positive[row] & ~raw_negative
 
         known = valid & (positive | negative)
         target = positive.to(logits.dtype)
+        loss_logits = logits.float()
         if known.any():
             bce = torch.nn.functional.binary_cross_entropy_with_logits(
-                logits[known], target[known]
+                loss_logits[known], target[known].float()
             )
         else:
-            bce = logits.sum() * 0.0
+            bce = loss_logits.sum() * 0.0
 
         row_effective = positive.any(-1) & negative.any(-1)
         ranking_terms = []
         for row in torch.nonzero(row_effective, as_tuple=False).flatten().tolist():
-            pos = torch.logsumexp(logits[row][positive[row]], dim=0)
-            neg = torch.logsumexp(logits[row][negative[row]], dim=0)
+            pos = torch.logsumexp(loss_logits[row][positive[row]], dim=0)
+            neg = torch.logsumexp(loss_logits[row][negative[row]], dim=0)
             ranking_terms.append(torch.nn.functional.softplus(neg - pos))
         ranking = (
             torch.stack(ranking_terms).mean()
             if ranking_terms
-            else logits.sum() * 0.0
+            else loss_logits.sum() * 0.0
         )
         loss = self.bce_weight * bce + self.ranking_weight * ranking
 
@@ -123,7 +133,11 @@ class TaskGraspScoringLoss(nn.Module):
         for amount in (16, 32, 64):
             translation_hit = logits.new_zeros((logits.shape[0],))
             translation_rotation_hit = logits.new_zeros((logits.shape[0],))
-            applicable = labels["target_valid"].any(-1)
+            applicable = (
+                positive.any(-1)
+                if direct_status is not None
+                else labels["target_valid"].any(-1)
+            )
             for row in range(logits.shape[0]):
                 candidates = torch.nonzero(valid[row], as_tuple=False).flatten()
                 if not len(candidates) or not bool(applicable[row]):
@@ -131,16 +145,21 @@ class TaskGraspScoringLoss(nn.Module):
                 order = candidates[
                     base_logit[row, candidates].argsort(descending=True, stable=True)
                 ][:amount]
-                targets = torch.nonzero(
-                    labels["target_valid"][row], as_tuple=False
-                ).flatten()
-                distance = torch.cdist(
-                    prediction["translation_world"][row, order].float(),
-                    labels["translation_world"][row, targets].float(),
-                )
-                translation_hit[row] = (distance <= self.translation_m).any().to(
-                    translation_hit.dtype
-                )
+                if direct_status is not None:
+                    translation_hit[row] = positive[row, order].any().to(
+                        translation_hit.dtype
+                    )
+                else:
+                    targets = torch.nonzero(
+                        labels["target_valid"][row], as_tuple=False
+                    ).flatten()
+                    distance = torch.cdist(
+                        prediction["translation_world"][row, order].float(),
+                        labels["translation_world"][row, targets].float(),
+                    )
+                    translation_hit[row] = (distance <= self.translation_m).any().to(
+                        translation_hit.dtype
+                    )
                 translation_rotation_hit[row] = positive[row, order].any().to(
                     translation_rotation_hit.dtype
                 )

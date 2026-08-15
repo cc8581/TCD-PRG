@@ -40,6 +40,7 @@ SENSOR_KEYS = frozenset({
     "graspnet_xyz_world", "graspnet_point_mask",
     "camera2_eye_world", "camera2_target_world", "camera2_up_world",
     "camera2_valid",
+    "teacher_target_crop_mask", "teacher_target_identity_valid",
 })
 TASK_KEYS = frozenset({
     "task_category_id", "task_region_id", "remaining_steps",
@@ -273,6 +274,7 @@ class TCDPRGModel(nn.Module):
         proposal_count: int,
         input_points: int,
         target_identity_valid: Tensor | None = None,
+        target_crop_mask_override: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Run official GraspNet on the independent Camera2 cloud."""
 
@@ -317,7 +319,21 @@ class TCDPRGModel(nn.Module):
             if target_identity_valid is None
             else target_identity_valid.bool()
         )
-        if strict_target_crop:
+        if target_crop_mask_override is not None:
+            crop_mask = (
+                camera_point_mask
+                & target_crop_mask_override.bool()
+                & sensor["camera2_valid"][:, None].bool()
+            )
+            crop_count = crop_mask.sum(-1)
+            target_grasp_valid = (
+                sensor["camera2_valid"].bool()
+                & identity_valid
+                & (crop_count >= self.graspnet_config.target_min_crop_points)
+            )
+            crop_mask = crop_mask & target_grasp_valid[:, None]
+            camera_target_probability = target_crop_mask_override.to(camera_xyz.dtype)
+        elif strict_target_crop:
             if target_probability is None:
                 raise ValueError("strict target crop requires predicted target_probability")
             camera_target_probability = target_probability.gather(
@@ -859,6 +875,11 @@ class TCDPRGModel(nn.Module):
             sensor["point_mask"],
         )
         target_identity_valid = self._target_identity_gate(encoded)
+        teacher_crop = sensor.get("teacher_target_crop_mask") if self.training else None
+        if teacher_crop is not None:
+            target_identity_valid = sensor.get(
+                "teacher_target_identity_valid", teacher_crop.bool().any(-1)
+            ).bool()
         target_proposals = self._forward_camera_graspnet(
             sensor,
             target_probability=encoded.target_instance_probability,
@@ -867,29 +888,41 @@ class TCDPRGModel(nn.Module):
             proposal_count=self.graspnet_config.target_proposals,
             input_points=self.graspnet_config.target_input_points,
             target_identity_valid=target_identity_valid,
+            target_crop_mask_override=teacher_crop,
         )
         target_proposals["target_hard_mask_fused"] = (
             encoded.target_instance_probability
             >= self.graspnet_config.target_crop_probability
         ) & sensor["point_mask"].bool()
-        target_width = self.ag_width(
-            target_proposals,
-            encoded.point_features,
-            sensor["xyz"],
-            sensor["point_mask"],
-            encoded.target_probability,
+        target_proposals["target_identity_teacher_forced"] = torch.full_like(
+            target_identity_valid, teacher_crop is not None, dtype=torch.bool
         )
-        target_proposals = {**target_proposals, **target_width}
-        task_grasp = self.task_grasp(
-            target_proposals,
-            encoded.point_features,
-            sensor["xyz"],
-            sensor["point_mask"],
-            region["region_probability"],
-            encoded.target_probability,
-            encoded.task_token,
-            encoded.target_token,
-        )
+        # Proposal scoring contains masked local attention and ranking gradients.
+        # Keep this learned path in FP32: unlike frozen GraspNet, it participates
+        # in backward and sparse proposal batches can overflow FP16 GradScaler.
+        fp32_proposals = {
+            key: value.float() if value.is_floating_point() else value
+            for key, value in target_proposals.items()
+        }
+        with torch.autocast(device_type=sensor["xyz"].device.type, enabled=False):
+            target_width = self.ag_width(
+                fp32_proposals,
+                encoded.point_features.float(),
+                sensor["xyz"].float(),
+                sensor["point_mask"],
+                encoded.target_probability.float(),
+            )
+            fp32_proposals = {**fp32_proposals, **target_width}
+            task_grasp = self.task_grasp(
+                fp32_proposals,
+                encoded.point_features.float(),
+                sensor["xyz"].float(),
+                sensor["point_mask"],
+                region["region_probability"].float(),
+                encoded.target_probability.float(),
+                encoded.task_token.float(),
+                encoded.target_token.float(),
+            )
         global_grasp = self._forward_global_grasp(encoded, sensor)
 
         if self.ablation.use_dependency_graph:

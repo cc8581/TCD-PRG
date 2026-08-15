@@ -2,6 +2,7 @@ defaults:
   - _self_
 
 dataset:
+  acronym_object_grasp_database: ""
   # 下列三个路径会被 train.py 的本机路径配置覆盖，此处保留可移植的仓库相对值。
   root: data/TaskOrientedClutterSceneDataset
   acronym_root: data/ACRONYM

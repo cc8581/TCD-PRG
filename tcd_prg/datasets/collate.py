@@ -323,6 +323,19 @@ def collate_unified(
         "object_present": object_present.bool(),
         "object_active": object_active.bool(),
         "object_category_id": object_category_id.long(),
+        "target_model_id": [
+            str(x.metadata.get("object_model_id", ("",))[x.target_object])
+            if x.target_object < len(x.metadata.get("object_model_id", ())) else ""
+            for x in observations
+        ],
+        "target_object_scale": torch.tensor(
+            [
+                float(x.metadata.get("object_scale", (1.0,))[x.target_object])
+                if x.target_object < len(x.metadata.get("object_scale", ())) else 1.0
+                for x in observations
+            ],
+            dtype=torch.float32,
+        ),
         "push_object_known": push_object_known,
         "push_object_positive": push_object_positive,
         "task_category_id": torch.tensor(
