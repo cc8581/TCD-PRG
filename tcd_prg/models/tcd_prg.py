@@ -135,6 +135,8 @@ class TCDPRGModel(nn.Module):
             hmax_list=graspnet_config.hmax_list,
         )
         self.graspnet_config = graspnet_config
+        self.target_prompt_min_support = float(c.target_prompt_min_support)
+        self.target_prompt_min_margin = float(c.target_prompt_min_margin)
         self.task_grasp = TaskGraspScorer(
             c.feature_dim,
             layers=c.task_grasp_scorer_layers,
@@ -270,6 +272,7 @@ class TCDPRGModel(nn.Module):
         strict_target_crop: bool,
         proposal_count: int,
         input_points: int,
+        target_identity_valid: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Run official GraspNet on the independent Camera2 cloud."""
 
@@ -291,27 +294,42 @@ class TCDPRGModel(nn.Module):
             camera_xyz_world, rotation_world_camera, sensor["camera2_eye_world"]
         )
 
-        nearest_scene = self._nearest_reference_index(
+        reference_mask = sensor["point_mask"].bool()
+        if "source_view" in sensor:
+            reference_mask = reference_mask & (
+                sensor["source_view"].long()
+                == int(self.graspnet_config.camera_view_index)
+            )
+        nearest_scene, transfer_distance, transfer_valid = self._nearest_reference_index(
             camera_xyz_world,
             camera_point_mask,
             sensor["xyz"],
-            sensor["point_mask"],
+            reference_mask,
+            max_distance_m=self.graspnet_config.camera_transfer_max_distance_m,
         )
         camera_instance_probability = torch.gather(
             instance_probability,
             2,
             nearest_scene[:, None].expand(-1, instance_probability.shape[1], -1),
+        ) * transfer_valid[:, None].to(instance_probability.dtype)
+        identity_valid = (
+            torch.ones_like(sensor["camera2_valid"], dtype=torch.bool)
+            if target_identity_valid is None
+            else target_identity_valid.bool()
         )
         if strict_target_crop:
             if target_probability is None:
                 raise ValueError("strict target crop requires predicted target_probability")
-            camera_target_probability = target_probability.gather(1, nearest_scene)
-            crop_mask = camera_point_mask & (
+            camera_target_probability = target_probability.gather(
+                1, nearest_scene
+            ) * transfer_valid.to(target_probability.dtype)
+            crop_mask = camera_point_mask & transfer_valid & (
                 camera_target_probability >= self.graspnet_config.target_crop_probability
             )
             crop_count = crop_mask.sum(-1)
             target_grasp_valid = (
                 sensor["camera2_valid"].bool()
+                & identity_valid
                 & (crop_count >= self.graspnet_config.target_min_crop_points)
             )
             crop_mask = crop_mask & target_grasp_valid[:, None]
@@ -364,6 +382,14 @@ class TCDPRGModel(nn.Module):
             "target_crop_mask": crop_mask,
             "target_crop_probability": camera_target_probability,
             "target_crop_points": crop_count,
+            "camera_transfer_reference_index": nearest_scene,
+            "camera_transfer_distance_m": transfer_distance,
+            "camera_transfer_valid": transfer_valid,
+            "camera_transfer_coverage": (
+                transfer_valid.float().sum(-1)
+                / camera_point_mask.float().sum(-1).clamp_min(1.0)
+            ),
+            "target_identity_valid": identity_valid,
             "graspnet_valid_proposals_per_row": valid.sum(-1),
         }
 
@@ -378,6 +404,30 @@ class TCDPRGModel(nn.Module):
         scene.global_scene_token = encoded.scene_global_token
         return self._forward_global_grasp_neutral(
             scene, encoded.instance, sensor
+        )
+
+    def _target_identity_gate(self, encoded: Any) -> Tensor:
+        """Fail closed unless a prompt or a valid ReID track identifies the target."""
+
+        prompt_support = encoded.target_prompt_support
+        if prompt_support.ndim == 2:
+            rows = torch.arange(
+                prompt_support.shape[0], device=prompt_support.device
+            )
+            prompt_support = prompt_support[
+                rows, encoded.target_query_index
+            ]
+        prompt_valid = (
+            encoded.target_prompt_used.bool()
+            & (prompt_support >= self.target_prompt_min_support)
+        )
+        reid_valid = (
+            ~encoded.target_prompt_used.bool()
+            & encoded.target_reid_used.bool()
+        )
+        return (
+            (prompt_valid | reid_valid)
+            & (encoded.target_selection_margin >= self.target_prompt_min_margin)
         )
 
     def forward_global_grasp(
@@ -400,11 +450,15 @@ class TCDPRGModel(nn.Module):
         reference: Tensor,
         reference_mask: Tensor,
         chunk_size: int = 1024,
-    ) -> Tensor:
+        max_distance_m: float | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """Nearest reference point without materializing an N-by-M matrix."""
 
         result = torch.zeros(
             query.shape[:2], dtype=torch.long, device=query.device
+        )
+        nearest_distance = torch.full(
+            query.shape[:2], float("inf"), dtype=torch.float32, device=query.device
         )
         for row in range(query.shape[0]):
             queries = torch.nonzero(query_mask[row], as_tuple=False).flatten()
@@ -418,8 +472,13 @@ class TCDPRGModel(nn.Module):
                 distance = torch.cdist(
                     query[row, local].float(), reference[row, references].float()
                 )
-                result[row, local] = references[distance.argmin(-1)]
-        return result
+                local_distance, local_index = distance.min(-1)
+                result[row, local] = references[local_index]
+                nearest_distance[row, local] = local_distance
+        valid = query_mask.bool() & torch.isfinite(nearest_distance)
+        if max_distance_m is not None:
+            valid = valid & (nearest_distance <= float(max_distance_m))
+        return result, nearest_distance, valid
 
     @staticmethod
     @torch.no_grad()
@@ -799,14 +858,20 @@ class TCDPRGModel(nn.Module):
             encoded.target_probability,
             sensor["point_mask"],
         )
+        target_identity_valid = self._target_identity_gate(encoded)
         target_proposals = self._forward_camera_graspnet(
             sensor,
-            target_probability=encoded.target_probability,
+            target_probability=encoded.target_instance_probability,
             instance_probability=encoded.instance.mask_probability,
             strict_target_crop=True,
             proposal_count=self.graspnet_config.target_proposals,
             input_points=self.graspnet_config.target_input_points,
+            target_identity_valid=target_identity_valid,
         )
+        target_proposals["target_hard_mask_fused"] = (
+            encoded.target_instance_probability
+            >= self.graspnet_config.target_crop_probability
+        ) & sensor["point_mask"].bool()
         target_width = self.ag_width(
             target_proposals,
             encoded.point_features,

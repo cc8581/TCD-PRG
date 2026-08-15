@@ -164,12 +164,14 @@ class EncoderOutput:
     object_mask: Tensor
     target_token: Tensor
     target_probability: Tensor
+    target_instance_probability: Tensor
     target_query_logits: Tensor
     target_query_weights: Tensor
     target_query_index: Tensor
     target_selection_margin: Tensor
     target_prompt_support: Tensor
     target_prompt_used: Tensor
+    target_reid_used: Tensor
     global_scene_token: Tensor
     task_token: Tensor
     scene_point_features: Tensor
@@ -354,6 +356,10 @@ class TaskConditioningAdapter(nn.Module):
         target_probability = torch.einsum(
             "bq,bqn->bn", target_weights, instance.mask_probability
         ) * point_mask.to(scene.point_features.dtype)
+        rows = torch.arange(xyz.shape[0], device=xyz.device)
+        target_instance_probability = instance.mask_probability[
+            rows, selection.query_index
+        ] * point_mask.to(scene.point_features.dtype)
 
         point_condition = torch.cat(
             (
@@ -390,12 +396,14 @@ class TaskConditioningAdapter(nn.Module):
             object_mask=instance.object_mask,
             target_token=target,
             target_probability=target_probability,
+            target_instance_probability=target_instance_probability,
             target_query_logits=target_logits,
             target_query_weights=target_weights,
             target_query_index=selection.query_index,
             target_selection_margin=selection.margin,
             target_prompt_support=selection.positive_prompt_support,
             target_prompt_used=selection.used_prompt,
+            target_reid_used=selection.used_reid,
             global_scene_token=global_token,
             task_token=task,
             scene_point_features=scene.point_features,

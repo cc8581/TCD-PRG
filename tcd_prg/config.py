@@ -91,6 +91,7 @@ class GraspNetConfig:
     camera_view_index: int = 2
     target_crop_probability: float = 0.5
     target_min_crop_points: int = 32
+    camera_transfer_max_distance_m: float = 0.010
     num_view: int = 300
     num_angle: int = 12
     num_depth: int = 4
@@ -758,6 +759,8 @@ class TCDPRGConfig:
             raise ValueError("GraspNet camera_view_index must be non-negative")
         if not 0.0 < self.graspnet.target_crop_probability < 1.0:
             raise ValueError("GraspNet target_crop_probability must lie in (0,1)")
+        if self.graspnet.camera_transfer_max_distance_m <= 0:
+            raise ValueError("GraspNet camera_transfer_max_distance_m must be positive")
         if self.model.verifier_transformer_layers <= 0:
             raise ValueError("verifier_transformer_layers must be positive")
         if self.model.feature_dim % self.model.verifier_transformer_heads:

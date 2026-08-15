@@ -59,7 +59,7 @@ def test_chunked_camera_to_ptv3_nearest_index_matches_dense_distance():
     reference_mask = torch.ones(2, 19, dtype=torch.bool)
     query_mask[1, 20:] = False
     reference_mask[0, 17:] = False
-    actual = TCDPRGModel._nearest_reference_index(
+    actual, distance, valid = TCDPRGModel._nearest_reference_index(
         query, query_mask, reference, reference_mask, chunk_size=5
     )
     for row in range(2):
@@ -69,6 +69,8 @@ def test_chunked_camera_to_ptv3_nearest_index_matches_dense_distance():
             torch.cdist(query[row, queries], reference[row, references]).argmin(-1)
         ]
         assert torch.equal(actual[row, queries], expected)
+        assert torch.all(valid[row, queries])
+        assert torch.all(torch.isfinite(distance[row, queries]))
 
 
 def test_camera2_strict_crop_never_falls_back_to_scene(fake_graspnet, tiny_batch):

@@ -17,6 +17,17 @@ never mix with the TCD-PRG source package or training outputs.
 All three files are ignored by Git. Redistribution and use remain subject to
 the upstream GAPG and GraspNet licenses.
 
+## GraspNet fine-tuning boundary
+
+`graspnet.freeze: true` remains the default. Setting it to `false` enables the
+adapter's separate official-training API, but does not add GraspNet parameters
+to the TCD-PRG optimizer, EMA, DDP broadcasts or checkpoint. Call
+`prepare_finetuning(device)`, create an optimizer from `finetune_parameters()`,
+train only with the complete upstream dense-label schema, and save
+`finetune_state_dict()` as a standalone checkpoint. Sparse task-grasp pose sets
+are rejected by `official_training_loss()` because unmatched grasps are not
+valid negatives.
+
 ## Verified smoke run
 
 The full TCD-PRG training entry point was run on one real cached state at 2,048

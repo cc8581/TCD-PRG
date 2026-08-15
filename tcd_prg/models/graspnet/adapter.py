@@ -34,7 +34,7 @@ def _load_official_graspnet(source_root: str | Path):
         if value not in sys.path:
             sys.path.insert(0, value)
     module = importlib.import_module("graspnet")
-    return module.GraspNet, module.pred_decode
+    return module.GraspNet, module.pred_decode, module.get_loss
 
 
 def _safe_logit(probability: Tensor, eps: float = 1e-5) -> Tensor:
@@ -43,7 +43,12 @@ def _safe_logit(probability: Tensor, eps: float = 1e-5) -> Tensor:
 
 
 class FrozenGraspNetProposalGenerator(nn.Module):
-    """Generate fixed-capacity 6DoF proposals with official GraspNet inference."""
+    """Official GraspNet inference plus opt-in, dense-label fine-tuning support.
+
+    The historical class name is retained for checkpoint/API compatibility.  In
+    fine-tuning mode the external network remains outside the TCD-PRG module
+    tree, so it requires its own optimizer and checkpoint.
+    """
 
     def __init__(
         self,
@@ -60,16 +65,11 @@ class FrozenGraspNetProposalGenerator(nn.Module):
         hmax_list: tuple[float, ...] = (0.01, 0.02, 0.03, 0.04),
     ) -> None:
         super().__init__()
-        if not freeze:
-            raise ValueError(
-                "ProposalV2 v1 intentionally supports frozen GraspNet only; "
-                "joint fine-tuning requires a separate optimizer/checkpoint design."
-            )
         self.source_root = str(source_root)
         self.checkpoint = str(checkpoint)
         self.proposal_count = int(proposal_count)
         self.input_points = int(input_points)
-        self.freeze = True
+        self.freeze = bool(freeze)
         self.num_view = int(num_view)
         self.num_angle = int(num_angle)
         self.num_depth = int(num_depth)
@@ -77,6 +77,7 @@ class FrozenGraspNetProposalGenerator(nn.Module):
         self.hmin = float(hmin)
         self.hmax_list = tuple(float(v) for v in hmax_list)
         self.pred_decode = None
+        self.official_get_loss = None
         # Unregistered on purpose: frozen external model must not enter TCD-PRG
         # optimizer, EMA, DDP parameter broadcasts or checkpoints.
         object.__setattr__(self, "_network", None)
@@ -90,7 +91,7 @@ class FrozenGraspNetProposalGenerator(nn.Module):
         network = self.network
         current = object.__getattribute__(self, "_network_device")
         if network is None:
-            official, pred_decode = _load_official_graspnet(self.source_root)
+            official, pred_decode, get_loss = _load_official_graspnet(self.source_root)
             network = official(
                 input_feature_dim=0,
                 num_view=self.num_view,
@@ -120,8 +121,9 @@ class FrozenGraspNetProposalGenerator(nn.Module):
                     f"matched={matched}/{model_keys}, missing={len(missing)}, "
                     f"unexpected={len(unexpected)}"
                 )
-            network.requires_grad_(False).eval()
+            network.requires_grad_(not self.freeze).eval()
             self.pred_decode = pred_decode
+            self.official_get_loss = get_loss
             object.__setattr__(self, "_network", network)
             current = None
         if current != device:
@@ -130,10 +132,96 @@ class FrozenGraspNetProposalGenerator(nn.Module):
         network.eval()
         return network
 
+    @staticmethod
+    def _set_official_training_mode(network: nn.Module, enabled: bool) -> None:
+        network.is_training = bool(enabled)
+        if hasattr(network, "grasp_generator"):
+            network.grasp_generator.is_training = bool(enabled)
+        network.train(enabled)
+
+    def prepare_finetuning(self, device: torch.device | str) -> nn.Module:
+        """Expose the external network for a separate dense-label optimizer."""
+
+        if self.freeze:
+            raise RuntimeError("Set graspnet.freeze=false to enable fine-tuning")
+        network = self._ensure_loaded(torch.device(device))
+        network.requires_grad_(True)
+        self._set_official_training_mode(network, True)
+        return network
+
+    def finish_finetuning(self) -> None:
+        """Restore the official network's label-free inference protocol."""
+
+        if self.network is not None:
+            self._set_official_training_mode(self.network, False)
+
+    def finetune_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return parameters only after ``prepare_finetuning`` initialized them."""
+
+        if self.freeze:
+            return ()
+        network = self.network
+        if network is None:
+            raise RuntimeError("Call prepare_finetuning(device) before creating the optimizer")
+        return tuple(parameter for parameter in network.parameters() if parameter.requires_grad)
+
+    def official_training_loss(
+        self, dense_batch: dict[str, Any]
+    ) -> tuple[Tensor, dict[str, Any]]:
+        """Compute the upstream GraspNet loss from its complete dense label schema.
+
+        Sparse TCD task-grasp poses are intentionally rejected: upstream training
+        requires per-object grasp points, offsets, scores and tolerances.
+        """
+
+        required = {
+            "point_clouds",
+            "objectness_label",
+            "object_poses_list",
+            "grasp_points_list",
+            "grasp_offsets_list",
+            "grasp_labels_list",
+            "grasp_tolerance_list",
+        }
+        missing = required - dense_batch.keys()
+        if missing:
+            raise KeyError(
+                "GraspNet fine-tuning requires dense upstream labels; missing "
+                + ", ".join(sorted(missing))
+            )
+        point_clouds = dense_batch["point_clouds"]
+        network = self.prepare_finetuning(point_clouds.device)
+        if self.official_get_loss is None:
+            raise RuntimeError("Official GraspNet loss was not loaded")
+        try:
+            end_points = network(dense_batch)
+            loss, end_points = self.official_get_loss(end_points)
+        finally:
+            self.finish_finetuning()
+        return loss, end_points
+
+    def finetune_state_dict(self) -> dict[str, Tensor]:
+        """Return a standalone GraspNet checkpoint payload."""
+
+        if self.network is None:
+            raise RuntimeError("GraspNet network has not been initialized")
+        return self.network.state_dict()
+
+    def load_finetune_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        device: torch.device | str,
+        *,
+        strict: bool = True,
+    ) -> Any:
+        """Load standalone fine-tuned weights without entering TCD checkpoints."""
+
+        network = self._ensure_loaded(torch.device(device))
+        return network.load_state_dict(state_dict, strict=strict)
+
     def train(self, mode: bool = True):
         super().train(mode)
-        if self.network is not None:
-            self.network.eval()
+        self.finish_finetuning()
         return self
 
     @staticmethod
@@ -195,6 +283,7 @@ class FrozenGraspNetProposalGenerator(nn.Module):
         input_points: int | None = None,
     ) -> dict[str, Tensor]:
         network = self._ensure_loaded(xyz.device)
+        self.finish_finetuning()
         requested_points = int(input_points or self.input_points)
         requested_proposals = int(proposal_count or self.proposal_count)
         sample_index, row_valid = self._sample_indices(

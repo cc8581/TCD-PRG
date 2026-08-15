@@ -329,6 +329,12 @@ def test_policy_heads_match_training_contract(tiny_batch) -> None:
 def test_camera2_to_ag_width_to_dense_candidate_end_to_end(tiny_batch) -> None:
     config = _config()
     config.instance_objectness_threshold = 0.0
+    config.target_prompt_min_support = 0.0
+    config.target_prompt_min_margin = 0.0
+    tiny_batch = dict(tiny_batch)
+    tiny_batch["target_prompt_xyz"] = tiny_batch["xyz"][:, :1]
+    tiny_batch["target_prompt_label"] = torch.ones(1, 1, dtype=torch.bool)
+    tiny_batch["target_prompt_valid"] = torch.ones(1, 1, dtype=torch.bool)
     graspnet = GraspNetConfig(
         target_crop_probability=0.0,
         target_min_crop_points=1,

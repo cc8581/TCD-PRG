@@ -491,6 +491,24 @@ class TCDPRGObjective(nn.Module):
                 score_losses["target_crop_points"] = task_output[
                     "target_crop_points"
                 ].float().mean().detach()
+                score_losses["camera2_transfer_coverage"] = task_output[
+                    "camera_transfer_coverage"
+                ].float().mean().detach()
+                score_losses["target_identity_valid_rate"] = task_output[
+                    "target_identity_valid"
+                ].float().mean().detach()
+                if "target_mask" in batch:
+                    hard_target = task_output["target_hard_mask_fused"].bool()
+                    target_gt = batch["target_mask"].bool() & batch[
+                        "point_mask"
+                    ].bool()
+                    intersection = (hard_target & target_gt).float().sum()
+                    score_losses["hard_target_mask_purity_fused"] = (
+                        intersection / hard_target.float().sum().clamp_min(1.0)
+                    ).detach()
+                    score_losses["hard_target_mask_recall_fused"] = (
+                        intersection / target_gt.float().sum().clamp_min(1.0)
+                    ).detach()
                 if "graspnet_instance_id" in batch:
                     crop = task_output["target_crop_mask"].bool()
                     instance = batch["graspnet_instance_id"]
@@ -509,6 +527,23 @@ class TCDPRGObjective(nn.Module):
                     score_losses["target_proposal_ratio"] = (
                         proposal_target.float().sum()
                         / task_output["valid"].float().sum().clamp_min(1.0)
+                    ).detach()
+                    transfer_valid = task_output[
+                        "camera_transfer_valid"
+                    ].bool()
+                    reference = task_output[
+                        "camera_transfer_reference_index"
+                    ]
+                    transfer_rows = torch.arange(
+                        reference.shape[0], device=reference.device
+                    )[:, None]
+                    same_instance = (
+                        batch["instance_id"][transfer_rows, reference]
+                        == instance
+                    ) & transfer_valid
+                    score_losses["camera2_mask_transfer_accuracy"] = (
+                        same_instance.float().sum()
+                        / transfer_valid.float().sum().clamp_min(1.0)
                     ).detach()
                 families["task_grasp"] = score_losses
                 supervised_rows = score_losses[

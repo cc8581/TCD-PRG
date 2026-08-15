@@ -68,12 +68,15 @@ graspnet:
   # Frozen official graspnet-baseline; external to TCD-PRG checkpoint/EMA.
   source_root: .deps/graspnet-baseline
   checkpoint: .deps/checkpoints/graspnet-rs.tar
+  # false enables only the separate dense-label GraspNet fine-tuning API;
+  # sparse TCD task-grasp losses never backpropagate into the proposal network.
   freeze: true
   scene_input_points: 20000
   target_input_points: 20000
   camera_view_index: 2
   target_crop_probability: 0.5
   target_min_crop_points: 32
+  camera_transfer_max_distance_m: 0.010
   global_proposals: 128
   target_proposals: 128
   num_view: 300
