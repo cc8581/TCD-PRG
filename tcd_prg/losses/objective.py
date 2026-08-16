@@ -130,7 +130,7 @@ class TCDPRGObjective(nn.Module):
             Path(acronym_object_grasp_database)
             if acronym_object_grasp_database else None
         )
-        self._acronym_paths: dict[str, Path] | None = None
+        self._acronym_paths: dict[str, list[tuple[float, Path]]] | None = None
         self._acronym_cache: dict[
             tuple[str, str], tuple[Tensor, Tensor, Tensor]
         ] = {}
@@ -147,7 +147,7 @@ class TCDPRGObjective(nn.Module):
             return valid.reshape(1)
         return valid.reshape(valid.shape[0], -1).any(-1)
 
-    def _acronym_path_map(self) -> dict[str, Path]:
+    def _acronym_path_map(self) -> dict[str, list[tuple[float, Path]]]:
         if self.acronym_database_root is None:
             return {}
         if self._acronym_paths is None:
@@ -156,18 +156,43 @@ class TCDPRGObjective(nn.Module):
                     encoding="utf-8"
                 )
             )
-            self._acronym_paths = {
-                str(record["model_id"]): Path(record["path"])
-                for record in manifest["records"]
-            }
+            paths: dict[str, list[tuple[float, Path]]] = {}
+            for record in manifest["records"]:
+                model_id = str(record["model_id"])
+                record_path = Path(record["path"])
+                if not record_path.is_absolute():
+                    record_path = self.acronym_database_root / record_path
+                if not record_path.is_file():
+                    raise FileNotFoundError(
+                        f"ACRONYM object-grasp record does not exist: {record_path}"
+                    )
+                scale = record.get("object_scale")
+                if scale is None:
+                    scale = float(load_object_grasps(record_path)["object_scale"])
+                entries = paths.setdefault(model_id, [])
+                if any(abs(existing_scale - float(scale)) <= 1e-9 for existing_scale, _ in entries):
+                    raise ValueError(
+                        "Duplicate ACRONYM object-grasp model/scale in manifest: "
+                        f"{model_id} scale={scale}"
+                    )
+                entries.append((float(scale), record_path))
+            self._acronym_paths = paths
         return self._acronym_paths
 
     def _acronym_tensors(
-        self, model_id: str, device: torch.device
+        self, model_id: str, object_scale: float, device: torch.device
     ) -> tuple[Tensor, Tensor, Tensor]:
-        key = (model_id, str(device))
+        entries = self._acronym_path_map()[model_id]
+        scale, path = min(entries, key=lambda item: abs(item[0] - object_scale))
+        tolerance = max(1e-7, abs(object_scale) * 1e-4)
+        if abs(scale - object_scale) > tolerance:
+            raise KeyError(
+                f"No ACRONYM grasp record for {model_id} scale={object_scale}; "
+                f"nearest={scale}"
+            )
+        key = (f"{model_id}:{scale:.12g}", str(device))
         if key not in self._acronym_cache:
-            database = load_object_grasps(self._acronym_path_map()[model_id])
+            database = load_object_grasps(path)
             self._acronym_cache[key] = (
                 torch.from_numpy(database["translation_object"]).to(device),
                 torch.from_numpy(database["rotation_object"]).to(device),
@@ -186,6 +211,7 @@ class TCDPRGObjective(nn.Module):
             dtype=torch.int8,
         )
         for row, model_id in enumerate(batch["target_model_id"]):
+            object_scale = float(batch["target_object_scale"][row])
             pose = batch["object_pose"][row, batch["target_object"][row]]
             rotation_world_object = quaternion_xyzw_to_matrix(pose[3:])
             translation_object = torch.einsum(
@@ -198,7 +224,9 @@ class TCDPRGObjective(nn.Module):
             )
             intrinsic = match_object_grasp_priors(
                 translation_object, rotation_object, prediction["valid"][row],
-                *self._acronym_tensors(str(model_id), translation_object.device),
+                *self._acronym_tensors(
+                    str(model_id), object_scale, translation_object.device
+                ),
                 translation_m=self.task_grasp.translation_m,
                 rotation_deg=self.task_grasp.rotation_deg,
             )["status"]

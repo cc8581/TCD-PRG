@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from tcd_prg.config import EvaluationConfig, GraphConfig
-from tcd_prg.losses.labels import build_graph_labels, build_verifier_labels
+from tcd_prg.losses.labels import build_verifier_labels
 
 from .evaluator import Evaluator
 from .metrics import binary_confusion

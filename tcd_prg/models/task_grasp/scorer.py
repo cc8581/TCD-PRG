@@ -1,8 +1,6 @@
 """Task-region residual scorer over frozen GraspNet proposals."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 from torch import Tensor, nn
 

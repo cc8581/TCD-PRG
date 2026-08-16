@@ -2,4 +2,8 @@
 dataset_root: data/TaskOrientedClutterSceneDataset
 acronym_root: data/ACRONYM
 functional_region_root: data/manual_function_regions
+acronym_object_grasp_database: data/ACRONYM_ObjectGraspDatabase
+observation_cache_dir: runtime/cache/observations
+cache_index_directory: runtime/cache/dataset_indexes
+output_root: outputs
 pybullet_python: python

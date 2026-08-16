@@ -27,7 +27,7 @@ def test_launcher_path_arguments_have_local_config_defaults(tmp_path) -> None:
     assert args.pybullet_python == "D:/envs/gapg/python.exe"
     assert args.gpus == 1
     assert args.output_dir.parent == PROJECT / "outputs"
-    assert args.output_dir.name.startswith("ptv3_full_")
+    assert args.output_dir.name.startswith("formal_")
     assert args.resume is None
     assert args.initialize is None
     assert args.batch_size is None

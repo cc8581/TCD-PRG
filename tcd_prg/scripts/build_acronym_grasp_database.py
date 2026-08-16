@@ -67,6 +67,7 @@ def main() -> None:
         os.replace(temporary, destination)
         summary.append({
             "record_id": record["record_id"], "model_id": record["model_id"],
+            "object_scale": float(record["object_scale"]),
             "positive": int(np.count_nonzero(status == 1)),
             "negative": int(np.count_nonzero(status == 0)), "path": str(destination),
         })

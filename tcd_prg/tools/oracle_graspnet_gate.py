@@ -73,7 +73,13 @@ def main() -> None:
         hmax_list=config.graspnet.hmax_list,
     )
     manifest = json.loads((Path(args.database_root) / "manifest.json").read_text("utf-8"))
-    by_model = {record["model_id"]: Path(record["path"]) for record in manifest["records"]}
+    by_model: dict[str, list[tuple[float, Path]]] = {}
+    for record in manifest["records"]:
+        path = Path(record["path"])
+        scale = record.get("object_scale")
+        if scale is None:
+            scale = float(load_object_grasps(path)["object_scale"])
+        by_model.setdefault(str(record["model_id"]), []).append((float(scale), path))
     totals: Counter[str] = Counter()
     hypothesis_totals: dict[str, Counter[str]] = {
         name: Counter() for name in (
@@ -136,7 +142,11 @@ def main() -> None:
             "ij,kjl->kil", rotation_world_object.transpose(0, 1), rotation_world[0]
         )
         model_id = str(observation.metadata["object_model_id"][target_object])
-        database = load_object_grasps(by_model[model_id])
+        object_scale = float(observation.metadata["object_scale"][target_object])
+        _, database_path = min(
+            by_model[model_id], key=lambda item: abs(item[0] - object_scale)
+        )
+        database = load_object_grasps(database_path)
         database_translation = torch.from_numpy(database["translation_object"]).to(device)
         database_rotation = torch.from_numpy(database["rotation_object"]).to(device)
         database_status = torch.from_numpy(database["status"]).to(device)

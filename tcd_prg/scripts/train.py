@@ -141,6 +141,19 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_config(args.config, args.overrides)
+    if config.losses.task_grasp > 0:
+        if not config.dataset.acronym_object_grasp_database:
+            raise ValueError(
+                "Task-grasp training requires dataset.acronym_object_grasp_database; "
+                "refusing to silently fall back to the old sparse supervision."
+            )
+        database_root = Path(config.dataset.acronym_object_grasp_database)
+        manifest = database_root / "manifest.json"
+        if not database_root.is_dir() or not manifest.is_file():
+            raise FileNotFoundError(
+                "Task-grasp training requires a valid ACRONYM object-grasp database "
+                f"with manifest.json: {database_root}"
+            )
     if config.observation.provider != "cached":
         raise ValueError(
             "Formal training requires observation.provider=cached for bounded read-through caching"
@@ -560,7 +573,6 @@ def main() -> None:
             config.graph,
             config.evaluation,
         )
-        grasp_diagnostics = GraspDiagnosticAccumulator(config.model, config.evaluation)
         validation_batches = len(validation_loader)
         validation_groups = len(validation_loader.sampler)
         with torch.no_grad():
@@ -568,7 +580,6 @@ def main() -> None:
                 batch = trainer._move(raw, trainer.device)
                 _, terms, model_output = objective(module, batch, return_output=True)
                 evaluator.update(batch, model_output, terms)
-                grasp_diagnostics.update(batch, model_output)
                 score = sum(
                     weight * float(terms[f"loss_{family}"])
                     for family, weight in config.training.validation_family_weights.items()

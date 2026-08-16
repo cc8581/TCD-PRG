@@ -400,7 +400,6 @@ class Trainer:
                     "git_commit": commit,
                     "torch": torch.__version__,
                     "train_metrics_schema_version": 5,
-                    "grasp_diagnostics_schema_version": 1,
                     "validation_metrics_schema_version": 3,
                     "training_events_schema_version": 1,
                 },
