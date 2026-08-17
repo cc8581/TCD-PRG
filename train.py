@@ -255,7 +255,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Persistent dataset-index cache directory.",
     )
     parser.add_argument("--gpus", type=int, default=defaults["gpus"], help="Number of local training GPUs.")
-    parser.add_argument("--output-dir", type=Path, default=defaults["output_dir"], help="Directory for checkpoints, JSONL metrics, and TensorBoard logs.")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for checkpoints, JSONL metrics, and TensorBoard logs. "
+        "On resume, defaults to the checkpoint parent directory.",
+    )
     # resume 恢复优化器/调度器等完整状态；initialize 仅加载模型权重，二者不可同时使用。
     parser.add_argument("--resume", type=Path, default=defaults["resume"], help="Checkpoint used to resume the complete training state.")
     parser.add_argument("--initialize", type=Path, default=defaults["initialize"], help="Checkpoint used only to initialize model weights.")
@@ -264,6 +270,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override training.data_fraction with a deterministic fraction in (0, 1].",
     )
     args = parser.parse_args(argv)
+    # resume checkpoint parent becomes the default output directory
+    if args.output_dir is None:
+        args.output_dir = (
+            args.resume.expanduser().resolve().parent
+            if args.resume is not None
+            else Path(defaults["output_dir"])
+        )
     if args.gpus <= 0:
         parser.error("--gpus must be positive")
     if args.resume and args.initialize:

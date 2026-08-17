@@ -37,6 +37,11 @@ class TrainerState:
     effective_epochs: float = 0.0
     best_validation: float = float("inf")
     validation_without_improvement: int = 0
+    # Validation is a transaction tied to an optimizer step. The pending flag
+    # is persisted before validation starts so resume can finish validation
+    # before consuming the next training batch.
+    last_completed_validation_step: int = 0
+    pending_validation_step: int = 0
 
 
 class Trainer:
@@ -360,6 +365,252 @@ class Trainer:
         )
         print("  ".join(fields), flush=True)
 
+    # validation-resume-transaction-v1
+    def _validation_record_for_step(self, step: int) -> dict[str, Any] | None:
+        # Return the last successfully written validation record for this step.
+        if not self.validation_metrics_path.is_file():
+            return None
+        found: dict[str, Any] | None = None
+        with self.validation_metrics_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise RuntimeError(
+                        f"Malformed validation_metrics.jsonl line {line_number}: "
+                        f"{self.validation_metrics_path}"
+                    ) from error
+                if int(record.get("optimizer_step", -1)) == int(step):
+                    found = record
+        return found
+
+    def _recover_completed_validation(self, step: int) -> bool:
+        # Recover post-validation state from the durable validation JSONL.
+        record = self._validation_record_for_step(step)
+        if record is None:
+            return False
+        self.state.best_validation = float(
+            record.get("best_validation", self.state.best_validation)
+        )
+        self.state.validation_without_improvement = int(
+            record.get(
+                "validation_without_improvement",
+                self.state.validation_without_improvement,
+            )
+        )
+        self.state.last_completed_validation_step = max(
+            int(self.state.last_completed_validation_step), int(step)
+        )
+        self.state.pending_validation_step = 0
+        self._write_event(
+            "validation_resume_recovered",
+            validation_step=int(step),
+            best_validation=self.state.best_validation,
+            validation_without_improvement=self.state.validation_without_improvement,
+        )
+        self.save_checkpoint(self.output_dir / "last.pt")
+        return True
+
+    def _resume_validation_due(self) -> bool:
+        # True means validate before consuming the next training batch.
+        step = int(self.state.optimizer_steps)
+        interval = int(self.config.training.validation_interval)
+        if step <= 0 or interval <= 0 or step % interval != 0:
+            # Do not back-fill historical validation points with a newer model.
+            return False
+
+        pending = int(self.state.pending_validation_step)
+        if pending not in (0, step):
+            raise RuntimeError(
+                "Checkpoint validation transaction is inconsistent: "
+                f"optimizer_step={step}, pending_validation_step={pending}"
+            )
+        if pending == 0 and int(self.state.last_completed_validation_step) >= step:
+            return False
+
+        # Old checkpoints do not contain the transaction fields. If a successful
+        # record exists, recover it; otherwise this exact boundary is pending.
+        if self._recover_completed_validation(step):
+            return False
+
+        self.state.pending_validation_step = step
+        self._write_event("validation_resume_pending", validation_step=step)
+        return True
+
+    def _run_validation_cycle(
+        self,
+        validate: Callable[[nn.Module], Any],
+        step: int,
+        *,
+        resumed: bool,
+    ) -> bool:
+        # Run one validation transaction; return True if early stopping fires.
+        step = int(step)
+        interval = int(self.config.training.validation_interval)
+        if step != int(self.state.optimizer_steps):
+            raise RuntimeError(
+                "Validation step must equal the current optimizer step: "
+                f"validation={step}, optimizer={self.state.optimizer_steps}"
+            )
+        if step <= 0 or interval <= 0 or step % interval != 0:
+            raise RuntimeError(
+                f"Invalid validation transaction boundary: step={step}, interval={interval}"
+            )
+
+        # BEGIN: durable checkpoint explicitly says this validation is pending.
+        self.state.pending_validation_step = step
+        self.save_checkpoint(self.output_dir / "last.pt")
+        self._write_event(
+            "validation_started",
+            validation_step=step,
+            resumed=bool(resumed),
+        )
+
+        validation = validate(self.ema.model if self.ema else self.model)
+        self.model.train()
+        self._apply_frozen_module_modes()
+
+        validation_items = 1
+        validation_details: dict[str, float] = {}
+        performance_summary: dict[str, Any] = {
+            "count": 0,
+            "scene_count": 0,
+            "metrics": {},
+        }
+        if isinstance(validation, Mapping):
+            summaries: list[Mapping[str, Any]] = [validation]
+            if torch.distributed.is_initialized():
+                gathered: list[Mapping[str, Any] | None] = [
+                    None for _ in range(torch.distributed.get_world_size())
+                ]
+                torch.distributed.all_gather_object(gathered, validation)
+                summaries = [item for item in gathered if item is not None]
+            score_sum = sum(float(item["score_sum"]) for item in summaries)
+            validation_items = sum(int(item["score_count"]) for item in summaries)
+            score = score_sum / max(1, validation_items)
+            metric_sums: dict[str, float] = {}
+            metric_counts: dict[str, int] = {}
+            for item in summaries:
+                for key, value in item.get("metric_sums", {}).items():
+                    metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
+                for key, value in item.get("metric_counts", {}).items():
+                    metric_counts[key] = metric_counts.get(key, 0) + int(value)
+            validation_details = {
+                key: (
+                    value
+                    if key in self.COUNT_TERMS
+                    else value / max(1, metric_counts.get(key, 0))
+                )
+                for key, value in metric_sums.items()
+            }
+            evaluation_records = [
+                record
+                for item in summaries
+                for record in item.get("evaluation_records", [])
+            ]
+            if evaluation_records:
+                evaluator = OfflineModelEvaluator(
+                    self.config.model,
+                    self.config.evaluation.bootstrap_samples,
+                    self.config.evaluation.confidence,
+                    self.config.graph,
+                    self.config.evaluation,
+                )
+                evaluator.evaluator.records = evaluation_records
+                performance_summary = evaluator.summarize()
+                validation_details.update(
+                    {
+                        key: float(payload["mean"])
+                        for key, payload in performance_summary["metrics"].items()
+                        if payload.get("mean") is not None
+                    }
+                )
+        elif torch.distributed.is_initialized():
+            if isinstance(validation, tuple):
+                value = torch.tensor(validation, dtype=torch.float64, device=self.device)
+                torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+                score = float(value[0] / value[1].clamp_min(1))
+                validation_items = int(value[1])
+            else:
+                value = torch.tensor(float(validation), device=self.device)
+                torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+                score = float(value / torch.distributed.get_world_size())
+        elif isinstance(validation, tuple):
+            score = float(validation[0] / max(1, validation[1]))
+            validation_items = int(validation[1])
+        else:
+            score = float(validation)
+
+        previous_best = self.state.best_validation
+        improved = score < previous_best
+        if improved:
+            self.state.best_validation = score
+            self.state.validation_without_improvement = 0
+        else:
+            self.state.validation_without_improvement += 1
+
+        # COMMIT state is established before the durable validation record.
+        self.state.last_completed_validation_step = step
+        self.state.pending_validation_step = 0
+
+        if improved:
+            self.save_checkpoint(self.output_dir / "best.pt")
+
+        if self.is_primary:
+            validation_record = {
+                "schema_version": 3,
+                "timestamp_utc": self._timestamp(),
+                "optimizer_step": step,
+                "validation_score": score,
+                "best_validation": self.state.best_validation,
+                "improved": improved,
+                "validation_items": validation_items,
+                "validation_without_improvement": self.state.validation_without_improvement,
+                "early_stopping_patience": self.config.training.early_stopping_patience,
+                "metrics": validation_details,
+                "performance": performance_summary,
+            }
+            validation_record["training_stage"] = self._training_stage(validation_details)
+            self._append_jsonl(self.validation_metrics_path, validation_record)
+            if self.tensorboard is not None:
+                self.tensorboard.add_scalar("validation/score", score, step)
+                self.tensorboard.add_scalar("validation/best", self.state.best_validation, step)
+                for key, value in validation_details.items():
+                    self.tensorboard.add_scalar(f"validation/{key}", value, step)
+            self._print_validation_summary(validation_record)
+
+        self._write_event(
+            "validation_completed",
+            validation_step=step,
+            validation_score=score,
+            best_validation=self.state.best_validation,
+            improved=improved,
+            validation_items=validation_items,
+            metrics=validation_details,
+        )
+        self.save_checkpoint(self.output_dir / "last.pt")
+
+        if (
+            self.state.validation_without_improvement
+            >= self.config.training.early_stopping_patience
+        ):
+            self._write_event(
+                "early_stopping",
+                best_validation=self.state.best_validation,
+                validation_score=score,
+            )
+            if self.is_primary:
+                print(
+                    f"[early-stop] step={step:07d} "
+                    f"best={self.state.best_validation:.6f}",
+                    flush=True,
+                )
+            return True
+        return False
+
     def _set_frozen_modules(self, frozen: bool) -> None:
         source = self.model.module if hasattr(self.model, "module") else self.model
         prefixes = tuple(self.config.training.frozen_modules)
@@ -519,6 +770,17 @@ class Trainer:
                 f"terminal_interval={self.config.logging.log_interval}",
                 flush=True,
             )
+        # Resume contract: an exact validation-boundary checkpoint must finish
+        # or recover that validation before the next training batch is consumed.
+        if validate is not None and self._resume_validation_due():
+            stop = self._run_validation_cycle(
+                validate,
+                int(self.state.optimizer_steps),
+                resumed=True,
+            )
+            last_optimizer_time = time.time()
+            batch_finished_time = last_optimizer_time
+
         while self.state.optimizer_steps < self.config.training.max_optimizer_steps and not stop:
             self._set_loader_epoch(loader, epoch)
             epoch += 1
@@ -792,150 +1054,17 @@ class Trainer:
                 window_data_seconds = 0.0
                 if step_finished is not None:
                     step_finished(step)
-                if validate and step % self.config.training.validation_interval == 0:
-                    # Persist progress BEFORE validation: validation runs the full
-                    # loader alongside the persistent training loaders and is the
-                    # highest-memory moment of the loop; a crash here must not
-                    # lose the training since the previous validation cycle.
-                    self.save_checkpoint(self.output_dir / "last.pt")
-                    validation = validate(self.ema.model if self.ema else self.model)
-                    self.model.train()
-                    self._apply_frozen_module_modes()
-                    validation_items = 1
-                    validation_details: dict[str, float] = {}
-                    performance_summary: dict[str, Any] = {
-                        "count": 0,
-                        "scene_count": 0,
-                        "metrics": {},
-                    }
-                    if isinstance(validation, Mapping):
-                        summaries: list[Mapping[str, Any]] = [validation]
-                        if torch.distributed.is_initialized():
-                            gathered: list[Mapping[str, Any] | None] = [
-                                None for _ in range(torch.distributed.get_world_size())
-                            ]
-                            torch.distributed.all_gather_object(gathered, validation)
-                            summaries = [item for item in gathered if item is not None]
-                        score_sum = sum(float(item["score_sum"]) for item in summaries)
-                        validation_items = sum(int(item["score_count"]) for item in summaries)
-                        score = score_sum / max(1, validation_items)
-                        metric_sums: dict[str, float] = {}
-                        metric_counts: dict[str, int] = {}
-                        for item in summaries:
-                            for key, value in item.get("metric_sums", {}).items():
-                                metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
-                            for key, value in item.get("metric_counts", {}).items():
-                                metric_counts[key] = metric_counts.get(key, 0) + int(value)
-                        validation_details = {
-                            key: (
-                                value
-                                if key in self.COUNT_TERMS
-                                else value / max(1, metric_counts.get(key, 0))
-                            )
-                            for key, value in metric_sums.items()
-                        }
-                        evaluation_records = [
-                            record
-                            for item in summaries
-                            for record in item.get("evaluation_records", [])
-                        ]
-                        if evaluation_records:
-                            evaluator = OfflineModelEvaluator(
-                                self.config.model,
-                                self.config.evaluation.bootstrap_samples,
-                                self.config.evaluation.confidence,
-                                self.config.graph,
-                                self.config.evaluation,
-                            )
-                            evaluator.evaluator.records = evaluation_records
-                            performance_summary = evaluator.summarize()
-                            validation_details.update(
-                                {
-                                    key: float(payload["mean"])
-                                    for key, payload in performance_summary["metrics"].items()
-                                    if payload.get("mean") is not None
-                                }
-                            )
-                    elif torch.distributed.is_initialized():
-                        if isinstance(validation, tuple):
-                            value = torch.tensor(
-                                validation, dtype=torch.float64, device=self.device
-                            )
-                            torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
-                            score = float(value[0] / value[1].clamp_min(1))
-                            validation_items = int(value[1])
-                        else:
-                            value = torch.tensor(float(validation), device=self.device)
-                            torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
-                            score = float(value / torch.distributed.get_world_size())
-                    elif isinstance(validation, tuple):
-                        score = float(validation[0] / max(1, validation[1]))
-                        validation_items = int(validation[1])
-                    else:
-                        score = float(validation)
-                    previous_best = self.state.best_validation
-                    improved = score < previous_best
-                    if improved:
-                        self.state.best_validation = score
-                        self.state.validation_without_improvement = 0
-                        self.save_checkpoint(self.output_dir / "best.pt")
-                    else:
-                        self.state.validation_without_improvement += 1
-                    if self.is_primary:
-                        validation_record = {
-                            "schema_version": 3,
-                            "timestamp_utc": self._timestamp(),
-                            "optimizer_step": step,
-                            "validation_score": score,
-                            "best_validation": self.state.best_validation,
-                            "improved": improved,
-                            "validation_items": validation_items,
-                            "validation_without_improvement": (
-                                self.state.validation_without_improvement
-                            ),
-                            "early_stopping_patience": (
-                                self.config.training.early_stopping_patience
-                            ),
-                            "metrics": validation_details,
-                            "performance": performance_summary,
-                        }
-                        validation_record["training_stage"] = self._training_stage(
-                            validation_details
-                        )
-                        self._append_jsonl(self.validation_metrics_path, validation_record)
-                        if self.tensorboard is not None:
-                            self.tensorboard.add_scalar("validation/score", score, step)
-                            self.tensorboard.add_scalar(
-                                "validation/best", self.state.best_validation, step
-                            )
-                            for key, value in validation_details.items():
-                                self.tensorboard.add_scalar(f"validation/{key}", value, step)
-                        self._print_validation_summary(validation_record)
-                    self._write_event(
-                        "validation_completed",
-                        validation_score=score,
-                        best_validation=self.state.best_validation,
-                        improved=improved,
-                        validation_items=validation_items,
-                        metrics=validation_details,
+                if (
+                    validate is not None
+                    and self.config.training.validation_interval > 0
+                    and step % self.config.training.validation_interval == 0
+                ):
+                    stop = self._run_validation_cycle(
+                        validate,
+                        step,
+                        resumed=False,
                     )
-                    self.save_checkpoint(self.output_dir / "last.pt")
-                    if (
-                        self.state.validation_without_improvement
-                        >= self.config.training.early_stopping_patience
-                    ):
-                        self._write_event(
-                            "early_stopping",
-                            best_validation=self.state.best_validation,
-                            validation_score=score,
-                        )
-                        if self.is_primary:
-                            print(
-                                f"[early-stop] step={step:07d} "
-                                f"best={self.state.best_validation:.6f}",
-                                flush=True,
-                            )
-                        stop = True
+                    if stop:
                         break
                 last_optimizer_time = time.time()
                 batch_finished_time = last_optimizer_time
