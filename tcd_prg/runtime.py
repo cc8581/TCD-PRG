@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from tcd_prg.config import TCDPRGConfig
-from tcd_prg.datasets import TaskOrientedClutterAdapter, collate_unified, load_candidate_batch
+from tcd_prg.datasets import TaskOrientedClutterAdapter, collate_unified
 from tcd_prg.datasets.collate import collate_global_grasp
 from tcd_prg.execution import ExternalFR5AG16095Certifier
-from tcd_prg.geometry.gripper_provider import ExactAG16095GeometryProvider
-from tcd_prg.models.grasp_verifier import build_verifier_inputs
 from tcd_prg.observation import (
     CachedObservationProvider,
     ExternalPyBulletObservationProvider,
@@ -94,21 +92,6 @@ def create_adapter(config: TCDPRGConfig, allow_render: bool = False):
     )
 
 
-def create_gripper_provider(
-    config: TCDPRGConfig, allow_generate: bool = False
-) -> ExactAG16095GeometryProvider:
-    return ExactAG16095GeometryProvider(
-        config.observation.pybullet_python,
-        project_path(config.observation.gripper_worker_script),
-        config.dataset.fr5_ag_urdf,
-        config.observation.gripper_cache_dir,
-        point_count=config.grasp_verifier.gripper_points,
-        width_quantization_m=config.grasp_verifier.gripper_width_quantization_m,
-        seed=config.training.seed,
-        allow_generate=allow_generate,
-    )
-
-
 def create_action_certifier(config: TCDPRGConfig) -> ExternalFR5AG16095Certifier:
     urdf = Path(config.dataset.fr5_ag_urdf)
     return ExternalFR5AG16095Certifier(
@@ -126,9 +109,8 @@ class UnifiedBatchCollator:
     """Pickle-safe Windows DataLoader collator with provider-backed exact geometry."""
 
     config: TCDPRGConfig
-    gripper_provider: ExactAG16095GeometryProvider | None = None
     training: bool = False
-    _candidate_manifest_validated: bool = field(default=False, init=False)
+    include_graspnet: bool | None = None
 
     def __call__(self, samples: list[Any]) -> dict[str, Any]:
         grid_size = (
@@ -146,32 +128,12 @@ class UnifiedBatchCollator:
                 self.config.graspnet.target_input_points,
             ),
             graspnet_view_index=self.config.graspnet.camera_view_index,
+            include_graspnet=(
+                self.config.losses.task_grasp > 0
+                if self.include_graspnet is None
+                else self.include_graspnet
+            ),
         )
-        # generated candidate manifest 每个 worker 只验证一次，单条 entry 仍逐样本校验来源签名。
-        if self.config.training.generated_policy_candidate_cache:
-            batch["generated_policy_candidates"] = load_candidate_batch(
-                samples,
-                self.config.training.generated_policy_candidate_cache,
-                self.config,
-                self.config.training.generated_policy_checkpoint_sha256,
-                validate_manifest=not self._candidate_manifest_validated,
-            )
-            self._candidate_manifest_validated = True
-        # 纯 generated-policy 已缓存几何/Verifier 证据，不再构造昂贵的局部夹爪输入。
-        pure_generated_policy = (
-            self.config.training.generated_policy_candidate_ratio == 1.0
-            and self.config.losses.policy_candidate > 0
-            and self.config.losses.verify_overall == 0
-        )
-        if self.config.ablation.use_gripper_scene_verifier and not pure_generated_policy:
-            if self.gripper_provider is None:
-                raise RuntimeError("The verifier is enabled but no gripper provider was configured")
-            batch["verifier_inputs"] = build_verifier_inputs(
-                batch,
-                self.gripper_provider,
-                local_scene_points=self.config.grasp_verifier.local_scene_points,
-                local_radius_m=self.config.model.verifier_local_radius_m,
-            )
         return batch
 
 

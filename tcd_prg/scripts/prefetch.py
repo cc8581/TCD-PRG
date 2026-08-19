@@ -9,7 +9,7 @@ from itertools import islice
 from tqdm import tqdm
 
 from tcd_prg.config import load_config
-from tcd_prg.runtime import create_adapter, create_gripper_provider
+from tcd_prg.runtime import create_adapter
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,8 +33,6 @@ def main() -> None:
     unit_iterator = adapter.iter_action_groups(args.split)
     units = list(islice(unit_iterator, args.max_groups))
     unique_states = sorted({unit[:3] for unit in units})
-    provider = create_gripper_provider(config, allow_generate=True)
-    gripper_paths = provider.prewarm_uniform_bins()
 
     def render(unit: tuple[int, int, int]):
         return adapter.load_observation(*unit).xyz.shape[0]
@@ -44,8 +42,7 @@ def main() -> None:
         for future in tqdm(as_completed(futures), total=len(futures), desc="render states"):
             future.result()
     print(
-        f"prefetch complete: groups={len(units)}, states={len(unique_states)}, "
-        f"gripper_width_bins={len(gripper_paths)}"
+        f"prefetch complete: groups={len(units)}, states={len(unique_states)}"
     )
 
 

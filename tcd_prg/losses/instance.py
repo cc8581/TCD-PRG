@@ -299,41 +299,6 @@ def map_gt_object_indices(indices: Tensor, match: InstanceMatch) -> tuple[Tensor
     return mapped, valid
 
 
-def remap_graph_targets(
-    physical: Tensor,
-    task: Tensor,
-    match: InstanceMatch,
-    query_count: int,
-) -> dict[str, Tensor]:
-    """Scatter GT O-space graph targets into predicted Q-space."""
-    b = physical.shape[0]
-    r_phys = physical.shape[-1]
-    r_task = task.shape[-1]
-    physical_target = physical.new_zeros((b, query_count, query_count, r_phys))
-    physical_valid = torch.zeros_like(physical_target, dtype=torch.bool)
-    task_target = task.new_zeros((b, query_count, r_task))
-    task_valid = torch.zeros_like(task_target, dtype=torch.bool)
-    for row in range(b):
-        gt = torch.nonzero(match.gt_to_query[row] >= 0, as_tuple=False).flatten()
-        if not len(gt):
-            continue
-        q = match.gt_to_query[row, gt]
-        task_target[row, q] = task[row, gt]
-        task_valid[row, q] = True
-        # Small O/Q (<= ~32); explicit indexed assignment is clearer and avoids
-        # duplicate scatter semantics.
-        for gi, qi in zip(gt.tolist(), q.tolist(), strict=True):
-            for gj, qj in zip(gt.tolist(), q.tolist(), strict=True):
-                physical_target[row, qi, qj] = physical[row, gi, gj]
-                physical_valid[row, qi, qj] = True
-    return {
-        "physical_edge_target": physical_target,
-        "physical_edge_valid": physical_valid,
-        "task_edge_target": task_target,
-        "task_edge_valid": task_valid,
-    }
-
-
 def gather_query_logits_to_gt_objects(
     query_logits: Tensor,
     match: InstanceMatch,
@@ -402,6 +367,7 @@ def build_object_query_push_supervision(
     batch: dict[str, Tensor],
     config,
     match: InstanceMatch,
+    training_hints: dict[str, Tensor] | None = None,
 ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
     """Build PUSH supervision without feeding GT object ids/contacts into PushHead."""
     import math
@@ -417,9 +383,18 @@ def build_object_query_push_supervision(
     # Contact/object heads remain dense and can use every evaluated GT action.
     # Direction/utility heads are supervised only where the prediction-only
     # top-k selection actually computed a direction token.
-    point_index, direction_parameter_valid = _nearest_selected_push_points(
-        output, batch, candidate
-    )
+    if training_hints is None:
+        point_index, direction_parameter_valid = _nearest_selected_push_points(
+            output, batch, candidate
+        )
+    else:
+        point_index = training_hints["push_gt_point_index"].long()
+        direction_parameter_valid = (
+            candidate & training_hints["push_gt_point_valid"].bool()
+        )
+        safe_point = point_index.clamp(0, max(0, output["direction_point_mask"].shape[1] - 1))
+        selected = output["direction_point_mask"].bool().gather(1, safe_point)
+        direction_parameter_valid &= selected
 
     row = torch.arange(
         action_type.shape[0], device=action_type.device

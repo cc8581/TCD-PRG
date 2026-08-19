@@ -60,9 +60,8 @@ class ExperimentController:
         self.load_model()
         if target not in self.scene.instance_ids:
             raise RuntimeError("目标实例不在当前预测场景")
-        required = int(self.config.raw["task"].get("required_grasp_count", 1))
         self.prediction = self.predictor.predict(
-            self.scene, target, category, region, required
+            self.scene, target, category, region
         )
         return self.prediction
 
@@ -71,9 +70,8 @@ class ExperimentController:
         if self.scene is None:
             raise RuntimeError("请先重新采集并融合点云")
         self.load_model()
-        required = int(self.config.raw["task"].get("required_grasp_count", 1))
         self.prediction = self.predictor.predict(
-            self.scene, None, category, region, required
+            self.scene, None, category, region
         )
         return self.prediction
 

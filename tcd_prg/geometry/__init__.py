@@ -10,7 +10,6 @@ from .numpy_se3 import (
 
 __all__ = [
     "SE3",
-    "ExactAG16095GeometryProvider",
     "task_grasp_nms",
     "compose_pose_with_transform",
     "matrix_to_quaternion_xyzw",
@@ -23,10 +22,6 @@ __all__ = [
 def __getattr__(name: str) -> Any:
     """Load tensor geometry only when a model-side caller requests it."""
 
-    if name == "ExactAG16095GeometryProvider":
-        from .gripper_provider import ExactAG16095GeometryProvider
-
-        return ExactAG16095GeometryProvider
     if name == "task_grasp_nms":
         from .grasp_nms import task_grasp_nms
 

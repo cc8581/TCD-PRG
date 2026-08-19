@@ -41,7 +41,7 @@ def create_baseline(
     }
     if kind == "one_shot_sequence_prediction":
         return OneShotSequencePolicy(candidate_policy)
-    if kind in {"tcd_prg", "no_graph_action_classifier"}:
+    if kind == "tcd_prg":
         return candidate_policy
     if kind not in constructors:
         raise ValueError(f"Unknown baseline.type={kind}")

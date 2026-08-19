@@ -31,9 +31,6 @@ class TrainerState:
     states_seen: int = 0
     candidate_groups_seen: int = 0
     global_states_seen: int = 0
-    generated_states_seen: int = 0
-    generated_positive_states_seen: int = 0
-    effective_policy_rows_seen: int = 0
     effective_epochs: float = 0.0
     best_validation: float = float("inf")
     validation_without_improvement: int = 0
@@ -46,12 +43,6 @@ class TrainerState:
 
 class Trainer:
     COUNT_TERMS = {
-        "generated_states",
-        "generated_states_with_positive",
-        "generated_effective_policy_rows",
-        "generated_known_candidates",
-        "generated_unknown_candidates",
-        "generated_conflict_candidates",
         "task_grasp_supervised_rows",
         "task_grasp_effective_rows",
         "task_grasp_positive_proposals",
@@ -66,14 +57,9 @@ class Trainer:
         "task_supervised_rows",
         "task_effective_ranking_rows",
         "positive_wrong_region_overlap",
-        "collision_diverted_to_verifier",
-        "approach_diverted_to_verifier",
+        "collision_excluded_from_task_score",
+        "approach_excluded_from_task_score",
         "ag_width_targets",
-        "verifier_valid_candidates",
-        "verifier_supervised_rows",
-        "verifier_positive_candidates",
-        "verifier_negative_candidates",
-        "verifier_ranking_metrics_valid",
         "push_object_effective_rows",
         "push_multiobject_states",
         "push_positive_objects",
@@ -84,14 +70,11 @@ class Trainer:
         "push_direction_effective_rows",
         "push_direction_residual_targets",
         "push_potential_valid_candidates",
-        "policy_effective_rows",
     }
     LOSS_GROUPS = (
         ("instance", ("weighted_loss_instance",)),
         ("region", ("weighted_loss_region",)),
         ("task_g", ("weighted_loss_task_grasp",)),
-        ("graph", ("weighted_loss_physical_edge", "weighted_loss_task_edge")),
-        ("verify", ("weighted_loss_verify_overall",)),
         (
             "push",
             (
@@ -101,7 +84,6 @@ class Trainer:
                 "weighted_loss_push_potential",
             ),
         ),
-        ("policy", ("weighted_loss_policy_candidate",)),
     )
     TERMINAL_AVERAGE_TERMS = {
         "gradient_norm",
@@ -111,15 +93,21 @@ class Trainer:
         "optimizer_step_seconds",
         "data_seconds",
         "samples_per_second",
+        "task_grasp_effective_fraction",
+        "task_grasp_unknown_fraction",
+        "task_grasp_top1_positive",
+        "task_grasp_top1_known_positive",
+        "task_grasp_top1_unknown",
+        "task_grasp_top1_known_negative",
+        "task_proposal_recall_at_16",
+        "task_proposal_recall_at_32",
+        "task_proposal_recall_at_64",
     }
     GRADIENT_GROUPS = {
         "encoder": ("encoder",),
         "region": ("region_head",),
-        "grasp": ("task_grasp",),
-        "graph": ("graph",),
-        "verify": ("verifier",),
+        "grasp": ("task_grasp", "ag_width"),
         "push": ("push",),
-        "policy": ("router", "flat_router", "candidate_encoder", "candidate_evidence"),
     }
 
     def __init__(
@@ -222,21 +210,18 @@ class Trainer:
         }
 
     def _training_stage(self, record: Mapping[str, Any]) -> str:
-        ratio = self.config.training.generated_policy_candidate_ratio
-        has_policy = "loss_policy_candidate" in record
-        has_upstream = any(
-            key.startswith("loss_") and key not in {"loss_total", "loss_policy_candidate"}
-            for key in record
+        has_grasp = "loss_task_grasp" in record
+        has_push = any(
+            f"loss_{name}" in record
+            for name in ("push_object", "push_contact", "push_direction", "push_potential")
         )
-        if has_policy and ratio >= 1.0:
-            return "policy_generated"
-        if has_policy and ratio > 0.0:
-            return "policy_mixed"
-        if has_policy and not has_upstream:
-            return "policy_teacher"
-        if has_policy:
-            return "joint"
-        return "geometry"
+        if has_grasp and has_push:
+            return "full"
+        if has_push:
+            return "push"
+        if has_grasp:
+            return "grasp"
+        return "perception"
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -304,14 +289,20 @@ class Trainer:
             coverage = self._group_coverage(record, keys)
             suffix = f"({coverage:.0%})" if coverage is not None and coverage < 1.0 else ""
             fields.append(f"{label}: {value:.4f}{suffix}")
-        generated = float(record.get("generated_states", 0.0))
-        if generated:
-            positive = float(record.get("generated_states_with_positive", 0.0))
-            effective = float(record.get("generated_effective_policy_rows", 0.0))
+        if "loss_task_grasp" in record:
             fields.extend(
                 (
-                    f"pos_cov: {positive / generated:.1%}",
-                    f"eff_rows: {effective:.0f}/{generated:.0f}",
+                    f"sup: {float(record.get('active_loss_task_grasp', 0.0)):.0%}",
+                    f"rank: {float(record.get('task_grasp_effective_fraction', 0.0)):.0%}",
+                    "R16/32/64: "
+                    f"{float(record.get('task_proposal_recall_at_16', 0.0)):.0%}/"
+                    f"{float(record.get('task_proposal_recall_at_32', 0.0)):.0%}/"
+                    f"{float(record.get('task_proposal_recall_at_64', 0.0)):.0%}",
+                    f"unk: {float(record.get('task_grasp_unknown_fraction', 0.0)):.0%}",
+                    f"top1+: {float(record.get('task_grasp_top1_positive', 0.0)):.0%}",
+                    f"known+: {float(record.get('task_grasp_top1_known_positive', 0.0)):.0%}",
+                    f"winU/N: {float(record.get('task_grasp_top1_unknown', 0.0)):.0%}/"
+                    f"{float(record.get('task_grasp_top1_known_negative', 0.0)):.0%}",
                 )
             )
         fields.extend(
@@ -339,30 +330,8 @@ class Trainer:
             f"{label}: {value:.4f}" for label, value in self._grouped_losses(record["metrics"])
         )
         metrics = record["metrics"]
-        for key, label, percent in (
-            ("standard_region_miou", "mIoU", True),
-            ("standard_verifier_overall_average_precision", "vAP", True),
-            ("standard_task_relation_ng_mean_recall_at_50", "t-ngmR50", True),
-        ):
-            if key in metrics:
-                value = float(metrics[key])
-                fields.append(f"{label}: {value:.1%}" if percent else f"{label}: {value:.4f}")
-        generated = float(metrics.get("generated_states", 0.0))
-        if generated:
-            positive = float(metrics.get("generated_states_with_positive", 0.0))
-            effective = float(metrics.get("generated_effective_policy_rows", 0.0))
-            fields.extend(
-                (
-                    f"pos_cov: {positive / generated:.1%}",
-                    f"eff_rows: {effective:.0f}/{generated:.0f}",
-                )
-            )
-        fields.extend(
-            (
-                f"items: {int(record['validation_items'])}",
-                f"improved: {'yes' if record['improved'] else 'no'}",
-            )
-        )
+        if "standard_region_miou" in metrics:
+            fields.append(f"mIoU: {float(metrics['standard_region_miou']):.1%}")
         print("  ".join(fields), flush=True)
 
     # validation-resume-transaction-v1
@@ -516,7 +485,6 @@ class Trainer:
                     self.config.model,
                     self.config.evaluation.bootstrap_samples,
                     self.config.evaluation.confidence,
-                    self.config.graph,
                     self.config.evaluation,
                 )
                 evaluator.evaluator.records = evaluation_records
@@ -621,7 +589,7 @@ class Trainer:
                 parameter.requires_grad_(not frozen)
 
     def _apply_frozen_module_modes(self) -> None:
-        """Keep frozen upstream modules deterministic during router-only stages."""
+        """Keep frozen upstream modules deterministic during staged training."""
 
         source = self.model.module if hasattr(self.model, "module") else self.model
         for prefix in self.config.training.frozen_modules:
@@ -650,7 +618,7 @@ class Trainer:
                 {
                     "git_commit": commit,
                     "torch": torch.__version__,
-                    "train_metrics_schema_version": 5,
+                    "train_metrics_schema_version": 6,
                     "validation_metrics_schema_version": 3,
                     "training_events_schema_version": 1,
                 },
@@ -854,25 +822,6 @@ class Trainer:
                             terms[key] = value
                         loss = loss + auxiliary_weight * auxiliary_loss
                         terms["loss_total"] = loss.detach()
-                if "generated_states" in terms:
-                    generated_counts = (
-                        torch.stack(
-                            [
-                                terms["generated_states"],
-                                terms["generated_states_with_positive"],
-                                terms["generated_effective_policy_rows"],
-                            ]
-                        )
-                        .detach()
-                        .to(dtype=torch.long)
-                    )
-                    if torch.distributed.is_initialized():
-                        torch.distributed.all_reduce(
-                            generated_counts, op=torch.distributed.ReduceOp.SUM
-                        )
-                    self.state.generated_states_seen += int(generated_counts[0])
-                    self.state.generated_positive_states_seen += int(generated_counts[1])
-                    self.state.effective_policy_rows_seen += int(generated_counts[2])
                 batch_size = self._batch_size(batch)
                 global_batch_size = batch_size * (
                     torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -1002,9 +951,6 @@ class Trainer:
                         "states_seen": self.state.states_seen,
                         "candidate_groups_seen": self.state.candidate_groups_seen,
                         "global_states_seen": self.state.global_states_seen,
-                        "generated_states_seen": self.state.generated_states_seen,
-                        "generated_positive_states_seen": self.state.generated_positive_states_seen,
-                        "effective_policy_rows_seen": self.state.effective_policy_rows_seen,
                         "effective_epochs": self.state.effective_epochs,
                         "gradient_norm": gradient_norm_value,
                         "gradient_norm_after_clip": gradient_norm_after_clip,
@@ -1113,7 +1059,7 @@ class Trainer:
         path.parent.mkdir(parents=True, exist_ok=True)
         source = self.model.module if hasattr(self.model, "module") else self.model
         payload = {
-            "schema_version": 10,
+            "schema_version": 11,
             "model": source.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler else None,
@@ -1137,14 +1083,13 @@ class Trainer:
     def load_checkpoint(self, path: str | Path) -> None:
         payload = torch.load(path, map_location=self.device, weights_only=False)
         schema_version = int(payload.get("schema_version", 1))
-        if schema_version != 10:
+        if schema_version != 11:
             raise RuntimeError(
                 "Unsupported TCD-PRG checkpoint schema "
-                f"{schema_version}; this code expects schema 10. Official PTv3 features, the "
-                "shared M2T2-style decoder, PyG graph transformer, transformer verifier and "
-                "direction-token PUSH head require a fresh checkpoint. Load the "
-                "original GAPG encoder through the pretrained-backbone option, "
-                "or start a new TCD-PRG run instead of resuming this checkpoint."
+                f"{schema_version}; minimal architecture v3 expects schema 11. "
+                "Graph/learned-Verifier/Router checkpoints are intentionally "
+                "not resume-compatible; start Stage A or initialize from a "
+                "v3 stage checkpoint instead."
             )
         source = self.model.module if hasattr(self.model, "module") else self.model
         source.load_state_dict(payload["model"])

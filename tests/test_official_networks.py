@@ -81,7 +81,6 @@ def test_task_and_global_grasp_use_one_shared_frozen_graspnet_adapter() -> None:
             feature_dim=16,
             task_dim=8,
             task_grasp_scorer_heads=8,
-            verifier_transformer_heads=8,
         )
     )
     keys = tuple(model.state_dict())

@@ -38,8 +38,6 @@ class ObservationConfig:
     pybullet_python: str = "python"
     worker_script: str = "scripts/render_observation_worker_py38.py"
     runtime_mesh_root: str = "runtime/cache/meshes"
-    gripper_worker_script: str = "scripts/sample_gripper_worker_py38.py"
-    gripper_cache_dir: str = "runtime/cache/grippers"
     certification_worker_script: str = "scripts/certify_actions_worker_py38.py"
     render_temporary_root: str = "runtime/tmp/render_requests"
     certification_temporary_root: str = "runtime/tmp/certification"
@@ -154,7 +152,6 @@ class ModelConfig:
     target_prompt_min_support: float = 0.20
     target_prompt_min_margin: float = 0.25
     target_same_category_loss_boost: float = 2.0
-    num_relation_types: int = 8
     num_direction_bins: int = 16
     # 每个抓取 query 直接预测平移、连续 SO(3)、夹爪宽度和条件化质量。
     contact_heatmap_sigma_m: float = 0.008
@@ -162,6 +159,8 @@ class ModelConfig:
     min_grasp_width_m: float = 0.0
     candidate_topk: int = 64
     task_grasp_candidates: int = 64
+    task_grasp_probability_threshold: float = 0.5
+    pick_remove_probability_threshold: float = 0.5
     global_grasp_candidates: int = 64
     task_grasp_scorer_layers: int = 2
     task_grasp_scorer_heads: int = 8
@@ -172,42 +171,27 @@ class ModelConfig:
     # push_candidates 是接触点预算；每个点再展开多个方向，最终总量受 max_push_candidates 限制。
     push_directions_per_contact: int = 2
     max_push_candidates: int = 32
-    # 每个预测实例只在高分接触点计算方向和效用；GT 接触点不进入 forward。
+    # 稀疏方向计算；训练时仅把已评价 GT contact 强制并入预测 top-k。
     push_direction_contact_topk: int = 32
+    push_object_topk: int = 4
+    pick_remove_target_margin_m: float = 0.05
     push_direction_feature_dim: int = 64
     push_direction_transformer_layers: int = 1
     push_direction_transformer_heads: int = 4
     # 默认关闭以避免反向传播时重复执行 PTv3；显存不足时再显式开启。
     activation_checkpointing: bool = False
-    verifier_local_radius_m: float = 0.25
-    verifier_candidate_micro_batch: int = 16
-    verifier_transformer_layers: int = 2
-    verifier_transformer_heads: int = 8
-    verifier_validity_threshold: float = 0.5
-    # Verifier 是学习到的策略证据，不等价于确定性几何认证；hard gate 只用于消融实验。
-    verifier_hard_gate: bool = False
-    graph_edge_threshold: float = 0.5
-    graph_candidate_mode: str = "soft"
-    graph_candidate_topk_objects: int = 4
-    default_required_grasp_count: int = 20
-    max_required_grasp_count: int = 20
     grasp_nms_translation_m: float = 0.010
     grasp_nms_rotation_deg: float = 12.0
     grasp_nms_width_m: float = 0.005
     grasp_nms_approach_deg: float = 12.0
-    graph_candidate_fallback_objects: int = 1
-    # 数据中允许推动目标物体自恢复；该开关显式保留此动作原语，避免图门控静默覆盖。
-    allow_target_push_recovery: bool = True
     global_grasp_input_mode: str = "scene_only"
     global_grasp_nms_translation_m: float = 0.01
     global_grasp_nms_rotation_deg: float = 15.0
     global_grasp_nms_width_m: float = 0.005
     global_grasp_nms_approach_deg: float = 15.0
-    policy_push_match_contact_m: float = 0.020
-    policy_push_match_direction_deg: float = 22.5
-    policy_grasp_match_translation_m: float = 0.020
-    policy_grasp_match_rotation_deg: float = 20.0
-    policy_grasp_match_width_m: float = 0.010
+    task_grasp_match_translation_m: float = 0.020
+    task_grasp_match_rotation_deg: float = 20.0
+    task_grasp_match_width_m: float = 0.010
     push_nms_contact_m: float = 0.015
     push_nms_direction_deg: float = 15.0
     push_utility_component_weights: tuple[float, ...] = (0.05, 1.0, -1.0, -0.25, 1.0)
@@ -217,11 +201,7 @@ class ModelConfig:
 @dataclass(slots=True)
 class AblationConfig:
     use_task_region_condition: bool = True
-    use_dependency_graph: bool = True
-    use_indirect_dependency_reasoning: bool = True
-    use_gripper_scene_verifier: bool = True
     use_push_potential: bool = True
-    router_type: str = "hierarchical"
 
 
 @dataclass(slots=True)
@@ -239,6 +219,8 @@ class TrainingConfig:
         "direct_grasp", "pick_remove", "push", "push_failure",
         "unresolved_or_unknown",
     )
+    # Optional stage-level filter over the immutable action-group snapshot.
+    allowed_action_strata: tuple[str, ...] = ()
     # Unique scene-state Global Grasp stream is added once per action batch.
     gradient_accumulation_steps: int = 1
     max_optimizer_steps: int = 100_000
@@ -281,21 +263,10 @@ class TrainingConfig:
     unfreeze_at_optimizer_step: int | None = None
     ddp_backend: str = "auto"
     ddp_find_unused_parameters: bool = True
-    # Policy Stage B/C 可读取冻结前级网络生成的候选；ratio=0 保持纯 teacher 预训练。
-    generated_policy_candidate_cache: str = ""
-    generated_policy_candidate_ratio: float = 0.0
-    generated_policy_checkpoint_sha256: str = ""
-    # generated-only 启动前必须达到正样本覆盖率和有效排序行覆盖率，避免静默训练极少状态。
-    generated_policy_min_positive_coverage: float = 0.05
-    generated_policy_min_effective_coverage: float = 0.01
     validation_family_weights: dict[str, float] = field(default_factory=lambda: {
-        "policy_candidate": 1.0,
         "instance": 0.1,
-        "verify_overall": 0.5,
-        "physical_edge": 0.25,
-        "task_edge": 0.25,
-        "task_grasp": 0.25,
         "region": 0.1,
+        "task_grasp": 0.25,
         "push_object": 0.1,
         "push_contact": 0.05,
         "push_direction": 0.05,
@@ -312,9 +283,7 @@ class EvaluationConfig:
     max_groups: int | None = None
     # 这些阈值属于评测协议；修改后产生的结果不得与旧实验直接混合。
     region_probability_threshold: float = 0.5
-    verifier_probability_threshold: float = 0.5
     ranking_topk: tuple[int, ...] = (1, 5, 10)
-    relation_ranking_topk: tuple[int, ...] = (20, 50, 100)
     calibration_bins: int = 15
     global_grasp_tracks: tuple[str, ...] = ("scene_only", "instance_assisted")
     # Internal convergence diagnostics only. Public Global Grasp comparison
@@ -338,36 +307,9 @@ class EvaluationConfig:
 
 
 @dataclass(slots=True)
-class GraspVerifierConfig:
-    # Verifier 仅打包有效抓取候选；128+128 个点控制局部自注意力的二次复杂度。
-    local_scene_points: int = 128
-    gripper_points: int = 128
-    # 连续夹爪宽度映射到有限档位，避免训练 worker 为每个浮点宽度启动 PyBullet。
-    gripper_width_quantization_m: float = 0.001
-
-
-@dataclass(slots=True)
-class GraphConfig:
-    physical_relations: tuple[str, ...] = ("near", "contact", "support", "press", "occlude")
-    task_relations: tuple[str, ...] = (
-        "block_task_region", "block_task_grasp", "block_grasp_approach"
-    )
-    layers: int = 3
-    heads: int = 4
-
-
-@dataclass(slots=True)
 class PushConfig:
     distance_m: float = PUSH_DISTANCE_M
     direction_bins: int = 16
-
-
-@dataclass(slots=True)
-class RouterConfig:
-    type: str = "hierarchical"
-    layers: int = 2
-    heads: int = 4
-    max_preparation_actions: int = MAX_PREPARATION_ACTIONS
 
 
 @dataclass(slots=True)
@@ -376,14 +318,10 @@ class LossConfig:
     instance: float = 1.0
     region: float = 1.0
     task_grasp: float = 1.0
-    physical_edge: float = 0.5
-    task_edge: float = 0.5
-    verify_overall: float = 1.0
     push_object: float = 0.25
     push_contact: float = 0.25
     push_direction: float = 0.25
     push_potential: float = 0.25
-    policy_candidate: float = 1.0
     internal: dict[str, float] = field(default_factory=lambda: {
         "instance_objectness": 1.0,
         "instance_mask": 2.0,
@@ -400,9 +338,8 @@ class LossConfig:
         return {
             name: float(getattr(self, name))
             for name in (
-                "instance", "region", "task_grasp", "physical_edge", "task_edge",
-                "verify_overall", "push_object", "push_contact", "push_direction",
-                "push_potential", "policy_candidate",
+                "instance", "region", "task_grasp", "push_object",
+                "push_contact", "push_direction", "push_potential",
             )
         }
 
@@ -455,10 +392,7 @@ class TCDPRGConfig:
     ablation: AblationConfig = field(default_factory=AblationConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
-    grasp_verifier: GraspVerifierConfig = field(default_factory=GraspVerifierConfig)
-    graph: GraphConfig = field(default_factory=GraphConfig)
     push: PushConfig = field(default_factory=PushConfig)
-    router: RouterConfig = field(default_factory=RouterConfig)
     losses: LossConfig = field(default_factory=LossConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -486,6 +420,8 @@ class TCDPRGConfig:
             raise ValueError("training.num_workers must be non-negative")
         if self.training.validation_num_workers < 0:
             raise ValueError("training.validation_num_workers must be non-negative")
+        if self.training.validation_interval < 0:
+            raise ValueError("training.validation_interval must be non-negative")
         expected_strata = {
             "direct_grasp", "pick_remove", "push", "push_failure",
             "unresolved_or_unknown",
@@ -496,6 +432,16 @@ class TCDPRGConfig:
         if not set(coverage_strata).issubset(expected_strata):
             raise ValueError(
                 "training.action_batch_coverage_strata contains an unknown action stratum"
+            )
+        allowed_strata = tuple(self.training.allowed_action_strata)
+        if len(set(allowed_strata)) != len(allowed_strata):
+            raise ValueError("training.allowed_action_strata must not contain duplicates")
+        if not set(allowed_strata).issubset(expected_strata):
+            raise ValueError("training.allowed_action_strata contains an unknown action stratum")
+        if allowed_strata and not set(coverage_strata).issubset(set(allowed_strata)):
+            raise ValueError(
+                "action_batch_coverage_strata must be a subset of allowed_action_strata "
+                "when stage filtering is enabled"
             )
         if not 0.0 < self.training.data_fraction <= 1.0:
             raise ValueError("training.data_fraction must be in (0,1]")
@@ -528,22 +474,21 @@ class TCDPRGConfig:
                 raise ValueError(
                     "training.validation_stratum_quota must sum to max_validation_groups"
                 )
+            if allowed_strata and any(
+                int(value) != 0 and name not in set(allowed_strata)
+                for name, value in self.training.validation_stratum_quota.items()
+            ):
+                raise ValueError(
+                    "validation_stratum_quota must be zero outside allowed_action_strata"
+                )
         if self.training.amp_initial_scale <= 0:
             raise ValueError("training.amp_initial_scale must be positive")
         if not 0 < self.evaluation.region_probability_threshold < 1:
             raise ValueError("evaluation.region_probability_threshold must be in (0,1)")
-        if not 0 < self.evaluation.verifier_probability_threshold < 1:
-            raise ValueError("evaluation.verifier_probability_threshold must be in (0,1)")
         if not self.evaluation.ranking_topk or any(
             value <= 0 for value in self.evaluation.ranking_topk
         ):
             raise ValueError("evaluation.ranking_topk must contain positive integers")
-        if not self.evaluation.relation_ranking_topk or any(
-            value <= 0 for value in self.evaluation.relation_ranking_topk
-        ):
-            raise ValueError(
-                "evaluation.relation_ranking_topk must contain positive integers"
-            )
         diagnostic_thresholds = (
             self.evaluation.task_translation_threshold_m,
             self.evaluation.task_rotation_threshold_deg,
@@ -603,25 +548,12 @@ class TCDPRGConfig:
             raise ValueError("push.distance_m must be 0.15 for the main experiment")
         if self.evaluation.max_preparation_actions != MAX_PREPARATION_ACTIONS:
             raise ValueError("The main experiment requires H=5")
-        if self.router.max_preparation_actions != MAX_PREPARATION_ACTIONS:
-            raise ValueError("router.max_preparation_actions must be H=5")
         if self.planner.max_preparation_actions != MAX_PREPARATION_ACTIONS:
             raise ValueError("planner.max_preparation_actions must be H=5")
         if not 0 <= self.model.min_grasp_width_m < self.model.max_grasp_width_m:
             raise ValueError("Invalid AG gripper opening range")
         if self.model.contact_heatmap_sigma_m <= 0:
             raise ValueError("contact_heatmap_sigma_m must be positive")
-        if not 0 < self.model.graph_edge_threshold < 1:
-            raise ValueError("graph_edge_threshold must be in (0,1)")
-        if self.model.default_required_grasp_count <= 0:
-            raise ValueError("default_required_grasp_count must be positive")
-        if self.model.max_required_grasp_count < self.model.default_required_grasp_count:
-            raise ValueError("max_required_grasp_count cannot be smaller than the default")
-        if self.model.task_grasp_candidates < self.model.max_required_grasp_count:
-            raise ValueError(
-                "task_grasp_candidates must cover max_required_grasp_count so the "
-                "state gate can be satisfied"
-            )
         if min(
             self.model.grasp_nms_translation_m,
             self.model.grasp_nms_rotation_deg,
@@ -637,19 +569,21 @@ class TCDPRGConfig:
         ) <= 0:
             raise ValueError("Global grasp NMS thresholds must be positive")
         if min(
-            self.model.policy_push_match_contact_m,
-            self.model.policy_push_match_direction_deg,
-            self.model.policy_grasp_match_translation_m,
-            self.model.policy_grasp_match_rotation_deg,
-            self.model.policy_grasp_match_width_m,
+            self.model.task_grasp_match_translation_m,
+            self.model.task_grasp_match_rotation_deg,
+            self.model.task_grasp_match_width_m,
         ) <= 0:
-            raise ValueError("Generated policy matching thresholds must be positive")
-        if self.model.graph_candidate_fallback_objects < 0:
-            raise ValueError("graph_candidate_fallback_objects cannot be negative")
-        if self.model.graph_candidate_mode not in {"hard", "soft", "none"}:
-            raise ValueError("graph_candidate_mode must be hard, soft, or none")
-        if self.model.graph_candidate_topk_objects <= 0:
-            raise ValueError("graph_candidate_topk_objects must be positive")
+            raise ValueError("Task-grasp matching thresholds must be positive")
+        if not 0.0 < self.model.task_grasp_probability_threshold < 1.0:
+            raise ValueError("task_grasp_probability_threshold must be in (0,1)")
+        if not 0.0 < self.model.pick_remove_probability_threshold < 1.0:
+            raise ValueError("pick_remove_probability_threshold must be in (0,1)")
+        if self.model.push_object_topk <= 0:
+            raise ValueError("push_object_topk must be positive")
+        if self.model.push_object_topk > self.model.instance_queries:
+            raise ValueError("push_object_topk cannot exceed instance_queries")
+        if self.model.pick_remove_target_margin_m <= 0:
+            raise ValueError("pick_remove_target_margin_m must be positive")
         if min(self.model.push_nms_contact_m, self.model.push_nms_direction_deg) <= 0:
             raise ValueError("PUSH NMS thresholds must be positive")
         if not 1 <= self.model.push_directions_per_contact <= self.model.num_direction_bins:
@@ -660,39 +594,6 @@ class TCDPRGConfig:
             raise ValueError("PUSH contact and final candidate budgets must be positive")
         if self.model.push_direction_contact_topk <= 0:
             raise ValueError("push_direction_contact_topk must be positive")
-        if min(
-            self.grasp_verifier.local_scene_points,
-            self.grasp_verifier.gripper_points,
-        ) <= 0:
-            raise ValueError("grasp verifier point budgets must be positive")
-        if not (
-            0.0 < self.grasp_verifier.gripper_width_quantization_m
-            <= self.model.max_grasp_width_m - self.model.min_grasp_width_m
-        ):
-            raise ValueError("gripper_width_quantization_m must fit the grasp width range")
-        if not 0.0 <= self.training.generated_policy_candidate_ratio <= 1.0:
-            raise ValueError("generated_policy_candidate_ratio must be in [0,1]")
-        if self.training.validation_interval < 0:
-            raise ValueError("validation_interval must be non-negative")
-        if not 0.0 <= self.training.generated_policy_min_positive_coverage <= 1.0:
-            raise ValueError("generated_policy_min_positive_coverage must be in [0,1]")
-        if not 0.0 <= self.training.generated_policy_min_effective_coverage <= 1.0:
-            raise ValueError("generated_policy_min_effective_coverage must be in [0,1]")
-        if self.training.generated_policy_candidate_ratio == 1.0 and (
-            self.training.generated_policy_min_positive_coverage <= 0
-            or self.training.generated_policy_min_effective_coverage <= 0
-        ):
-            raise ValueError(
-                "Pure generated policy training requires positive non-zero coverage thresholds"
-            )
-        if (
-            self.training.generated_policy_candidate_ratio > 0
-            and not self.training.generated_policy_candidate_cache
-        ):
-            raise ValueError(
-                "generated_policy_candidate_cache is required when generated policy "
-                "candidate training is enabled"
-            )
         if self.model.global_grasp_input_mode not in {"scene_only", "instance_assisted"}:
             raise ValueError("global_grasp_input_mode must be scene_only or instance_assisted")
         if min(
@@ -762,10 +663,6 @@ class TCDPRGConfig:
             raise ValueError("GraspNet target_crop_probability must lie in (0,1)")
         if self.graspnet.camera_transfer_max_distance_m <= 0:
             raise ValueError("GraspNet camera_transfer_max_distance_m must be positive")
-        if self.model.verifier_transformer_layers <= 0:
-            raise ValueError("verifier_transformer_layers must be positive")
-        if self.model.feature_dim % self.model.verifier_transformer_heads:
-            raise ValueError("feature_dim must be divisible by verifier_transformer_heads")
         if self.model.push_direction_transformer_layers <= 0:
             raise ValueError("push_direction_transformer_layers must be positive")
         if (
@@ -782,12 +679,6 @@ class TCDPRGConfig:
             )
         if len(self.model.push_failure_penalties) != 3:
             raise ValueError("push_failure_penalties must cover unstable/workspace/other failures")
-        if self.ablation.router_type not in {
-            "hierarchical",
-            "fixed_priority",
-            "flat_candidate_classifier",
-        }:
-            raise ValueError(f"Unsupported router_type={self.ablation.router_type}")
         if self.training.amp_dtype not in {"float16", "bfloat16"}:
             raise ValueError("training.amp_dtype must be float16 or bfloat16")
         if self.cache.eviction != "lru":
@@ -836,15 +727,12 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> TCDPRGC
         (config.dataset, "fr5_ag_urdf"),
         (config.observation, "worker_script"),
         (config.observation, "runtime_mesh_root"),
-        (config.observation, "gripper_worker_script"),
-        (config.observation, "gripper_cache_dir"),
         (config.observation, "certification_worker_script"),
         (config.observation, "render_temporary_root"),
         (config.observation, "certification_temporary_root"),
         (config.cache, "directory"),
         (config.cache, "index_directory"),
         (config.backbone, "source_root"),
-        (config.training, "generated_policy_candidate_cache"),
         (config.baseline, "gapg_root"),
         (config.baseline, "grasp_checkpoint"),
         (config.baseline, "push_checkpoint"),

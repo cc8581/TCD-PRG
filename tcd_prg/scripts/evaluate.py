@@ -13,7 +13,7 @@ from tcd_prg.config import load_config
 from tcd_prg.datasets import ActionStateGroupDataset
 from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.models import TCDPRGModel
-from tcd_prg.runtime import UnifiedBatchCollator, create_adapter, create_gripper_provider
+from tcd_prg.runtime import UnifiedBatchCollator, create_adapter
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,11 +49,6 @@ def main() -> None:
     )
     if not len(dataset):
         raise RuntimeError(f"No completed action groups exist for split={args.split}")
-    gripper = (
-        create_gripper_provider(config, allow_generate=False)
-        if config.ablation.use_gripper_scene_verifier
-        else None
-    )
     loader = DataLoader(
         dataset,
         batch_size=config.training.batch_size,
@@ -61,11 +56,13 @@ def main() -> None:
         num_workers=config.training.num_workers,
         pin_memory=config.training.pin_memory,
         persistent_workers=config.training.num_workers > 0,
-        collate_fn=UnifiedBatchCollator(config, gripper, training=False),
+        collate_fn=UnifiedBatchCollator(
+            config, training=False, include_graspnet=False
+        ),
     )
     device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
     model = TCDPRGModel(
-        config.model, config.ablation, config.graph, config.router, config.backbone
+        config.model, config.ablation, config.backbone, config.graspnet
     ).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["ema"] or checkpoint["model"])
@@ -74,7 +71,6 @@ def main() -> None:
         config.model,
         config.evaluation.bootstrap_samples,
         config.evaluation.confidence,
-        config.graph,
         config.evaluation,
     )
     evaluated_groups = 0
@@ -101,7 +97,9 @@ def main() -> None:
                     key: value.to(device)
                     for key, value in raw["verifier_inputs"].items()
                 }
-            evaluator.update(batch, model(batch))
+            evaluator.update(
+                batch, model(batch, forward_mode="perception")
+            )
             batch_groups = int(batch["xyz"].shape[0])
             evaluated_groups += batch_groups
             if evaluated_groups >= next_log or evaluated_groups == len(dataset):

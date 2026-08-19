@@ -31,8 +31,6 @@ observation:
   pybullet_python: python
   worker_script: scripts/render_observation_worker_py38.py
   runtime_mesh_root: runtime/cache/meshes
-  gripper_worker_script: scripts/sample_gripper_worker_py38.py
-  gripper_cache_dir: runtime/cache/grippers
   certification_worker_script: scripts/certify_actions_worker_py38.py
   render_temporary_root: runtime/tmp/render_requests
   certification_temporary_root: runtime/tmp/certification
@@ -122,13 +120,14 @@ model:
   target_prompt_min_support: 0.20
   target_prompt_min_margin: 0.25
   target_same_category_loss_boost: 2.0
-  num_relation_types: 8
   num_direction_bins: 16
   contact_heatmap_sigma_m: 0.008
   min_grasp_width_m: 0.0
   max_grasp_width_m: 0.095
   candidate_topk: 64
   task_grasp_candidates: 32
+  task_grasp_probability_threshold: 0.5 # 运行时至少一个高置信任务抓取即可尝试认证
+  pick_remove_probability_threshold: 0.5 # 低置信移除不得压过 Push
   global_grasp_candidates: 32
   # GraspNet 产生 6DoF proposal；任务评分器只学习任务残差。
   task_grasp_scorer_layers: 2
@@ -138,80 +137,46 @@ model:
   pick_remove_candidates: 16
   push_candidates: 16
   push_directions_per_contact: 2  # 每个接触点展开 Top-2 方向
-  max_push_candidates: 32         # 展开后进入 Router 前的 PUSH 上限
+  max_push_candidates: 32         # 展开后保留的最终 PUSH 候选上限
   push_direction_contact_topk: 32 # 每个预测实例仅对 Top-K 预测接触点计算方向/utility
+  push_object_topk: 4              # 推理时只展开最高分的 Push 作用对象
+  pick_remove_target_margin_m: 0.05 # 仅移除预测目标邻域内的非目标物体
   push_direction_feature_dim: 64
   push_direction_transformer_layers: 1
   push_direction_transformer_heads: 4
   activation_checkpointing: false # 显存不足时再开启；开启会重复计算 PTv3 前向
-  verifier_local_radius_m: 0.25
-  verifier_candidate_micro_batch: 64
-  verifier_transformer_layers: 1
-  verifier_transformer_heads: 8
-  verifier_validity_threshold: 0.5
-  verifier_hard_gate: false
-  graph_edge_threshold: 0.5       # 仅用于图指标/硬模式，soft 模式使用连续先验
-  graph_candidate_mode: soft      # 图预测用于加权，不直接删除候选
-  graph_candidate_topk_objects: 4
-  default_required_grasp_count: 20
-  max_required_grasp_count: 20
   grasp_nms_translation_m: 0.010
   grasp_nms_rotation_deg: 12.0
   grasp_nms_width_m: 0.005
   grasp_nms_approach_deg: 12.0
-  graph_candidate_fallback_objects: 1
-  allow_target_push_recovery: true
   global_grasp_input_mode: scene_only
   global_grasp_nms_translation_m: 0.01
   global_grasp_nms_rotation_deg: 15.0
   global_grasp_nms_width_m: 0.005
   global_grasp_nms_approach_deg: 15.0
-  # Generated candidate 与教师动作的匹配阈值；同时匹配正负时标签为 UNKNOWN。
-  policy_push_match_contact_m: 0.020
-  policy_push_match_direction_deg: 22.5
-  policy_grasp_match_translation_m: 0.020
-  policy_grasp_match_rotation_deg: 20.0
-  policy_grasp_match_width_m: 0.010
+  # Task Grasp proposal 与监督抓取的匹配阈值。
+  task_grasp_match_translation_m: 0.020
+  task_grasp_match_rotation_deg: 20.0
+  task_grasp_match_width_m: 0.010
   # 同物体 PUSH 的动作级 NMS 阈值。
   push_nms_contact_m: 0.015
   push_nms_direction_deg: 15.0
   push_utility_component_weights: [0.05, 1.0, -1.0, -0.25, 1.0]
   push_failure_penalties: [1.0, 2.0, 1.0]
 
-grasp_verifier:
-  local_scene_points: 64
-  gripper_points: 64
-  gripper_width_quantization_m: 0.001 # 1 mm 档位，最大几何近似误差 0.5 mm
-
-graph:
-  physical_relations: [near, contact, support, press, occlude]
-  task_relations: [block_task_region, block_task_grasp, block_grasp_approach]
-  layers: 3
-  heads: 4
-
 push:
   distance_m: 0.15
   direction_bins: 16
-
-router:
-  type: hierarchical
-  layers: 2
-  heads: 4
-  max_preparation_actions: 5
 
 losses:
   # Instance GT is supervision-only; no instance/target mask enters forward.
   instance: 1.0
   region: 1.0
   task_grasp: 1.0
-  physical_edge: 0.5
-  task_edge: 0.5
-  verify_overall: 1.0
   push_object: 0.25
   push_contact: 0.25
   push_direction: 0.25
   push_potential: 0.25
-  policy_candidate: 1.0
   internal:
     instance_objectness: 1.0
     instance_mask: 2.0
@@ -254,6 +219,8 @@ training:
   # targets when an already-selected state has multiple action groups.
   action_batch_coverage_strata:
     [direct_grasp, pick_remove, push, push_failure, unresolved_or_unknown]
+  # Empty means all groups. Stage configs narrow this to guaranteed supervision.
+  allowed_action_strata: []
   gradient_accumulation_steps: 3  # 梯度累积
   max_optimizer_steps: 30000
   validation_interval: 2000     # 周期验证。
@@ -288,25 +255,15 @@ training:
   unfreeze_at_optimizer_step: null
   ddp_backend: auto
   ddp_find_unused_parameters: true  # 多任务阶段并非每批都激活全部 head
-  # generated cache 用于 Policy Stage；ratio=0/1 分别表示纯 teacher/纯 generated。
-  generated_policy_candidate_cache: ""
-  generated_policy_candidate_ratio: 0.0
-  generated_policy_checkpoint_sha256: ""
-  generated_policy_min_positive_coverage: 0.05   # 低于该正样本状态覆盖率时拒绝纯 generated
-  generated_policy_min_effective_coverage: 0.01  # 同时含已知正负、可形成排序损失的状态比例
   validation_family_weights:
-    policy_candidate: 1.0
     instance: 0.1
-    verify_overall: 0.5
-    physical_edge: 0.25
-    task_edge: 0.25
-    task_grasp: 0.25
     region: 0.1
+    task_grasp: 0.25
     push_object: 0.1
     push_contact: 0.05
     push_direction: 0.05
     push_potential: 0.1
-
+  # generated cache 用于 Policy Stage；ratio=0/1 分别表示纯 teacher/纯 generated。
 evaluation:
   max_preparation_actions: 5
   horizons: [0, 1, 3, 5]
@@ -315,9 +272,7 @@ evaluation:
   max_groups: null
   # 所有验证入口共用这些阈值和 Top-K，保证训练验证与离线评测可直接比较。
   region_probability_threshold: 0.5
-  verifier_probability_threshold: 0.5
   ranking_topk: [1, 5, 10]
-  relation_ranking_topk: [20, 50, 100]
   calibration_bins: 15
   global_grasp_tracks: [scene_only, instance_assisted]
   # 以下 grasp pose 阈值只服务训练收敛诊断，不进入 paper 标准指标。
@@ -338,12 +293,7 @@ evaluation:
 
 ablation:
   use_task_region_condition: true
-  use_dependency_graph: true
-  use_indirect_dependency_reasoning: true
-  use_gripper_scene_verifier: true
   use_push_potential: true
-  router_type: hierarchical
-
 logging:
   backend: tensorboard
   log_interval: 20    # 终端每 log_interval 步打印核心摘要；train_metrics.jsonl 保存每个优化器步的完整指标。

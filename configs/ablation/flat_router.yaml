@@ -1,3 +1,0 @@
-# 使用扁平候选分类器，作为层次化 Router 的结构消融。
-ablation:
-  router_type: flat_candidate_classifier

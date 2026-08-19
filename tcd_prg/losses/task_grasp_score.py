@@ -117,8 +117,13 @@ class TaskGraspScoringLoss(nn.Module):
         row_effective = positive.any(-1) & negative.any(-1)
         ranking_terms = []
         for row in torch.nonzero(row_effective, as_tuple=False).flatten().tolist():
-            pos = torch.logsumexp(loss_logits[row][positive[row]], dim=0)
-            neg = torch.logsumexp(loss_logits[row][negative[row]], dim=0)
+            # Deployment selects the highest-scoring proposal.  Set-level
+            # logsumexp is count-sensitive and can be small even when the top
+            # known negative outranks every positive.  Optimize the same hard
+            # ordering used by candidate selection while leaving UNKNOWN
+            # proposals ignored rather than silently treating them as negatives.
+            pos = loss_logits[row][positive[row]].max()
+            neg = loss_logits[row][negative[row]].max()
             ranking_terms.append(torch.nn.functional.softplus(neg - pos))
         ranking = (
             torch.stack(ranking_terms).mean()
@@ -175,6 +180,9 @@ class TaskGraspScoringLoss(nn.Module):
             ]
 
         top1_positive = logits.new_zeros((logits.shape[0],))
+        top1_known_positive = logits.new_zeros((logits.shape[0],))
+        top1_unknown = logits.new_zeros((logits.shape[0],))
+        top1_known_negative = logits.new_zeros((logits.shape[0],))
         has_candidate = valid.any(-1)
         if has_candidate.any():
             masked = logits.masked_fill(~valid, -30.0)
@@ -183,8 +191,25 @@ class TaskGraspScoringLoss(nn.Module):
             top1_positive = positive[rows, top1].float()
         supervised = known.any(-1)
         unknown = valid & ~known
+        if supervised.any():
+            known_top1 = logits.masked_fill(~known, -30.0).argmax(-1)
+            top1_known_positive = positive[rows, known_top1].float()
+            top1_unknown = unknown[rows, top1].float()
+            top1_known_negative = negative[rows, top1].float()
         top1_metric = (
             (top1_positive * supervised.float()).sum()
+            / supervised.float().sum().clamp_min(1.0)
+        )
+        top1_known_metric = (
+            (top1_known_positive * supervised.float()).sum()
+            / supervised.float().sum().clamp_min(1.0)
+        )
+        top1_unknown_fraction = (
+            (top1_unknown * supervised.float()).sum()
+            / supervised.float().sum().clamp_min(1.0)
+        )
+        top1_known_negative_fraction = (
+            (top1_known_negative * supervised.float()).sum()
             / supervised.float().sum().clamp_min(1.0)
         )
 
@@ -193,17 +218,21 @@ class TaskGraspScoringLoss(nn.Module):
         unknown_count = unknown.float().sum().detach()
         supervised_rows = supervised.float().sum().detach()
         effective_rows = row_effective.float().sum().detach()
+        row_count = max(1, logits.shape[0])
+        proposal_count = (known.float().sum() + unknown_count).clamp_min(1.0)
         return {
             "loss": loss,
             "task_grasp_score_bce": bce.detach(),
             "task_grasp_score_ranking": ranking.detach(),
             "task_grasp_effective_rows": effective_rows,
+            "task_grasp_effective_fraction": effective_rows / row_count,
             "task_grasp_supervised_rows": supervised_rows,
             "task_grasp_positive_proposals": positive_count,
             "task_grasp_wrong_region_negative_proposals": wrong_region_count,
             "task_grasp_negative_proposals": wrong_region_count,
             "task_grasp_known_proposals": known.float().sum().detach(),
             "task_grasp_unknown_proposals": unknown_count,
+            "task_grasp_unknown_fraction": unknown_count / proposal_count,
             "task_grasp_effective_ranking_rows": effective_rows,
             # Stable protocol names used by training dashboards.
             "task_positive_proposals": positive_count,
@@ -214,13 +243,16 @@ class TaskGraspScoringLoss(nn.Module):
             "positive_wrong_region_overlap": (
                 positive_wrong_region_overlap.float().sum().detach()
             ),
-            "collision_diverted_to_verifier": labels.get(
-                "collision_diverted_to_verifier", logits.new_zeros(logits.shape[0])
+            "collision_excluded_from_task_score": labels.get(
+                "collision_excluded_from_task_score", logits.new_zeros(logits.shape[0])
             ).float().sum().detach(),
-            "approach_diverted_to_verifier": labels.get(
-                "approach_diverted_to_verifier", logits.new_zeros(logits.shape[0])
+            "approach_excluded_from_task_score": labels.get(
+                "approach_excluded_from_task_score", logits.new_zeros(logits.shape[0])
             ).float().sum().detach(),
             "task_grasp_top1_positive": top1_metric.detach(),
+            "task_grasp_top1_known_positive": top1_known_metric.detach(),
+            "task_grasp_top1_unknown": top1_unknown_fraction.detach(),
+            "task_grasp_top1_known_negative": top1_known_negative_fraction.detach(),
             "task_top1_positive": top1_metric.detach(),
             **{key: value.detach() for key, value in recalls.items()},
         }

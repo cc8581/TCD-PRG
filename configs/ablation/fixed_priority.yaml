@@ -1,3 +1,0 @@
-# 用固定 TASK_GRASP > PICK_REMOVE > PUSH 规则替代学习型 Router。
-ablation:
-  router_type: fixed_priority

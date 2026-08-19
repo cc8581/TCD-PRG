@@ -227,182 +227,73 @@ def build_grasp_proposal_labels(
         & (labels["width_m"] >= config.min_grasp_width_m)
         & (labels["width_m"] <= config.max_grasp_width_m)
     )
-    labels["collision_diverted_to_verifier"] = collision_diverted.sum(-1)
-    labels["approach_diverted_to_verifier"] = approach_diverted.sum(-1)
+    # Physical infeasibility is handled by the exact execution certifier,
+    # so these examples are excluded from task-suitability ranking.
+    labels["collision_excluded_from_task_score"] = collision_diverted.sum(-1)
+    labels["approach_excluded_from_task_score"] = approach_diverted.sum(-1)
     labels["label_set_complete"] = label_set_complete
     labels["sample_valid"] = valid.any(-1) | wrong_region.any(-1)
     labels["unmatched_quality_valid"] = torch.zeros_like(label_set_complete)
     return labels
 
 
-def build_graph_labels(batch: dict[str, Tensor]) -> dict[str, Tensor]:
-    # 图损失只覆盖当前物理活跃物体之间的边，padding 和已移除物体全部 ignore。
-    object_mask = batch["object_mask"] & batch["object_active"]
-    pair_valid = object_mask[:, :, None, None] & object_mask[:, None, :, None]
+
+@torch.no_grad()
+def build_push_training_hints(batch: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Map only evaluated GT PUSH contacts to visible points once per batch.
+
+    The model receives only the union mask used to compute sparse Direction tokens.
+    The candidate->point index remains loss-side and prevents a second nearest-point
+    search in ``build_object_query_push_supervision``.
+    """
+    xyz = batch["xyz"]
+    point_mask = batch["point_mask"].bool()
+    instance_id = batch["instance_id"].long()
+    contact = batch["action_parameters"]["push_contact_world"]
+    acted_object = batch["acted_object"].long()
+    evaluated = (
+        batch["candidate_mask"].bool()
+        & (batch["action_type"] == int(ActionType.PUSH))
+        & (
+            batch["evaluation_status"]
+            != int(CandidateStatus.UNKNOWN_UNTESTED)
+        )
+        & torch.isfinite(contact).all(-1)
+        & (acted_object >= 0)
+    )
+    point_index = torch.zeros_like(acted_object)
+    point_valid = torch.zeros_like(evaluated)
+    forced = torch.zeros_like(point_mask)
+
+    for row in range(xyz.shape[0]):
+        candidate_index = torch.nonzero(
+            evaluated[row], as_tuple=False
+        ).flatten()
+        if candidate_index.numel() == 0:
+            continue
+        contacts = contact[row, candidate_index]
+        objects = acted_object[row, candidate_index]
+        domain = (
+            point_mask[row][None]
+            & (instance_id[row][None] == objects[:, None])
+        )
+        distance_sq = (
+            xyz[row][None] - contacts[:, None]
+        ).square().sum(-1)
+        distance_sq = distance_sq.masked_fill(~domain, float("inf"))
+        nearest = distance_sq.argmin(-1)
+        valid = domain.any(-1)
+        selected_candidates = candidate_index[valid]
+        selected_points = nearest[valid]
+        point_index[row, selected_candidates] = selected_points
+        point_valid[row, selected_candidates] = True
+        forced[row, selected_points] = True
+
     return {
-        "physical_edge_target": batch["relation_graph"],
-        "physical_edge_valid": pair_valid.expand_as(batch["relation_graph"]),
-        "task_edge_target": batch["task_block_graph"],
-        "task_edge_valid": object_mask[:, :, None].expand_as(batch["task_block_graph"]),
+        "push_direction_point_mask": forced,
+        "push_gt_point_index": point_index,
+        "push_gt_point_valid": point_valid,
     }
-
-
-def build_push_supervision(
-    output: dict[str, Tensor], batch: dict[str, Tensor], config: ModelConfig
-) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-    action_type = batch["action_type"]
-    parameters = batch["action_parameters"]
-    candidate = batch["candidate_mask"] & (action_type == int(ActionType.PUSH))
-    point_index, parameter_valid = _nearest_point_indices(
-        batch["xyz"], batch["point_mask"], batch["instance_id"],
-        parameters["push_contact_world"], batch["acted_object"], candidate,
-    )
-    row = torch.arange(action_type.shape[0], device=action_type.device)[:, None]
-    direction = torch.nn.functional.normalize(
-        torch.nan_to_num(parameters["push_direction_world"]), dim=-1
-    )
-    angle = torch.atan2(direction[..., 1], direction[..., 0]).remainder(2 * math.pi)
-    bins = output["direction_logits"].shape[-1]
-    direction_bin = torch.floor(angle * bins / (2 * math.pi)).long().remainder(bins)
-    gathered = {
-        "object_logits": output["object_logits"],
-        "contact_logits": output["contact_logits"],
-        "point_index": point_index,
-        "direction_logits": output["direction_logits"][row, point_index],
-        "direction_residual": output["direction_residual"][row, point_index],
-        "utility_delta": output["utility_delta"][row, point_index, direction_bin],
-    }
-
-    evaluated = batch["evaluation_status"] != int(CandidateStatus.UNKNOWN_UNTESTED)
-    evaluated_push = candidate & parameter_valid & evaluated
-    positive = evaluated_push & batch["action_improves_state"]
-    center_angle = (direction_bin.float() + 0.5) * 2 * math.pi / bins
-    center = torch.stack((torch.cos(center_angle), torch.sin(center_angle)), -1)
-    action_residual = direction[..., :2] - center
-
-    # Every evaluated contact neighbourhood is supervised. Failed pushes are
-    # explicit negatives; untested surface regions remain UNKNOWN.
-    contact_target = torch.zeros_like(output["contact_logits"])
-    contact_valid = torch.zeros_like(output["contact_logits"], dtype=torch.bool)
-    sigma_sq = float(config.contact_heatmap_sigma_m) ** 2
-    for batch_row in range(action_type.shape[0]):
-        for candidate_index in torch.nonzero(
-            evaluated_push[batch_row], as_tuple=False
-        ).flatten().tolist():
-            object_index = int(batch["acted_object"][batch_row, candidate_index])
-            domain = batch["point_mask"][batch_row] & (
-                batch["instance_id"][batch_row] == object_index
-            )
-            delta = (
-                batch["xyz"][batch_row]
-                - parameters["push_contact_world"][batch_row, candidate_index]
-            )
-            distance_sq = (delta * delta).sum(-1)
-            neighborhood = domain & (distance_sq <= 9.0 * sigma_sq)
-            contact_valid[batch_row] |= neighborhood
-            if bool(positive[batch_row, candidate_index]):
-                contact_target[batch_row] = torch.maximum(
-                    contact_target[batch_row],
-                    torch.exp(-0.5 * distance_sq / sigma_sq) * neighborhood,
-                )
-
-    # Untested active objects are UNKNOWN and never enter the listwise denominator.
-    object_positive = torch.zeros_like(batch["object_mask"])
-    object_evaluated = torch.zeros_like(batch["object_mask"])
-    for batch_row in range(action_type.shape[0]):
-        evaluated_objects = batch["acted_object"][batch_row, evaluated_push[batch_row]]
-        evaluated_objects = evaluated_objects[evaluated_objects >= 0]
-        object_evaluated[batch_row, evaluated_objects] = True
-        positive_objects = batch["acted_object"][batch_row, positive[batch_row]]
-        positive_objects = positive_objects[positive_objects >= 0]
-        object_positive[batch_row, positive_objects] = True
-
-    # Aggregate all evaluated bins at each unique contact point. This makes the
-    # direction head a multi-positive ranking problem rather than contradictory CE.
-    direction_positive = torch.zeros(
-        (*candidate.shape, bins), dtype=torch.bool, device=candidate.device
-    )
-    direction_evaluated = torch.zeros_like(direction_positive)
-    direction_residual_target = output["direction_residual"].new_zeros(
-        (*candidate.shape, bins, 2)
-    )
-    direction_residual_count = output["direction_residual"].new_zeros(
-        (*candidate.shape, bins)
-    )
-    for batch_row in range(action_type.shape[0]):
-        canonical: dict[int, int] = {}
-        for candidate_index in torch.nonzero(
-            evaluated_push[batch_row], as_tuple=False
-        ).flatten().tolist():
-            point = int(point_index[batch_row, candidate_index])
-            slot = canonical.setdefault(point, candidate_index)
-            bin_index = int(direction_bin[batch_row, candidate_index])
-            direction_evaluated[batch_row, slot, bin_index] = True
-            if bool(positive[batch_row, candidate_index]):
-                direction_positive[batch_row, slot, bin_index] = True
-                direction_residual_target[batch_row, slot, bin_index] += (
-                    action_residual[batch_row, candidate_index]
-                )
-                direction_residual_count[batch_row, slot, bin_index] += 1.0
-    direction_residual_valid = direction_residual_count > 0
-    direction_residual_target = direction_residual_target / (
-        direction_residual_count.clamp_min(1.0).unsqueeze(-1)
-    )
-
-    component_weights = torch.as_tensor(
-        config.push_utility_component_weights,
-        dtype=batch["potential_delta"].dtype,
-        device=batch["potential_delta"].device,
-    )
-    utility = (torch.nan_to_num(batch["potential_delta"]) * component_weights).sum(-1)
-    failures = torch.stack((
-        parameters["risk_unstable"], parameters["risk_out_of_workspace"],
-        parameters["risk_other_invalid"],
-    ), -1)
-    penalties = torch.as_tensor(
-        config.push_failure_penalties, dtype=utility.dtype, device=utility.device
-    )
-    utility = utility - (torch.nan_to_num(failures) * penalties).sum(-1)
-    has_failure = (torch.nan_to_num(failures) > 0.5).any(-1)
-    return gathered, {
-        "object_positive": object_positive,
-        "object_valid_mask": (
-            batch["object_mask"] & batch["object_active"] & object_evaluated
-        ),
-        "contact_target": contact_target,
-        "contact_valid": contact_valid,
-        "direction_positive": direction_positive,
-        "direction_evaluated": direction_evaluated,
-        # Per-candidate diagnostics retained for offline validation. The loss
-        # itself uses the aggregated multi-positive tensors above.
-        "direction_valid": evaluated_push,
-        "direction_bin": direction_bin,
-        "direction_residual_target": direction_residual_target,
-        "direction_residual_valid": direction_residual_valid,
-        "utility_delta": utility,
-        "utility_valid": (
-            parameter_valid & evaluated & (batch["potential_after_valid"] | has_failure)
-        ),
-    }
-
-
-def build_verifier_labels(batch: dict[str, Tensor]) -> dict[str, Tensor]:
-    """Supervise only final certifier executability."""
-
-    candidate_valid = batch["verifier_inputs"]["candidate_valid"]
-    target = batch["action_parameters"]["verifier_overall_target"]
-    valid = batch["action_parameters"]["verifier_overall_valid"] & candidate_valid
-    result = {
-        "overall_target": torch.nan_to_num(target),
-        "overall_valid": valid & torch.isfinite(target),
-    }
-    for head in ("collision", "approach"):
-        head_target = batch["action_parameters"][f"verifier_{head}_target"]
-        head_valid = batch["action_parameters"][f"verifier_{head}_valid"] & candidate_valid
-        result[f"{head}_target"] = torch.nan_to_num(head_target)
-        result[f"{head}_valid"] = head_valid & torch.isfinite(head_target)
-    return result
-
 
 def build_region_labels(batch: dict[str, Tensor]) -> dict[str, Tensor] | None:
     if "region_target" not in batch:

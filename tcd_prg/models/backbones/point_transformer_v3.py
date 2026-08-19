@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import spconv.pytorch as spconv
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
@@ -57,15 +58,25 @@ class PointTransformerV3SceneGeometryBackbone(nn.Module):
         patches = (patch_size,) * 5
         self.grid_size_m = float(grid_size_m)
         self.activation_checkpointing = activation_checkpointing
-        self.backbone = official(
-            in_channels=6,
-            enc_patch_size=patches,
-            dec_patch_size=patches[:-1],
-            enable_flash=enable_flash_attention,
-            enable_rpe=False,
-            upcast_attention=not enable_flash_attention,
-            upcast_softmax=not enable_flash_attention,
-        )
+        original_submanifold_conv = spconv.SubMConv3d
+
+        def stable_submanifold_conv(*args, **kwargs):
+            kwargs.setdefault("algo", spconv.ConvAlgo.Native)
+            return original_submanifold_conv(*args, **kwargs)
+
+        spconv.SubMConv3d = stable_submanifold_conv
+        try:
+            self.backbone = official(
+                in_channels=6,
+                enc_patch_size=patches,
+                dec_patch_size=patches[:-1],
+                enable_flash=enable_flash_attention,
+                enable_rpe=False,
+                upcast_attention=not enable_flash_attention,
+                upcast_softmax=not enable_flash_attention,
+            )
+        finally:
+            spconv.SubMConv3d = original_submanifold_conv
         self.output_projection = nn.Sequential(nn.Linear(64, dim), nn.LayerNorm(dim))
         self.pool_query = nn.Parameter(torch.empty(dim))
         nn.init.normal_(self.pool_query, std=0.02)

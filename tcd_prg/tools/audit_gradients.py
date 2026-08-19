@@ -14,7 +14,7 @@ from tcd_prg.datasets import ActionStateGroupDataset
 from tcd_prg.diagnostics import family_gradient_norms
 from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import TCDPRGModel
-from tcd_prg.runtime import UnifiedBatchCollator, create_adapter, create_gripper_provider
+from tcd_prg.runtime import UnifiedBatchCollator, create_adapter
 
 
 def _move(value, device: torch.device):
@@ -47,23 +47,19 @@ def main() -> None:
     dataset = ActionStateGroupDataset(
         adapter, split="train", max_groups=args.batches * config.training.batch_size
     )
-    gripper = (
-        create_gripper_provider(config, allow_generate=False)
-        if config.ablation.use_gripper_scene_verifier else None
-    )
     loader = DataLoader(
         dataset, batch_size=config.training.batch_size, shuffle=False, num_workers=0,
-        collate_fn=UnifiedBatchCollator(config, gripper, training=False),
+        collate_fn=UnifiedBatchCollator(config, training=False),
     )
     model = TCDPRGModel(
-        config.model, config.ablation, config.graph, config.router, config.backbone
+        config.model, config.ablation, config.backbone, config.graspnet
     ).to(device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint.get("ema") or checkpoint.get("model") or checkpoint)
     model.train()
     objective = TCDPRGObjective(
         adapter.capabilities, config.model, config.ablation, config.losses,
-        config.region_head, config.training.generated_policy_candidate_ratio,
+        config.region_head,
         config.dataset.acronym_object_grasp_database,
     ).to(device)
     sums: dict[str, float] = {}

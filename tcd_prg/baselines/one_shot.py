@@ -36,11 +36,11 @@ class OneShotSequencePolicy(ManipulationPolicy):
             return self._sequence
         generated = self.policy.generate_candidates(encoded)
         tensors = generated.get("candidates") if isinstance(generated, dict) else None
-        router = generated.get("router") if isinstance(generated, dict) else None
-        if tensors is None or router is None:
-            raise TypeError("OneShotSequencePolicy requires scored candidate tensors")
+        if tensors is None:
+            raise TypeError("OneShotSequencePolicy requires candidate tensors")
         valid = torch.nonzero(tensors["valid"][0], as_tuple=False).flatten()
-        ranked = valid[router.candidate_logits[0, valid].argsort(descending=True)]
+        score = tensors["proposal_score"][0]
+        ranked = valid[score[valid].argsort(descending=True, stable=True)]
         selected_objects: set[int] = set()
         preparations = []
         task_grasps = []

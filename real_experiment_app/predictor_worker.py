@@ -79,7 +79,6 @@ def main():
                     int(request["target"]),
                     int(request["category"]),
                     int(request["region"]),
-                    int(request["required"]),
                 )
                 result = {
                     "action": prediction.action,

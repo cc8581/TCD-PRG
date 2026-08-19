@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from tcd_prg.models.instance_segmentation import InstanceMaskDecoder
 from tcd_prg.models.task_grasp import TaskGraspScorer
@@ -63,7 +64,12 @@ def test_task_grasp_score_loss_has_proposal_metrics():
     out = loss_fn(pred, labels)
     assert out["loss"].requires_grad
     assert float(out["task_proposal_recall_at_16"]) == 1.0
+    assert float(out["task_grasp_effective_fraction"]) == 1.0
+    assert 0.0 <= float(out["task_grasp_unknown_fraction"]) <= 1.0
     assert float(out["task_grasp_top1_positive"]) == 1.0
+    assert float(out["task_grasp_top1_known_positive"]) == 1.0
+    assert float(out["task_grasp_top1_unknown"]) == 0.0
+    assert float(out["task_grasp_top1_known_negative"]) == 0.0
 
 
 def test_task_grasp_matching_respects_parallel_jaw_symmetry():
@@ -88,6 +94,29 @@ def test_task_grasp_matching_respects_parallel_jaw_symmetry():
     output = loss_fn(prediction, labels)
 
     assert float(output["task_grasp_positive_proposals"]) == 1.0
+
+
+def test_task_grasp_ranking_uses_top_known_candidates_not_set_mass():
+    loss_fn = TaskGraspScoringLoss()
+    prediction = {
+        "quality_logit": torch.tensor([[1.0, 0.0, 0.9, 0.9]], requires_grad=True),
+        "translation_world": torch.tensor(
+            [[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]]
+        ),
+        "rotation_matrix": torch.eye(3).reshape(1, 1, 3, 3).expand(1, 4, 3, 3),
+        "valid": torch.ones(1, 4, dtype=torch.bool),
+    }
+    labels = {
+        "translation_world": torch.tensor([[[0.0, 0.0, 0.0]]]),
+        "rotation_matrix": torch.eye(3).reshape(1, 1, 3, 3),
+        "target_valid": torch.ones(1, 1, dtype=torch.bool),
+        "wrong_region_translation_world": torch.tensor([[[1.0, 0.0, 0.0]]]),
+        "wrong_region_rotation_matrix": torch.eye(3).reshape(1, 1, 3, 3),
+        "wrong_region_valid": torch.ones(1, 1, dtype=torch.bool),
+    }
+    output = loss_fn(prediction, labels)
+    expected = torch.nn.functional.softplus(torch.tensor(0.9 - 1.0))
+    assert output["task_grasp_score_ranking"] == pytest.approx(float(expected))
     assert float(output["task_proposal_recall_at_16"]) == 1.0
 
 

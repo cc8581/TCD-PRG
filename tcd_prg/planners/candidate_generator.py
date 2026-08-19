@@ -14,8 +14,11 @@ from tcd_prg.geometry.se3 import matrix_to_quaternion_xyzw
 
 
 class DenseCandidateGenerator:
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(
+        self, config: ModelConfig, *, use_push_potential: bool = True
+    ) -> None:
         self.config = config
+        self.use_push_potential = bool(use_push_potential)
 
     @staticmethod
     def _top_per_object(
@@ -28,21 +31,26 @@ class DenseCandidateGenerator:
         if not len(object_ids) or total <= 0:
             return torch.empty(0, dtype=torch.long, device=score.device)
         per_object = max(1, math.ceil(total / len(object_ids)))
-        valid_point_count = int(point_mask.sum())
+        owner = object_probability.argmax(0)
         selected = []
         for object_id in object_ids.tolist():
-            membership = object_probability[object_id].clamp_min(1e-6)
-            joint = score.clamp_min(1e-6).log() + membership.log()
-            joint = joint.masked_fill(~point_mask, -30.0)
-            count = min(per_object, valid_point_count)
+            membership = object_probability[object_id]
+            domain = point_mask & (owner == object_id) & (membership >= 0.5)
+            if not bool(domain.any()):
+                domain = point_mask & (owner == object_id)
+            points = torch.nonzero(domain, as_tuple=False).flatten()
+            count = min(per_object, len(points))
             if count:
-                selected.append(torch.topk(joint, k=count).indices)
+                joint = (
+                    score[points].clamp_min(1e-6).log()
+                    + membership[points].clamp_min(1e-6).log()
+                )
+                selected.append(points[torch.topk(joint, k=count).indices])
         if not selected:
             return torch.empty(0, dtype=torch.long, device=score.device)
         candidates = torch.unique(torch.cat(selected), sorted=True)
-        joint_score = score[candidates]
         return candidates[
-            joint_score.topk(min(total, len(candidates))).indices
+            score[candidates].topk(min(total, len(candidates))).indices
         ]
 
     @staticmethod
@@ -57,21 +65,40 @@ class DenseCandidateGenerator:
         distance = torch.cdist(translation, xyz[points])
         return points[distance.argmin(-1)]
 
-    def _with_graph_fallback(
-        self, eligible: Tensor, domain: Tensor, score: Tensor
+    @staticmethod
+    def _target_local_object_mask(
+        xyz: Tensor,
+        point_mask: Tensor,
+        instance_probability: Tensor,
+        object_mask: Tensor,
+        target_object: int,
+        margin_m: float,
     ) -> Tensor:
-        amount = self.config.graph_candidate_fallback_objects
-        fallback_domain = domain & ~eligible
-        if amount and fallback_domain.any():
-            indices = torch.nonzero(
-                fallback_domain, as_tuple=False
-            ).flatten()
-            selected = indices[
-                score[indices].topk(min(amount, len(indices))).indices
-            ]
-            eligible = eligible.clone()
-            eligible[selected] = True
-        return eligible
+        """Approximate GAPG-style expanded target neighborhood in XY.
+
+        This is candidate-domain pruning only, not a learned dependency graph.
+        A predicted object is relevant when its hard mask AABB intersects the
+        target AABB expanded by ``margin_m``.
+        """
+        owner = instance_probability.argmax(0)
+        owner_domain = (
+            owner[None] == torch.arange(
+                instance_probability.shape[0], device=xyz.device
+            )[:, None]
+        ) & point_mask[None] & object_mask[:, None]
+        confident = owner_domain & (instance_probability >= 0.5)
+        has_confident = confident.any(-1)
+        hard = torch.where(has_confident[:, None], confident, owner_domain)
+        xy = xyz[:, :2]
+        inf = torch.full_like(xy, float("inf"))
+        ninf = torch.full_like(xy, float("-inf"))
+        minimum = torch.where(hard[..., None], xy[None], inf[None]).amin(1)
+        maximum = torch.where(hard[..., None], xy[None], ninf[None]).amax(1)
+        has_points = hard.any(-1) & object_mask
+        target_min = minimum[target_object] - float(margin_m)
+        target_max = maximum[target_object] + float(margin_m)
+        overlap = (maximum >= target_min).all(-1) & (minimum <= target_max).all(-1)
+        return has_points & overlap & has_points[target_object]
 
     def _nms_indices(
         self,
@@ -120,7 +147,7 @@ class DenseCandidateGenerator:
         ]
 
     def apply_push_nms(
-        self, candidates: dict[str, Tensor], router_logits: Tensor
+        self, candidates: dict[str, Tensor], candidate_scores: Tensor
     ) -> Tensor:
         keep = candidates["valid"].clone()
         cosine_threshold = math.cos(
@@ -133,7 +160,7 @@ class DenseCandidateGenerator:
                 as_tuple=False,
             ).flatten()
             ordered = push[
-                router_logits[row, push].argsort(
+                candidate_scores[row, push].argsort(
                     descending=True, stable=True
                 )
             ]
@@ -235,27 +262,6 @@ class DenseCandidateGenerator:
                 encoded.instance.mask_probability[batch_row]
             )
             active = encoded.object_mask[batch_row]
-            graph_output = output["graph"]
-
-            if (
-                graph_output is None
-                or self.config.graph_candidate_mode == "none"
-            ):
-                actionable = active
-                graph_prior = active.to(xyz.dtype)
-            elif self.config.graph_candidate_mode == "hard":
-                actionable = graph_output.derived_actionable_mask[
-                    batch_row
-                ]
-                graph_prior = actionable.to(xyz.dtype)
-            else:
-                actionable = active
-                graph_prior = getattr(
-                    graph_output,
-                    "dependency_prior",
-                    graph_output.derived_actionable_mask.to(xyz.dtype),
-                )[batch_row]
-
             target_object = int(
                 encoded.target_query_weights[batch_row].argmax()
             )
@@ -298,6 +304,9 @@ class DenseCandidateGenerator:
             )
             if "valid" in task:
                 selected = selected[task["valid"][batch_row, selected]]
+            selected = selected[
+                task_score[selected] >= self.config.task_grasp_probability_threshold
+            ]
             if not bool(active[target_object]):
                 selected = selected[:0]
             if len(selected):
@@ -355,51 +364,30 @@ class DenseCandidateGenerator:
 
             remove_domain = active.clone()
             remove_domain[target_object] = False
-            remove_eligible = active & actionable & remove_domain
-            per_object_score = global_score.new_full(
-                active.shape, -1.0
+            target_local = self._target_local_object_mask(
+                xyz,
+                point_mask,
+                instance_probability,
+                active,
+                target_object,
+                self.config.pick_remove_target_margin_m,
             )
-            for object_index in torch.nonzero(
-                active, as_tuple=False
-            ).flatten().tolist():
-                mask = global_object == object_index
-                if mask.any():
-                    per_object_score[object_index] = (
-                        global_score[mask].max()
-                    )
-            if (
-                graph_output is not None
-                and self.config.graph_candidate_mode == "hard"
-            ):
-                remove_eligible = self._with_graph_fallback(
-                    remove_eligible,
-                    remove_domain,
-                    per_object_score,
-                )
+            remove_eligible = remove_domain & target_local
             valid_remove = (
                 (global_object >= 0)
-                & remove_eligible[
-                    global_object.clamp(0, len(active) - 1)
-                ]
+                & remove_eligible[global_object.clamp(0, len(active) - 1)]
             )
             if "valid" in global_head:
                 valid_remove &= global_head["valid"][batch_row]
-            candidates = torch.nonzero(
-                valid_remove, as_tuple=False
-            ).flatten()
+            valid_remove &= (
+                global_score >= self.config.pick_remove_probability_threshold
+            )
+            candidates = torch.nonzero(valid_remove, as_tuple=False).flatten()
             if len(candidates):
                 candidate_score = global_score[candidates]
-                if self.config.graph_candidate_mode == "soft":
-                    candidate_score = candidate_score * (
-                        0.25
-                        + 0.75
-                        * graph_prior[global_object[candidates]]
-                    )
                 local = self._nms_indices(
                     global_pose[candidates],
-                    global_head["width_m"][
-                        batch_row, candidates
-                    ],
+                    global_head["width_m"][batch_row, candidates],
                     candidate_score,
                     global_object[candidates],
                     self.config.pick_remove_candidates,
@@ -411,86 +399,54 @@ class DenseCandidateGenerator:
                 ))
                 object_parts.append(global_object[selected])
                 contact_parts.append(torch.full(
-                    (len(selected), 3), float("nan"),
-                    device=xyz.device,
+                    (len(selected), 3), float("nan"), device=xyz.device,
                 ))
                 direction_parts.append(torch.full(
-                    (len(selected), 3), float("nan"),
-                    device=xyz.device,
+                    (len(selected), 3), float("nan"), device=xyz.device,
                 ))
                 pose_parts.append(global_pose[selected])
                 destination_parts.append(torch.full(
-                    (len(selected), 3), float("nan"),
-                    device=xyz.device,
+                    (len(selected), 3), float("nan"), device=xyz.device,
                 ))
-                width_parts.append(
-                    global_head["width_m"][batch_row, selected]
-                )
-                score_parts.append(global_score[selected])
+                width_parts.append(global_head["width_m"][batch_row, selected])
+                score_parts.append(candidate_score[local])
                 point_parts.append(global_point[selected])
-                direction_bin_parts.append(
-                    torch.full_like(selected, -1)
-                )
+                direction_bin_parts.append(torch.full_like(selected, -1))
                 direction_score_parts.append(torch.full_like(
-                    global_score[selected], float("nan")
+                    candidate_score[local], float("nan")
                 ))
 
-            # PUSH candidates use predicted instance probabilities.
+            # PUSH candidates are shortlisted by the learned Object head;
+            # no dependency graph gates or reweights them.
             push = output["push"]
-            push_eligible = active & actionable
-            if (
-                graph_output is not None
-                and self.config.graph_candidate_mode == "hard"
-            ):
-                if self.config.allow_target_push_recovery:
-                    push_eligible[target_object] = active[target_object]
-                push_eligible = self._with_graph_fallback(
-                    push_eligible,
-                    active,
-                    push["object_logits"][batch_row],
-                )
-            push_objects = torch.nonzero(
-                push_eligible, as_tuple=False
-            ).flatten()
+            push_object_probability = torch.sigmoid(push["object_logits"][batch_row])
+            push_objects = torch.nonzero(active, as_tuple=False).flatten()
             if len(push_objects):
-                object_score = torch.sigmoid(
-                    push["object_logits"][
-                        batch_row, push_objects
-                    ]
-                )
-                if self.config.graph_candidate_mode == "soft":
-                    object_score = object_score * (
-                        0.25 + 0.75 * graph_prior[push_objects]
-                    )
                 push_objects = push_objects[
-                    object_score.argsort(descending=True)[
-                        : self.config.graph_candidate_topk_objects
-                    ]
+                    push_object_probability[push_objects]
+                    .argsort(descending=True, stable=True)[: self.config.push_object_topk]
                 ]
             push_index = self._top_per_object(
-                torch.sigmoid(
-                    push["contact_logits"][batch_row]
-                ),
+                torch.sigmoid(push["contact_logits"][batch_row]),
                 instance_probability,
                 push_objects,
                 point_mask,
                 self.config.push_candidates,
             )
             if len(push_index):
+                push_index = push_index[
+                    push["direction_point_mask"][batch_row, push_index]
+                ]
+            if len(push_index):
                 direction_probability = torch.softmax(
-                    push["direction_logits"][
-                        batch_row, push_index
-                    ],
-                    dim=-1,
+                    push["direction_logits"][batch_row, push_index], dim=-1
                 )
                 directions_per_contact = min(
                     self.config.push_directions_per_contact,
                     direction_probability.shape[-1],
                 )
-                direction_score, direction_bin = (
-                    direction_probability.topk(
-                        directions_per_contact, dim=-1
-                    )
+                direction_score, direction_bin = direction_probability.topk(
+                    directions_per_contact, dim=-1
                 )
                 expanded_point = push_index[:, None].expand(
                     -1, directions_per_contact
@@ -498,49 +454,49 @@ class DenseCandidateGenerator:
                 direction_bin = direction_bin.reshape(-1)
                 direction_score = direction_score.reshape(-1)
                 contact_score = torch.sigmoid(
-                    push["contact_logits"][
-                        batch_row, expanded_point
-                    ]
+                    push["contact_logits"][batch_row, expanded_point]
                 )
-                if (
-                    len(expanded_point)
-                    > self.config.max_push_candidates
-                ):
-                    keep = (
-                        contact_score * direction_score
-                    ).topk(
-                        self.config.max_push_candidates
-                    ).indices
+
+                # Object identity must stay inside the learned object shortlist.
+                membership = instance_probability[
+                    push_objects[:, None], expanded_point[None]
+                ].T
+                pushed_object = push_objects[membership.argmax(-1)]
+                object_score = push_object_probability[pushed_object]
+                utility = push["utility_delta"][
+                    batch_row, expanded_point, direction_bin
+                ]
+                utility_factor = (
+                    0.5 + 0.5 * torch.sigmoid(utility)
+                    if self.use_push_potential
+                    else torch.ones_like(utility)
+                )
+                composite = (
+                    object_score
+                    * contact_score
+                    * direction_score
+                    * utility_factor
+                )
+                if len(expanded_point) > self.config.max_push_candidates:
+                    keep = composite.topk(self.config.max_push_candidates).indices
                     expanded_point = expanded_point[keep]
                     direction_bin = direction_bin[keep]
                     direction_score = direction_score[keep]
                     contact_score = contact_score[keep]
+                    pushed_object = pushed_object[keep]
+                    utility = utility[keep]
+                    composite = composite[keep]
 
-                # Object identity is a predicted query id, not simulator id.
-                membership = instance_probability[
-                    :, expanded_point
-                ].T
-                pushed_object = membership.argmax(-1)
                 angle = (
                     direction_bin.float() + 0.5
                 ) * 2.0 * math.pi / self.config.num_direction_bins
-                center = torch.stack(
-                    (torch.cos(angle), torch.sin(angle)), -1
-                )
+                center = torch.stack((torch.cos(angle), torch.sin(angle)), -1)
                 residual = push["direction_residual"][
                     batch_row, expanded_point, direction_bin
                 ]
-                planar = torch.nn.functional.normalize(
-                    center + residual, dim=-1
-                )
+                planar = torch.nn.functional.normalize(center + residual, dim=-1)
                 direction = torch.cat(
-                    (
-                        planar,
-                        torch.zeros(
-                            len(planar), 1, device=xyz.device
-                        ),
-                    ),
-                    -1,
+                    (planar, torch.zeros(len(planar), 1, device=xyz.device)), -1
                 )
                 type_parts.append(torch.full_like(
                     expanded_point, int(ActionType.PUSH)
@@ -549,21 +505,15 @@ class DenseCandidateGenerator:
                 contact_parts.append(xyz[expanded_point])
                 direction_parts.append(direction)
                 pose_parts.append(torch.full(
-                    (len(expanded_point), 7),
-                    float("nan"),
-                    device=xyz.device,
+                    (len(expanded_point), 7), float("nan"), device=xyz.device,
                 ))
                 destination_parts.append(torch.full(
-                    (len(expanded_point), 3),
-                    float("nan"),
-                    device=xyz.device,
+                    (len(expanded_point), 3), float("nan"), device=xyz.device,
                 ))
                 width_parts.append(torch.full(
-                    (len(expanded_point),),
-                    float("nan"),
-                    device=xyz.device,
+                    (len(expanded_point),), float("nan"), device=xyz.device,
                 ))
-                score_parts.append(contact_score)
+                score_parts.append(composite)
                 point_parts.append(expanded_point)
                 direction_bin_parts.append(direction_bin)
                 direction_score_parts.append(direction_score)
@@ -657,126 +607,4 @@ class DenseCandidateGenerator:
                 result["proposal_score"], float("nan")
             ),
         )
-        flags = torch.stack(
-            (
-                torch.isfinite(
-                    result["contact_world"]
-                ).all(-1),
-                torch.isfinite(
-                    result["direction_world"]
-                ).all(-1),
-                torch.isfinite(
-                    result["pose_world"]
-                ).all(-1),
-                torch.isfinite(
-                    result["destination_world"]
-                ).all(-1),
-                torch.isfinite(result["width_m"]),
-            ),
-            -1,
-        )
-        result["tokens"] = model.candidate_encoder(
-            encoded.object_tokens,
-            result["type"],
-            result["object"],
-            result["contact_world"],
-            result["direction_world"],
-            result["pose_world"],
-            result["destination_world"],
-            flags,
-            encoded.task_token,
-        )
-        evidence = torch.zeros(
-            result["type"].shape + (7,),
-            device=result["type"].device,
-        )
-        evidence[..., 1] = torch.where(
-            result["valid"], result["proposal_score"], 0.0
-        )
-        for row in range(result["type"].shape[0]):
-            push_candidates = torch.nonzero(
-                result["valid"][row]
-                & (
-                    result["type"][row]
-                    == int(ActionType.PUSH)
-                ),
-                as_tuple=False,
-            ).flatten()
-            if len(push_candidates):
-                points = result["point_index"][
-                    row, push_candidates
-                ]
-                bins = result["direction_bin"][
-                    row, push_candidates
-                ]
-                evidence[
-                    row, push_candidates, 0
-                ] = output["push"]["utility_delta"][
-                    row, points, bins
-                ]
-                evidence[
-                    row, push_candidates, 3
-                ] = result["direction_score"][
-                    row, push_candidates
-                ]
-
-        if (
-            output["graph"] is not None
-            and self.config.graph_candidate_mode == "soft"
-        ):
-            for row in range(result["type"].shape[0]):
-                prior = getattr(
-                    output["graph"],
-                    "dependency_prior",
-                    output["graph"].derived_actionable_mask.to(
-                        evidence.dtype
-                    ),
-                )[row]
-                safe_object = result["object"][row].clamp(
-                    0, len(prior) - 1
-                )
-                evidence[row, :, 4] = torch.where(
-                    result["valid"][row],
-                    prior[safe_object],
-                    0.0,
-                )
-        result["evidence"] = evidence
         return result
-
-    @staticmethod
-    def verifier_batch(
-        base_batch: dict[str, Tensor],
-        candidates: dict[str, Tensor],
-    ) -> dict[str, Any]:
-        """Build verifier geometry from sensor inputs + predicted candidates."""
-        sensor = base_batch.get("model_inputs", base_batch)
-        kind = candidates["type"].cpu()
-        pose = candidates["pose_world"].cpu()
-        nan_pose = torch.full_like(pose, float("nan"))
-        return {
-            "xyz": sensor["xyz"].cpu(),
-            "point_mask": sensor["point_mask"].cpu(),
-            "candidate_mask": candidates["valid"].cpu(),
-            "action_type": kind,
-            "action_parameters": {
-                "removal_grasp_pose_world": torch.where(
-                    (
-                        kind
-                        == int(ActionType.PICK_REMOVE)
-                    ).unsqueeze(-1),
-                    pose,
-                    nan_pose,
-                ),
-                "task_grasp_pose_world": torch.where(
-                    (
-                        kind
-                        == int(ActionType.TASK_GRASP)
-                    ).unsqueeze(-1),
-                    pose,
-                    nan_pose,
-                ),
-                "grasp_width_m": candidates[
-                    "width_m"
-                ].cpu(),
-            },
-        }

@@ -105,6 +105,27 @@ def test_validation_scene_subset_rejects_manifest_drift(tmp_path):
         load_or_create_validation_scene_subset(tuple(range(30)), 20, 7, manifest)
 
 
+def test_stage_filter_and_deduplication_run_before_group_limit():
+    filtered = ActionStateGroupDataset(
+        _Adapter(False),
+        max_groups=4,
+        allowed_strata=("push",),
+        global_grasp_mode="never",
+    )
+    assert len(filtered) == 4
+    assert {unit.stratum for unit in filtered.units} == {"push"}
+
+    deduplicated = ActionStateGroupDataset(
+        _Adapter(False),
+        max_groups=4,
+        deduplicate_state_task=True,
+        global_grasp_mode="never",
+    )
+    assert len(deduplicated) == 4
+    keys = {(unit.scene_id, unit.state_id, unit.task_index) for unit in deduplicated.units}
+    assert len(keys) == 4
+
+
 def test_push_object_state_aggregation_uses_groups_outside_subset():
     def group(acted_object, status, success):
         return SimpleNamespace(

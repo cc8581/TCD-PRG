@@ -1,0 +1,19 @@
+# Stage C: keep perception/grasp fixed; execute only the Push branch in forward.
+defaults:
+  - ../config.yaml
+  - _self_
+
+training:
+  max_optimizer_steps: 15000
+  frozen_modules: [encoder, region_head, task_grasp, ag_width]
+  allowed_action_strata: [push, push_failure]
+  action_batch_coverage_strata: [push, push_failure]
+
+losses:
+  instance: 0.0
+  region: 0.0
+  task_grasp: 0.0
+  push_object: 0.25
+  push_contact: 0.25
+  push_direction: 0.25
+  push_potential: 0.25

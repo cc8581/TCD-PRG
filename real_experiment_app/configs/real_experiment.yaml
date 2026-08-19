@@ -3,7 +3,6 @@ tcd_prg:
   paths_config: ../../configs/local_paths.yaml
   checkpoint: ../../outputs/ptv3_full_20260808_214241/best.pt
   device: cuda
-  allow_gripper_generate: false
 
 cameras:
   - id: camera_0
@@ -72,4 +71,3 @@ robot:
 task:
   default_category_id: 0
   default_region_id: 0
-  required_grasp_count: 1

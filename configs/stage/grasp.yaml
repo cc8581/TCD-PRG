@@ -1,0 +1,19 @@
+# Stage B: keep perception fixed; learn task-conditioned grasp scoring and AG width.
+defaults:
+  - ../config.yaml
+  - _self_
+
+training:
+  max_optimizer_steps: 15000
+  frozen_modules: [encoder, region_head, push]
+  allowed_action_strata: [direct_grasp]
+  action_batch_coverage_strata: [direct_grasp]
+
+losses:
+  instance: 0.0
+  region: 0.0
+  task_grasp: 1.0
+  push_object: 0.0
+  push_contact: 0.0
+  push_direction: 0.0
+  push_potential: 0.0

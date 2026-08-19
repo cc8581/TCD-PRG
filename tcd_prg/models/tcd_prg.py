@@ -7,9 +7,8 @@ import torch
 from torch import Tensor, nn
 
 from tcd_prg.config import (
-    AblationConfig, BackboneConfig, GraphConfig, GraspNetConfig, ModelConfig, RouterConfig
+    AblationConfig, BackboneConfig, GraspNetConfig, ModelConfig
 )
-from tcd_prg.constants import ActionType
 from tcd_prg.geometry.camera import (
     camera_to_world_points,
     camera_to_world_rotations,
@@ -22,14 +21,7 @@ from .backbones import (
     PointTransformerV3SceneGeometryBackbone,
     TaskConditionedPointTransformer,
 )
-from .common import ActionCandidateEncoder
-from .dependency_graph import TaskConditionedDependencyGraph
 from .graspnet import FrozenGraspNetProposalGenerator
-from .grasp_verifier import GripperSceneTaskVerifier
-from .policy import (
-    FlatCandidateClassifier, MaskedHierarchicalCandidateRouter,
-    fixed_priority_output,
-)
 from .push import PushHead
 from .region import TaskRegionHead
 from .task_grasp import AGWidthAdapter, TaskGraspScorer
@@ -43,8 +35,7 @@ SENSOR_KEYS = frozenset({
     "teacher_target_crop_mask", "teacher_target_identity_valid",
 })
 TASK_KEYS = frozenset({
-    "task_category_id", "task_region_id", "remaining_steps",
-    "required_grasp_count",
+    "task_category_id", "task_region_id",
     "target_prompt_xyz", "target_prompt_label", "target_prompt_valid",
     "target_reid_token", "target_reid_center", "target_reid_valid",
 })
@@ -68,16 +59,12 @@ class TCDPRGModel(nn.Module):
         self,
         config: ModelConfig | None = None,
         ablation: AblationConfig | None = None,
-        graph_config: GraphConfig | None = None,
-        router_config: RouterConfig | None = None,
         backbone_config: BackboneConfig | None = None,
         graspnet_config: GraspNetConfig | None = None,
     ) -> None:
         super().__init__()
         self.config = config or ModelConfig()
         self.ablation = ablation or AblationConfig()
-        graph_config = graph_config or GraphConfig()
-        router_config = router_config or RouterConfig()
         backbone_config = backbone_config or BackboneConfig(backend="legacy")
         graspnet_config = graspnet_config or GraspNetConfig()
         c = self.config
@@ -150,18 +137,6 @@ class TCDPRGModel(nn.Module):
             max_width_m=c.max_grasp_width_m,
             local_radius_m=c.task_grasp_local_radius_m,
         )
-        self.verifier = GripperSceneTaskVerifier(
-            c.feature_dim, c.feature_dim,
-            c.verifier_transformer_layers, c.verifier_transformer_heads,
-        )
-        self.graph = TaskConditionedDependencyGraph(
-            c.feature_dim,
-            physical_relations=len(graph_config.physical_relations),
-            task_relations=len(graph_config.task_relations),
-            layers=graph_config.layers,
-            heads=graph_config.heads,
-            edge_threshold=c.graph_edge_threshold,
-        )
         self.push = PushHead(
             c.feature_dim,
             c.num_direction_bins,
@@ -169,19 +144,8 @@ class TCDPRGModel(nn.Module):
             c.push_direction_transformer_layers,
             c.push_direction_transformer_heads,
             c.push_direction_contact_topk,
+            c.push_object_topk,
         )
-        self.router = MaskedHierarchicalCandidateRouter(
-            c.feature_dim, layers=router_config.layers, heads=router_config.heads
-        )
-        self.flat_router = FlatCandidateClassifier(
-            c.feature_dim, layers=router_config.layers, heads=router_config.heads
-        )
-        self.candidate_encoder = ActionCandidateEncoder(c.feature_dim)
-        self.candidate_evidence = nn.Sequential(
-            nn.Linear(7, c.feature_dim), nn.GELU(),
-            nn.Linear(c.feature_dim, c.feature_dim),
-        )
-
     @staticmethod
     def _sensor(batch: Mapping[str, Any]) -> dict[str, Tensor]:
         source = batch.get("model_inputs", batch)
@@ -194,7 +158,7 @@ class TCDPRGModel(nn.Module):
     @staticmethod
     def _task(batch: Mapping[str, Any]) -> dict[str, Tensor]:
         source = batch.get("task_inputs", batch)
-        required = {"task_category_id", "task_region_id", "remaining_steps"}
+        required = {"task_category_id", "task_region_id"}
         missing = required - source.keys()
         if missing:
             raise KeyError(f"Missing task inputs: {sorted(missing)}")
@@ -509,371 +473,23 @@ class TCDPRGModel(nn.Module):
         found = domain.any(-1)
         return distance.argmin(-1), found
 
-    @torch.no_grad()
-    def infer_candidate_objects(
-        self,
-        encoded: Any,
-        sensor: dict[str, Tensor],
-        candidates: Mapping[str, Tensor],
-    ) -> tuple[Tensor, Tensor]:
-        """Infer candidate object query ids from candidate geometry and predicted masks."""
-        kind = candidates["type"].long()
-        pose = candidates["pose_world"]
-        contact = candidates["contact_world"]
-        reference = torch.where(
-            (kind == int(ActionType.PUSH)).unsqueeze(-1), contact, pose[..., :3]
-        )
-        valid = candidates["valid"].bool() & torch.isfinite(reference).all(-1)
-        point, found = self._nearest_scene_point(
-            sensor["xyz"], sensor["point_mask"], reference, valid
-        )
-        b, k = point.shape
-        row = torch.arange(b, device=point.device)[:, None]
-        membership = encoded.instance.mask_probability[
-            row, :, point
-        ]  # [B,K,Q]
-        object_index = membership.argmax(-1)
-        object_valid = encoded.object_mask.gather(1, object_index)
-        return object_index, found & object_valid
-
-    def _candidate_evidence(
-        self,
-        result: dict[str, Any],
-        sensor: dict[str, Tensor],
-        candidate_inputs: Mapping[str, Tensor],
-    ) -> Tensor:
-        kind = candidate_inputs["type"]
-        valid = candidate_inputs["valid"].bool()
-        b, k = kind.shape
-        evidence = sensor["xyz"].new_zeros((b, k, 7))
-
-        # PUSH evidence.
-        if result.get("push") is not None:
-            push_mask = (
-                valid
-                & (kind == int(ActionType.PUSH))
-                & torch.isfinite(candidate_inputs["contact_world"]).all(-1)
-                & torch.isfinite(candidate_inputs["direction_world"]).all(-1)
-            )
-            point, found = self._nearest_scene_point(
-                sensor["xyz"], sensor["point_mask"],
-                candidate_inputs["contact_world"], push_mask,
-            )
-            rows, cand = torch.nonzero(found, as_tuple=True)
-            if rows.numel():
-                directions = candidate_inputs["direction_world"][rows, cand]
-                angles = torch.atan2(
-                    directions[:, 1], directions[:, 0]
-                ).remainder(2 * torch.pi)
-                direction_bin = torch.floor(
-                    angles * self.config.num_direction_bins / (2 * torch.pi)
-                ).long().remainder(self.config.num_direction_bins)
-                p = point[rows, cand]
-                push = result["push"]
-                evidence[rows, cand, 0] = push["utility_delta"][
-                    rows, p, direction_bin
-                ].to(evidence.dtype)
-                evidence[rows, cand, 1] = torch.sigmoid(
-                    push["contact_logits"][rows, p]
-                ).to(evidence.dtype)
-                direction_logits = push["direction_logits"][rows, p]
-                evidence[rows, cand, 3] = torch.softmax(
-                    direction_logits, -1
-                ).gather(1, direction_bin[:, None]).squeeze(1).to(
-                    evidence.dtype
-                )
-
-        # Grasp proposal quality evidence.
-        finite_pose = torch.isfinite(candidate_inputs["pose_world"][..., :3]).all(-1)
-        for action_type, head_name in (
-            (ActionType.PICK_REMOVE, "global_grasp"),
-            (ActionType.TASK_GRASP, "task_grasp"),
-        ):
-            if result.get(head_name) is None:
-                continue
-            eligible = valid & (kind == int(action_type)) & finite_pose
-            if not eligible.any():
-                continue
-            with torch.no_grad():
-                distance = torch.cdist(
-                    torch.nan_to_num(
-                        candidate_inputs["pose_world"][..., :3],
-                        nan=0.0, posinf=0.0, neginf=0.0,
-                    ).float(),
-                    result[head_name]["translation_world"].detach().float(),
-                )
-                nearest = distance.argmin(-1)
-            # Router consumes grasp quality as evidence; it must not redefine the
-            # Task Scorer objective. In particular, an UNKNOWN-only task row must
-            # not train the scorer indirectly through the policy loss.
-            quality = result[head_name]["quality_logit"].gather(1, nearest).detach()
-            evidence[..., 1] = torch.where(
-                eligible, torch.sigmoid(quality), evidence[..., 1]
-            )
-        return evidence
-
-    def prepare_candidate_inputs(
-        self,
-        result: dict[str, Any],
-        candidates: Mapping[str, Tensor],
-        *,
-        evidence: Tensor | None = None,
-        verifier_evidence_cached: bool = False,
-    ) -> dict[str, Any]:
-        encoded = result["encoded"]
-        sensor = result["sensor"]
-        object_index = candidates.get("object")
-        object_valid = candidates["valid"].bool()
-        if object_index is None:
-            object_index, inferred_valid = self.infer_candidate_objects(
-                encoded, sensor, candidates
-            )
-            object_valid &= inferred_valid
-        else:
-            object_index = object_index.long()
-            object_valid &= (
-                (object_index >= 0)
-                & (object_index < encoded.object_tokens.shape[1])
-            )
-        flags = torch.stack(
-            (
-                torch.isfinite(candidates["contact_world"]).all(-1),
-                torch.isfinite(candidates["direction_world"]).all(-1),
-                torch.isfinite(candidates["pose_world"]).all(-1),
-                torch.isfinite(candidates["destination_world"]).all(-1),
-                torch.isfinite(candidates["width_m"]),
-            ),
-            -1,
-        )
-        if evidence is None:
-            evidence = self._candidate_evidence(result, sensor, {
-                **candidates, "valid": object_valid
-            })
-        return {
-            **candidates,
-            "object": object_index,
-            "valid": object_valid,
-            "evidence": evidence,
-            "verifier_evidence_cached": verifier_evidence_cached,
-            "tokens": self.candidate_encoder(
-                encoded.object_tokens,
-                candidates["type"],
-                object_index,
-                candidates["contact_world"],
-                candidates["direction_world"],
-                candidates["pose_world"],
-                candidates["destination_world"],
-                flags,
-                encoded.task_token,
-            ),
-        }
-
-    def verify_cached(
-        self,
-        batch: Mapping[str, Any],
-        result: dict[str, Any],
-        verifier_inputs: dict[str, Tensor],
+    def _forward_region(
+        self, encoded: Any, sensor: dict[str, Tensor]
     ) -> dict[str, Tensor]:
-        encoded = result["encoded"]
-        candidate_valid = verifier_inputs["candidate_valid"].bool()
-        coordinates = torch.nonzero(candidate_valid, as_tuple=False)
-        batch_size, candidates = candidate_valid.shape
-        outputs = {
-            f"{head}_logit": encoded.point_features.new_full(
-                (batch_size, candidates), -30.0
-            )
-            for head in self.verifier.HEADS
-        }
-        if not coordinates.numel():
-            return outputs
-
-        micro = self.config.verifier_candidate_micro_batch
-        for start in range(0, coordinates.shape[0], micro):
-            selected = coordinates[start:start + micro]
-            rows, candidate_indices = selected[:, 0], selected[:, 1]
-            point_index = verifier_inputs["scene_point_index"][
-                rows, candidate_indices
-            ]
-            verifier_features = encoded.point_features[
-                rows[:, None], point_index
-            ]
-            verifier_target = encoded.target_probability[
-                rows[:, None], point_index
-            ]
-            verifier_region = result["region"]["region_probability"][
-                rows[:, None], point_index
-            ]
-            chunk = self.verifier(
-                verifier_inputs["scene_xyz_grasp"][
-                    rows, candidate_indices
-                ][:, None],
-                verifier_inputs["gripper_xyz_grasp"][
-                    rows, candidate_indices
-                ][:, None],
-                verifier_features[:, None],
-                verifier_target[:, None],
-                verifier_region[:, None],
-                encoded.task_token[rows],
-                verifier_inputs["scene_valid"][
-                    rows, candidate_indices
-                ][:, None],
-                verifier_inputs["gripper_valid"][
-                    rows, candidate_indices
-                ][:, None],
-            )
-            for key, value in chunk.items():
-                outputs[key] = outputs[key].index_put(
-                    (rows, candidate_indices), value.squeeze(1)
-                )
-        return outputs
-
-    def route_cached(
-        self,
-        batch: Mapping[str, Any],
-        result: dict[str, Any],
-        candidate_inputs: dict[str, Any],
-    ) -> Any:
-        encoded = result["encoded"]
-        task = result.get("task") or self._task(batch)
-        evidence = candidate_inputs.get("evidence")
-        if evidence is None:
-            evidence = torch.zeros(
-                candidate_inputs["tokens"].shape[:2] + (7,),
-                device=candidate_inputs["tokens"].device,
-            )
-        else:
-            evidence = evidence.clone()
-        if (
-            result.get("verifier") is not None
-            and not candidate_inputs.get("verifier_evidence_cached", False)
-        ):
-            evidence[..., 2] = torch.sigmoid(
-                result["verifier"]["overall_logit"]
-            )
-        routed_tokens = (
-            candidate_inputs["tokens"] + self.candidate_evidence(evidence)
-        )
-        router_args = (
-            encoded.task_token,
-            encoded.global_scene_token,
-            encoded.object_tokens,
-            encoded.object_mask,
-            routed_tokens,
-            candidate_inputs["type"],
-            candidate_inputs["object"],
-            candidate_inputs["valid"],
-            task["remaining_steps"],
-            candidate_inputs.get("previous_action"),
-        )
-        if self.ablation.router_type == "hierarchical":
-            return self.router(*router_args)
-        if self.ablation.router_type == "flat_candidate_classifier":
-            return self.flat_router(*router_args)
-        if self.ablation.router_type == "fixed_priority":
-            return fixed_priority_output(
-                candidate_inputs["type"],
-                candidate_inputs["object"],
-                candidate_inputs["valid"],
-                encoded.object_mask,
-            )
-        raise ValueError(
-            f"Unsupported router type {self.ablation.router_type}"
-        )
-
-    def forward_instances(
-        self, batch: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        """Task-free sensor-only instance inference for real-scene acquisition."""
-        scene, instance, sensor = self._encode_scene_instances(batch)
-        return {
-            "scene": scene,
-            "instance": instance,
-            "sensor": sensor,
-        }
-
-    def forward_perception(
-        self, batch: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        """Instance/target-only stage; skips every manipulation head."""
-        encoded, sensor, task = self._encode_scene(batch)
-        return {
-            "encoded": encoded,
-            "sensor": sensor,
-            "task": task,
-            "instance": encoded.instance,
-        }
-
-    def forward_generated_policy(
-        self, batch: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        generated = batch.get("generated_policy_candidates")
-        if generated is None:
-            raise RuntimeError(
-                "Generated-policy forward requires cached generated candidates"
-            )
-        encoded, sensor, task = self._encode_scene(batch)
-        result: dict[str, Any] = {
-            "encoded": encoded,
-            "sensor": sensor,
-            "task": task,
-            "region": {
-                "region_probability": encoded.target_probability.new_zeros(
-                    encoded.target_probability.shape
-                )
-            },
-            "task_grasp": None,
-            "global_grasp": None,
-            "push": None,
-            "verifier": None,
-        }
-        # Generated caches created by the patched model contain geometry/object ids
-        # and may contain cached evidence. Unknown supervision fields are ignored.
-        candidates = {
-            key: generated[key]
-            for key in (
-                "type", "object", "contact_world", "direction_world",
-                "pose_world", "destination_world", "width_m", "valid",
-                "previous_action",
-            )
-            if key in generated
-        }
-        prepared = self.prepare_candidate_inputs(
-            result,
-            candidates,
-            evidence=generated.get("evidence"),
-            verifier_evidence_cached=True,
-        )
-        result["generated_router"] = self.route_cached(
-            batch, result, prepared
-        )
-        return result
-
-    def forward(
-        self,
-        batch: Mapping[str, Any],
-        candidate_inputs: Mapping[str, Tensor] | None = None,
-        *,
-        forward_mode: str = "full",
-    ) -> dict[str, Any]:
-        if forward_mode == "generated_policy":
-            return self.forward_generated_policy(batch)
-        if forward_mode == "instances":
-            return self.forward_instances(batch)
-        if forward_mode == "perception":
-            return self.forward_perception(batch)
-        if forward_mode == "global_grasp":
-            return self.forward_global_grasp(batch)
-        if forward_mode != "full":
-            raise ValueError(f"Unsupported forward_mode={forward_mode}")
-
-        encoded, sensor, task = self._encode_scene(batch)
-        region = self.region_head(
+        return self.region_head(
             encoded.point_features,
             encoded.target_token,
             encoded.task_token,
             encoded.target_probability,
             sensor["point_mask"],
         )
+
+    def _forward_task_grasps(
+        self,
+        encoded: Any,
+        sensor: dict[str, Tensor],
+        region: dict[str, Tensor],
+    ) -> dict[str, Tensor]:
         target_identity_valid = self._target_identity_gate(encoded)
         teacher_crop = sensor.get("teacher_target_crop_mask") if self.training else None
         if teacher_crop is not None:
@@ -897,9 +513,6 @@ class TCDPRGModel(nn.Module):
         target_proposals["target_identity_teacher_forced"] = torch.full_like(
             target_identity_valid, teacher_crop is not None, dtype=torch.bool
         )
-        # Proposal scoring contains masked local attention and ranking gradients.
-        # Keep this learned path in FP32: unlike frozen GraspNet, it participates
-        # in backward and sparse proposal batches can overflow FP16 GradScaler.
         fp32_proposals = {
             key: value.float() if value.is_floating_point() else value
             for key, value in target_proposals.items()
@@ -923,23 +536,17 @@ class TCDPRGModel(nn.Module):
                 encoded.task_token.float(),
                 encoded.target_token.float(),
             )
-        global_grasp = self._forward_global_grasp(encoded, sensor)
+        return task_grasp
 
-        if self.ablation.use_dependency_graph:
-            graph = self.graph(
-                encoded.object_tokens,
-                encoded.object_mask,
-                encoded.task_token,
-                target_object=None,
-                relation_graph=None,
-                use_indirect_reasoning=self.ablation.use_indirect_dependency_reasoning,
-            )
-            graph_context = graph.node_features[:, :-1]
-        else:
-            graph = None
-            graph_context = encoded.object_tokens
-
-        push = self.push(
+    def _forward_push(
+        self,
+        encoded: Any,
+        sensor: dict[str, Tensor],
+        region: dict[str, Tensor],
+        training_hints: Mapping[str, Tensor] | None = None,
+    ) -> dict[str, Tensor]:
+        hints = training_hints or {}
+        return self.push(
             encoded.point_features,
             sensor["xyz"],
             encoded.instance.mask_probability,
@@ -948,11 +555,100 @@ class TCDPRGModel(nn.Module):
             encoded.object_mask,
             encoded.task_token,
             encoded.target_token,
-            graph_context,
-            task["remaining_steps"],
+            encoded.target_instance_probability,
+            region["region_probability"],
+            forced_direction_point_mask=hints.get("push_direction_point_mask"),
         )
 
-        result: dict[str, Any] = {
+    def forward_instances(
+        self, batch: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Task-free sensor-only instance inference for real-scene acquisition."""
+        scene, instance, sensor = self._encode_scene_instances(batch)
+        return {"scene": scene, "instance": instance, "sensor": sensor}
+
+    def forward_perception(
+        self, batch: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Stage A: instance/target/region only; no GraspNet or Push execution."""
+        encoded, sensor, task = self._encode_scene(batch)
+        region = self._forward_region(encoded, sensor)
+        return {
+            "encoded": encoded,
+            "sensor": sensor,
+            "task": task,
+            "instance": encoded.instance,
+            "region": region,
+            "task_grasp": None,
+            "global_grasp": None,
+            "push": None,
+        }
+
+    def forward_grasp(
+        self, batch: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Stage B: perception + Grasp only; Push is not executed."""
+        encoded, sensor, task = self._encode_scene(batch)
+        region = self._forward_region(encoded, sensor)
+        task_grasp = self._forward_task_grasps(encoded, sensor, region)
+        return {
+            "encoded": encoded,
+            "sensor": sensor,
+            "task": task,
+            "instance": encoded.instance,
+            "region": region,
+            "task_grasp": task_grasp,
+            "global_grasp": None,
+            "push": None,
+        }
+
+    def forward_push(
+        self, batch: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Stage C: perception + Push only; GraspNet/TaskGrasp are not executed."""
+        encoded, sensor, task = self._encode_scene(batch)
+        region = self._forward_region(encoded, sensor)
+        push = self._forward_push(
+            encoded, sensor, region, batch.get("training_hints")
+        )
+        return {
+            "encoded": encoded,
+            "sensor": sensor,
+            "task": task,
+            "instance": encoded.instance,
+            "region": region,
+            "task_grasp": None,
+            "global_grasp": None,
+            "push": push,
+        }
+
+    def forward(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        forward_mode: str = "full",
+    ) -> dict[str, Any]:
+        if forward_mode == "instances":
+            return self.forward_instances(batch)
+        if forward_mode == "perception":
+            return self.forward_perception(batch)
+        if forward_mode == "grasp":
+            return self.forward_grasp(batch)
+        if forward_mode == "push":
+            return self.forward_push(batch)
+        if forward_mode == "global_grasp":
+            return self.forward_global_grasp(batch)
+        if forward_mode != "full":
+            raise ValueError(f"Unsupported forward_mode={forward_mode}")
+
+        encoded, sensor, task = self._encode_scene(batch)
+        region = self._forward_region(encoded, sensor)
+        task_grasp = self._forward_task_grasps(encoded, sensor, region)
+        global_grasp = self._forward_global_grasp(encoded, sensor)
+        push = self._forward_push(
+            encoded, sensor, region, batch.get("training_hints")
+        )
+        return {
             "encoded": encoded,
             "sensor": sensor,
             "task": task,
@@ -960,34 +656,5 @@ class TCDPRGModel(nn.Module):
             "region": region,
             "task_grasp": task_grasp,
             "global_grasp": global_grasp,
-            "graph": graph,
             "push": push,
-            "verifier": None,
         }
-
-        if candidate_inputs is not None:
-            prepared = self.prepare_candidate_inputs(result, candidate_inputs)
-            result["candidate_inputs"] = prepared
-            result["router"] = self.route_cached(batch, result, prepared)
-
-        generated = batch.get("generated_policy_candidates")
-        if generated is not None:
-            candidates = {
-                key: generated[key]
-                for key in (
-                    "type", "object", "contact_world", "direction_world",
-                    "pose_world", "destination_world", "width_m", "valid",
-                    "previous_action",
-                )
-                if key in generated
-            }
-            prepared = self.prepare_candidate_inputs(
-                result,
-                candidates,
-                evidence=generated.get("evidence"),
-                verifier_evidence_cached=True,
-            )
-            result["generated_router"] = self.route_cached(
-                batch, result, prepared
-            )
-        return result

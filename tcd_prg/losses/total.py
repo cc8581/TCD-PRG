@@ -1,4 +1,4 @@
-"""Capability-aware aggregation of object-centric paper-level objectives."""
+"""Capability-aware aggregation for the minimal TCD-PRG objective set."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -14,14 +14,10 @@ class MultiTaskLoss(nn.Module):
         "instance": 1.0,
         "region": 1.0,
         "task_grasp": 1.0,
-        "physical_edge": 1.0,
-        "task_edge": 1.0,
-        "verify_overall": 1.0,
         "push_object": 1.0,
         "push_contact": 1.0,
         "push_direction": 1.0,
         "push_potential": 1.0,
-        "policy_candidate": 1.0,
     }
 
     def __init__(
@@ -37,27 +33,20 @@ class MultiTaskLoss(nn.Module):
         self.weights.update(weights or {})
 
     def enabled(self, family: str) -> bool:
+        if family not in self.weights:
+            raise KeyError(family)
         if float(self.weights[family]) == 0.0:
             return False
         requirement = {
             "instance": "instance",
             "region": "region",
             "task_grasp": "proposal",
-            "physical_edge": "graph",
-            "task_edge": "graph",
-            "verify_overall": "verify",
             "push_object": "push",
             "push_contact": "push",
             "push_direction": "push",
             "push_potential": "push",
-            "policy_candidate": "policy",
         }[family]
-        if requirement == "graph" and not self.ablation.use_dependency_graph:
-            return False
-        if (
-            family == "push_potential"
-            and not self.ablation.use_push_potential
-        ):
+        if family == "push_potential" and not self.ablation.use_push_potential:
             return False
         return self.capabilities.loss_available(requirement)
 
@@ -78,8 +67,6 @@ class MultiTaskLoss(nn.Module):
             selected[f"weighted_loss_{family}"] = weighted.detach()
             total = weighted if total is None else total + weighted
         if total is None:
-            raise ValueError(
-                "No applicable loss objective for this dataset/configuration"
-            )
+            raise ValueError("No applicable loss objective for this dataset/configuration")
         selected["loss_total"] = total
         return total, selected

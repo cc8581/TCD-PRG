@@ -177,6 +177,8 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
         split: str | None = None,
         max_groups: int | None = None,
         include_strata: bool = True,
+        allowed_strata: tuple[str, ...] = (),
+        deduplicate_state_task: bool = False,
         fraction: float = 1.0,
         subset_seed: int = 2026,
         scene_ids: set[int] | frozenset[int] | None = None,
@@ -205,7 +207,14 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
             if not allowed_scenes:
                 raise ValueError("scene_ids must not be empty")
             iterator = (unit for unit in iterator if int(unit[0]) in allowed_scenes)
-        if fraction == 1.0 and max_groups is not None and not stratified_max_groups:
+        stage_filtering = bool(allowed_strata) or deduplicate_state_task
+        strata: dict[tuple[int, int, int, int], str] = {}
+        if (
+            fraction == 1.0
+            and max_groups is not None
+            and not stratified_max_groups
+            and not stage_filtering
+        ):
             raw_units = list(islice(iterator, max_groups))
             self.source_group_count: int | None = None
         else:
@@ -214,12 +223,35 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
             if fraction < 1.0:
                 selected = _deterministic_fraction_indices(len(raw_units), fraction, subset_seed)
                 raw_units = [raw_units[int(index)] for index in selected]
+            if stage_filtering:
+                strata_method = getattr(adapter, "action_group_strata", None)
+                if not include_strata or strata_method is None:
+                    raise ValueError("stage filtering requires action-group strata")
+                strata = strata_method(raw_units)
+                if allowed_strata:
+                    allowed = frozenset(str(value) for value in allowed_strata)
+                    raw_units = [
+                        unit for unit in raw_units
+                        if strata.get(unit, "unclassified") in allowed
+                    ]
+                    if not raw_units:
+                        raise RuntimeError(
+                            f"Stage filter {sorted(allowed)} removed every action-state group"
+                        )
+                if deduplicate_state_task:
+                    unique: dict[tuple[int, int, int], tuple[int, int, int, int]] = {}
+                    for unit in raw_units:
+                        unique.setdefault((unit[0], unit[1], unit[2]), unit)
+                    raw_units = list(unique.values())
             if max_groups is not None and not stratified_max_groups:
                 raw_units = raw_units[:max_groups]
 
         self.requested_fraction = float(fraction)
         strata_method = getattr(adapter, "action_group_strata", None)
-        strata = strata_method(raw_units) if include_strata and strata_method else {}
+        if not strata:
+            strata = strata_method(raw_units) if include_strata and strata_method else {}
+        else:
+            strata = {unit: strata.get(unit, "unclassified") for unit in raw_units}
         if stratified_max_groups:
             assert stratum_quota is not None
             if sum(int(value) for value in stratum_quota.values()) != int(max_groups):

@@ -11,13 +11,13 @@ import numpy as np
 import torch
 
 from tcd_prg.config import load_config
+from tcd_prg.constants import ActionType
 from tcd_prg.baselines import create_baseline
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.planners import TCDPRGPolicy
 from tcd_prg.runtime import (
     create_action_certifier,
     create_adapter,
-    create_gripper_provider,
 )
 
 
@@ -42,7 +42,6 @@ def main() -> None:
     parser.add_argument("--task-index", type=int, required=True)
     parser.add_argument("--output")
     parser.add_argument("--no-certification", action="store_true")
-    parser.add_argument("--allow-gripper-generate", action="store_true")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
@@ -56,40 +55,36 @@ def main() -> None:
             raise ValueError("--checkpoint is required for learned TCD-PRG candidates")
         device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
         model = TCDPRGModel(
-            config.model, config.ablation, config.graph, config.router, config.backbone
+            config.model, config.ablation, config.backbone, config.graspnet
         ).to(device)
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint.get("ema") or checkpoint["model"])
-        gripper = (create_gripper_provider(config, args.allow_gripper_generate)
-                   if config.ablation.use_gripper_scene_verifier else None)
-        # Candidate generation/routing stays robot-agnostic.  The selected
-        # action is certified below, with rejection followed by reranking.
-        base_policy = TCDPRGPolicy(model, config, gripper, certifier=None)
+        # Candidate scoring remains robot-agnostic. The deterministic
+        # controller exact-certifies grasp actions and falls through on rejection.
+        base_policy = TCDPRGPolicy(model, config)
         policy = create_baseline(config, base_policy)
     encoded = policy.encode_observation(observation)
     candidates = policy.generate_candidates(encoded)
-    final_certification = None
+    # Certification is an execution-boundary operation, not part of Policy.
+    # Rejected grasps are masked and fixed-priority selection is repeated without
+    # rerunning the scene backbone.
     action = policy.select_action(candidates)
+    final_certification = None
     if certifier is not None:
         certifier.set_observation(observation)
-        while action is not None:
-            final_certification = certifier.certify(action)
-            if final_certification[0]:
+        while action is not None and int(action["action_type"]) != int(ActionType.PUSH):
+            accepted, reason = certifier.certify(action)
+            if accepted:
+                action["certified"] = True
+                action["certification_reason"] = reason
+                final_certification = (True, reason)
                 break
-            tensor_group = candidates.get("candidates") if isinstance(candidates, dict) else None
-            index = action.get("candidate_index") if isinstance(action, dict) else None
-            if not isinstance(tensor_group, dict) or index is None or "valid" not in tensor_group:
-                action = None
-                break
-            tensor_group["valid"][0, int(index)] = False
-            encoded_state = candidates.get("encoded")
-            routed_model = getattr(policy, "model", None)
-            if encoded_state is None or routed_model is None:
-                action = None
-                break
-            candidates["router"] = routed_model.route_cached(
-                encoded_state.device_batch, encoded_state.output, tensor_group
-            )
+            tensor_group = candidates.get("candidates")
+            index = int(action["candidate_index"])
+            tensor_group["valid"][0, index] = False
+            candidates["certification_reasons"].append({
+                "candidate_index": index, "reason": reason
+            })
             action = policy.select_action(candidates)
     tensor_candidates = candidates.get("candidates") if isinstance(candidates, dict) else None
     valid_count = (int(tensor_candidates["valid"].sum())
@@ -97,8 +92,7 @@ def main() -> None:
                    else len(candidates.get("candidates", [])) if isinstance(candidates, dict) else 0)
     survival_keys = (
         "task_grasp_query_count", "task_grasp_after_nms_count",
-        "task_grasp_after_verifier_count", "task_grasp_after_certifier_count",
-        "verified_unique_grasp_count",
+        "unique_task_grasp_count",
     )
     task_grasp_survival = {
         key: int(tensor_candidates[key][0])

@@ -251,16 +251,6 @@ def test_source_and_config_contain_no_absolute_drive_paths() -> None:
     assert offenders == []
 
 
-def test_task_grasp_candidate_capacity_covers_maximum_required_count() -> None:
-    config = TCDPRGConfig(
-        model=ModelConfig(
-            task_grasp_candidates=19,
-            default_required_grasp_count=19,
-            max_required_grasp_count=20,
-        )
-    )
-    with pytest.raises(ValueError, match="task_grasp_candidates"):
-        config.validate()
 
 
 def test_train_only_bootstrap_allows_zero_validation_interval() -> None:

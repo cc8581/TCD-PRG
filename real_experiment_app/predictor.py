@@ -16,7 +16,6 @@ if str(PROJECT) not in sys.path:
 from tcd_prg.config import load_config
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.planners import TCDPRGPolicy
-from tcd_prg.runtime import create_gripper_provider
 from .types import FusedScene, Prediction
 
 
@@ -53,25 +52,15 @@ class TCDPRGPredictor:
         self.model = TCDPRGModel(
             self.config.model,
             self.config.ablation,
-            self.config.graph,
-            self.config.router,
             self.config.backbone,
+            self.config.graspnet,
         ).to(self.device)
         checkpoint_path = app_config.resolve(section["checkpoint"])
         checkpoint = torch.load(
             checkpoint_path, map_location=self.device, weights_only=False
         )
         self.model.load_state_dict(checkpoint.get("ema") or checkpoint["model"])
-        gripper = (
-            create_gripper_provider(
-                self.config, bool(section.get("allow_gripper_generate", False))
-            )
-            if self.config.ablation.use_gripper_scene_verifier
-            else None
-        )
-        self.policy = TCDPRGPolicy(
-            self.model, self.config, gripper, certifier=None
-        )
+        self.policy = TCDPRGPolicy(self.model, self.config)
 
     def reset(self) -> None:
         self.policy.reset()
@@ -105,7 +94,6 @@ class TCDPRGPredictor:
         target: int,
         category: int,
         region: int,
-        required: int = 1,
     ) -> Prediction:
         started = time.perf_counter()
         # V2: the UI-selected predicted query is converted to an observable 3D
@@ -119,7 +107,6 @@ class TCDPRGPredictor:
                 scene.rgb,
                 int(category),
                 int(region),
-                int(required),
                 source_view=scene.source_view,
                 camera_parameters=self._camera_parameters(scene),
                 target_prompt_xyz=prompt,
@@ -134,7 +121,6 @@ class TCDPRGPredictor:
                 scene.rgb,
                 int(category),
                 int(region),
-                int(required),
                 source_view=scene.source_view,
                 camera_parameters=self._camera_parameters(scene),
                 continue_target=True,

@@ -1,4 +1,4 @@
-"""Rule routers over a shared learned candidate generator and safety mask."""
+"""Rule policies over shared learned candidates and deterministic validity masks."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ class RulePolicy(ManipulationPolicy):
         if not isinstance(candidates, dict) or "candidates" not in candidates:
             raise TypeError("RulePolicy requires a generated candidate dictionary")
         tensors = candidates["candidates"]
-        scores = candidates["router"].candidate_logits
+        scores = tensors["proposal_score"]
         for kind in self.allowed:
             eligible = tensors["valid"][0] & (tensors["type"][0] == int(kind))
             index = torch.nonzero(eligible, as_tuple=False).flatten()
@@ -54,7 +54,7 @@ class RulePolicy(ManipulationPolicy):
                 if decoder is None:
                     raise TypeError("Candidate policy cannot decode its candidate tensors")
                 action = decoder(tensors, selected)
-                action["router_score"] = float(scores[0, selected])
+                action["rule_score"] = float(scores[0, selected])
                 return action
         return None
 

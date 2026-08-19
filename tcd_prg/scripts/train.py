@@ -22,11 +22,6 @@ from tcd_prg.datasets import (
     DistributedEvaluationSampler,
     DistributedTaskStateBatchSampler,
 )
-from tcd_prg.datasets.policy_candidates import (
-    checkpoint_sha256,
-    validate_cache_manifest,
-    validate_generated_policy_coverage,
-)
 from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import TCDPRGModel
@@ -35,7 +30,6 @@ from tcd_prg.pretrained import load_pretrained_backbone, prepare_pretrained_chec
 from tcd_prg.runtime import (
     UnifiedBatchCollator,
     create_adapter,
-    create_gripper_provider,
 )
 from tcd_prg.trainers import Trainer
 
@@ -124,6 +118,31 @@ def load_or_create_validation_scene_subset(
     return selected
 
 
+def restrict_action_dataset_to_stage(
+    dataset,
+    allowed_strata: tuple[str, ...],
+    *,
+    deduplicate_state_task: bool = False,
+) -> None:
+    """Restrict action groups without changing their published labels."""
+    units = dataset.units
+    if allowed_strata:
+        allowed = frozenset(str(value) for value in allowed_strata)
+        units = tuple(unit for unit in units if unit.stratum in allowed)
+        if not units:
+            raise RuntimeError(
+                f"Stage filter {sorted(allowed)} removed every action-state group"
+            )
+    if deduplicate_state_task:
+        unique = {}
+        for unit in units:
+            unique.setdefault(
+                (unit.scene_id, unit.state_id, unit.task_index), unit
+            )
+        units = tuple(unique.values())
+    dataset.units = units
+    dataset.selected_group_count = len(units)
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
@@ -160,32 +179,6 @@ def main() -> None:
         )
     if args.resume and args.initialize:
         raise ValueError("--resume and --initialize are mutually exclusive")
-    # 只要训练使用 generated candidates，就必须校验生成器 checkpoint 和缓存版本签名。
-    if config.training.generated_policy_candidate_ratio > 0:
-        if args.initialize:
-            actual_sha256 = checkpoint_sha256(args.initialize)
-            expected = config.training.generated_policy_checkpoint_sha256
-            if expected and expected != actual_sha256:
-                raise ValueError("--initialize checkpoint does not match generated cache SHA-256")
-            config.training.generated_policy_checkpoint_sha256 = actual_sha256
-        elif not config.training.generated_policy_checkpoint_sha256:
-            raise ValueError(
-                "Generated policy training requires --initialize or an explicit "
-                "training.generated_policy_checkpoint_sha256"
-            )
-        manifest = validate_cache_manifest(
-            config.training.generated_policy_candidate_cache,
-            config,
-            config.training.generated_policy_checkpoint_sha256,
-        )
-        if config.training.generated_policy_candidate_ratio == 1.0:
-            coverage = validate_generated_policy_coverage(
-                manifest,
-                "train",
-                minimum_positive=config.training.generated_policy_min_positive_coverage,
-                minimum_effective=config.training.generated_policy_min_effective_coverage,
-            )
-            print({"generated_policy_preflight": coverage})
     world_size = (
         args.world_size if args.world_size is not None else int(os.environ.get("WORLD_SIZE", "1"))
     )
@@ -230,10 +223,19 @@ def main() -> None:
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
     observation_cache = validate_read_through_observation_cache(adapter)
+    perception_only_stage = (
+        config.losses.task_grasp == 0
+        and config.losses.push_object == 0
+        and config.losses.push_contact == 0
+        and config.losses.push_direction == 0
+        and config.losses.push_potential == 0
+    )
     train_dataset = ActionStateGroupDataset(
         adapter,
         split="train",
         max_groups=config.training.max_train_groups,
+        allowed_strata=config.training.allowed_action_strata,
+        deduplicate_state_task=perception_only_stage,
         global_grasp_mode="never",
     )
     validation_scene_ids = (
@@ -252,6 +254,8 @@ def main() -> None:
             split="val",
             scene_ids=frozenset(validation_scene_ids),
             max_groups=config.training.max_validation_groups,
+            allowed_strata=config.training.allowed_action_strata,
+            deduplicate_state_task=perception_only_stage,
             stratified_max_groups=config.training.max_validation_groups is not None,
             stratum_quota=config.training.validation_stratum_quota,
             subset_manifest_path=(
@@ -259,6 +263,7 @@ def main() -> None:
                 if config.training.max_validation_groups is not None
                 else None
             ),
+            global_grasp_mode="never",
             global_grasp_width_bounds=(
                 config.model.min_grasp_width_m,
                 config.model.max_grasp_width_m,
@@ -291,24 +296,8 @@ def main() -> None:
                 f"groups={len(validation_dataset)}",
                 flush=True,
             )
-    gripper = None
-    if config.ablation.use_gripper_scene_verifier:
-        if rank == 0:
-            # 正式训练只在 DataLoader 启动前生成有限宽度档位；worker 永不调用 PyBullet。
-            gripper = create_gripper_provider(config, allow_generate=True)
-            gripper_paths = gripper.prewarm_uniform_bins()
-            gripper.allow_generate = False
-            print(
-                f"[gripper-cache] ready bins={len(gripper_paths)} "
-                f"quantization={config.grasp_verifier.gripper_width_quantization_m:g}m",
-                flush=True,
-            )
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-        if rank != 0:
-            gripper = create_gripper_provider(config, allow_generate=False)
-    train_collator = UnifiedBatchCollator(config, gripper, training=True)
-    validation_collator = UnifiedBatchCollator(config, gripper, training=False)
+    train_collator = UnifiedBatchCollator(config, training=True)
+    validation_collator = UnifiedBatchCollator(config, training=False)
     train_batch_sampler = DistributedTaskStateBatchSampler(
         train_dataset.units,
         batch_size=config.training.batch_size,
@@ -348,8 +337,7 @@ def main() -> None:
         else None
     )
     model = TCDPRGModel(
-        config.model, config.ablation, config.graph, config.router,
-        config.backbone, config.graspnet,
+        config.model, config.ablation, config.backbone, config.graspnet,
     )
     pretrained_report = None
     resume_pretrained_names: list[str] = []
@@ -359,7 +347,7 @@ def main() -> None:
         resume_config = resume_payload.get("config", {})
         resume_extra = resume_config.get("extra", {}) if isinstance(resume_config, dict) else {}
         resume_pretrained_names = list(resume_extra.get("pretrained_matched_parameter_names", []))
-        # Older schema-10 checkpoints may have been written before the
+        # Older pre-minimal-architecture checkpoints may have been written before the
         # pre-trained parameter-name list was copied into ``config.extra``.
         # The optimizer still contains the original split, so falling back to
         # every encoder parameter changes the parameter-group sizes and makes
@@ -442,7 +430,22 @@ def main() -> None:
             config.training.unfreeze_at_optimizer_step or 0,
         )
 
-    # Only parameters actually restored from pre-training receive the small LR.
+    # For fixed stages, freeze unused modules before optimizer/DDP construction.
+    # This avoids optimizer state and DDP reducer bookkeeping for branches that
+    # the stage never executes. Dynamic unfreeze experiments retain Trainer's
+    # delayed freeze path so those parameters stay inside the optimizer.
+    if (
+        config.training.frozen_modules
+        and config.training.unfreeze_at_optimizer_step is None
+    ):
+        for parameter_name, parameter in model.named_parameters():
+            if any(
+                parameter_name == prefix
+                or parameter_name.startswith(prefix + ".")
+                for prefix in config.training.frozen_modules
+            ):
+                parameter.requires_grad_(False)
+
     pretrained_parameter_names = (
         list(pretrained_report["matched_parameter_names"])
         if pretrained_report is not None
@@ -458,26 +461,34 @@ def main() -> None:
                 "Checkpoint pre-trained parameter names do not match this model: "
                 + ", ".join(missing_names[:8])
             )
-        low_lr_parameters = [named_parameters[name] for name in pretrained_parameter_names]
+        low_lr_parameters = [
+            named_parameters[name] for name in pretrained_parameter_names
+            if named_parameters[name].requires_grad
+        ]
         low_lr = config.optimizer.backbone_learning_rate
     else:
-        low_lr_parameters = list(model.encoder.parameters())
+        low_lr_parameters = [p for p in model.encoder.parameters() if p.requires_grad]
         low_lr = config.optimizer.learning_rate
     low_lr_ids = {id(parameter) for parameter in low_lr_parameters}
     other_parameters = [
         p for p in model.parameters()
         if p.requires_grad and id(p) not in low_lr_ids
     ]
+    optimizer_groups = []
+    if low_lr_parameters:
+        optimizer_groups.append(
+            {"params": low_lr_parameters, "lr": low_lr, "name": "pretrained_trunk"}
+        )
+    if other_parameters:
+        optimizer_groups.append({
+            "params": other_parameters,
+            "lr": config.optimizer.learning_rate,
+            "name": "new_modules",
+        })
+    if not optimizer_groups:
+        raise RuntimeError("Selected training stage has no trainable parameters")
     optimizer = torch.optim.AdamW(
-        [
-            {"params": low_lr_parameters, "lr": low_lr, "name": "pretrained_trunk"},
-            {
-                "params": other_parameters,
-                "lr": config.optimizer.learning_rate,
-                "name": "new_modules",
-            },
-        ],
-        weight_decay=config.optimizer.weight_decay,
+        optimizer_groups, weight_decay=config.optimizer.weight_decay
     )
 
     def learning_rate(step: int) -> float:
@@ -504,7 +515,6 @@ def main() -> None:
         config.ablation,
         config.losses,
         config.region_head,
-        config.training.generated_policy_candidate_ratio,
         config.dataset.acronym_object_grasp_database,
     )
     if rank == 0:
@@ -570,7 +580,6 @@ def main() -> None:
             config.model,
             config.evaluation.bootstrap_samples,
             config.evaluation.confidence,
-            config.graph,
             config.evaluation,
         )
         validation_batches = len(validation_loader)

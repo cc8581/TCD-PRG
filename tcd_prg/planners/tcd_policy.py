@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 import numpy as np
 import torch
@@ -12,58 +12,13 @@ from tcd_prg.baselines.base import (
     GlobalGraspPrediction, ManipulationPolicy
 )
 from tcd_prg.config import TCDPRGConfig
-from tcd_prg.constants import ActionType, MAX_PREPARATION_ACTIONS
+from tcd_prg.constants import ActionType
 from tcd_prg.datasets.collate import grid_sample_indices
 from tcd_prg.datasets.types import SceneObservation
-from tcd_prg.geometry.grasp_nms import task_grasp_nms
 from tcd_prg.models import TCDPRGModel
-from tcd_prg.models.grasp_verifier import build_verifier_inputs
-from tcd_prg.models.policy.router import (
-    MaskedHierarchicalCandidateRouter,
-)
 
 from .candidate_generator import DenseCandidateGenerator
 from .target_tracker import TargetIdentityTracker
-
-
-def apply_verified_candidate_count_gate(
-    candidate_type: Tensor,
-    candidate_object: Tensor,
-    candidate_pose_world: Tensor,
-    candidate_width_m: Tensor,
-    candidate_score: Tensor,
-    candidate_valid: Tensor,
-    required_count: Tensor,
-    *,
-    translation_threshold_m: float,
-    rotation_threshold_deg: float,
-    width_threshold_m: float,
-    approach_threshold_deg: float,
-) -> tuple[Tensor, Tensor, Tensor]:
-    task = candidate_type == int(ActionType.TASK_GRASP)
-    unique_task = task_grasp_nms(
-        candidate_pose_world,
-        candidate_width_m,
-        candidate_score,
-        candidate_object,
-        candidate_valid & task,
-        translation_threshold_m=translation_threshold_m,
-        rotation_threshold_deg=rotation_threshold_deg,
-        width_threshold_m=width_threshold_m,
-        approach_threshold_deg=approach_threshold_deg,
-    )
-    unique_count = unique_task.sum(-1)
-    count_gate = unique_count >= required_count
-    deduplicated = candidate_valid & (~task | unique_task)
-    return (
-        deduplicated & (~task | count_gate[:, None]),
-        unique_count,
-        unique_task,
-    )
-
-
-class CandidateCertifier(Protocol):
-    def certify(self, action: dict[str, Any]) -> tuple[bool, str]: ...
 
 
 @dataclass(slots=True)
@@ -79,15 +34,14 @@ class TCDPRGPolicy(ManipulationPolicy):
         self,
         model: TCDPRGModel,
         config: TCDPRGConfig,
-        gripper_provider: Any | None = None,
-        certifier: CandidateCertifier | None = None,
     ) -> None:
         self.model = model.eval()
         self.config = config
         self.device = next(model.parameters()).device
-        self.generator = DenseCandidateGenerator(config.model)
-        self.gripper_provider = gripper_provider
-        self.certifier = certifier
+        self.generator = DenseCandidateGenerator(
+            config.model,
+            use_push_potential=config.ablation.use_push_potential,
+        )
         self.preparation_actions = 0
         self.target_tracker = TargetIdentityTracker()
 
@@ -97,7 +51,6 @@ class TCDPRGPolicy(ManipulationPolicy):
         rgb: np.ndarray,
         task_category_id: int,
         task_region_id: int,
-        required_grasp_count: int,
         point_valid: np.ndarray | None = None,
         source_view: np.ndarray | None = None,
         camera_parameters: tuple[Any, ...] | None = None,
@@ -125,18 +78,6 @@ class TCDPRGPolicy(ManipulationPolicy):
                 training=False,
             )
         ]
-        if required_grasp_count > self.config.model.max_required_grasp_count:
-            raise ValueError(
-                f"required_grasp_count={required_grasp_count} exceeds "
-                f"max_required_grasp_count="
-                f"{self.config.model.max_required_grasp_count}"
-            )
-        if required_grasp_count > self.config.model.task_grasp_candidates:
-            raise ValueError(
-                f"required_grasp_count={required_grasp_count} exceeds "
-                f"task_grasp_candidates="
-                f"{self.config.model.task_grasp_candidates}"
-            )
         model_inputs = {
             "xyz": torch.from_numpy(xyz[selected])[None].float(),
             "rgb": torch.from_numpy(rgb[selected])[None].float(),
@@ -206,19 +147,6 @@ class TCDPRGPolicy(ManipulationPolicy):
             "task_region_id": torch.tensor(
                 [int(task_region_id)], dtype=torch.long
             ),
-            "remaining_steps": torch.tensor(
-                [
-                    max(
-                        0,
-                        MAX_PREPARATION_ACTIONS
-                        - self.preparation_actions,
-                    )
-                ],
-                dtype=torch.long,
-            ),
-            "required_grasp_count": torch.tensor(
-                [int(required_grasp_count)], dtype=torch.long
-            ),
         }
         if target_prompt_xyz is None:
             task_inputs.update({
@@ -285,12 +213,6 @@ class TCDPRGPolicy(ManipulationPolicy):
     ) -> dict[str, Any]:
         """Dataset/evaluation adapter: GT fields are deliberately ignored."""
         observation.validate()
-        required = int(
-            observation.metadata.get(
-                "required_grasp_count",
-                self.config.model.default_required_grasp_count,
-            )
-        )
         # Category/region are the closed-vocabulary task specification.  The
         # GT target mask/instance id/object state are not copied into model input.
         category = int(
@@ -314,7 +236,6 @@ class TCDPRGPolicy(ManipulationPolicy):
             observation.rgb,
             category,
             int(observation.task_region_id),
-            required,
             point_valid=observation.point_valid,
             source_view=observation.source_view,
             camera_parameters=observation.camera_parameters,
@@ -434,7 +355,6 @@ class TCDPRGPolicy(ManipulationPolicy):
         rgb: np.ndarray,
         task_category_id: int,
         task_region_id: int,
-        required_grasp_count: int = 1,
         *,
         point_valid: np.ndarray | None = None,
         source_view: np.ndarray | None = None,
@@ -450,7 +370,6 @@ class TCDPRGPolicy(ManipulationPolicy):
             np.asarray(rgb, np.float32),
             int(task_category_id),
             int(task_region_id),
-            int(required_grasp_count),
             point_valid=point_valid,
             source_view=source_view,
             camera_parameters=camera_parameters,
@@ -529,140 +448,34 @@ class TCDPRGPolicy(ManipulationPolicy):
     ) -> dict[str, Any]:
         with torch.no_grad():
             candidates = self.generator.generate(
-                self.model,
-                encoded.device_batch,
-                encoded.output,
+                self.model, encoded.device_batch, encoded.output
             )
-            task_query_count = encoded.output[
-                "task_grasp"
-            ]["quality_logit"].shape[1]
-            task_mask = (
-                candidates["type"]
-                == int(ActionType.TASK_GRASP)
-            )
+            task_mask = candidates["type"] == int(ActionType.TASK_GRASP)
             candidates["task_grasp_query_count"] = torch.full(
                 (candidates["type"].shape[0],),
-                task_query_count,
+                encoded.output["task_grasp"]["quality_logit"].shape[1],
                 dtype=torch.long,
                 device=self.device,
             )
             candidates["task_grasp_after_nms_count"] = (
                 candidates["valid"] & task_mask
             ).sum(-1)
-
-            if self.config.ablation.use_gripper_scene_verifier:
-                if self.gripper_provider is None:
-                    raise RuntimeError(
-                        "Verifier-enabled inference requires "
-                        "AG geometry provider"
-                    )
-                verifier_batch = self.generator.verifier_batch(
-                    encoded.cpu_batch, candidates
-                )
-                verifier_inputs_cpu = build_verifier_inputs(
-                    verifier_batch,
-                    self.gripper_provider,
-                    self.config.grasp_verifier.local_scene_points,
-                    self.config.model.verifier_local_radius_m,
-                )
-                verifier_inputs = {
-                    key: value.to(self.device)
-                    for key, value in verifier_inputs_cpu.items()
-                }
-                encoded.output["verifier"] = (
-                    self.model.verify_cached(
-                        encoded.device_batch,
-                        encoded.output,
-                        verifier_inputs,
-                    )
-                )
-                grasp = (
-                    candidates["type"]
-                    != int(ActionType.PUSH)
-                )
-                learned_valid = torch.sigmoid(
-                    encoded.output["verifier"][
-                        "overall_logit"
-                    ]
-                ) >= self.config.model.verifier_validity_threshold
-                if self.config.model.verifier_hard_gate:
-                    candidates["valid"] &= (
-                        ~grasp | learned_valid
-                    )
-
-            candidates["task_grasp_after_verifier_count"] = (
+            # DenseCandidateGenerator has already applied task-grasp NMS and
+            # the calibrated probability threshold. One executable grasp is enough
+            # for execution; dataset grasp-count labels are not runtime hard gates.
+            candidates["unique_task_grasp_count"] = (
                 candidates["valid"] & task_mask
             ).sum(-1)
-            candidates["task_grasp_after_certifier_count"] = (
-                candidates["valid"] & task_mask
-            ).sum(-1)
-
-            required = encoded.device_batch["task_inputs"][
-                "required_grasp_count"
-            ]
-            (
-                candidates["valid"],
-                verified_count,
-                unique_task_mask,
-            ) = apply_verified_candidate_count_gate(
-                candidates["type"],
-                candidates["object"],
-                candidates["pose_world"],
-                candidates["width_m"],
-                candidates["proposal_score"],
-                candidates["valid"],
-                required,
-                translation_threshold_m=(
-                    self.config.model.grasp_nms_translation_m
-                ),
-                rotation_threshold_deg=(
-                    self.config.model.grasp_nms_rotation_deg
-                ),
-                width_threshold_m=(
-                    self.config.model.grasp_nms_width_m
-                ),
-                approach_threshold_deg=(
-                    self.config.model.grasp_nms_approach_deg
-                ),
-            )
-            candidates[
-                "verified_unique_grasp_count"
-            ] = verified_count
-            candidates[
-                "verified_candidate_count"
-            ] = verified_count
-            candidates[
-                "task_grasp_nms_keep"
-            ] = unique_task_mask
-
-            router = self.model.route_cached(
-                encoded.device_batch,
-                encoded.output,
-                candidates,
-            )
-            nms_valid = self.generator.apply_push_nms(
-                candidates, router.candidate_logits
+            candidates["valid"] = self.generator.apply_push_nms(
+                candidates, candidates["proposal_score"]
             )
             candidates["push_after_nms_count"] = (
-                nms_valid
-                & (
-                    candidates["type"]
-                    == int(ActionType.PUSH)
-                )
+                candidates["valid"]
+                & (candidates["type"] == int(ActionType.PUSH))
             ).sum(-1)
-            if not torch.equal(
-                nms_valid, candidates["valid"]
-            ):
-                candidates["valid"] = nms_valid
-                router = self.model.route_cached(
-                    encoded.device_batch,
-                    encoded.output,
-                    candidates,
-                )
         return {
             "encoded": encoded,
             "candidates": candidates,
-            "router": router,
             "certification_reasons": [],
         }
 
@@ -670,24 +483,37 @@ class TCDPRGPolicy(ManipulationPolicy):
         self, candidates: dict[str, Any]
     ) -> dict[str, Any] | None:
         tensors = candidates["candidates"]
-        selected = (
-            MaskedHierarchicalCandidateRouter.select(
-                candidates["router"],
-                tensors["type"],
-                tensors["object"],
-            )
-        )
-        if int(selected[0]) < 0:
-            return None
-        action = self._action(
-            tensors, int(selected[0])
-        )
-        action["router_score"] = float(
-            candidates["router"].candidate_logits[
-                0, int(selected[0])
+        valid = tensors["valid"][0]
+        for action_type in (
+            ActionType.TASK_GRASP,
+            ActionType.PICK_REMOVE,
+            ActionType.PUSH,
+        ):
+            indices = torch.nonzero(
+                valid & (tensors["type"][0] == int(action_type)),
+                as_tuple=False,
+            ).flatten()
+            if not len(indices):
+                continue
+            order = indices[
+                tensors["proposal_score"][0, indices].argsort(
+                    descending=True, stable=True
+                )
             ]
-        )
-        return action
+            for index_tensor in order:
+                index = int(index_tensor)
+                action = self._action(tensors, index)
+                action["selection_score"] = float(
+                    tensors["proposal_score"][0, index]
+                )
+                point_index = int(tensors["point_index"][0, index])
+                if point_index >= 0:
+                    action["association_point_world"] = (
+                        candidates["encoded"].cpu_batch["model_inputs"]["xyz"]
+                        [0, point_index].detach().cpu().numpy()
+                    )
+                return action
+        return None
 
     def predict_grasps(
         self, encoded: EncodedPolicyState

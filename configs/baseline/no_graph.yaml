@@ -1,5 +1,0 @@
-# 无图动作分类基线，同时关闭 TCD-PRG 依赖图模块。
-baseline:
-  type: no_graph_action_classifier
-ablation:
-  use_dependency_graph: false

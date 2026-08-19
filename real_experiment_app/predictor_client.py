@@ -101,7 +101,6 @@ class PredictorClient:
         target: int | None,
         category: int,
         region: int,
-        required: int = 1,
     ):
         self._save_scene(scene)
         result = self._call(
@@ -110,7 +109,6 @@ class PredictorClient:
             target=(-1 if target is None else int(target)),
             category=category,
             region=region,
-            required=required,
         )
         return Prediction(
             result["action"], float(result["inference_seconds"])

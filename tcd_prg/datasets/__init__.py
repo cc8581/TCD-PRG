@@ -6,11 +6,6 @@ from .base import DatasetAdapter
 from .acronym_grasp_database import load_object_grasps, match_object_grasp_priors
 from .capabilities import DatasetCapabilities
 from .gapg_observation import GAPGObservationAdapter
-from .policy_candidates import (
-    POLICY_CANDIDATE_CACHE_FORMAT,
-    load_candidate_batch,
-    match_generated_candidates,
-)
 from .task_oriented_clutter import TaskOrientedClutterAdapter
 from .template import DatasetAdapterTemplate
 from .types import (
@@ -34,15 +29,12 @@ __all__ = [
     "DatasetAdapterTemplate",
     "GAPGObservationAdapter",
     "GlobalGraspLabels",
-    "POLICY_CANDIDATE_CACHE_FORMAT",
     "SceneObservation",
     "SequenceLabels",
     "StateLabels",
     "StateGroupUnit",
     "TaskOrientedClutterAdapter",
-    "load_candidate_batch",
     "load_object_grasps",
-    "match_generated_candidates",
     "match_object_grasp_priors",
 ]
 

@@ -86,9 +86,5 @@ class ClosedLoopPlanner:
             if "valid" not in tensor_group or not bool(tensor_group["valid"][0, int(index)]):
                 return None, reason
             tensor_group["valid"][0, int(index)] = False
-            # 仅更新候选有效 mask 并重跑 Router，不重复编码未变化的点云。
-            encoded = candidates.get("encoded")
-            if encoded is not None and hasattr(self.policy, "model"):
-                candidates["router"] = self.policy.model.route_cached(  # type: ignore[attr-defined]
-                    encoded.device_batch, encoded.output, tensor_group
-                )
+            # Fixed-priority selection reads the mutated valid mask directly;
+            # no learned Router needs to be recomputed.

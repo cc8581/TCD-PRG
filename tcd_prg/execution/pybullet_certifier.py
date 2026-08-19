@@ -32,6 +32,43 @@ class ExternalFR5AG16095Certifier:
     def set_observation(self, observation: SceneObservation) -> None:
         self.observation = observation
 
+    def _physical_acted_object(self, action: dict[str, Any]) -> int:
+        """Resolve predicted-query actions to the simulator's physical body index.
+
+        Query ids are model-local and cannot be passed to the PyBullet worker as
+        object array indices.  Certification already uses oracle simulator scene
+        geometry, so this association belongs to the execution adapter, not the
+        perception/model input contract.
+        """
+        if self.observation is None:
+            raise RuntimeError("set_observation must be called before certification")
+        observation = self.observation
+        reference = action.get("association_point_world")
+        if reference is None:
+            pose = np.asarray(action.get("grasp_pose_world"), np.float64)
+            if pose.shape != (7,) or not np.isfinite(pose[:3]).all():
+                raise RuntimeError("grasp action has no finite association reference")
+            reference = pose[:3]
+        reference = np.asarray(reference, np.float64).reshape(3)
+        valid = np.asarray(
+            observation.point_valid
+            if observation.point_valid is not None
+            else np.ones(len(observation.xyz), dtype=bool),
+            dtype=bool,
+        )
+        instance = np.asarray(observation.instance_id, np.int64)
+        valid &= instance >= 0
+        if not np.any(valid):
+            raise RuntimeError("observation has no visible physical instance ids")
+        indices = np.flatnonzero(valid)
+        nearest = indices[
+            np.linalg.norm(observation.xyz[indices] - reference[None], axis=-1).argmin()
+        ]
+        physical = int(instance[nearest])
+        if physical < 0 or physical >= len(observation.object_pose):
+            raise RuntimeError(f"resolved physical object index out of range: {physical}")
+        return physical
+
     def certify_many(self, actions: list[dict[str, Any]]) -> list[tuple[bool, str]]:
         if not actions:
             return []
@@ -82,7 +119,8 @@ class ExternalFR5AG16095Certifier:
                 support_present=support_present, support_pose=support_pose, support_size=support_size,
                 action_type=action_type,
                 acted_object=np.asarray(
-                    [item["acted_object"] for item in grasp_actions], np.int16
+                    [self._physical_acted_object(item) for item in grasp_actions],
+                    np.int16,
                 ),
                 pose_world=pose, width_m=width, contact_world=contact,
                 direction_world=direction,

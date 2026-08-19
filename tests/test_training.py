@@ -5,18 +5,7 @@ import json
 import pytest
 import torch
 
-from tcd_prg.config import (
-    AblationConfig,
-    BackboneConfig,
-    GraphConfig,
-    LoggingConfig,
-    LossConfig,
-    ModelConfig,
-    RegionHeadConfig,
-    RouterConfig,
-    TCDPRGConfig,
-    TrainingConfig,
-)
+from tcd_prg.config import AblationConfig, BackboneConfig, LoggingConfig, LossConfig, ModelConfig, RegionHeadConfig, TCDPRGConfig, TrainingConfig
 from tcd_prg.datasets import TaskOrientedClutterAdapter
 from tcd_prg.datasets.collate import collate_unified
 from tcd_prg.datasets.torch_dataset import (
@@ -106,7 +95,7 @@ def test_checkpoint_rejects_obsolete_schema(tmp_path, tiny_batch) -> None:
     )
     path = tmp_path / "obsolete.pt"
     torch.save({"schema_version": 5}, path)
-    with pytest.raises(RuntimeError, match="expects schema 10"):
+    with pytest.raises(RuntimeError, match="expects schema 11"):
         trainer.load_checkpoint(path)
 
 
@@ -160,7 +149,7 @@ def test_trainer_prints_concise_summary_and_saves_every_step_metric(tmp_path, ca
     Trainer(model, optimizer, config, loss_step).train(batches)
     terminal = capsys.readouterr().out
     assert "[train-start]" in terminal
-    assert "Train [geometry] [0000001/0000001]" in terminal
+    assert "Train [perception] [0000001/0000001]" in terminal
     assert "eta: 0:00:00" in terminal
     assert "loss:" in terminal
     assert "lr:" in terminal
@@ -177,7 +166,7 @@ def test_trainer_prints_concise_summary_and_saves_every_step_metric(tmp_path, ca
     assert records[0]["schema_version"] == 5
     assert records[0]["gradient_norm_after_clip"] <= config.training.gradient_clip_norm
     assert 0.0 < records[0]["gradient_clip_scale"] <= 1.0
-    assert records[0]["training_stage"] == "geometry"
+    assert records[0]["training_stage"] == "perception"
     assert records[0]["micro_batches"] == 2
     assert records[0]["window_samples"] == 4
     assert records[0]["global_states_seen"] == 0
@@ -252,6 +241,29 @@ def test_terminal_window_zero_fills_inactive_loss_contributions() -> None:
     assert summary["active_loss_task_grasp"] == pytest.approx(0.5)
 
 
+def test_terminal_window_averages_grasp_diagnostics() -> None:
+    summary = Trainer._summarize_terminal_window(
+        [
+            {
+                "task_grasp_effective_fraction": 0.25,
+                "task_grasp_unknown_fraction": 0.75,
+                "task_grasp_top1_positive": 0.2,
+                "task_proposal_recall_at_64": 0.8,
+            },
+            {
+                "task_grasp_effective_fraction": 0.75,
+                "task_grasp_unknown_fraction": 0.25,
+                "task_grasp_top1_positive": 0.6,
+                "task_proposal_recall_at_64": 1.0,
+            },
+        ]
+    )
+    assert summary["task_grasp_effective_fraction"] == pytest.approx(0.5)
+    assert summary["task_grasp_unknown_fraction"] == pytest.approx(0.5)
+    assert summary["task_grasp_top1_positive"] == pytest.approx(0.4)
+    assert summary["task_proposal_recall_at_64"] == pytest.approx(0.9)
+
+
 def test_terminal_weighted_groups_reconcile_with_total_loss() -> None:
     records = [
         {
@@ -267,55 +279,6 @@ def test_terminal_weighted_groups_reconcile_with_total_loss() -> None:
     assert sum(grouped.values()) == pytest.approx(summary["loss_total"])
 
 
-def test_validation_metrics_and_checkpoint_events_are_persisted(tmp_path, capsys) -> None:
-    config = TCDPRGConfig(
-        training=TrainingConfig(
-            device="cpu",
-            amp=False,
-            max_optimizer_steps=1,
-            gradient_accumulation_steps=1,
-            validation_interval=1,
-        ),
-        logging=LoggingConfig(backend="none", log_interval=10),
-        output_dir=str(tmp_path),
-    )
-    model = torch.nn.Linear(3, 1)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    batch = {"x": torch.randn(2, 3)}
-
-    def loss_step(module, current):
-        loss = module(current["x"]).square().mean()
-        return loss, {"loss_total": loss}
-
-    trainer = Trainer(model, optimizer, config, loss_step)
-    trainer.train(
-        [batch],
-        validate=lambda module: {
-            "score_sum": 2.0,
-            "score_count": 4,
-            "metric_sums": {"loss_policy_candidate": 1.2},
-            "metric_counts": {"loss_policy_candidate": 4},
-        },
-    )
-    validation = json.loads((tmp_path / "validation_metrics.jsonl").read_text().strip())
-    assert validation["validation_score"] == pytest.approx(0.5)
-    assert validation["schema_version"] == 3
-    assert validation["training_stage"] == "policy_teacher"
-    assert validation["metrics"]["loss_policy_candidate"] == pytest.approx(0.3)
-    assert validation["improved"]
-    assert (tmp_path / "best.pt").is_file()
-    terminal = capsys.readouterr().out
-    assert "Val [policy_teacher] [0000001]" in terminal
-    assert "score: 0.500000" in terminal
-    assert "policy: 0.3000" in terminal
-    assert "items: 4" in terminal
-    assert "improved: yes" in terminal
-    events = [
-        json.loads(line)["event"]
-        for line in (tmp_path / "training_events.jsonl").read_text().splitlines()
-    ]
-    assert "checkpoint_saved" in events
-    assert "validation_completed" in events
 
 
 def test_validation_overwrites_last_without_step_archives(tmp_path) -> None:
@@ -353,49 +316,6 @@ def test_validation_overwrites_last_without_step_archives(tmp_path) -> None:
     assert list(tmp_path.glob("step_*.pt")) == []
 
 
-def test_terminal_summary_averages_interval_and_shows_generated_coverage(tmp_path, capsys) -> None:
-    config = TCDPRGConfig(
-        training=TrainingConfig(
-            device="cpu",
-            amp=False,
-            max_optimizer_steps=3,
-            gradient_accumulation_steps=1,
-            generated_policy_candidate_cache="generated-cache",
-            generated_policy_candidate_ratio=1.0,
-        ),
-        logging=LoggingConfig(backend="none", log_interval=3),
-        output_dir=str(tmp_path),
-    )
-    model = torch.nn.Linear(3, 1)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    batches = [{"x": torch.randn(2, 3), "marker": torch.tensor(value)} for value in (1.0, 2.0, 3.0)]
-
-    def loss_step(module, batch):
-        differentiable = module(batch["x"]).square().mean() * 0.0
-        loss = differentiable + batch["marker"]
-        return loss, {
-            "loss_total": loss,
-            "loss_policy_candidate": loss,
-            "generated_states": loss.new_tensor(4.0),
-            "generated_states_with_positive": loss.new_tensor(3.0),
-            "generated_effective_policy_rows": loss.new_tensor(2.0),
-            "generated_known_candidates": loss.new_tensor(10.0),
-            "generated_unknown_candidates": loss.new_tensor(5.0),
-            "generated_conflict_candidates": loss.new_tensor(1.0),
-        }
-
-    Trainer(model, optimizer, config, loss_step).train(batches)
-    terminal = capsys.readouterr().out
-    summaries = [line for line in terminal.splitlines() if line.startswith("Train ")]
-    assert len(summaries) == 2
-    assert "Train [policy_generated] [0000003/0000003]" in summaries[-1]
-    assert "loss: 2.5000" in summaries[-1]
-    assert "policy: 2.5000" in summaries[-1]
-    assert "pos_cov: 75.0%" in summaries[-1]
-    assert "eff_rows: 4/8" in summaries[-1]
-    assert "known" not in summaries[-1]
-    assert "unknown" not in summaries[-1]
-    assert "conflict" not in summaries[-1]
 
 
 def test_ten_batch_overfit_smoke(tiny_batch) -> None:
@@ -413,46 +333,6 @@ def test_ten_batch_overfit_smoke(tiny_batch) -> None:
     assert losses[-1] < losses[0]
 
 
-@pytest.mark.real_data
-def test_real_state_group_all_enabled_training_losses_are_finite(dataset_root) -> None:
-    scene_root = dataset_root / "task_clutter_scenes_20_categories"
-    provider = SavedObservationProvider(scene_root, scene_root / "metadata.json", 256)
-    region_root = (
-        dataset_root.parent / "Grasp_20_class_object_3D_model" / "data" / "manual_function_regions"
-    )
-    adapter = TaskOrientedClutterAdapter(
-        dataset_root,
-        observation_provider=provider,
-        point_count=256,
-        functional_region_root=region_root,
-    )
-    batch = collate_unified([adapter.load_sample(1, 0, 0, 0)])
-    config = ModelConfig(feature_dim=32, task_dim=16, activation_checkpointing=False)
-    ablation = AblationConfig(use_gripper_scene_verifier=False)
-    model = TCDPRGModel(
-        config,
-        ablation,
-        GraphConfig(layers=1),
-        RouterConfig(layers=1),
-        BackboneConfig(backend="legacy", attention_points=64),
-    )
-    objective = TCDPRGObjective(
-        adapter.capabilities, config, ablation, LossConfig(), RegionHeadConfig()
-    )
-    loss, terms = objective(model, batch)
-    assert torch.isfinite(loss)
-    assert all(torch.isfinite(value) for value in terms.values())
-    assert int(batch["policy_success_mask"].sum()) > 0
-    assert int(batch["policy_success_mask"].sum()) < int(batch["action_improves_state"].sum())
-    assert not any("approach" in key and key.startswith("push_") for key in terms)
-    assert not any("outcome" in key and key.startswith(("push_", "remove_")) for key in terms)
-    assert not any("depth" in key and "proposal" in key for key in terms)
-    loss.backward()
-    assert all(
-        torch.isfinite(parameter.grad).all()
-        for parameter in model.parameters()
-        if parameter.grad is not None
-    )
 
 
 def test_distributed_training_sampler_avoids_rank_overlap() -> None:

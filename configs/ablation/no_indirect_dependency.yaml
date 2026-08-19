@@ -1,3 +1,0 @@
-# 只使用直接依赖关系，不执行多跳 prerequisite 闭包。
-ablation:
-  use_indirect_dependency_reasoning: false

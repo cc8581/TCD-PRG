@@ -813,7 +813,7 @@ class MainWindow(QMainWindow):
             f"动作类型    {ACTION_NAMES.get(kind, kind)}",
             f"作用实例    {action['acted_object']}",
             f"模型耗时    {prediction.inference_seconds:.3f} s",
-            f"Router 分数  {action.get('router_score', float('nan')):.4f}",
+            f"候选分数    {action.get('proposal_score', float('nan')):.4f}",
         ]
         if kind == 0:
             lines += [

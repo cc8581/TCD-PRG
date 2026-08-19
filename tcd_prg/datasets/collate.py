@@ -175,6 +175,7 @@ def collate_unified(
     samples: list[UnifiedSample], *, grid_size_m: float | None = None,
     training: bool = False, point_count: int = 0,
     graspnet_point_count: int = 0, graspnet_view_index: int = 2,
+    include_graspnet: bool = True,
 ) -> dict[str, Any]:
     if not samples:
         raise ValueError("Cannot collate an empty batch")
@@ -214,22 +215,6 @@ def collate_unified(
     status, _ = _pad([x.evaluation_status for x in candidates], -1)
     outcome, _ = _pad([x.outcome_code for x in candidates], -1)
     success, _ = _pad([x.action_improves_state for x in candidates], False)
-    # 一个动作只要出现在任一成功序列中即为已知正策略候选；其余动作仍需看评价状态。
-    policy_success_arrays = []
-    for sample in samples:
-        successful_ids: list[np.ndarray] = []
-        for sequence in sample.sequences:
-            if len(sequence.policy_action_ids):
-                successful_ids.append(sequence.policy_action_ids)
-            if len(sequence.terminal_action_ids):
-                successful_ids.append(sequence.terminal_action_ids)
-        union = (
-            np.unique(np.concatenate(successful_ids))
-            if successful_ids
-            else np.empty(0, dtype=np.int64)
-        )
-        policy_success_arrays.append(np.isin(sample.candidates.candidate_action_ids, union))
-    policy_success, _ = _pad(policy_success_arrays, False)
     potential_delta, _ = _pad([x.potential_delta for x in candidates], np.nan)
     after_state_valid, _ = _pad([x.after_state_valid for x in candidates], False)
     after_pose_valid, _ = _pad([x.after_pose_valid for x in candidates], False)
@@ -246,11 +231,6 @@ def collate_unified(
         else:
             fill = np.nan
         action_parameters[key], _ = _pad([x.action_parameters[key] for x in candidates], fill)
-    relation_graph = _pad_square([x.state_labels.relation_graph for x in samples])
-    task_block_graph, _ = _pad([x.state_labels.task_block_graph for x in samples])
-    direct_blocker, _ = _pad([x.state_labels.direct_blocker_mask for x in samples], False)
-    indirect_blocker, _ = _pad([x.state_labels.indirect_blocker_mask for x in samples], False)
-    actionable_blocker, _ = _pad([x.state_labels.actionable_blocker_mask for x in samples], False)
     object_count = object_pose.shape[1]
     push_object_known = torch.zeros(
         (len(samples), object_count), dtype=torch.bool
@@ -268,35 +248,16 @@ def collate_unified(
         ]
         push_object_known[row, known] = True
         push_object_positive[row, positive_objects] = True
-    # prerequisite_object_order 转成有向先后关系，仅对有明确顺序的物体对监督。
-    topology_target = torch.zeros(
-        (len(samples), object_count, object_count), dtype=torch.bool
-    )
-    topology_edge_valid = torch.zeros_like(topology_target)
-    for row, sample in enumerate(samples):
-        order = sample.state_labels.prerequisite_object_order.tolist()
-        for earlier_index, earlier in enumerate(order):
-            for later in order[earlier_index + 1 :]:
-                topology_target[row, earlier, later] = True
-                topology_edge_valid[row, earlier, later] = True
-                topology_edge_valid[row, later, earlier] = True
-    remaining_steps_target = []
-    remaining_steps_valid = []
-    for sample in samples:
-        candidates_remaining = []
-        current_state = sample.observation.state_id
-        for sequence in sample.sequences:
-            positions = np.flatnonzero(sequence.state_ids == current_state)
-            for position in positions:
-                candidates_remaining.append(max(0, len(sequence.policy_action_ids) - int(position)))
-        remaining_steps_valid.append(bool(candidates_remaining))
-        remaining_steps_target.append(min(candidates_remaining) if candidates_remaining else 0)
-    camera_payload = _camera_view_payload(
-        observations,
-        view_index=graspnet_view_index,
-        grid_size_m=grid_size_m,
-        training=training,
-        point_count=graspnet_point_count,
+    camera_payload = (
+        _camera_view_payload(
+            observations,
+            view_index=graspnet_view_index,
+            grid_size_m=grid_size_m,
+            training=training,
+            point_count=graspnet_point_count,
+        )
+        if include_graspnet
+        else {}
     )
     source_view, _ = _pad(
         [
@@ -354,7 +315,6 @@ def collate_unified(
         # sequence; the two concepts must never be conflated.
         "action_improves_state": success.bool(),
         "success_mask": success.bool(),  # compatibility alias for reporting
-        "policy_success_mask": policy_success.bool(),
         "potential_delta": potential_delta.float(),
         "after_state_valid": after_state_valid.bool(),
         "after_pose_valid": after_pose_valid.bool(),
@@ -365,16 +325,6 @@ def collate_unified(
             key: value.long() if not value.dtype.is_floating_point else value.float()
             for key, value in action_parameters.items()
         },
-        "relation_graph": relation_graph.float(),
-        "task_block_graph": task_block_graph.float(),
-        "direct_blocker_target": direct_blocker.bool(),
-        "indirect_blocker_target": indirect_blocker.bool(),
-        "actionable_blocker_target": actionable_blocker.bool(),
-        "topology_target": topology_target,
-        "topology_edge_valid": topology_edge_valid,
-        "sequence_topology_valid": torch.tensor(
-            [x.state_labels.sequence_topology_valid for x in samples], dtype=torch.bool
-        ),
         "verified_positive_grasp_count": torch.tensor(
             [x.state_labels.verified_positive_grasp_count for x in samples], dtype=torch.long
         ),
@@ -384,8 +334,6 @@ def collate_unified(
         "remaining_steps": torch.tensor(
             [max(0, 5 - x.state_labels.sequence_depth) for x in samples], dtype=torch.long
         ),
-        "remaining_steps_target": torch.tensor(remaining_steps_target, dtype=torch.float32),
-        "remaining_steps_valid": torch.tensor(remaining_steps_valid, dtype=torch.bool),
         "samples": samples,
         **camera_payload,
     }
@@ -448,8 +396,7 @@ def collate_global_grasp(
 
     The tensor values consumed by the neutral scene backbone and
     ``build_global_grasp_labels`` are constructed with the same helpers and
-    dtypes as ``collate_unified``.  Policy, graph, Push and Verifier-only fields
-    are intentionally not materialized.
+    dtypes as ``collate_unified``.  Task-policy graph/verifier fields are intentionally not materialized.
     """
 
     if not samples:
