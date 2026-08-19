@@ -1,4 +1,4 @@
-"""Task-region residual scorer over frozen GraspNet proposals."""
+"""Task-conditioned scorer over frozen GraspNet proposals."""
 from __future__ import annotations
 
 import torch
@@ -11,12 +11,7 @@ def _rotation_6d(matrix: Tensor) -> Tensor:
 
 
 class TaskGraspScorer(nn.Module):
-    """Re-rank physically plausible GraspNet proposals for a requested task.
-
-    GraspNet provides the physical grasp prior. This scorer learns only a residual
-    task preference, initialized to zero so training starts from the pretrained
-    GraspNet ranking rather than destroying it.
-    """
+    """Predict an independent task score; GraspNet quality is an input feature."""
 
     def __init__(
         self,
@@ -30,7 +25,7 @@ class TaskGraspScorer(nn.Module):
         if dim % heads:
             raise ValueError("feature_dim must be divisible by task_grasp_scorer_heads")
         self.local_radius_m = float(local_radius_m)
-        self.residual_scale = float(residual_scale)
+        del residual_scale
 
         self.geometry = nn.Sequential(
             nn.Linear(12, dim), nn.LayerNorm(dim), nn.GELU(),
@@ -53,9 +48,9 @@ class TaskGraspScorer(nn.Module):
         self.candidate_transformer = nn.TransformerEncoder(
             layer, num_layers=layers, norm=nn.LayerNorm(dim)
         )
-        self.residual_head = nn.Linear(dim, 1)
-        nn.init.zeros_(self.residual_head.weight)
-        nn.init.zeros_(self.residual_head.bias)
+        self.score_head = nn.Linear(dim, 1)
+        nn.init.normal_(self.score_head.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.score_head.bias)
 
     @staticmethod
     def _weighted_pool(
@@ -149,16 +144,14 @@ class TaskGraspScorer(nn.Module):
         refined = self.candidate_transformer(
             safe_candidate, src_key_padding_mask=safe_padding
         )
-        residual = self.residual_head(refined).squeeze(-1)
-        residual = residual.masked_fill(~valid, 0.0)
-        task_logit = gn_logit + self.residual_scale * residual
+        task_logit = self.score_head(refined).squeeze(-1)
         task_logit = task_logit.masked_fill(~valid, -30.0)
 
         return {
             **proposals,
             "quality_logit": task_logit,
             "graspnet_quality_logit": gn_logit,
-            "task_residual_logit": residual,
+            "task_residual_logit": task_logit.detach() * 0.0,
             "task_probability": torch.sigmoid(task_logit),
             "local_support": local_weight.sum(-1),
             "region_support": region_weight.sum(-1),

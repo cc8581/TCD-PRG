@@ -322,8 +322,32 @@ class FrozenGraspNetProposalGenerator(nn.Module):
             if not row_valid[row] or prediction.numel() == 0:
                 continue
             prediction = prediction.to(device=xyz.device, dtype=dtype)
-            ranked = prediction[:, 0].argsort(descending=True, stable=True)[:k]
-            selected = prediction[ranked]
+            quality_order = prediction[:, 0].argsort(descending=True, stable=True)
+            high_count = min(k // 2, prediction.shape[0])
+            selected_indices = quality_order[:high_count].tolist()
+            # Fill the remaining budget with deterministic SE(3)-diverse grasps.
+            # Parallel-jaw symmetry makes R and -R equivalent for this purpose.
+            for candidate in quality_order.tolist():
+                if candidate in selected_indices:
+                    continue
+                if len(selected_indices) >= k:
+                    break
+                keep = True
+                for chosen in selected_indices:
+                    dt = torch.linalg.vector_norm(
+                        prediction[candidate, 13:16] - prediction[chosen, 13:16]
+                    )
+                    axis_cos = (
+                        prediction[candidate, 4:13].reshape(3, 3)[:, 0]
+                        * prediction[chosen, 4:13].reshape(3, 3)[:, 0]
+                    ).sum().abs().clamp(-1.0, 1.0)
+                    dr = torch.rad2deg(torch.acos(axis_cos))
+                    if dt < 0.01 and dr < 12.0:
+                        keep = False
+                        break
+                if keep:
+                    selected_indices.append(candidate)
+            selected = prediction[selected_indices]
             count = len(selected)
             score[row, :count] = selected[:, 0].clamp(0.0, 1.0)
             width[row, :count] = selected[:, 1]

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 from tcd_prg.geometry.se3 import parallel_jaw_rotation_distance
 from tcd_prg.constants import CandidateStatus
@@ -30,6 +31,9 @@ class TaskGraspScoringLoss(nn.Module):
         width_m: float | None = None,
         bce_weight: float = 1.0,
         ranking_weight: float = 1.0,
+        listwise_weight: float = 1.0,
+        hard_weight: float = 0.25,
+        temperature: float = 1.0,
     ) -> None:
         super().__init__()
         # Compatibility-only argument: width is intentionally not proposal identity.
@@ -38,6 +42,9 @@ class TaskGraspScoringLoss(nn.Module):
         self.rotation_deg = float(rotation_deg)
         self.bce_weight = float(bce_weight)
         self.ranking_weight = float(ranking_weight)
+        self.listwise_weight = float(listwise_weight)
+        self.hard_weight = float(hard_weight)
+        self.temperature = float(temperature)
 
     def _match_set(
         self,
@@ -116,6 +123,7 @@ class TaskGraspScoringLoss(nn.Module):
 
         row_effective = positive.any(-1) & negative.any(-1)
         ranking_terms = []
+        listwise_terms = []
         for row in torch.nonzero(row_effective, as_tuple=False).flatten().tolist():
             # Deployment selects the highest-scoring proposal.  Set-level
             # logsumexp is count-sensitive and can be small even when the top
@@ -125,12 +133,26 @@ class TaskGraspScoringLoss(nn.Module):
             pos = loss_logits[row][positive[row]].max()
             neg = loss_logits[row][negative[row]].max()
             ranking_terms.append(torch.nn.functional.softplus(neg - pos))
+            known_logits = loss_logits[row][known[row]] / self.temperature
+            known_positive = positive[row][known[row]]
+            listwise_terms.append(
+                -(torch.logsumexp(known_logits[known_positive], dim=0)
+                  - torch.logsumexp(known_logits, dim=0))
+            )
         ranking = (
             torch.stack(ranking_terms).mean()
             if ranking_terms
             else loss_logits.sum() * 0.0
         )
-        loss = self.bce_weight * bce + self.ranking_weight * ranking
+        listwise = (
+            torch.stack(listwise_terms).mean()
+            if listwise_terms else loss_logits.sum() * 0.0
+        )
+        loss = (
+            self.bce_weight * bce
+            + self.listwise_weight * listwise
+            + self.hard_weight * self.ranking_weight * ranking
+        )
 
         # Proposal-recall diagnostics are measured in frozen GraspNet score order.
         base_logit = prediction.get("graspnet_quality_logit", prediction["quality_logit"])
@@ -224,6 +246,7 @@ class TaskGraspScoringLoss(nn.Module):
             "loss": loss,
             "task_grasp_score_bce": bce.detach(),
             "task_grasp_score_ranking": ranking.detach(),
+            "task_grasp_score_listwise": listwise.detach(),
             "task_grasp_effective_rows": effective_rows,
             "task_grasp_effective_fraction": effective_rows / row_count,
             "task_grasp_supervised_rows": supervised_rows,

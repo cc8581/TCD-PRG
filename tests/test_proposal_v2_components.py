@@ -17,7 +17,7 @@ def test_instance_decoder_shapes_and_auxiliary_outputs():
     assert len(out.aux_outputs) == 2
 
 
-def test_task_grasp_residual_starts_from_graspnet_score():
+def test_task_grasp_score_is_independent_from_graspnet_score():
     scorer = TaskGraspScorer(64, layers=2, heads=8)
     b, k, n = 2, 6, 32
     proposals = {
@@ -35,7 +35,9 @@ def test_task_grasp_residual_starts_from_graspnet_score():
         torch.ones(b, n, dtype=torch.bool), torch.rand(b, n), torch.rand(b, n),
         torch.randn(b, 64), torch.randn(b, 64),
     )
-    assert torch.allclose(output["quality_logit"], proposals["quality_logit"], atol=1e-6)
+    assert output["quality_logit"].shape == proposals["quality_logit"].shape
+    assert torch.isfinite(output["quality_logit"]).all()
+    assert not torch.allclose(output["quality_logit"], proposals["quality_logit"])
 
 
 def test_task_grasp_score_loss_has_proposal_metrics():
