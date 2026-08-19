@@ -95,6 +95,7 @@ def test_camera2_strict_crop_never_falls_back_to_scene(fake_graspnet, tiny_batch
         strict_target_crop=True,
         proposal_count=4,
         input_points=8,
+        selection_mode="quality_diverse",
     )
     assert not bool(output["target_grasp_valid"].any())
     assert not bool(output["valid"].any())

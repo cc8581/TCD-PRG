@@ -64,7 +64,6 @@ def test_policy_heads_match_training_contract(tiny_batch) -> None:
         "object_logits",
         "valid",
         "graspnet_quality_logit",
-        "task_residual_logit",
         "task_probability",
         "local_support",
         "region_support",

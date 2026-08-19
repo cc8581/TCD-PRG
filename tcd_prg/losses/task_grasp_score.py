@@ -30,7 +30,6 @@ class TaskGraspScoringLoss(nn.Module):
         rotation_deg: float = 20.0,
         width_m: float | None = None,
         bce_weight: float = 1.0,
-        ranking_weight: float = 1.0,
         listwise_weight: float = 1.0,
         hard_weight: float = 0.25,
         temperature: float = 1.0,
@@ -41,7 +40,6 @@ class TaskGraspScoringLoss(nn.Module):
         self.translation_m = float(translation_m)
         self.rotation_deg = float(rotation_deg)
         self.bce_weight = float(bce_weight)
-        self.ranking_weight = float(ranking_weight)
         self.listwise_weight = float(listwise_weight)
         self.hard_weight = float(hard_weight)
         self.temperature = float(temperature)
@@ -114,12 +112,13 @@ class TaskGraspScoringLoss(nn.Module):
         known = valid & (positive | negative)
         target = positive.to(logits.dtype)
         loss_logits = logits.float()
-        if known.any():
-            bce = torch.nn.functional.binary_cross_entropy_with_logits(
-                loss_logits[known], target[known].float()
+        bce_terms = [
+            F.binary_cross_entropy_with_logits(
+                loss_logits[row][known[row]], target[row][known[row]].float()
             )
-        else:
-            bce = loss_logits.sum() * 0.0
+            for row in torch.nonzero(known.any(-1), as_tuple=False).flatten().tolist()
+        ]
+        bce = torch.stack(bce_terms).mean() if bce_terms else loss_logits.sum() * 0.0
 
         row_effective = positive.any(-1) & negative.any(-1)
         ranking_terms = []
@@ -151,55 +150,49 @@ class TaskGraspScoringLoss(nn.Module):
         loss = (
             self.bce_weight * bce
             + self.listwise_weight * listwise
-            + self.hard_weight * self.ranking_weight * ranking
+            + self.hard_weight * ranking
         )
 
-        # Proposal-recall diagnostics are measured in frozen GraspNet score order.
-        base_logit = prediction.get("graspnet_quality_logit", prediction["quality_logit"])
-        recalls: dict[str, Tensor] = {}
-        for amount in (16, 32, 64):
-            translation_hit = logits.new_zeros((logits.shape[0],))
-            translation_rotation_hit = logits.new_zeros((logits.shape[0],))
-            applicable = (
-                positive.any(-1)
-                if direct_status is not None
-                else labels["target_valid"].any(-1)
-            )
+        eligible = (
+            torch.ones(logits.shape[0], dtype=torch.bool, device=logits.device)
+            if direct_status is not None else labels["target_valid"].any(-1)
+        )
+        positive_present = positive.any(-1)
+
+        def ranked_recall(
+            ranking_logit: Tensor, amount: int, denominator_mask: Tensor
+        ) -> Tensor:
+            hit = logits.new_zeros(logits.shape[0])
             for row in range(logits.shape[0]):
+                if not bool(denominator_mask[row]):
+                    continue
                 candidates = torch.nonzero(valid[row], as_tuple=False).flatten()
-                if not len(candidates) or not bool(applicable[row]):
+                if not len(candidates):
                     continue
                 order = candidates[
-                    base_logit[row, candidates].argsort(descending=True, stable=True)
+                    ranking_logit[row, candidates].argsort(descending=True, stable=True)
                 ][:amount]
-                if direct_status is not None:
-                    translation_hit[row] = positive[row, order].any().to(
-                        translation_hit.dtype
-                    )
-                else:
-                    targets = torch.nonzero(
-                        labels["target_valid"][row], as_tuple=False
-                    ).flatten()
-                    distance = torch.cdist(
-                        prediction["translation_world"][row, order].float(),
-                        labels["translation_world"][row, targets].float(),
-                    )
-                    translation_hit[row] = (distance <= self.translation_m).any().to(
-                        translation_hit.dtype
-                    )
-                translation_rotation_hit[row] = positive[row, order].any().to(
-                    translation_rotation_hit.dtype
-                )
-            denom = applicable.float().sum().clamp_min(1.0)
-            recalls[f"proposal_translation_recall_at_{amount}"] = (
-                (translation_hit * applicable.float()).sum() / denom
+                hit[row] = positive[row, order].any().float()
+            denominator = denominator_mask.float()
+            return (hit * denominator).sum() / denominator.sum().clamp_min(1.0)
+
+        gn_logit = prediction["graspnet_quality_logit"]
+        recalls: dict[str, Tensor] = {
+            "task_candidate_positive_coverage": (
+                (positive_present & eligible).float().sum()
+                / eligible.float().sum().clamp_min(1.0)
             )
-            recalls[f"proposal_translation_rotation_recall_at_{amount}"] = (
-                (translation_rotation_hit * applicable.float()).sum() / denom
+        }
+        for amount in (1, 5, 10, 16, 32, 64):
+            recalls[f"graspnet_ranked_recall_at_{amount}"] = ranked_recall(
+                gn_logit, amount, eligible
             )
-            recalls[f"task_proposal_recall_at_{amount}"] = recalls[
-                f"proposal_translation_rotation_recall_at_{amount}"
-            ]
+            recalls[f"task_reranked_recall_at_{amount}"] = ranked_recall(
+                logits, amount, eligible
+            )
+            recalls[f"task_conditional_recall_at_{amount}"] = ranked_recall(
+                logits, amount, eligible & positive_present
+            )
 
         top1_positive = logits.new_zeros((logits.shape[0],))
         top1_known_positive = logits.new_zeros((logits.shape[0],))
@@ -238,6 +231,12 @@ class TaskGraspScoringLoss(nn.Module):
         positive_count = positive.float().sum().detach()
         wrong_region_count = negative.float().sum().detach()
         unknown_count = unknown.float().sum().detach()
+        unknown_no_acronym = labels.get(
+            "proposal_unknown_no_acronym_match", torch.zeros_like(valid)
+        ).bool() & valid
+        unknown_region = labels.get(
+            "proposal_unknown_region_unlabeled", torch.zeros_like(valid)
+        ).bool() & valid
         supervised_rows = supervised.float().sum().detach()
         effective_rows = row_effective.float().sum().detach()
         row_count = max(1, logits.shape[0])
@@ -256,6 +255,14 @@ class TaskGraspScoringLoss(nn.Module):
             "task_grasp_known_proposals": known.float().sum().detach(),
             "task_grasp_unknown_proposals": unknown_count,
             "task_grasp_unknown_fraction": unknown_count / proposal_count,
+            "task_grasp_unknown_no_acronym_fraction": (
+                unknown_no_acronym.float().sum()
+                / valid.float().sum().clamp_min(1.0)
+            ),
+            "task_grasp_unknown_region_fraction": (
+                unknown_region.float().sum()
+                / valid.float().sum().clamp_min(1.0)
+            ),
             "task_grasp_effective_ranking_rows": effective_rows,
             # Stable protocol names used by training dashboards.
             "task_positive_proposals": positive_count,

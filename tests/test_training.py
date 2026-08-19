@@ -248,20 +248,20 @@ def test_terminal_window_averages_grasp_diagnostics() -> None:
                 "task_grasp_effective_fraction": 0.25,
                 "task_grasp_unknown_fraction": 0.75,
                 "task_grasp_top1_positive": 0.2,
-                "task_proposal_recall_at_64": 0.8,
+                "graspnet_ranked_recall_at_64": 0.8,
             },
             {
                 "task_grasp_effective_fraction": 0.75,
                 "task_grasp_unknown_fraction": 0.25,
                 "task_grasp_top1_positive": 0.6,
-                "task_proposal_recall_at_64": 1.0,
+                "graspnet_ranked_recall_at_64": 1.0,
             },
         ]
     )
     assert summary["task_grasp_effective_fraction"] == pytest.approx(0.5)
     assert summary["task_grasp_unknown_fraction"] == pytest.approx(0.5)
     assert summary["task_grasp_top1_positive"] == pytest.approx(0.4)
-    assert summary["task_proposal_recall_at_64"] == pytest.approx(0.9)
+    assert summary["graspnet_ranked_recall_at_64"] == pytest.approx(0.9)
 
 
 def test_terminal_weighted_groups_reconcile_with_total_loss() -> None:

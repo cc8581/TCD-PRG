@@ -56,12 +56,14 @@ class TCDPRGObjective(nn.Module):
         loss_config: LossConfig | None = None,
         region_config: RegionHeadConfig | None = None,
         acronym_object_grasp_database: str = "",
+        use_teacher_target_crop: bool = False,
     ) -> None:
         super().__init__()
         self.model_config = model_config
         self.ablation = ablation
         loss_config = loss_config or LossConfig()
         self.internal_weights = dict(loss_config.internal)
+        self.use_teacher_target_crop = bool(use_teacher_target_crop)
         region_config = region_config or RegionHeadConfig()
 
         self.instance = InstanceSetLoss(
@@ -105,6 +107,10 @@ class TCDPRGObjective(nn.Module):
             translation_m=model_config.task_grasp_match_translation_m,
             rotation_deg=model_config.task_grasp_match_rotation_deg,
             width_m=model_config.task_grasp_match_width_m,
+            bce_weight=float(self.internal_weights.get("task_grasp_bce", 1.0)),
+            listwise_weight=float(self.internal_weights.get("task_grasp_listwise", 1.0)),
+            hard_weight=float(self.internal_weights.get("task_grasp_hard", 0.25)),
+            temperature=float(self.internal_weights.get("task_grasp_temperature", 1.0)),
         )
         self.ag_width = AGWidthLoss(
             translation_m=model_config.task_grasp_match_translation_m,
@@ -188,12 +194,16 @@ class TCDPRGObjective(nn.Module):
     @torch.no_grad()
     def _acronym_proposal_status(
         self, prediction: dict[str, Tensor], batch: dict[str, Any]
-    ) -> Tensor | None:
+    ) -> dict[str, Tensor] | None:
         if self.acronym_database_root is None or "target_model_id" not in batch:
             return None
         proposal_status = torch.full_like(
             prediction["valid"], int(CandidateStatus.UNKNOWN_UNTESTED),
             dtype=torch.int8,
+        )
+        unknown_no_acronym = torch.zeros_like(prediction["valid"], dtype=torch.bool)
+        unknown_region_unlabeled = torch.zeros_like(
+            prediction["valid"], dtype=torch.bool
         )
         for row, model_id in enumerate(batch["target_model_id"]):
             object_scale = float(batch["target_object_scale"][row])
@@ -217,6 +227,10 @@ class TCDPRGObjective(nn.Module):
             )["status"]
             status = intrinsic.clone()
             intrinsic_positive = intrinsic == int(CandidateStatus.POSITIVE)
+            unknown_no_acronym[row] = (
+                prediction["valid"][row].bool()
+                & (intrinsic == int(CandidateStatus.UNKNOWN_UNTESTED))
+            )
             if "region_valid" in batch and bool(intrinsic_positive.any()):
                 domain = (
                     batch["point_mask"][row].bool()
@@ -231,14 +245,20 @@ class TCDPRGObjective(nn.Module):
                     point_index = indices[nearest]
                     region_known = batch["region_valid"][row, point_index].bool()
                     in_region = batch["region_target"][row, point_index].bool()
-                    status[intrinsic_positive & ~region_known] = int(
+                    region_unknown = intrinsic_positive & ~region_known
+                    status[region_unknown] = int(
                         CandidateStatus.UNKNOWN_UNTESTED
                     )
+                    unknown_region_unlabeled[row] = region_unknown
                     status[intrinsic_positive & region_known & ~in_region] = int(
                         CandidateStatus.NEGATIVE
                     )
             proposal_status[row] = status
-        return proposal_status
+        return {
+            "status": proposal_status,
+            "unknown_no_acronym_match": unknown_no_acronym,
+            "unknown_region_unlabeled": unknown_region_unlabeled,
+        }
 
     @classmethod
     def _listwise_active_rows(
@@ -430,7 +450,7 @@ class TCDPRGObjective(nn.Module):
             else None
         )
         model_view = self._model_view(
-            batch, include_grasp_teacher=has_grasp
+            batch, include_grasp_teacher=(has_grasp and self.use_teacher_target_crop)
         )
         if training_hints is not None:
             model_view["training_hints"] = {
@@ -493,9 +513,17 @@ class TCDPRGObjective(nn.Module):
             if output.get("task_grasp") is None:
                 raise RuntimeError("task_grasp loss enabled but Grasp forward was skipped")
             task_labels = build_grasp_proposal_labels(batch, self.model_config)
-            acronym_status = self._acronym_proposal_status(output["task_grasp"], batch)
-            if acronym_status is not None:
-                task_labels["proposal_status"] = acronym_status
+            proposal_supervision = self._acronym_proposal_status(
+                output["task_grasp"], batch
+            )
+            if proposal_supervision is not None:
+                task_labels["proposal_status"] = proposal_supervision["status"]
+                task_labels["proposal_unknown_no_acronym_match"] = (
+                    proposal_supervision["unknown_no_acronym_match"]
+                )
+                task_labels["proposal_unknown_region_unlabeled"] = (
+                    proposal_supervision["unknown_region_unlabeled"]
+                )
             score_losses = self.task_grasp(output["task_grasp"], task_labels)
             width_losses = self.ag_width(output["task_grasp"], task_labels)
             score_losses["task_grasp_score_loss"] = score_losses["loss"].detach()

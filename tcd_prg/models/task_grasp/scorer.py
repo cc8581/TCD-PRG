@@ -19,13 +19,11 @@ class TaskGraspScorer(nn.Module):
         layers: int = 2,
         heads: int = 8,
         local_radius_m: float = 0.08,
-        residual_scale: float = 1.0,
     ) -> None:
         super().__init__()
         if dim % heads:
             raise ValueError("feature_dim must be divisible by task_grasp_scorer_heads")
         self.local_radius_m = float(local_radius_m)
-        del residual_scale
 
         self.geometry = nn.Sequential(
             nn.Linear(12, dim), nn.LayerNorm(dim), nn.GELU(),
@@ -151,7 +149,6 @@ class TaskGraspScorer(nn.Module):
             **proposals,
             "quality_logit": task_logit,
             "graspnet_quality_logit": gn_logit,
-            "task_residual_logit": task_logit.detach() * 0.0,
             "task_probability": torch.sigmoid(task_logit),
             "local_support": local_weight.sum(-1),
             "region_support": region_weight.sum(-1),

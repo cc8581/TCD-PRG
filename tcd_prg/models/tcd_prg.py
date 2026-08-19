@@ -121,6 +121,10 @@ class TCDPRGModel(nn.Module):
             cylinder_radius=graspnet_config.cylinder_radius,
             hmin=graspnet_config.hmin,
             hmax_list=graspnet_config.hmax_list,
+            diversity_quality_fraction=graspnet_config.diversity_quality_fraction,
+            diversity_translation_m=graspnet_config.diversity_translation_m,
+            diversity_rotation_deg=graspnet_config.diversity_rotation_deg,
+            diversity_pool_factor=graspnet_config.diversity_pool_factor,
         )
         self.graspnet_config = graspnet_config
         self.target_prompt_min_support = float(c.target_prompt_min_support)
@@ -130,7 +134,6 @@ class TCDPRGModel(nn.Module):
             layers=c.task_grasp_scorer_layers,
             heads=c.task_grasp_scorer_heads,
             local_radius_m=c.task_grasp_local_radius_m,
-            residual_scale=c.task_grasp_residual_scale,
         )
         self.ag_width = AGWidthAdapter(
             c.feature_dim,
@@ -218,6 +221,7 @@ class TCDPRGModel(nn.Module):
             strict_target_crop=False,
             proposal_count=self.graspnet_config.global_proposals,
             input_points=self.graspnet_config.scene_input_points,
+            selection_mode=self.graspnet_config.global_selection_mode,
         )
         width = self.ag_width(
             proposals,
@@ -237,6 +241,7 @@ class TCDPRGModel(nn.Module):
         strict_target_crop: bool,
         proposal_count: int,
         input_points: int,
+        selection_mode: str,
         target_identity_valid: Tensor | None = None,
         target_crop_mask_override: Tensor | None = None,
     ) -> dict[str, Tensor]:
@@ -325,6 +330,7 @@ class TCDPRGModel(nn.Module):
             instance_probability=camera_instance_probability,
             proposal_count=proposal_count,
             input_points=input_points,
+            selection_mode=selection_mode,
         )
         translation_camera = proposal["translation_world"]
         rotation_camera_graspnet = proposal["rotation_matrix"]
@@ -503,6 +509,7 @@ class TCDPRGModel(nn.Module):
             strict_target_crop=True,
             proposal_count=self.graspnet_config.target_proposals,
             input_points=self.graspnet_config.target_input_points,
+            selection_mode=self.graspnet_config.target_selection_mode,
             target_identity_valid=target_identity_valid,
             target_crop_mask_override=teacher_crop,
         )

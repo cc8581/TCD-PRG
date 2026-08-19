@@ -20,8 +20,9 @@ def fake_graspnet(monkeypatch):
         instance_probability=None,
         proposal_count=None,
         input_points=None,
+        selection_mode="quality_topk",
     ):
-        del importance, input_points
+        del importance, input_points, selection_mode
         batch, points, _ = xyz.shape
         count = int(proposal_count or self.proposal_count)
         base = torch.arange(count, device=xyz.device) % points

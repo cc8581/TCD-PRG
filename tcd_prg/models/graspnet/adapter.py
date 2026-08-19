@@ -17,6 +17,8 @@ import torch
 from torch import Tensor, nn
 
 from tcd_prg.paths import project_path
+from tcd_prg.geometry.camera import graspnet_to_tcd_rotation
+from tcd_prg.geometry.se3 import parallel_jaw_rotation_distance
 
 
 def _load_official_graspnet(source_root: str | Path):
@@ -65,6 +67,10 @@ class FrozenGraspNetProposalGenerator(nn.Module):
         cylinder_radius: float = 0.05,
         hmin: float = -0.02,
         hmax_list: tuple[float, ...] = (0.01, 0.02, 0.03, 0.04),
+        diversity_quality_fraction: float = 0.5,
+        diversity_translation_m: float = 0.010,
+        diversity_rotation_deg: float = 12.0,
+        diversity_pool_factor: int = 4,
     ) -> None:
         super().__init__()
         self.source_root = str(source_root)
@@ -78,6 +84,10 @@ class FrozenGraspNetProposalGenerator(nn.Module):
         self.cylinder_radius = float(cylinder_radius)
         self.hmin = float(hmin)
         self.hmax_list = tuple(float(v) for v in hmax_list)
+        self.diversity_quality_fraction = float(diversity_quality_fraction)
+        self.diversity_translation_m = float(diversity_translation_m)
+        self.diversity_rotation_deg = float(diversity_rotation_deg)
+        self.diversity_pool_factor = int(diversity_pool_factor)
         self.pred_decode = None
         self.official_get_loss = None
         # Unregistered on purpose: frozen external model must not enter TCD-PRG
@@ -280,6 +290,62 @@ class FrozenGraspNetProposalGenerator(nn.Module):
             result[row, candidates] = points[distance.argmin(-1)]
         return result
 
+    def _select_proposal_indices(
+        self, prediction: Tensor, requested: int, selection_mode: str
+    ) -> Tensor:
+        finite = torch.isfinite(prediction[:, :16]).all(-1)
+        candidates = torch.nonzero(finite, as_tuple=False).flatten()
+        if not len(candidates):
+            return candidates
+        quality_order = candidates[
+            prediction[candidates, 0].argsort(descending=True, stable=True)
+        ]
+        if selection_mode == "quality_topk":
+            return quality_order[:requested]
+        if selection_mode != "quality_diverse":
+            raise ValueError(f"Unsupported GraspNet selection mode: {selection_mode}")
+
+        pool_count = min(len(quality_order), requested * self.diversity_pool_factor)
+        pool = quality_order[:pool_count]
+        quality_count = min(
+            requested,
+            pool_count,
+            max(1, int(requested * self.diversity_quality_fraction)),
+        )
+        rotation_gn = prediction[pool, 4:13].reshape(-1, 3, 3).float()
+        rotation_tcd = graspnet_to_tcd_rotation(rotation_gn)
+        translation = prediction[pool, 13:16].float()
+        translation_distance = torch.cdist(translation, translation)
+        rotation_distance = torch.rad2deg(
+            parallel_jaw_rotation_distance(
+                rotation_tcd[:, None], rotation_tcd[None, :]
+            )
+        )
+        duplicate = (
+            (translation_distance < self.diversity_translation_m)
+            & (rotation_distance < self.diversity_rotation_deg)
+        ).cpu()
+        selected_positions = list(range(quality_count))
+        selected_set = set(selected_positions)
+        for position in range(quality_count, pool_count):
+            if len(selected_positions) >= requested:
+                break
+            if selected_positions and bool(duplicate[position, selected_positions].any()):
+                continue
+            selected_positions.append(position)
+            selected_set.add(position)
+        if len(selected_positions) < min(requested, pool_count):
+            for position in range(pool_count):
+                if position in selected_set:
+                    continue
+                selected_positions.append(position)
+                if len(selected_positions) >= requested:
+                    break
+        positions = torch.tensor(
+            selected_positions[:requested], dtype=torch.long, device=prediction.device
+        )
+        return pool[positions]
+
     def forward(
         self,
         xyz: Tensor,
@@ -289,6 +355,7 @@ class FrozenGraspNetProposalGenerator(nn.Module):
         instance_probability: Tensor | None = None,
         proposal_count: int | None = None,
         input_points: int | None = None,
+        selection_mode: str = "quality_topk",
     ) -> dict[str, Tensor]:
         network = self._ensure_loaded(xyz.device)
         self.finish_finetuning()
@@ -322,31 +389,9 @@ class FrozenGraspNetProposalGenerator(nn.Module):
             if not row_valid[row] or prediction.numel() == 0:
                 continue
             prediction = prediction.to(device=xyz.device, dtype=dtype)
-            quality_order = prediction[:, 0].argsort(descending=True, stable=True)
-            high_count = min(k // 2, prediction.shape[0])
-            selected_indices = quality_order[:high_count].tolist()
-            # Fill the remaining budget with deterministic SE(3)-diverse grasps.
-            # Parallel-jaw symmetry makes R and -R equivalent for this purpose.
-            for candidate in quality_order.tolist():
-                if candidate in selected_indices:
-                    continue
-                if len(selected_indices) >= k:
-                    break
-                keep = True
-                for chosen in selected_indices:
-                    dt = torch.linalg.vector_norm(
-                        prediction[candidate, 13:16] - prediction[chosen, 13:16]
-                    )
-                    axis_cos = (
-                        prediction[candidate, 4:13].reshape(3, 3)[:, 0]
-                        * prediction[chosen, 4:13].reshape(3, 3)[:, 0]
-                    ).sum().abs().clamp(-1.0, 1.0)
-                    dr = torch.rad2deg(torch.acos(axis_cos))
-                    if dt < 0.01 and dr < 12.0:
-                        keep = False
-                        break
-                if keep:
-                    selected_indices.append(candidate)
+            selected_indices = self._select_proposal_indices(
+                prediction, k, selection_mode
+            )
             selected = prediction[selected_indices]
             count = len(selected)
             score[row, :count] = selected[:, 0].clamp(0.0, 1.0)
@@ -354,7 +399,7 @@ class FrozenGraspNetProposalGenerator(nn.Module):
             depth[row, :count] = selected[:, 3]
             rotation[row, :count] = selected[:, 4:13].reshape(-1, 3, 3)
             translation[row, :count] = selected[:, 13:16]
-            valid[row, :count] = torch.isfinite(selected[:, :16]).all(-1)
+            valid[row, :count] = True
 
         attention_point_index = self._nearest_scene_point(
             translation, xyz, point_mask.bool(), valid

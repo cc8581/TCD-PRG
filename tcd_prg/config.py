@@ -87,6 +87,13 @@ class GraspNetConfig:
     target_input_points: int = 20_000
     global_proposals: int = 128
     target_proposals: int = 128
+    target_selection_mode: str = "quality_diverse"
+    global_selection_mode: str = "quality_topk"
+    diversity_quality_fraction: float = 0.5
+    diversity_translation_m: float = 0.010
+    diversity_rotation_deg: float = 12.0
+    diversity_pool_factor: int = 4
+    use_teacher_target_crop_for_task_training: bool = False
     camera_view_index: int = 2
     target_crop_probability: float = 0.5
     target_min_crop_points: int = 32
@@ -165,7 +172,6 @@ class ModelConfig:
     task_grasp_scorer_layers: int = 2
     task_grasp_scorer_heads: int = 8
     task_grasp_local_radius_m: float = 0.08
-    task_grasp_residual_scale: float = 1.0
     pick_remove_candidates: int = 16
     push_candidates: int = 16
     # push_candidates 是接触点预算；每个点再展开多个方向，最终总量受 max_push_candidates 限制。
@@ -332,6 +338,10 @@ class LossConfig:
         "region_focal": 1.0,
         "region_dice": 1.0,
         "region_visibility": 0.2,
+        "task_grasp_bce": 1.0,
+        "task_grasp_listwise": 1.0,
+        "task_grasp_hard": 0.25,
+        "task_grasp_temperature": 1.0,
     })
 
     def family_weights(self) -> dict[str, float]:
@@ -663,6 +673,33 @@ class TCDPRGConfig:
             raise ValueError("GraspNet target_crop_probability must lie in (0,1)")
         if self.graspnet.camera_transfer_max_distance_m <= 0:
             raise ValueError("GraspNet camera_transfer_max_distance_m must be positive")
+        selection_modes = {"quality_topk", "quality_diverse"}
+        if self.graspnet.target_selection_mode not in selection_modes:
+            raise ValueError(
+                "graspnet.target_selection_mode must be quality_topk or quality_diverse"
+            )
+        if self.graspnet.global_selection_mode not in selection_modes:
+            raise ValueError(
+                "graspnet.global_selection_mode must be quality_topk or quality_diverse"
+            )
+        if not 0.0 < self.graspnet.diversity_quality_fraction <= 1.0:
+            raise ValueError("graspnet.diversity_quality_fraction must be in (0,1]")
+        if self.graspnet.diversity_translation_m <= 0:
+            raise ValueError("graspnet.diversity_translation_m must be positive")
+        if self.graspnet.diversity_rotation_deg <= 0:
+            raise ValueError("graspnet.diversity_rotation_deg must be positive")
+        if self.graspnet.diversity_pool_factor < 1:
+            raise ValueError("graspnet.diversity_pool_factor must be >= 1")
+        task_bce = self.losses.internal.get("task_grasp_bce", 1.0)
+        task_list = self.losses.internal.get("task_grasp_listwise", 1.0)
+        task_hard = self.losses.internal.get("task_grasp_hard", 0.25)
+        task_temp = self.losses.internal.get("task_grasp_temperature", 1.0)
+        if min(task_bce, task_list, task_hard) < 0:
+            raise ValueError("TaskGrasp internal loss weights must be non-negative")
+        if task_bce + task_list + task_hard <= 0:
+            raise ValueError("At least one TaskGrasp loss weight must be positive")
+        if task_temp <= 0:
+            raise ValueError("task_grasp_temperature must be positive")
         if self.model.push_direction_transformer_layers <= 0:
             raise ValueError("push_direction_transformer_layers must be positive")
         if (

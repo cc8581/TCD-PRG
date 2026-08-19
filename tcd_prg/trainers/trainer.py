@@ -99,9 +99,16 @@ class Trainer:
         "task_grasp_top1_known_positive",
         "task_grasp_top1_unknown",
         "task_grasp_top1_known_negative",
-        "task_proposal_recall_at_16",
-        "task_proposal_recall_at_32",
-        "task_proposal_recall_at_64",
+        "task_candidate_positive_coverage",
+        "graspnet_ranked_recall_at_16",
+        "graspnet_ranked_recall_at_32",
+        "graspnet_ranked_recall_at_64",
+        "task_reranked_recall_at_1",
+        "task_reranked_recall_at_5",
+        "task_reranked_recall_at_10",
+        "task_conditional_recall_at_1",
+        "task_grasp_unknown_no_acronym_fraction",
+        "task_grasp_unknown_region_fraction",
     }
     GRADIENT_GROUPS = {
         "encoder": ("encoder",),
@@ -294,11 +301,20 @@ class Trainer:
                 (
                     f"sup: {float(record.get('active_loss_task_grasp', 0.0)):.0%}",
                     f"rank: {float(record.get('task_grasp_effective_fraction', 0.0)):.0%}",
-                    "R16/32/64: "
-                    f"{float(record.get('task_proposal_recall_at_16', 0.0)):.0%}/"
-                    f"{float(record.get('task_proposal_recall_at_32', 0.0)):.0%}/"
-                    f"{float(record.get('task_proposal_recall_at_64', 0.0)):.0%}",
+                    f"cov: {float(record.get('task_candidate_positive_coverage', 0.0)):.0%}",
+                    "GN-R16/32/64: "
+                    f"{float(record.get('graspnet_ranked_recall_at_16', 0.0)):.0%}/"
+                    f"{float(record.get('graspnet_ranked_recall_at_32', 0.0)):.0%}/"
+                    f"{float(record.get('graspnet_ranked_recall_at_64', 0.0)):.0%}",
+                    "Task-R1/5/10: "
+                    f"{float(record.get('task_reranked_recall_at_1', 0.0)):.0%}/"
+                    f"{float(record.get('task_reranked_recall_at_5', 0.0)):.0%}/"
+                    f"{float(record.get('task_reranked_recall_at_10', 0.0)):.0%}",
+                    f"cond-R1: {float(record.get('task_conditional_recall_at_1', 0.0)):.0%}",
                     f"unk: {float(record.get('task_grasp_unknown_fraction', 0.0)):.0%}",
+                    "unk-src: "
+                    f"{float(record.get('task_grasp_unknown_no_acronym_fraction', 0.0)):.0%}/"
+                    f"{float(record.get('task_grasp_unknown_region_fraction', 0.0)):.0%}",
                     f"top1+: {float(record.get('task_grasp_top1_positive', 0.0)):.0%}",
                     f"known+: {float(record.get('task_grasp_top1_known_positive', 0.0)):.0%}",
                     f"winU/N: {float(record.get('task_grasp_top1_unknown', 0.0)):.0%}/"
