@@ -28,6 +28,87 @@ from .types import GlobalGraspSample, PushObjectStateGroup, UnifiedSample
 
 
 @dataclass(frozen=True, slots=True)
+class StageBBinarySample:
+    sample: UnifiedSample
+    translation_world: np.ndarray
+    rotation_matrix: np.ndarray
+    label: np.ndarray
+
+
+class StageBBinaryDataset(Dataset[StageBBinarySample]):
+    """Immutable GraspNet-proposal binary records for Stage-B training."""
+
+    def __init__(self, adapter: DatasetAdapter, root: str | Path, split: str = "train", max_groups: int | None = None) -> None:
+        self.adapter = adapter
+        self.root = Path(root)
+        manifest_path = self.root / "manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Stage-B binary manifest does not exist: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("schema_version") != "tcd_prg_stageb_binary_v1":
+            raise ValueError("Unsupported Stage-B binary dataset schema")
+        records = [record for record in manifest["records"] if record["split"] == split]
+        if max_groups is not None:
+            records = records[:max_groups]
+        if not records:
+            raise RuntimeError(f"Stage-B binary dataset has no {split!r} records")
+        if any(
+            "candidate_count" not in record or "positive_count" not in record
+            for record in records
+        ):
+            raise ValueError("Stage-B manifest is missing binary balance counts")
+        positives = sum(int(record["positive_count"]) for record in records)
+        candidates = sum(int(record["candidate_count"]) for record in records)
+        negatives = candidates - positives
+        if positives <= 0 or negatives < positives or negatives > 2 * positives:
+            raise ValueError(
+                "Stage-B binary dataset must keep positive:negative between 1:1 and 1:2"
+            )
+        self.records = tuple(records)
+        self.source_group_count = len(records)
+        self.selected_group_count = len(records)
+        self.units = tuple(
+            StateGroupUnit(
+                int(record["scene_id"]), int(record["state_id"]),
+                int(record["task_index"]), int(record["group_index"]), "binary_grasp",
+            )
+            for record in records
+        )
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    @property
+    def stratum_counts(self) -> dict[str, int]:
+        return {"binary_grasp": len(self.records)}
+
+    def __getitem__(self, index: int) -> StageBBinarySample:
+        record = self.records[index]
+        path = Path(record["path"])
+        if not path.is_absolute():
+            path = self.root / path
+        payload = np.load(path)
+        translation = payload["translation_world"].astype(np.float32)
+        rotation = payload["rotation_matrix"].astype(np.float32)
+        label = payload["task_valid"].astype(np.bool_)
+        count = len(label)
+        if translation.shape != (count, 3) or rotation.shape != (count, 3, 3) or count == 0:
+            raise ValueError(f"Invalid Stage-B binary record: {path}")
+        if not np.isfinite(translation).all() or not np.isfinite(rotation).all():
+            raise ValueError(f"Non-finite Stage-B pose in {path}")
+        if count != int(record["candidate_count"]) or int(label.sum()) != int(
+            record["positive_count"]
+        ):
+            raise ValueError(f"Stage-B manifest count mismatch: {path}")
+        sample = self.adapter.load_sample(
+            int(record["scene_id"]), int(record["state_id"]),
+            int(record["task_index"]), int(record["group_index"]),
+            include_global_grasps=False,
+        )
+        return StageBBinarySample(sample, translation, rotation, label)
+
+
+@dataclass(frozen=True, slots=True)
 class StateGroupUnit:
     scene_id: int
     state_id: int

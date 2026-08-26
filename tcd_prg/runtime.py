@@ -138,6 +138,24 @@ class UnifiedBatchCollator:
 
 
 @dataclass(slots=True)
+class StageBBinaryBatchCollator:
+    config: TCDPRGConfig
+    training: bool = True
+
+    def __call__(self, samples: list[Any]) -> dict[str, Any]:
+        from tcd_prg.datasets.collate import collate_stageb_binary
+
+        grid_size = (
+            self.config.backbone.grid_size_m
+            if self.config.backbone.backend == "point_transformer_v3" else None
+        )
+        return collate_stageb_binary(
+            samples, grid_size_m=grid_size, training=self.training,
+            point_count=self.config.dataset.scene_points,
+        )
+
+
+@dataclass(slots=True)
 class GlobalGraspBatchCollator:
     """Pickle-safe minimal collator for direct Global Grasp supervision."""
 

@@ -14,13 +14,14 @@ from tcd_prg.planners.tcd_policy import TCDPRGPolicy
 
 
 def test_minimal_stage_configs_load() -> None:
-    for path in (
-        "configs/stage/perception.yaml",
-        "configs/stage/grasp.yaml",
-        "configs/stage/push.yaml",
+    for path, stage in (
+        ("configs/stage/perception.yaml", "perception"),
+        ("configs/stage/grasp.yaml", "grasp"),
+        ("configs/stage/push.yaml", "push"),
     ):
         config = load_config(path)
         assert config.ablation.use_task_region_condition
+        assert config.training.stage == stage
 
 
 

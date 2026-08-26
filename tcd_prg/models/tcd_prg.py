@@ -16,6 +16,7 @@ from tcd_prg.geometry.camera import (
     look_at_rotation_world_camera,
     world_to_camera_points,
 )
+from tcd_prg.paths import project_path
 
 from .backbones import (
     PointTransformerV3SceneGeometryBackbone,
@@ -24,7 +25,7 @@ from .backbones import (
 from .graspnet import FrozenGraspNetProposalGenerator
 from .push import PushHead
 from .region import TaskRegionHead
-from .task_grasp import AGWidthAdapter, TaskGraspScorer
+from .task_grasp import TaskGraspEvaluator
 
 
 SENSOR_KEYS = frozenset({
@@ -32,7 +33,6 @@ SENSOR_KEYS = frozenset({
     "graspnet_xyz_world", "graspnet_point_mask",
     "camera2_eye_world", "camera2_target_world", "camera2_up_world",
     "camera2_valid",
-    "teacher_target_crop_mask", "teacher_target_identity_valid",
 })
 TASK_KEYS = frozenset({
     "task_category_id", "task_region_id",
@@ -129,16 +129,11 @@ class TCDPRGModel(nn.Module):
         self.graspnet_config = graspnet_config
         self.target_prompt_min_support = float(c.target_prompt_min_support)
         self.target_prompt_min_margin = float(c.target_prompt_min_margin)
-        self.task_grasp = TaskGraspScorer(
+        self.task_grasp = TaskGraspEvaluator(
             c.feature_dim,
-            layers=c.task_grasp_scorer_layers,
-            heads=c.task_grasp_scorer_heads,
-            local_radius_m=c.task_grasp_local_radius_m,
-        )
-        self.ag_width = AGWidthAdapter(
-            c.feature_dim,
-            max_width_m=c.max_grasp_width_m,
-            local_radius_m=c.task_grasp_local_radius_m,
+            project_path(c.task_grasp_gripper_geometry),
+            scene_points=c.task_grasp_scene_points,
+            gripper_points=c.task_grasp_gripper_points,
         )
         self.push = PushHead(
             c.feature_dim,
@@ -223,14 +218,7 @@ class TCDPRGModel(nn.Module):
             input_points=self.graspnet_config.scene_input_points,
             selection_mode=self.graspnet_config.global_selection_mode,
         )
-        width = self.ag_width(
-            proposals,
-            scene.point_features,
-            sensor["xyz"],
-            sensor["point_mask"],
-            sensor["point_mask"].to(sensor["xyz"].dtype),
-        )
-        return {**proposals, **width}
+        return proposals
 
     def _forward_camera_graspnet(
         self,
@@ -495,44 +483,28 @@ class TCDPRGModel(nn.Module):
         encoded: Any,
         sensor: dict[str, Tensor],
         region: dict[str, Tensor],
+        candidates: Mapping[str, Tensor] | None = None,
     ) -> dict[str, Tensor]:
-        target_identity_valid = self._target_identity_gate(encoded)
-        teacher_crop = sensor.get("teacher_target_crop_mask") if self.training else None
-        if teacher_crop is not None:
-            target_identity_valid = sensor.get(
-                "teacher_target_identity_valid", teacher_crop.bool().any(-1)
-            ).bool()
-        target_proposals = self._forward_camera_graspnet(
-            sensor,
-            target_probability=encoded.target_instance_probability,
-            instance_probability=encoded.instance.mask_probability,
-            strict_target_crop=True,
-            proposal_count=self.graspnet_config.target_proposals,
-            input_points=self.graspnet_config.target_input_points,
-            selection_mode=self.graspnet_config.target_selection_mode,
-            target_identity_valid=target_identity_valid,
-            target_crop_mask_override=teacher_crop,
-        )
-        target_proposals["target_hard_mask_fused"] = (
-            encoded.target_instance_probability
-            >= self.graspnet_config.target_crop_probability
-        ) & sensor["point_mask"].bool()
-        target_proposals["target_identity_teacher_forced"] = torch.full_like(
-            target_identity_valid, teacher_crop is not None, dtype=torch.bool
-        )
+        if candidates is None:
+            target_identity_valid = self._target_identity_gate(encoded)
+            target_proposals = self._forward_camera_graspnet(
+                sensor,
+                target_probability=encoded.target_instance_probability,
+                instance_probability=encoded.instance.mask_probability,
+                strict_target_crop=True,
+                proposal_count=self.graspnet_config.target_proposals,
+                input_points=self.graspnet_config.target_input_points,
+                selection_mode=self.graspnet_config.target_selection_mode,
+                target_identity_valid=target_identity_valid,
+                target_crop_mask_override=None,
+            )
+        else:
+            target_proposals = {key: value for key, value in candidates.items()}
         fp32_proposals = {
             key: value.float() if value.is_floating_point() else value
             for key, value in target_proposals.items()
         }
         with torch.autocast(device_type=sensor["xyz"].device.type, enabled=False):
-            target_width = self.ag_width(
-                fp32_proposals,
-                encoded.point_features.float(),
-                sensor["xyz"].float(),
-                sensor["point_mask"],
-                encoded.target_probability.float(),
-            )
-            fp32_proposals = {**fp32_proposals, **target_width}
             task_grasp = self.task_grasp(
                 fp32_proposals,
                 encoded.point_features.float(),
@@ -597,7 +569,9 @@ class TCDPRGModel(nn.Module):
         """Stage B: perception + Grasp only; Push is not executed."""
         encoded, sensor, task = self._encode_scene(batch)
         region = self._forward_region(encoded, sensor)
-        task_grasp = self._forward_task_grasps(encoded, sensor, region)
+        task_grasp = self._forward_task_grasps(
+            encoded, sensor, region, batch.get("grasp_candidates")
+        )
         return {
             "encoded": encoded,
             "sensor": sensor,
@@ -608,6 +582,22 @@ class TCDPRGModel(nn.Module):
             "global_grasp": None,
             "push": None,
         }
+
+    @torch.no_grad()
+    def generate_task_proposals(self, batch: Mapping[str, Any]) -> dict[str, Tensor]:
+        """Frozen Stage-A crop followed by the deployment GraspNet proposal path."""
+        encoded, sensor, _ = self._encode_scene(batch)
+        return self._forward_camera_graspnet(
+            sensor,
+            target_probability=encoded.target_instance_probability,
+            instance_probability=encoded.instance.mask_probability,
+            strict_target_crop=True,
+            proposal_count=self.graspnet_config.target_proposals,
+            input_points=self.graspnet_config.target_input_points,
+            selection_mode=self.graspnet_config.target_selection_mode,
+            target_identity_valid=self._target_identity_gate(encoded),
+            target_crop_mask_override=None,
+        )
 
     def forward_push(
         self, batch: Mapping[str, Any]

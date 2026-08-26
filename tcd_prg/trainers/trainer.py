@@ -43,23 +43,7 @@ class TrainerState:
 
 class Trainer:
     COUNT_TERMS = {
-        "task_grasp_supervised_rows",
-        "task_grasp_effective_rows",
-        "task_grasp_positive_proposals",
-        "task_grasp_wrong_region_negative_proposals",
-        "task_grasp_negative_proposals",
-        "task_grasp_known_proposals",
-        "task_grasp_unknown_proposals",
-        "task_grasp_effective_ranking_rows",
-        "task_positive_proposals",
-        "task_wrong_region_negative_proposals",
-        "task_unknown_proposals",
-        "task_supervised_rows",
-        "task_effective_ranking_rows",
-        "positive_wrong_region_overlap",
-        "collision_excluded_from_task_score",
-        "approach_excluded_from_task_score",
-        "ag_width_targets",
+        "task_grasp_supervised_candidates",
         "push_object_effective_rows",
         "push_multiobject_states",
         "push_positive_objects",
@@ -93,27 +77,14 @@ class Trainer:
         "optimizer_step_seconds",
         "data_seconds",
         "samples_per_second",
-        "task_grasp_effective_fraction",
-        "task_grasp_unknown_fraction",
-        "task_grasp_top1_positive",
-        "task_grasp_top1_known_positive",
-        "task_grasp_top1_unknown",
-        "task_grasp_top1_known_negative",
-        "task_candidate_positive_coverage",
-        "graspnet_ranked_recall_at_16",
-        "graspnet_ranked_recall_at_32",
-        "graspnet_ranked_recall_at_64",
-        "task_reranked_recall_at_1",
-        "task_reranked_recall_at_5",
-        "task_reranked_recall_at_10",
-        "task_conditional_recall_at_1",
-        "task_grasp_unknown_no_acronym_fraction",
-        "task_grasp_unknown_region_fraction",
+        "task_grasp_binary_accuracy",
+        "task_grasp_binary_f1",
+        "task_grasp_positive_fraction",
     }
     GRADIENT_GROUPS = {
         "encoder": ("encoder",),
         "region": ("region_head",),
-        "grasp": ("task_grasp", "ag_width"),
+        "grasp": ("task_grasp",),
         "push": ("push",),
     }
 
@@ -300,25 +271,9 @@ class Trainer:
             fields.extend(
                 (
                     f"sup: {float(record.get('active_loss_task_grasp', 0.0)):.0%}",
-                    f"rank: {float(record.get('task_grasp_effective_fraction', 0.0)):.0%}",
-                    f"cov: {float(record.get('task_candidate_positive_coverage', 0.0)):.0%}",
-                    "GN-R16/32/64: "
-                    f"{float(record.get('graspnet_ranked_recall_at_16', 0.0)):.0%}/"
-                    f"{float(record.get('graspnet_ranked_recall_at_32', 0.0)):.0%}/"
-                    f"{float(record.get('graspnet_ranked_recall_at_64', 0.0)):.0%}",
-                    "Task-R1/5/10: "
-                    f"{float(record.get('task_reranked_recall_at_1', 0.0)):.0%}/"
-                    f"{float(record.get('task_reranked_recall_at_5', 0.0)):.0%}/"
-                    f"{float(record.get('task_reranked_recall_at_10', 0.0)):.0%}",
-                    f"cond-R1: {float(record.get('task_conditional_recall_at_1', 0.0)):.0%}",
-                    f"unk: {float(record.get('task_grasp_unknown_fraction', 0.0)):.0%}",
-                    "unk-src: "
-                    f"{float(record.get('task_grasp_unknown_no_acronym_fraction', 0.0)):.0%}/"
-                    f"{float(record.get('task_grasp_unknown_region_fraction', 0.0)):.0%}",
-                    f"top1+: {float(record.get('task_grasp_top1_positive', 0.0)):.0%}",
-                    f"known+: {float(record.get('task_grasp_top1_known_positive', 0.0)):.0%}",
-                    f"winU/N: {float(record.get('task_grasp_top1_unknown', 0.0)):.0%}/"
-                    f"{float(record.get('task_grasp_top1_known_negative', 0.0)):.0%}",
+                    f"acc: {float(record.get('task_grasp_binary_accuracy', 0.0)):.1%}",
+                    f"f1: {float(record.get('task_grasp_binary_f1', 0.0)):.1%}",
+                    f"pos: {float(record.get('task_grasp_positive_fraction', 0.0)):.1%}",
                 )
             )
         fields.extend(
@@ -1075,7 +1030,8 @@ class Trainer:
         path.parent.mkdir(parents=True, exist_ok=True)
         source = self.model.module if hasattr(self.model, "module") else self.model
         payload = {
-            "schema_version": 11,
+            "schema_version": 12,
+            "training_stage": self.config.training.stage,
             "model": source.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler else None,
@@ -1099,13 +1055,16 @@ class Trainer:
     def load_checkpoint(self, path: str | Path) -> None:
         payload = torch.load(path, map_location=self.device, weights_only=False)
         schema_version = int(payload.get("schema_version", 1))
-        if schema_version != 11:
+        if schema_version != 12:
             raise RuntimeError(
                 "Unsupported TCD-PRG checkpoint schema "
-                f"{schema_version}; minimal architecture v3 expects schema 11. "
-                "Graph/learned-Verifier/Router checkpoints are intentionally "
-                "not resume-compatible; start Stage A or initialize from a "
-                "v3 stage checkpoint instead."
+                f"{schema_version}; staged training expects schema 12."
+            )
+        checkpoint_stage = payload.get("training_stage")
+        if checkpoint_stage != self.config.training.stage:
+            raise RuntimeError(
+                "Resume checkpoint stage mismatch: "
+                f"checkpoint={checkpoint_stage!r}, requested={self.config.training.stage!r}"
             )
         source = self.model.module if hasattr(self.model, "module") else self.model
         source.load_state_dict(payload["model"])

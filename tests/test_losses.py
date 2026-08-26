@@ -2,12 +2,8 @@ import pytest
 import torch
 
 from tcd_prg.config import AblationConfig, LossConfig, ModelConfig
-from tcd_prg.constants import ActionType, CandidateStatus
 from tcd_prg.datasets.capabilities import DatasetCapabilities
 from tcd_prg.diagnostics import family_gradient_norms
-from tcd_prg.losses.labels import (
-    build_grasp_proposal_labels,
-)
 from tcd_prg.losses.masked import multi_positive_listwise_loss, safe_smooth_l1
 from tcd_prg.losses.objective import TCDPRGObjective
 from tcd_prg.losses.total import MultiTaskLoss
@@ -111,35 +107,6 @@ def test_exactly_seven_minimal_architecture_objectives() -> None:
 def test_activity_helpers_report_fraction_of_supervised_rows() -> None:
     valid = torch.tensor([[True, False], [False, False]])
     assert TCDPRGObjective._row_active(valid).float().mean() == 0.5
-
-    positive = torch.tensor([[True, False], [True, False]])
-    evaluated = torch.tensor([[True, True], [True, False]])
-    active = TCDPRGObjective._listwise_active_rows(positive, evaluated)
-    assert active.tolist() == [True, False]
-    assert active.float().mean() == 0.5
-
-
-
-
-def test_grasp_proposal_labels_require_verifier_contract() -> None:
-    pose = torch.zeros(1, 1, 7)
-    pose[..., 6] = 1.0
-    batch = {
-        "candidate_mask": torch.ones(1, 1, dtype=torch.bool),
-        "action_type": torch.full((1, 1), int(ActionType.TASK_GRASP)),
-        "evaluation_status": torch.tensor([[int(CandidateStatus.POSITIVE)]]),
-        "action_improves_state": torch.tensor([[True]]),
-        "action_parameters": {
-            "task_grasp_pose_world": pose,
-            "grasp_width_m": torch.full((1, 1), 0.05),
-        },
-    }
-    # verifier 字段是硬契约：缺失必须报错而非静默改变监督语义。
-    with pytest.raises(KeyError):
-        build_grasp_proposal_labels(batch, ModelConfig(task_grasp_candidates=1))
-
-
-
 
 def test_family_gradient_audit_reports_weighted_shared_norms() -> None:
     parameter = torch.tensor([1.0, -2.0], requires_grad=True)

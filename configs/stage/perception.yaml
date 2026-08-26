@@ -4,8 +4,9 @@ defaults:
   - _self_
 
 training:
+  stage: perception
   max_optimizer_steps: 15000
-  frozen_modules: [task_grasp, ag_width, push]
+  frozen_modules: [task_grasp, graspnet, push]
   allowed_action_strata: []
   action_batch_coverage_strata: []
 

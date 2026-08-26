@@ -63,18 +63,12 @@ def test_policy_heads_match_training_contract(tiny_batch) -> None:
         "attention_point_index",
         "object_logits",
         "valid",
-        "graspnet_quality_logit",
-        "task_probability",
-        "local_support",
-        "region_support",
+        "task_valid_logit",
+        "task_valid_probability",
         "graspnet_width_m",
-        "ag_width_m",
         "target_grasp_valid",
         "target_crop_points",
     } <= set(output["task_grasp"])
-    assert torch.equal(
-        output["task_grasp"]["width_m"], output["task_grasp"]["ag_width_m"]
-    )
     assert "object_logits" in output["global_grasp"]
     assert output["push"]["utility_delta"].shape[-1] == _config().num_direction_bins
     assert "approach_logits" not in output["push"]
@@ -82,11 +76,12 @@ def test_policy_heads_match_training_contract(tiny_batch) -> None:
     assert "pick_remove" not in output
 
 
-def test_camera2_to_ag_width_to_dense_candidate_end_to_end(tiny_batch) -> None:
+def test_camera2_to_task_evaluator_to_dense_candidate_end_to_end(tiny_batch) -> None:
     config = _config()
     config.instance_objectness_threshold = 0.0
     config.target_prompt_min_support = 0.0
     config.target_prompt_min_margin = 0.0
+    config.task_grasp_probability_threshold = 1e-6
     tiny_batch = dict(tiny_batch)
     tiny_batch["target_prompt_xyz"] = tiny_batch["xyz"][:, :1]
     tiny_batch["target_prompt_label"] = torch.ones(1, 1, dtype=torch.bool)
@@ -107,8 +102,8 @@ def test_camera2_to_ag_width_to_dense_candidate_end_to_end(tiny_batch) -> None:
     task = output["task_grasp"]
     assert task["target_grasp_valid"].all()
     assert task["valid"].any()
-    assert torch.equal(task["width_m"], task["ag_width_m"])
-    assert torch.all((task["ag_width_m"] >= 0.0) & (task["ag_width_m"] <= 0.095))
+    assert torch.isfinite(task["task_valid_logit"]).all()
+    assert torch.all((task["width_m"] >= 0.0) & (task["width_m"] <= 0.095))
     task_candidates = candidates["valid"] & (
         candidates["type"] == int(ActionType.TASK_GRASP)
     )

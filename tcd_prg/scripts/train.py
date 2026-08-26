@@ -21,6 +21,7 @@ from tcd_prg.datasets import (
     ActionStateGroupDataset,
     DistributedEvaluationSampler,
     DistributedTaskStateBatchSampler,
+    StageBBinaryDataset,
 )
 from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.losses import TCDPRGObjective
@@ -28,6 +29,7 @@ from tcd_prg.models import TCDPRGModel
 from tcd_prg.observation.cached import CachedObservationProvider
 from tcd_prg.pretrained import load_pretrained_backbone, prepare_pretrained_checkpoint
 from tcd_prg.runtime import (
+    StageBBinaryBatchCollator,
     UnifiedBatchCollator,
     create_adapter,
 )
@@ -143,6 +145,65 @@ def restrict_action_dataset_to_stage(
     dataset.units = units
     dataset.selected_group_count = len(units)
 
+
+_STAGE_PREDECESSOR = {"grasp": "perception", "push": "grasp"}
+
+
+def validate_checkpoint_gate(
+    stage: str,
+    *,
+    resume_payload: dict | None,
+    initialize_payload: dict | None,
+) -> None:
+    """Enforce the one-way A -> B -> C checkpoint transition."""
+
+    if resume_payload is not None and initialize_payload is not None:
+        raise ValueError("--resume and --initialize are mutually exclusive")
+    if resume_payload is not None:
+        source = resume_payload.get("training_stage")
+        if source != stage:
+            raise RuntimeError(
+                f"Resume requires a {stage!r} checkpoint, got {source!r}"
+            )
+        return
+    predecessor = _STAGE_PREDECESSOR.get(stage)
+    if predecessor is None:
+        if initialize_payload is not None:
+            raise RuntimeError(f"Stage {stage!r} must not use --initialize")
+        return
+    if initialize_payload is None:
+        raise RuntimeError(
+            f"Stage {stage!r} requires --initialize from Stage {predecessor!r}"
+        )
+    source = initialize_payload.get("training_stage")
+    if source != predecessor:
+        raise RuntimeError(
+            f"Stage {stage!r} requires a Stage {predecessor!r} checkpoint, got {source!r}"
+        )
+
+
+def load_predecessor_weights(
+    model: torch.nn.Module, payload: dict, target_stage: str
+) -> None:
+    """Load exactly the modules learned by the preceding stage."""
+    prefixes = {
+        "grasp": ("encoder.", "region_head."),
+        "push": ("encoder.", "region_head.", "task_grasp."),
+    }[target_stage]
+    source = payload["model"]
+    current = model.state_dict()
+    required = {name for name in current if name.startswith(prefixes)}
+    incompatible = {
+        name for name in required
+        if name not in source or source[name].shape != current[name].shape
+    }
+    if incompatible:
+        raise RuntimeError(
+            "Predecessor checkpoint is incompatible with required modules: "
+            + ", ".join(sorted(incompatible)[:8])
+        )
+    model.load_state_dict({name: source[name] for name in required}, strict=False)
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
@@ -160,25 +221,23 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_config(args.config, args.overrides)
-    if config.losses.task_grasp > 0:
-        if not config.dataset.acronym_object_grasp_database:
-            raise ValueError(
-                "Task-grasp training requires dataset.acronym_object_grasp_database; "
-                "refusing to silently fall back to the old sparse supervision."
-            )
-        database_root = Path(config.dataset.acronym_object_grasp_database)
-        manifest = database_root / "manifest.json"
-        if not database_root.is_dir() or not manifest.is_file():
-            raise FileNotFoundError(
-                "Task-grasp training requires a valid ACRONYM object-grasp database "
-                f"with manifest.json: {database_root}"
-            )
     if config.observation.provider != "cached":
         raise ValueError(
             "Formal training requires observation.provider=cached for bounded read-through caching"
         )
-    if args.resume and args.initialize:
-        raise ValueError("--resume and --initialize are mutually exclusive")
+    resume_payload = (
+        torch.load(args.resume, map_location="cpu", weights_only=False)
+        if args.resume else None
+    )
+    initialize_payload = (
+        torch.load(args.initialize, map_location="cpu", weights_only=False)
+        if args.initialize else None
+    )
+    validate_checkpoint_gate(
+        config.training.stage,
+        resume_payload=resume_payload,
+        initialize_payload=initialize_payload,
+    )
     world_size = (
         args.world_size if args.world_size is not None else int(os.environ.get("WORLD_SIZE", "1"))
     )
@@ -223,6 +282,7 @@ def main() -> None:
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
     observation_cache = validate_read_through_observation_cache(adapter)
+    stageb = config.training.stage == "grasp"
     perception_only_stage = (
         config.losses.task_grasp == 0
         and config.losses.push_object == 0
@@ -230,13 +290,16 @@ def main() -> None:
         and config.losses.push_direction == 0
         and config.losses.push_potential == 0
     )
-    train_dataset = ActionStateGroupDataset(
-        adapter,
-        split="train",
-        max_groups=config.training.max_train_groups,
-        allowed_strata=config.training.allowed_action_strata,
-        deduplicate_state_task=perception_only_stage,
-        global_grasp_mode="never",
+    train_dataset = (
+        StageBBinaryDataset(
+            adapter, config.dataset.stageb_binary_root, "train",
+            config.training.max_train_groups,
+        )
+        if stageb else ActionStateGroupDataset(
+            adapter, split="train", max_groups=config.training.max_train_groups,
+            allowed_strata=config.training.allowed_action_strata,
+            deduplicate_state_task=perception_only_stage, global_grasp_mode="never",
+        )
     )
     validation_scene_ids = (
         load_or_create_validation_scene_subset(
@@ -245,11 +308,18 @@ def main() -> None:
             config.training.validation_scene_seed,
             os.path.join(config.output_dir, "validation_scene_subset.json"),
         )
-        if config.training.validation_interval > 0
+        if config.training.validation_interval > 0 and not stageb
         else ()
     )
-    validation_dataset = (
-        ActionStateGroupDataset(
+    if config.training.validation_interval <= 0:
+        validation_dataset = None
+    elif stageb:
+        validation_dataset = StageBBinaryDataset(
+            adapter, config.dataset.stageb_binary_root, "val",
+            config.training.max_validation_groups,
+        )
+    else:
+        validation_dataset = ActionStateGroupDataset(
             adapter,
             split="val",
             scene_ids=frozenset(validation_scene_ids),
@@ -260,8 +330,7 @@ def main() -> None:
             stratum_quota=config.training.validation_stratum_quota,
             subset_manifest_path=(
                 os.path.join(config.output_dir, "validation_subset.json")
-                if config.training.max_validation_groups is not None
-                else None
+                if config.training.max_validation_groups is not None else None
             ),
             global_grasp_mode="never",
             global_grasp_width_bounds=(
@@ -269,9 +338,6 @@ def main() -> None:
                 config.model.max_grasp_width_m,
             ),
         )
-        if config.training.validation_interval > 0
-        else None
-    )
     if not len(train_dataset):
         raise RuntimeError("The completed-file snapshot contains no training groups")
     if rank == 0:
@@ -296,24 +362,46 @@ def main() -> None:
                 f"groups={len(validation_dataset)}",
                 flush=True,
             )
-    train_collator = UnifiedBatchCollator(config, training=True)
-    validation_collator = UnifiedBatchCollator(config, training=False)
-    train_batch_sampler = DistributedTaskStateBatchSampler(
-        train_dataset.units,
-        batch_size=config.training.batch_size,
-        coverage_strata=config.training.action_batch_coverage_strata,
-        rank=rank,
-        world_size=world_size,
-        seed=config.training.seed,
+    train_collator = (
+        StageBBinaryBatchCollator(config, training=True)
+        if stageb else UnifiedBatchCollator(config, training=True)
     )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_sampler=train_batch_sampler,
-        num_workers=config.training.num_workers,
-        pin_memory=config.training.pin_memory,
-        persistent_workers=config.training.num_workers > 0,
-        collate_fn=train_collator,
+    validation_collator = (
+        StageBBinaryBatchCollator(config, training=False)
+        if stageb else UnifiedBatchCollator(config, training=False)
     )
+    if stageb:
+        train_sampler = (
+            torch.utils.data.DistributedSampler(
+                train_dataset, num_replicas=world_size, rank=rank,
+                shuffle=True, seed=config.training.seed,
+            ) if world_size > 1 else None
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=config.training.batch_size,
+            shuffle=train_sampler is None, sampler=train_sampler,
+            num_workers=config.training.num_workers,
+            pin_memory=config.training.pin_memory,
+            persistent_workers=config.training.num_workers > 0,
+            collate_fn=train_collator,
+        )
+    else:
+        train_batch_sampler = DistributedTaskStateBatchSampler(
+            train_dataset.units,
+            batch_size=config.training.batch_size,
+            coverage_strata=config.training.action_batch_coverage_strata,
+            rank=rank,
+            world_size=world_size,
+            seed=config.training.seed,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_batch_sampler,
+            num_workers=config.training.num_workers,
+            pin_memory=config.training.pin_memory,
+            persistent_workers=config.training.num_workers > 0,
+            collate_fn=train_collator,
+        )
     validation_sampler = (
         DistributedEvaluationSampler(len(validation_dataset), rank, world_size)
         if world_size > 1
@@ -343,7 +431,7 @@ def main() -> None:
     resume_pretrained_names: list[str] = []
     resume_validation_protocol_changed = False
     if args.resume:
-        resume_payload = torch.load(args.resume, map_location="cpu", weights_only=False)
+        assert resume_payload is not None
         resume_config = resume_payload.get("config", {})
         resume_extra = resume_config.get("extra", {}) if isinstance(resume_config, dict) else {}
         resume_pretrained_names = list(resume_extra.get("pretrained_matched_parameter_names", []))
@@ -387,8 +475,10 @@ def main() -> None:
                 config.training.unfreeze_at_optimizer_step,
             )
     if args.initialize:
-        initialized = torch.load(args.initialize, map_location="cpu", weights_only=False)
-        model.load_state_dict(initialized.get("ema") or initialized.get("model") or initialized)
+        assert initialize_payload is not None
+        if int(initialize_payload.get("schema_version", -1)) != 12:
+            raise RuntimeError("Initialization checkpoint must use schema 12")
+        load_predecessor_weights(model, initialize_payload, config.training.stage)
     elif not args.resume:
         distributed = torch.distributed.is_initialized()
         checkpoint_path = None
@@ -515,8 +605,6 @@ def main() -> None:
         config.ablation,
         config.losses,
         config.region_head,
-        config.dataset.acronym_object_grasp_database,
-        config.graspnet.use_teacher_target_crop_for_task_training,
     )
     if rank == 0:
         enabled = {name: objective.total.enabled(name) for name in objective.total.DEFAULT_WEIGHTS}
@@ -625,7 +713,10 @@ def main() -> None:
     state = trainer.train(
         train_loader,
         validate=validate if validation_loader is not None else None,
-        groups_per_effective_epoch=train_batch_sampler.global_samples_per_epoch,
+        groups_per_effective_epoch=(
+            len(train_dataset)
+            if stageb else train_batch_sampler.global_samples_per_epoch
+        ),
     )
     final_checkpoint = os.path.join(config.output_dir, "last.pt")
     trainer.save_checkpoint(final_checkpoint)

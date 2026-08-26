@@ -24,7 +24,7 @@ class DatasetConfig:
     scene_points: int = 0
     # target_points 仅供独立资源分析器使用，不限制正式 PTv3 输入。
     target_points: int = 4096
-    acronym_object_grasp_database: str = ""
+    stageb_binary_root: str = "runtime/stageb_binary"
 
 
 @dataclass(slots=True)
@@ -93,10 +93,9 @@ class GraspNetConfig:
     diversity_translation_m: float = 0.010
     diversity_rotation_deg: float = 12.0
     diversity_pool_factor: int = 4
-    use_teacher_target_crop_for_task_training: bool = False
     camera_view_index: int = 2
     target_crop_probability: float = 0.5
-    target_min_crop_points: int = 32
+    target_min_crop_points: int = 16
     camera_transfer_max_distance_m: float = 0.010
     num_view: int = 300
     num_angle: int = 12
@@ -169,9 +168,9 @@ class ModelConfig:
     task_grasp_probability_threshold: float = 0.5
     pick_remove_probability_threshold: float = 0.5
     global_grasp_candidates: int = 64
-    task_grasp_scorer_layers: int = 2
-    task_grasp_scorer_heads: int = 8
-    task_grasp_local_radius_m: float = 0.08
+    task_grasp_scene_points: int = 256
+    task_grasp_gripper_points: int = 128
+    task_grasp_gripper_geometry: str = "assets/robots/FR5_AG-160-95/ag16095_open_tcp_128.npz"
     pick_remove_candidates: int = 16
     push_candidates: int = 16
     # push_candidates 是接触点预算；每个点再展开多个方向，最终总量受 max_push_candidates 限制。
@@ -195,9 +194,6 @@ class ModelConfig:
     global_grasp_nms_rotation_deg: float = 15.0
     global_grasp_nms_width_m: float = 0.005
     global_grasp_nms_approach_deg: float = 15.0
-    task_grasp_match_translation_m: float = 0.020
-    task_grasp_match_rotation_deg: float = 20.0
-    task_grasp_match_width_m: float = 0.010
     push_nms_contact_m: float = 0.015
     push_nms_direction_deg: float = 15.0
     push_utility_component_weights: tuple[float, ...] = (0.05, 1.0, -1.0, -0.25, 1.0)
@@ -212,6 +208,7 @@ class AblationConfig:
 
 @dataclass(slots=True)
 class TrainingConfig:
+    stage: str = "joint"
     # max_optimizer_steps 统计真实参数更新次数，不包含 AMP 溢出后被跳过的 step。
     seed: int = 2026
     device: str = "cuda"
@@ -339,9 +336,6 @@ class LossConfig:
         "region_dice": 1.0,
         "region_visibility": 0.2,
         "task_grasp_bce": 1.0,
-        "task_grasp_listwise": 1.0,
-        "task_grasp_hard": 0.25,
-        "task_grasp_temperature": 1.0,
     })
 
     def family_weights(self) -> dict[str, float]:
@@ -416,6 +410,30 @@ class TCDPRGConfig:
     name: str = "tcd-prg"
 
     def validate(self) -> None:
+        if self.training.stage not in {"perception", "grasp", "push", "joint"}:
+            raise ValueError(
+                "training.stage must be one of perception, grasp, push, or joint"
+            )
+        stage_families = {
+            "perception": {"instance", "region"},
+            "grasp": {"task_grasp"},
+            "push": {"push_object", "push_contact", "push_direction", "push_potential"},
+        }
+        expected_families = stage_families.get(self.training.stage)
+        if expected_families is not None:
+            configured_families = {
+                name
+                for name in (
+                    "instance", "region", "task_grasp", "push_object",
+                    "push_contact", "push_direction", "push_potential",
+                )
+                if float(getattr(self.losses, name)) > 0
+            }
+            if configured_families != expected_families:
+                raise ValueError(
+                    f"Stage {self.training.stage!r} requires exactly loss families "
+                    f"{sorted(expected_families)}, got {sorted(configured_families)}"
+                )
         if (
             self.observation.renderer_version == LEGACY_READ_ONLY_RENDERER
             and self.observation.allow_render_on_miss
@@ -578,12 +596,6 @@ class TCDPRGConfig:
             self.model.global_grasp_nms_approach_deg,
         ) <= 0:
             raise ValueError("Global grasp NMS thresholds must be positive")
-        if min(
-            self.model.task_grasp_match_translation_m,
-            self.model.task_grasp_match_rotation_deg,
-            self.model.task_grasp_match_width_m,
-        ) <= 0:
-            raise ValueError("Task-grasp matching thresholds must be positive")
         if not 0.0 < self.model.task_grasp_probability_threshold < 1.0:
             raise ValueError("task_grasp_probability_threshold must be in (0,1)")
         if not 0.0 < self.model.pick_remove_probability_threshold < 1.0:
@@ -649,13 +661,11 @@ class TCDPRGConfig:
             raise ValueError("target_prompt_min_margin must be non-negative")
         if self.model.target_same_category_loss_boost < 1.0:
             raise ValueError("target_same_category_loss_boost must be >= 1")
-        if (
-            self.model.task_grasp_scorer_layers <= 0
-            or self.model.task_grasp_scorer_heads <= 0
-        ):
-            raise ValueError("Task grasp scorer layers and heads must be positive")
-        if self.model.feature_dim % self.model.task_grasp_scorer_heads:
-            raise ValueError("feature_dim must be divisible by task_grasp_scorer_heads")
+        if min(
+            self.model.task_grasp_scene_points,
+            self.model.task_grasp_gripper_points,
+        ) <= 0:
+            raise ValueError("Task-grasp point budgets must be positive")
         if min(
             self.graspnet.scene_input_points,
             self.graspnet.target_input_points,
@@ -690,16 +700,8 @@ class TCDPRGConfig:
             raise ValueError("graspnet.diversity_rotation_deg must be positive")
         if self.graspnet.diversity_pool_factor < 1:
             raise ValueError("graspnet.diversity_pool_factor must be >= 1")
-        task_bce = self.losses.internal.get("task_grasp_bce", 1.0)
-        task_list = self.losses.internal.get("task_grasp_listwise", 1.0)
-        task_hard = self.losses.internal.get("task_grasp_hard", 0.25)
-        task_temp = self.losses.internal.get("task_grasp_temperature", 1.0)
-        if min(task_bce, task_list, task_hard) < 0:
-            raise ValueError("TaskGrasp internal loss weights must be non-negative")
-        if task_bce + task_list + task_hard <= 0:
-            raise ValueError("At least one TaskGrasp loss weight must be positive")
-        if task_temp <= 0:
-            raise ValueError("task_grasp_temperature must be positive")
+        if self.losses.internal.get("task_grasp_bce", 1.0) <= 0:
+            raise ValueError("task_grasp_bce must be positive")
         if self.model.push_direction_transformer_layers <= 0:
             raise ValueError("push_direction_transformer_layers must be positive")
         if (
@@ -760,7 +762,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> TCDPRGC
         (config.dataset, "root"),
         (config.dataset, "acronym_root"),
         (config.dataset, "functional_region_root"),
-        (config.dataset, "acronym_object_grasp_database"),
+        (config.dataset, "stageb_binary_root"),
         (config.dataset, "fr5_ag_urdf"),
         (config.observation, "worker_script"),
         (config.observation, "runtime_mesh_root"),
@@ -774,6 +776,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> TCDPRGC
         (config.baseline, "grasp_checkpoint"),
         (config.baseline, "push_checkpoint"),
         (config.baseline, "graspnet_checkpoint"),
+        (config.model, "task_grasp_gripper_geometry"),
         (config, "output_dir"),
     )
     for owner, name in path_fields:

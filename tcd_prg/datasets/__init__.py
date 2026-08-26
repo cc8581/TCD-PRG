@@ -2,8 +2,8 @@
 
 from typing import Any
 
-from .base import DatasetAdapter
 from .acronym_grasp_database import load_object_grasps, match_object_grasp_priors
+from .base import DatasetAdapter
 from .capabilities import DatasetCapabilities
 from .gapg_observation import GAPGObservationAdapter
 from .task_oriented_clutter import TaskOrientedClutterAdapter
@@ -33,6 +33,7 @@ __all__ = [
     "SequenceLabels",
     "StateLabels",
     "StateGroupUnit",
+    "StageBBinaryDataset",
     "TaskOrientedClutterAdapter",
     "load_object_grasps",
     "match_object_grasp_priors",
@@ -51,6 +52,7 @@ def __getattr__(name: str) -> Any:
         "DistributedWeightedStateSampler",
         "GlobalStateDataset",
         "StateGroupUnit",
+        "StageBBinaryDataset",
     }:
         from .torch_dataset import (
             ActionStateGroupDataset,
@@ -59,6 +61,7 @@ def __getattr__(name: str) -> Any:
             DistributedWeightedStateSampler,
             GlobalStateDataset,
             StateGroupUnit,
+            StageBBinaryDataset,
         )
 
         return {
@@ -68,5 +71,6 @@ def __getattr__(name: str) -> Any:
             "DistributedWeightedStateSampler": DistributedWeightedStateSampler,
             "GlobalStateDataset": GlobalStateDataset,
             "StateGroupUnit": StateGroupUnit,
+            "StageBBinaryDataset": StageBBinaryDataset,
         }[name]
     raise AttributeError(name)

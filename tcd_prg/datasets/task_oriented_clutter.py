@@ -593,7 +593,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
     ) -> bool:
         """True when a positive TASK_GRASP survives the label-side width window.
 
-        ``build_grasp_proposal_labels`` drops grasp targets outside the model
+        The legacy action-label audit drops grasp targets outside the model
         width interval; ``direct_grasp`` must not be claimed for a group whose
         positive task grasps would all be filtered out at loss time.
         """

@@ -80,11 +80,11 @@ def test_task_and_global_grasp_use_one_shared_frozen_graspnet_adapter() -> None:
         ModelConfig(
             feature_dim=16,
             task_dim=8,
-            task_grasp_scorer_heads=8,
         )
     )
     keys = tuple(model.state_dict())
-    assert any(key.startswith("task_grasp.candidate_transformer") for key in keys)
+    assert any(key.startswith("task_grasp.sa1") for key in keys)
+    assert not any("candidate_transformer" in key for key in keys)
     assert not any(key.startswith("graspnet.") for key in keys)
     assert model.graspnet.network is None
 

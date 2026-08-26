@@ -453,7 +453,7 @@ class TCDPRGPolicy(ManipulationPolicy):
             task_mask = candidates["type"] == int(ActionType.TASK_GRASP)
             candidates["task_grasp_query_count"] = torch.full(
                 (candidates["type"].shape[0],),
-                encoded.output["task_grasp"]["quality_logit"].shape[1],
+                encoded.output["task_grasp"]["task_valid_logit"].shape[1],
                 dtype=torch.long,
                 device=self.device,
             )

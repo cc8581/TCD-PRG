@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 from typing import Any
-import json
-from pathlib import Path
 
 import torch
 from torch import Tensor, nn
@@ -11,26 +9,19 @@ from torch import Tensor, nn
 from tcd_prg.config import (
     AblationConfig, LossConfig, ModelConfig, RegionHeadConfig
 )
-from tcd_prg.constants import CandidateStatus
 from tcd_prg.datasets.capabilities import DatasetCapabilities
-from tcd_prg.datasets.acronym_grasp_database import (
-    load_object_grasps, match_object_grasp_priors,
-)
-from tcd_prg.geometry.se3 import quaternion_xyzw_to_matrix
 
 from .actions import PushLoss
-from .ag_width import AGWidthLoss
 from .instance import (
     InstanceSetLoss,
     build_instance_targets,
     build_object_query_push_supervision,
 )
 from .labels import (
-    build_grasp_proposal_labels,
     build_push_training_hints,
     build_region_labels,
 )
-from .task_grasp_score import TaskGraspScoringLoss
+from .task_grasp_binary import TaskGraspBinaryLoss
 from .region import TaskRegionLoss
 from .total import MultiTaskLoss
 
@@ -55,15 +46,12 @@ class TCDPRGObjective(nn.Module):
         ablation: AblationConfig,
         loss_config: LossConfig | None = None,
         region_config: RegionHeadConfig | None = None,
-        acronym_object_grasp_database: str = "",
-        use_teacher_target_crop: bool = False,
     ) -> None:
         super().__init__()
         self.model_config = model_config
         self.ablation = ablation
         loss_config = loss_config or LossConfig()
         self.internal_weights = dict(loss_config.internal)
-        self.use_teacher_target_crop = bool(use_teacher_target_crop)
         region_config = region_config or RegionHeadConfig()
 
         self.instance = InstanceSetLoss(
@@ -103,28 +91,8 @@ class TCDPRGObjective(nn.Module):
             region_config.focal_gamma,
             region_config.dice_weight,
         )
-        self.task_grasp = TaskGraspScoringLoss(
-            translation_m=model_config.task_grasp_match_translation_m,
-            rotation_deg=model_config.task_grasp_match_rotation_deg,
-            width_m=model_config.task_grasp_match_width_m,
-            bce_weight=float(self.internal_weights.get("task_grasp_bce", 1.0)),
-            listwise_weight=float(self.internal_weights.get("task_grasp_listwise", 1.0)),
-            hard_weight=float(self.internal_weights.get("task_grasp_hard", 0.25)),
-            temperature=float(self.internal_weights.get("task_grasp_temperature", 1.0)),
-        )
-        self.ag_width = AGWidthLoss(
-            translation_m=model_config.task_grasp_match_translation_m,
-            rotation_deg=model_config.task_grasp_match_rotation_deg,
-        )
+        self.task_grasp = TaskGraspBinaryLoss()
         self.push = PushLoss()
-        self.acronym_database_root = (
-            Path(acronym_object_grasp_database)
-            if acronym_object_grasp_database else None
-        )
-        self._acronym_paths: dict[str, list[tuple[float, Path]]] | None = None
-        self._acronym_cache: dict[
-            tuple[str, str], tuple[Tensor, Tensor, Tensor]
-        ] = {}
         self.total = MultiTaskLoss(
             capabilities,
             ablation,
@@ -137,139 +105,6 @@ class TCDPRGObjective(nn.Module):
         if valid.ndim == 0:
             return valid.reshape(1)
         return valid.reshape(valid.shape[0], -1).any(-1)
-
-    def _acronym_path_map(self) -> dict[str, list[tuple[float, Path]]]:
-        if self.acronym_database_root is None:
-            return {}
-        if self._acronym_paths is None:
-            manifest = json.loads(
-                (self.acronym_database_root / "manifest.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            paths: dict[str, list[tuple[float, Path]]] = {}
-            for record in manifest["records"]:
-                model_id = str(record["model_id"])
-                record_path = Path(record["path"])
-                if not record_path.is_absolute():
-                    record_path = self.acronym_database_root / record_path
-                if not record_path.is_file():
-                    raise FileNotFoundError(
-                        f"ACRONYM object-grasp record does not exist: {record_path}"
-                    )
-                scale = record.get("object_scale")
-                if scale is None:
-                    scale = float(load_object_grasps(record_path)["object_scale"])
-                entries = paths.setdefault(model_id, [])
-                if any(abs(existing_scale - float(scale)) <= 1e-9 for existing_scale, _ in entries):
-                    raise ValueError(
-                        "Duplicate ACRONYM object-grasp model/scale in manifest: "
-                        f"{model_id} scale={scale}"
-                    )
-                entries.append((float(scale), record_path))
-            self._acronym_paths = paths
-        return self._acronym_paths
-
-    def _acronym_tensors(
-        self, model_id: str, object_scale: float, device: torch.device
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        entries = self._acronym_path_map()[model_id]
-        scale, path = min(entries, key=lambda item: abs(item[0] - object_scale))
-        tolerance = max(1e-7, abs(object_scale) * 1e-4)
-        if abs(scale - object_scale) > tolerance:
-            raise KeyError(
-                f"No ACRONYM grasp record for {model_id} scale={object_scale}; "
-                f"nearest={scale}"
-            )
-        key = (f"{model_id}:{scale:.12g}", str(device))
-        if key not in self._acronym_cache:
-            database = load_object_grasps(path)
-            self._acronym_cache[key] = (
-                torch.from_numpy(database["translation_object"]).to(device),
-                torch.from_numpy(database["rotation_object"]).to(device),
-                torch.from_numpy(database["status"]).to(device),
-            )
-        return self._acronym_cache[key]
-
-    @torch.no_grad()
-    def _acronym_proposal_status(
-        self, prediction: dict[str, Tensor], batch: dict[str, Any]
-    ) -> dict[str, Tensor] | None:
-        if self.acronym_database_root is None or "target_model_id" not in batch:
-            return None
-        proposal_status = torch.full_like(
-            prediction["valid"], int(CandidateStatus.UNKNOWN_UNTESTED),
-            dtype=torch.int8,
-        )
-        unknown_no_acronym = torch.zeros_like(prediction["valid"], dtype=torch.bool)
-        unknown_region_unlabeled = torch.zeros_like(
-            prediction["valid"], dtype=torch.bool
-        )
-        for row, model_id in enumerate(batch["target_model_id"]):
-            object_scale = float(batch["target_object_scale"][row])
-            pose = batch["object_pose"][row, batch["target_object"][row]]
-            rotation_world_object = quaternion_xyzw_to_matrix(pose[3:])
-            translation_object = torch.einsum(
-                "ij,kj->ki", rotation_world_object.transpose(0, 1),
-                prediction["translation_world"][row] - pose[:3],
-            )
-            rotation_object = torch.einsum(
-                "ij,kjl->kil", rotation_world_object.transpose(0, 1),
-                prediction["rotation_matrix"][row],
-            )
-            intrinsic = match_object_grasp_priors(
-                translation_object, rotation_object, prediction["valid"][row],
-                *self._acronym_tensors(
-                    str(model_id), object_scale, translation_object.device
-                ),
-                translation_m=self.task_grasp.translation_m,
-                rotation_deg=self.task_grasp.rotation_deg,
-            )["status"]
-            status = intrinsic.clone()
-            intrinsic_positive = intrinsic == int(CandidateStatus.POSITIVE)
-            unknown_no_acronym[row] = (
-                prediction["valid"][row].bool()
-                & (intrinsic == int(CandidateStatus.UNKNOWN_UNTESTED))
-            )
-            if "region_valid" in batch and bool(intrinsic_positive.any()):
-                domain = (
-                    batch["point_mask"][row].bool()
-                    & batch["target_mask"][row].bool()
-                )
-                indices = torch.nonzero(domain, as_tuple=False).flatten()
-                if len(indices):
-                    nearest = torch.cdist(
-                        prediction["translation_world"][row].float(),
-                        batch["xyz"][row, indices].float(),
-                    ).argmin(-1)
-                    point_index = indices[nearest]
-                    region_known = batch["region_valid"][row, point_index].bool()
-                    in_region = batch["region_target"][row, point_index].bool()
-                    region_unknown = intrinsic_positive & ~region_known
-                    status[region_unknown] = int(
-                        CandidateStatus.UNKNOWN_UNTESTED
-                    )
-                    unknown_region_unlabeled[row] = region_unknown
-                    status[intrinsic_positive & region_known & ~in_region] = int(
-                        CandidateStatus.NEGATIVE
-                    )
-            proposal_status[row] = status
-        return {
-            "status": proposal_status,
-            "unknown_no_acronym_match": unknown_no_acronym,
-            "unknown_region_unlabeled": unknown_region_unlabeled,
-        }
-
-    @classmethod
-    def _listwise_active_rows(
-        cls, positive: Tensor, valid: Tensor
-    ) -> Tensor:
-        positive = positive.bool() & valid.bool()
-        effective = (
-            positive.any(-1)
-            & (valid & ~positive).any(-1)
-        )
-        return cls._row_active(effective)
 
     def _subtotal(
         self,
@@ -345,9 +180,7 @@ class TCDPRGObjective(nn.Module):
             )
         return prompt_xyz, prompt_label, prompt_valid
 
-    def _model_view(
-        self, batch: dict[str, Any], *, include_grasp_teacher: bool = False
-    ) -> dict[str, Any]:
+    def _model_view(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Strict view: fused sensor data + task semantics + observable prompt."""
         model_inputs = {
             "xyz": batch["xyz"],
@@ -361,22 +194,6 @@ class TCDPRGObjective(nn.Module):
         ):
             if key in batch:
                 model_inputs[key] = batch[key]
-        if (
-            include_grasp_teacher
-            and self.training
-            and "graspnet_instance_id" in batch
-        ):
-            teacher_crop = (
-                batch["graspnet_point_mask"].bool()
-                & (
-                    batch["graspnet_instance_id"].long()
-                    == batch["target_object"][:, None].long()
-                )
-            )
-            model_inputs["teacher_target_crop_mask"] = teacher_crop
-            model_inputs["teacher_target_identity_valid"] = (
-                teacher_crop.sum(-1) >= 32
-            )
         if "grid_coord" in batch:
             model_inputs["grid_coord"] = batch["grid_coord"]
         view: dict[str, Any] = {"model_inputs": model_inputs}
@@ -399,6 +216,10 @@ class TCDPRGObjective(nn.Module):
                 "target_prompt_label": prompt_label,
                 "target_prompt_valid": prompt_valid,
             })
+        if "stageb_candidates" in batch:
+            view["grasp_candidates"] = {
+                key: value for key, value in batch["stageb_candidates"].items()
+            }
         return view
 
     def _match_instances(
@@ -449,9 +270,7 @@ class TCDPRGObjective(nn.Module):
             if model.training and has_push
             else None
         )
-        model_view = self._model_view(
-            batch, include_grasp_teacher=(has_grasp and self.use_teacher_target_crop)
-        )
+        model_view = self._model_view(batch)
         if training_hints is not None:
             model_view["training_hints"] = {
                 "push_direction_point_mask": training_hints[
@@ -512,46 +331,13 @@ class TCDPRGObjective(nn.Module):
         if self.total.enabled("task_grasp"):
             if output.get("task_grasp") is None:
                 raise RuntimeError("task_grasp loss enabled but Grasp forward was skipped")
-            task_labels = build_grasp_proposal_labels(batch, self.model_config)
-            proposal_supervision = self._acronym_proposal_status(
-                output["task_grasp"], batch
+            if "stageb_label" not in batch or "stageb_candidate_valid" not in batch:
+                raise RuntimeError("Stage-B training requires the binary candidate dataset")
+            score_losses = self.task_grasp(
+                output["task_grasp"], batch["stageb_label"], batch["stageb_candidate_valid"]
             )
-            if proposal_supervision is not None:
-                task_labels["proposal_status"] = proposal_supervision["status"]
-                task_labels["proposal_unknown_no_acronym_match"] = (
-                    proposal_supervision["unknown_no_acronym_match"]
-                )
-                task_labels["proposal_unknown_region_unlabeled"] = (
-                    proposal_supervision["unknown_region_unlabeled"]
-                )
-            score_losses = self.task_grasp(output["task_grasp"], task_labels)
-            width_losses = self.ag_width(output["task_grasp"], task_labels)
-            score_losses["task_grasp_score_loss"] = score_losses["loss"].detach()
-            score_losses["ag_width_loss"] = width_losses["loss"].detach()
-            score_losses["loss"] = score_losses["loss"] + width_losses["loss"]
-            score_losses.update(
-                {key: value for key, value in width_losses.items() if key != "loss"}
-            )
-            task_output = output["task_grasp"]
-            score_losses.update({
-                "graspnet_valid_proposals_per_row": (
-                    task_output["valid"].float().sum(-1).mean().detach()
-                ),
-                "target_crop_points": task_output[
-                    "target_crop_points"
-                ].float().mean().detach(),
-                "camera2_transfer_coverage": task_output[
-                    "camera_transfer_coverage"
-                ].float().mean().detach(),
-                "target_identity_valid_rate": task_output[
-                    "target_identity_valid"
-                ].float().mean().detach(),
-            })
             families["task_grasp"] = score_losses
-            activity["active_loss_task_grasp"] = (
-                score_losses["task_grasp_supervised_rows"]
-                / max(1, task_output["quality_logit"].shape[0])
-            )
+            activity["active_loss_task_grasp"] = batch["stageb_candidate_valid"].any(-1).float().mean()
 
         if has_push:
             if output.get("push") is None or match is None:

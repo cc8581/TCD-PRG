@@ -95,7 +95,7 @@ def test_direct_grasp_stratum_respects_width_window() -> None:
         == "direct_grasp"
     )
 
-    # 唯一正 TASK_GRASP 超出模型宽度窗口：与 build_grasp_proposal_labels 一致地降级。
+    # 唯一正 TASK_GRASP 超出模型宽度窗口，动作分层应相应降级。
     out_of_bounds = _bare_adapter(width_bounds=(0.01, 0.08), library_width=0.20)
     assert (
         out_of_bounds._group_stratum(ids, action_type, executed, positive, _width_payload())

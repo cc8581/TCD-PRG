@@ -52,11 +52,8 @@ def _launcher_defaults(paths_config: Path) -> dict[str, str | Path | None]:
         "acronym_root": _project_relative_path(
             local.get("acronym_root", PROJECT / "data" / "ACRONYM")
         ),
-        "acronym_object_grasp_database": _project_relative_path(
-            local.get(
-                "acronym_object_grasp_database",
-                PROJECT / "data" / "ACRONYM_ObjectGraspDatabase",
-            )
+        "stageb_binary_root": _project_relative_path(
+            local.get("stageb_binary_root", PROJECT / "runtime" / "stageb_binary")
         ),
         "functional_region_root": _project_relative_path(
             local.get(
@@ -128,60 +125,8 @@ def _project_relative_path(value: str | Path) -> Path:
     return path if path.is_absolute() else PROJECT / path
 
 
-def _validate_acronym_object_grasp_database(root: Path) -> int:
-    if not root.is_dir():
-        raise FileNotFoundError(
-            f"ACRONYM object-grasp database directory does not exist: {root}"
-        )
-    manifest_path = root / "manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(
-            f"ACRONYM object-grasp database manifest is missing: {manifest_path}"
-        )
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    records = payload.get("records")
-    if not isinstance(records, list) or not records:
-        raise ValueError(
-            f"ACRONYM object-grasp manifest contains no records: {manifest_path}"
-        )
-    record_ids: list[int] = []
-    record_paths: list[str] = []
-    missing: list[str] = []
-    for record in records:
-        if not isinstance(record, dict) or "model_id" not in record or "path" not in record:
-            raise ValueError(
-                "Each ACRONYM object-grasp manifest record must contain model_id and path"
-            )
-        record_ids.append(int(record.get("record_id", len(record_ids))))
-        candidate = Path(str(record["path"]))
-        if not candidate.is_absolute():
-            candidate = root / candidate
-        if not candidate.is_file():
-            missing.append(str(candidate))
-        record_paths.append(str(candidate.resolve()))
-    if len(set(record_ids)) != len(record_ids):
-        raise ValueError(
-            "ACRONYM object-grasp manifest contains duplicate record_id values"
-        )
-    if len(set(record_paths)) != len(record_paths):
-        raise ValueError("ACRONYM object-grasp manifest contains duplicate paths")
-    if missing:
-        preview = "\n  ".join(missing[:8])
-        raise FileNotFoundError(
-            f"ACRONYM object-grasp manifest references missing files ({len(missing)}):\n  {preview}"
-        )
-    return len(records)
-
-
-def _resolve_formal_aux_paths(args: argparse.Namespace) -> tuple[Path, Path, int]:
+def _resolve_cache_index_path(args: argparse.Namespace) -> Path:
     local = _load_local_paths(args.paths_config.resolve())
-    database = _project_relative_path(
-        args.acronym_object_grasp_database
-        or local.get(
-            "acronym_object_grasp_database",
-            PROJECT / "data" / "ACRONYM_ObjectGraspDatabase",
-        )
-    ).resolve()
     cache_index = _project_relative_path(
         args.cache_index_directory
         or local.get(
@@ -189,9 +134,8 @@ def _resolve_formal_aux_paths(args: argparse.Namespace) -> tuple[Path, Path, int
             PROJECT / "runtime" / "cache" / "dataset_indexes",
         )
     ).resolve()
-    database_records = _validate_acronym_object_grasp_database(database)
     cache_index.mkdir(parents=True, exist_ok=True)
-    return database, cache_index, database_records
+    return cache_index
 
 
 def _quoted_override(name: str, value: str | Path) -> str:
@@ -241,11 +185,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dataset-root", type=Path, default=defaults["dataset_root"], help="Root directory of the task-oriented scene dataset.")
     parser.add_argument("--acronym-root", type=Path, default=defaults["acronym_root"], help="Root directory of the ACRONYM grasp dataset.")
-    parser.add_argument(
-        "--acronym-object-grasp-database", type=Path,
-        default=defaults["acronym_object_grasp_database"],
-        help="Root directory of the proposal x ACRONYM-2000 object-grasp database.",
-    )
+    parser.add_argument("--stageb-binary-root", type=Path, default=defaults["stageb_binary_root"], help="Stage-B binary proposal dataset directory.")
     parser.add_argument("--functional-region-root", type=Path, default=defaults["functional_region_root"], help="Root directory of the manual functional-region annotations.")
     parser.add_argument("--pybullet-python", default=defaults["pybullet_python"], help="Python interpreter used by the PyBullet compatibility workers.")
     parser.add_argument("--observation-cache-dir", type=Path, default=defaults["observation_cache_dir"], help="Content-addressed observation cache directory.")
@@ -328,9 +268,7 @@ def main() -> None:
                 "Multi-GPU training was not started."
             )
     dataset, acronym, functional_region, pybullet_python, observation_cache = _resolve_paths(args)
-    acronym_object_grasp_database, cache_index_directory, database_records = (
-        _resolve_formal_aux_paths(args)
-    )
+    cache_index_directory = _resolve_cache_index_path(args)
     ptv3_source = PROJECT / "third_party" / "PointTransformerV3" / "model.py"
     if not ptv3_source.is_file():
         raise FileNotFoundError(
@@ -341,10 +279,7 @@ def main() -> None:
         _quoted_override("dataset.root", dataset),
         _quoted_override("dataset.acronym_root", acronym),
         _quoted_override("dataset.functional_region_root", functional_region),
-        _quoted_override(
-            "dataset.acronym_object_grasp_database",
-            acronym_object_grasp_database,
-        ),
+        _quoted_override("dataset.stageb_binary_root", args.stageb_binary_root.resolve()),
         _quoted_override("observation.pybullet_python", pybullet_python),
         _quoted_override("cache.directory", observation_cache),
         _quoted_override("cache.index_directory", cache_index_directory),
@@ -354,11 +289,7 @@ def main() -> None:
     print(f"  platform={sys.platform} gpus={args.gpus}", flush=True)
     print(f"  dataset={dataset}", flush=True)
     print(f"  acronym={acronym}", flush=True)
-    print(
-        "  acronym_object_grasp_database="
-        f"{acronym_object_grasp_database} records={database_records}",
-        flush=True,
-    )
+    print(f"  stageb_binary_root={args.stageb_binary_root.resolve()}", flush=True)
     print(f"  functional_regions={functional_region}", flush=True)
     print(f"  observation_cache={observation_cache}", flush=True)
     print(f"  cache_index_directory={cache_index_directory}", flush=True)

@@ -11,6 +11,28 @@ from torch import Tensor
 from .types import GlobalGraspLabels, UnifiedSample
 
 
+def collate_stageb_binary(
+    samples: list[Any], *, grid_size_m: float | None = None,
+    training: bool = False, point_count: int = 0,
+) -> dict[str, Any]:
+    """Collate scene/task inputs and the concrete candidates labelled offline."""
+    batch = collate_unified(
+        [item.sample for item in samples], grid_size_m=grid_size_m,
+        training=training, point_count=point_count, include_graspnet=False,
+    )
+    translation, valid = _pad([item.translation_world for item in samples], np.nan)
+    rotation, _ = _pad([item.rotation_matrix for item in samples], np.nan)
+    label, _ = _pad([item.label for item in samples], False)
+    batch["stageb_candidates"] = {
+        "translation_world": translation.float(),
+        "rotation_matrix": rotation.float(),
+        "valid": valid.bool(),
+    }
+    batch["stageb_candidate_valid"] = valid.bool()
+    batch["stageb_label"] = label.bool()
+    return batch
+
+
 def _empty_global_grasps_like(label: GlobalGraspLabels) -> GlobalGraspLabels:
     """Create a contract-complete empty placeholder for mixed supervision batches."""
 

@@ -25,9 +25,8 @@ by a fresh observation and replanning.
 - `PICK_REMOVE` candidates are generic grasps on non-target predicted instances,
   restricted to a lightweight target-local geometric neighborhood instead of a
   learned dependency graph.
-- Fixed closed-loop action priority `TASK_GRASP > PICK_REMOVE > PUSH`; no learned
-  dependency graph, learned grasp verifier, or learned router is part of the formal
-  architecture.
+- Fixed closed-loop action priority `TASK_GRASP > PICK_REMOVE > PUSH`; Stage B uses
+  an independent binary TaskGraspEvaluator, while no learned router is used.
 - Exact grasp IK/collision/approach certification remains at the execution boundary.
   PUSH trajectory planning remains executor-owned.
 - Three independent training stages so PUSH training does not execute GraspNet or
@@ -158,9 +157,14 @@ prior checkpoint but only executes the branch it trains.
 tcd-prg-train --config configs/stage/perception.yaml `
   output_dir=outputs/perception
 
-# Stage B: grasp; initialize from A and freeze perception
+# One-time Stage B-D expansion: Stage-A crop -> frozen GraspNet -> binary geometry labels
+tcd-prg-build-stageb --config configs/stage/grasp.yaml `
+  --checkpoint outputs/perception/last.pt `
+  --output runtime/stageb_binary --split train
+
+# Stage B-T: binary evaluator; initialize from A and freeze perception/GraspNet
 tcd-prg-train --config configs/stage/grasp.yaml `
-  --initialize outputs/perception/best.pt `
+  --initialize outputs/perception/last.pt `
   output_dir=outputs/grasp
 
 # Stage C: PUSH; initialize from B and freeze perception + grasp
@@ -174,8 +178,9 @@ and the newly trained PUSH branch, so it is the deployment checkpoint. `--resume
 is for continuing the same stage; `--initialize` is for stage-to-stage weight
 transfer without optimizer state.
 
-Training units remain `(scene_id, state_id, task_index, action_state_group)`.
-UNKNOWN/untested action rows remain ignored by the corresponding losses.
+Stage B trains only on concrete GraspNet proposals stored with strict 0/1
+`task_valid` labels. Invalid data-generation attempts are dropped and never become
+a third class. Other stages retain their native action-state units.
 Validation uses only the loss families enabled by the selected stage.
 
 ## Evaluation and inference

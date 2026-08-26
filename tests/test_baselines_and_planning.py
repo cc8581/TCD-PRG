@@ -71,6 +71,7 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
         "rotation_matrix": torch.eye(3).expand(1, 2, 3, 3),
         "width_m": torch.ones(1, 2) * 0.05,
         "quality_logit": torch.zeros(1, 2),
+        "task_valid_probability": torch.full((1, 2), 0.5),
         "attention_point_index": torch.zeros(1, 2, dtype=torch.long),
     }
     global_head = {

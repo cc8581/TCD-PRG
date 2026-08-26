@@ -95,7 +95,7 @@ def test_checkpoint_rejects_obsolete_schema(tmp_path, tiny_batch) -> None:
     )
     path = tmp_path / "obsolete.pt"
     torch.save({"schema_version": 5}, path)
-    with pytest.raises(RuntimeError, match="expects schema 11"):
+    with pytest.raises(RuntimeError, match="expects schema 12"):
         trainer.load_checkpoint(path)
 
 
@@ -245,23 +245,20 @@ def test_terminal_window_averages_grasp_diagnostics() -> None:
     summary = Trainer._summarize_terminal_window(
         [
             {
-                "task_grasp_effective_fraction": 0.25,
-                "task_grasp_unknown_fraction": 0.75,
-                "task_grasp_top1_positive": 0.2,
-                "graspnet_ranked_recall_at_64": 0.8,
+                "task_grasp_binary_accuracy": 0.25,
+                "task_grasp_binary_f1": 0.75,
+                "task_grasp_positive_fraction": 0.2,
             },
             {
-                "task_grasp_effective_fraction": 0.75,
-                "task_grasp_unknown_fraction": 0.25,
-                "task_grasp_top1_positive": 0.6,
-                "graspnet_ranked_recall_at_64": 1.0,
+                "task_grasp_binary_accuracy": 0.75,
+                "task_grasp_binary_f1": 0.25,
+                "task_grasp_positive_fraction": 0.6,
             },
         ]
     )
-    assert summary["task_grasp_effective_fraction"] == pytest.approx(0.5)
-    assert summary["task_grasp_unknown_fraction"] == pytest.approx(0.5)
-    assert summary["task_grasp_top1_positive"] == pytest.approx(0.4)
-    assert summary["graspnet_ranked_recall_at_64"] == pytest.approx(0.9)
+    assert summary["task_grasp_binary_accuracy"] == pytest.approx(0.5)
+    assert summary["task_grasp_binary_f1"] == pytest.approx(0.5)
+    assert summary["task_grasp_positive_fraction"] == pytest.approx(0.4)
 
 
 def test_terminal_weighted_groups_reconcile_with_total_loss() -> None:

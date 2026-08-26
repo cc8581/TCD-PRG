@@ -288,9 +288,7 @@ class DenseCandidateGenerator:
                 ),
                 -1,
             )
-            task_score = torch.sigmoid(
-                task["quality_logit"][batch_row]
-            )
+            task_score = task["task_valid_probability"][batch_row]
             task_objects = torch.full_like(
                 task_score, target_object, dtype=torch.long
             )

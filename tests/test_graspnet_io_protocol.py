@@ -17,8 +17,6 @@ def _model_config() -> ModelConfig:
         instance_queries=4,
         instance_decoder_layers=1,
         instance_decoder_heads=4,
-        task_grasp_scorer_layers=1,
-        task_grasp_scorer_heads=4,
         push_direction_feature_dim=32,
         push_direction_transformer_heads=4,
     )
