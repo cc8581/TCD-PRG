@@ -26,7 +26,6 @@ from tcd_prg.datasets import (
 from tcd_prg.datasets.stageb_manifest import build_provenance
 from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.losses import TCDPRGObjective
-from tcd_prg.losses.task_grasp_binary import stageb_split_metrics
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.observation.cached import CachedObservationProvider
 from tcd_prg.pretrained import load_pretrained_backbone, prepare_pretrained_checkpoint
@@ -226,6 +225,10 @@ def main() -> None:
         resume_payload=resume_payload,
         initialize_payload=initialize_payload,
     )
+    if initialize_payload is not None and "task_grasp_probability_threshold" in initialize_payload:
+        config.model.task_grasp_probability_threshold = float(
+            initialize_payload["task_grasp_probability_threshold"]
+        )
     world_size = (
         args.world_size if args.world_size is not None else int(os.environ.get("WORLD_SIZE", "1"))
     )
@@ -716,20 +719,18 @@ def main() -> None:
                         f"score={total / max(1, count):.6f}",
                         flush=True,
                     )
-        if stageb_scores:
-            aggregate = stageb_split_metrics(
-                np.concatenate(stageb_scores), np.concatenate(stageb_targets)
-            )
-            metric_sums.update(aggregate)
-            metric_counts.update({key: 1 for key in aggregate})
         module.train()
-        return {
+        result = {
             "score_sum": total,
             "score_count": count,
             "metric_sums": metric_sums,
             "metric_counts": metric_counts,
             "evaluation_records": evaluator.evaluator.records,
         }
+        if stageb_scores:
+            result["stageb_scores"] = np.concatenate(stageb_scores)
+            result["stageb_targets"] = np.concatenate(stageb_targets)
+        return result
 
     state = trainer.train(
         train_loader,

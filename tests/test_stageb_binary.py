@@ -7,11 +7,16 @@ import pytest
 import torch
 
 from tcd_prg.config import ModelConfig, load_config
-from tcd_prg.geometry.stageb_grasp import evaluate_stageb_geometry, world_to_grasp_numpy
+from tcd_prg.geometry.stageb_grasp import (
+    any_distance_below,
+    evaluate_stageb_geometry,
+    world_to_grasp_numpy,
+)
 from tcd_prg.losses.task_grasp_binary import stageb_split_metrics
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.models.task_grasp import TaskGraspEvaluator, world_to_grasp
 from tcd_prg.scripts.build_stageb_binary import balance_binary_records
+from tcd_prg.trainers.trainer import aggregate_stageb_validation_payloads
 
 ASSET = Path("assets/robots/FR5_AG-160-95/ag16095_open_tcp_128.npz")
 DENSE_ASSET = Path("assets/robots/FR5_AG-160-95/ag16095_open_tcp_4096.npz")
@@ -80,6 +85,28 @@ def test_candidate_aligned_transform_moves_with_pose() -> None:
     assert np.allclose(
         world_to_grasp_numpy(points, np.asarray([0.01, 0, 0]), identity), [[0.01, 0, 0]]
     )
+
+
+def test_chunked_dense_distance_matches_full_matrix() -> None:
+    rng = np.random.default_rng(4)
+    scene = rng.normal(size=(513, 3)).astype(np.float32)
+    gripper = rng.normal(size=(4096, 3)).astype(np.float32)
+    for threshold in (0.001, 0.05, 0.5):
+        full = bool((((scene[:, None] - gripper[None]) ** 2).sum(-1) < threshold**2).any())
+        assert any_distance_below(scene, gripper, threshold, chunk_size=37) == full
+
+
+def test_ddp_stageb_metrics_are_computed_after_raw_union() -> None:
+    summaries = [
+        {"stageb_scores": np.asarray([0.9, 0.8]), "stageb_targets": np.asarray([1, 0])},
+        {"stageb_scores": np.asarray([0.7, 0.1]), "stageb_targets": np.asarray([1, 0])},
+    ]
+    merged = aggregate_stageb_validation_payloads(summaries)
+    direct = stageb_split_metrics(
+        np.concatenate([item["stageb_scores"] for item in summaries]),
+        np.concatenate([item["stageb_targets"] for item in summaries]),
+    )
+    assert merged == direct
 
 
 def test_geometry_protocol_binary_region_gate() -> None:

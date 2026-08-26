@@ -13,6 +13,21 @@ class StageBGeometryResult:
     reasons: tuple[str, ...]
 
 
+def any_distance_below(
+    scene: np.ndarray, gripper: np.ndarray, threshold_m: float, chunk_size: int = 256
+) -> bool:
+    """Return the exact radius-query result with bounded temporary memory."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    threshold_squared = float(threshold_m) ** 2
+    for start in range(0, len(scene), chunk_size):
+        points = scene[start : start + chunk_size]
+        distance_squared = ((points[:, None] - gripper[None]) ** 2).sum(-1)
+        if bool((distance_squared < threshold_squared).any()):
+            return True
+    return False
+
+
 def world_to_grasp_numpy(
     points: np.ndarray, translation: np.ndarray, rotation: np.ndarray
 ) -> np.ndarray:
@@ -110,10 +125,9 @@ def evaluate_stageb_geometry(
     # boxes above. Target contact is allowed on fingers but never on the palm.
     scene_local = local[valid]
     scene_is_target = target[valid]
-    squared = ((scene_local[:, None] - gripper[None]) ** 2).sum(-1)
-    base_collision = bool((squared[:, part == 1] < 0.003**2).any())
+    base_collision = any_distance_below(scene_local, gripper[part == 1], 0.003)
     non_target_finger_collision = (
-        bool((squared[~scene_is_target][:, part != 1] < 0.003**2).any())
+        any_distance_below(scene_local[~scene_is_target], gripper[part != 1], 0.003)
         if (~scene_is_target).any()
         else False
     )

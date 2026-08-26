@@ -84,6 +84,7 @@ class TaskGraspEvaluator(nn.Module):
         gripper_geometry_path: str | Path,
         scene_points: int = 256,
         gripper_points: int = 128,
+        preselection_points: int = 1024,
     ) -> None:
         super().__init__()
         payload = np.load(Path(gripper_geometry_path))
@@ -96,6 +97,7 @@ class TaskGraspEvaluator(nn.Module):
         self.register_buffer("gripper_points_tcp", points, persistent=True)
         self.register_buffer("gripper_part_id", part, persistent=True)
         self.scene_points = int(scene_points)
+        self.preselection_points = max(self.scene_points, int(preselection_points))
         self.sa1 = PointNetSetAbstraction(4, 96, centers=64, radius_m=0.045)
         self.sa2 = PointNetSetAbstraction(96, 128, centers=16, radius_m=0.090)
         self.pose = nn.Sequential(nn.Linear(10, dim), nn.LayerNorm(dim), nn.GELU())
@@ -130,10 +132,15 @@ class TaskGraspEvaluator(nn.Module):
         b, k, n, _ = local.shape
         flat_local = torch.nan_to_num(local.reshape(b * k, n, 3))
         flat_inside = inside.reshape(b * k, n)
+        preselection_count = min(self.preselection_points, n)
+        distance = flat_local.square().sum(-1).masked_fill(~flat_inside, torch.inf)
+        preselection = distance.topk(preselection_count, largest=False, sorted=False).indices
+        preselected_local = flat_local.gather(1, preselection[..., None].expand(-1, -1, 3))
+        preselected_mask = flat_inside.gather(1, preselection)
         local_index, selected_mask = masked_farthest_point_sample(
-            flat_local, flat_inside, self.scene_points
+            preselected_local, preselected_mask, self.scene_points
         )
-        selected = flat_local.gather(1, local_index[..., None].expand(-1, -1, 3))
+        selected = preselected_local.gather(1, local_index[..., None].expand(-1, -1, 3))
         selected = selected.reshape(b, k, self.scene_points, 3)
         selected_mask = selected_mask.reshape(b, k, self.scene_points)
         gripper = self.gripper_points_tcp.to(local)[None, None].expand(b, k, -1, -1)

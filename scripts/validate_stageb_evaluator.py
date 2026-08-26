@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import torch
@@ -39,6 +40,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
     parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument("--profile-full-scale", action="store_true")
     args = parser.parse_args()
     torch.manual_seed(16095)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -91,6 +93,39 @@ def main() -> None:
             torch.cuda.max_memory_allocated() / (1 << 20) if device.type == "cuda" else None
         ),
     }
+    if args.profile_full_scale:
+        model.zero_grad(set_to_none=True)
+        profile = inputs(8, 32, 16384, 32, device)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+        started = time.perf_counter()
+        with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+            profile_logit = model(*profile)["task_valid_logit"]
+            profile_loss = profile_logit.square().mean()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        forward_seconds = time.perf_counter() - started
+        started = time.perf_counter()
+        profile_loss.backward()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        report.update(
+            {
+                "profile_shape": "B=8,K=32,N=16384",
+                "profile_forward_seconds": forward_seconds,
+                "profile_backward_seconds": time.perf_counter() - started,
+                "profile_peak_cuda_memory_mb": (
+                    torch.cuda.max_memory_allocated() / (1 << 20) if device.type == "cuda" else None
+                ),
+                "profile_logits_finite": bool(torch.isfinite(profile_logit).all()),
+                "profile_gradients_finite": all(
+                    parameter.grad is None or bool(torch.isfinite(parameter.grad).all())
+                    for parameter in model.parameters()
+                ),
+            }
+        )
     if accuracy < 0.95 or f1 < 0.95 or not report["stable_logits_finite"] or not gradients_finite:
         raise RuntimeError(json.dumps(report, ensure_ascii=False))
     output = Path(args.output)

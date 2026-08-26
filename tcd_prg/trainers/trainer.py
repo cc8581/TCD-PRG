@@ -12,14 +12,29 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 
 from tcd_prg.config import TCDPRGConfig
 from tcd_prg.evaluators.offline import OfflineModelEvaluator
+from tcd_prg.losses.task_grasp_binary import stageb_split_metrics
 
 from .ema import ModelEMA
 from .reproducibility import seed_everything
+
+
+def aggregate_stageb_validation_payloads(
+    summaries: list[Mapping[str, Any]],
+) -> dict[str, float]:
+    """Compute nonlinear Stage-B metrics once over all gathered DDP ranks."""
+    scores = [np.asarray(item["stageb_scores"]) for item in summaries if "stageb_scores" in item]
+    targets = [np.asarray(item["stageb_targets"]) for item in summaries if "stageb_targets" in item]
+    if not scores:
+        return {}
+    if len(scores) != len(targets):
+        raise RuntimeError("Incomplete distributed Stage-B validation payload")
+    return stageb_split_metrics(np.concatenate(scores), np.concatenate(targets))
 
 
 @dataclass(slots=True)
@@ -108,6 +123,7 @@ class Trainer:
         self.scheduler = scheduler
         self.loss_step = loss_step
         self.state = TrainerState()
+        self.task_grasp_probability_threshold = float(config.model.task_grasp_probability_threshold)
         self.output_dir = Path(output_dir or config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         # JSONL 是逐步完整记录，终端输出只是低频核心摘要，两者职责不同。
@@ -444,6 +460,7 @@ class Trainer:
                 )
                 for key, value in metric_sums.items()
             }
+            validation_details.update(aggregate_stageb_validation_payloads(summaries))
             evaluation_records = [
                 record for item in summaries for record in item.get("evaluation_records", [])
             ]
@@ -491,6 +508,13 @@ class Trainer:
         self.state.last_completed_validation_step = step
         self.state.pending_validation_step = 0
 
+        if improved and "task_grasp_validation_threshold" in validation_details:
+            self.task_grasp_probability_threshold = float(
+                validation_details["task_grasp_validation_threshold"]
+            )
+            self.config.model.task_grasp_probability_threshold = (
+                self.task_grasp_probability_threshold
+            )
         if improved:
             self.save_checkpoint(self.output_dir / "best.pt")
 
@@ -1052,6 +1076,7 @@ class Trainer:
             "rng_cpu": torch.get_rng_state(),
             "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "rng_by_rank": rng_by_rank,
+            "task_grasp_probability_threshold": self.task_grasp_probability_threshold,
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
         torch.save(payload, temporary)
@@ -1078,6 +1103,13 @@ class Trainer:
             )
         source = self.model.module if hasattr(self.model, "module") else self.model
         source.load_state_dict(payload["model"])
+        self.task_grasp_probability_threshold = float(
+            payload.get(
+                "task_grasp_probability_threshold",
+                self.config.model.task_grasp_probability_threshold,
+            )
+        )
+        self.config.model.task_grasp_probability_threshold = self.task_grasp_probability_threshold
         self.optimizer.load_state_dict(payload["optimizer"])
         if self.scheduler and payload["scheduler"] is not None:
             self.scheduler.load_state_dict(payload["scheduler"])

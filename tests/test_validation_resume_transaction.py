@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+
+import numpy as np
 import torch
 
 from tcd_prg.config import LoggingConfig, TCDPRGConfig, TrainingConfig
@@ -69,7 +71,8 @@ def test_resume_boundary_uses_completed_validation_log_without_duplicate(tmp_pat
                 "performance": {"count": 0, "scene_count": 0, "metrics": {}},
                 "training_stage": "geometry",
             }
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -123,3 +126,23 @@ def test_pending_flag_is_persisted_before_validation_failure(tmp_path):
     assert payload["trainer_state"]["optimizer_steps"] == 2
     assert payload["trainer_state"]["pending_validation_step"] == 2
     assert payload["trainer_state"]["last_completed_validation_step"] == 0
+
+
+def test_best_stageb_threshold_is_saved_in_checkpoint(tmp_path):
+    trainer, batch = _make_trainer(tmp_path, max_steps=1, interval=1)
+
+    def validate(_module):
+        return {
+            "score_sum": 1.0,
+            "score_count": 1,
+            "metric_sums": {},
+            "metric_counts": {},
+            "stageb_scores": np.asarray([0.1, 0.4, 0.6, 0.9]),
+            "stageb_targets": np.asarray([0, 1, 0, 1], bool),
+        }
+
+    trainer.train([batch], validate=validate)
+    payload = torch.load(tmp_path / "best.pt", map_location="cpu", weights_only=False)
+    assert payload["task_grasp_probability_threshold"] == 0.4
+    threshold = json.loads((tmp_path / "stageb_decision_threshold.json").read_text())
+    assert threshold["threshold"] == 0.4

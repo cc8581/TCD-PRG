@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import time
+from dataclasses import asdict
 
 import torch
 from torch.utils.data import DataLoader
@@ -56,15 +56,15 @@ def main() -> None:
         num_workers=config.training.num_workers,
         pin_memory=config.training.pin_memory,
         persistent_workers=config.training.num_workers > 0,
-        collate_fn=UnifiedBatchCollator(
-            config, training=False, include_graspnet=False
-        ),
+        collate_fn=UnifiedBatchCollator(config, training=False, include_graspnet=False),
     )
     device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
-    model = TCDPRGModel(
-        config.model, config.ablation, config.backbone, config.graspnet
-    ).to(device)
+    model = TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    if "task_grasp_probability_threshold" in checkpoint:
+        config.model.task_grasp_probability_threshold = float(
+            checkpoint["task_grasp_probability_threshold"]
+        )
     model.load_state_dict(checkpoint["ema"] or checkpoint["model"])
     model.eval()
     evaluator = OfflineModelEvaluator(
@@ -89,17 +89,13 @@ def main() -> None:
             }
             if "action_parameters" in batch:
                 batch["action_parameters"] = {
-                    key: value.to(device)
-                    for key, value in raw["action_parameters"].items()
+                    key: value.to(device) for key, value in raw["action_parameters"].items()
                 }
             if "verifier_inputs" in batch:
                 batch["verifier_inputs"] = {
-                    key: value.to(device)
-                    for key, value in raw["verifier_inputs"].items()
+                    key: value.to(device) for key, value in raw["verifier_inputs"].items()
                 }
-            evaluator.update(
-                batch, model(batch, forward_mode="perception")
-            )
+            evaluator.update(batch, model(batch, forward_mode="perception"))
             batch_groups = int(batch["xyz"].shape[0])
             evaluated_groups += batch_groups
             if evaluated_groups >= next_log or evaluated_groups == len(dataset):

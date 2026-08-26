@@ -10,9 +10,9 @@ from typing import Any
 import numpy as np
 import torch
 
+from tcd_prg.baselines import create_baseline
 from tcd_prg.config import load_config
 from tcd_prg.constants import ActionType
-from tcd_prg.baselines import create_baseline
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.planners import TCDPRGPolicy
 from tcd_prg.runtime import (
@@ -54,10 +54,14 @@ def main() -> None:
         if not args.checkpoint:
             raise ValueError("--checkpoint is required for learned TCD-PRG candidates")
         device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
-        model = TCDPRGModel(
-            config.model, config.ablation, config.backbone, config.graspnet
-        ).to(device)
+        model = TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet).to(
+            device
+        )
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        if "task_grasp_probability_threshold" in checkpoint:
+            config.model.task_grasp_probability_threshold = float(
+                checkpoint["task_grasp_probability_threshold"]
+            )
         model.load_state_dict(checkpoint.get("ema") or checkpoint["model"])
         # Candidate scoring remains robot-agnostic. The deterministic
         # controller exact-certifies grasp actions and falls through on rejection.
@@ -82,16 +86,19 @@ def main() -> None:
             tensor_group = candidates.get("candidates")
             index = int(action["candidate_index"])
             tensor_group["valid"][0, index] = False
-            candidates["certification_reasons"].append({
-                "candidate_index": index, "reason": reason
-            })
+            candidates["certification_reasons"].append({"candidate_index": index, "reason": reason})
             action = policy.select_action(candidates)
     tensor_candidates = candidates.get("candidates") if isinstance(candidates, dict) else None
-    valid_count = (int(tensor_candidates["valid"].sum())
-                   if isinstance(tensor_candidates, dict) and "valid" in tensor_candidates
-                   else len(candidates.get("candidates", [])) if isinstance(candidates, dict) else 0)
+    valid_count = (
+        int(tensor_candidates["valid"].sum())
+        if isinstance(tensor_candidates, dict) and "valid" in tensor_candidates
+        else len(candidates.get("candidates", []))
+        if isinstance(candidates, dict)
+        else 0
+    )
     survival_keys = (
-        "task_grasp_query_count", "task_grasp_after_nms_count",
+        "task_grasp_query_count",
+        "task_grasp_after_nms_count",
         "unique_task_grasp_count",
     )
     task_grasp_survival = {
@@ -100,19 +107,23 @@ def main() -> None:
         if isinstance(tensor_candidates, dict) and key in tensor_candidates
     }
     payload = {
-        "scene_id": args.scene_id, "state_id": args.state_id,
-        "task_index": args.task_index, "selected_action": serializable(action),
+        "scene_id": args.scene_id,
+        "state_id": args.state_id,
+        "task_index": args.task_index,
+        "selected_action": serializable(action),
         "valid_candidate_count": valid_count,
         "task_grasp_survival": task_grasp_survival,
-        "certification_reasons": (candidates.get("certification_reasons", [])
-                                  if isinstance(candidates, dict) else []),
+        "certification_reasons": (
+            candidates.get("certification_reasons", []) if isinstance(candidates, dict) else []
+        ),
         "final_certification": final_certification,
         "checkpoint": str(Path(args.checkpoint).resolve()) if args.checkpoint else None,
         "baseline": config.baseline.type,
     }
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     if args.output:
-        output = Path(args.output); output.parent.mkdir(parents=True, exist_ok=True)
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(text, encoding="utf-8")
     print(text)
 

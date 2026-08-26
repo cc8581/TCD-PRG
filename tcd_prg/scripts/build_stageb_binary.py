@@ -119,6 +119,13 @@ def main() -> None:
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
+    root = Path(args.output)
+    manifest_path = root / "manifest.json"
+    provenance = build_provenance(config, args.checkpoint)
+    if manifest_path.is_file():
+        old = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if old.get("provenance") != provenance:
+            raise RuntimeError("Existing Stage-B split was built with different provenance")
     adapter = create_adapter(config, allow_render=False)
     dataset = ActionStateGroupDataset(
         adapter,
@@ -142,7 +149,6 @@ def main() -> None:
     device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
     model.to(device).eval()
     ag_geometry = np.load(config.model.stageb_label_gripper_geometry)
-    root = Path(args.output)
     records_dir = root / "records"
     records_dir.mkdir(parents=True, exist_ok=True)
     records = []
@@ -261,18 +267,12 @@ def main() -> None:
             "Stage-B construction produced no valid binary records; inspect build_audit.jsonl"
         )
     records = balance_binary_records(root, records, config.training.seed)
-    manifest_path = root / "manifest.json"
     existing = (
         json.loads(manifest_path.read_text(encoding="utf-8"))["records"]
         if manifest_path.is_file()
         else []
     )
     existing = [row for row in existing if row["split"] != args.split]
-    provenance = build_provenance(config, args.checkpoint)
-    if manifest_path.is_file():
-        old = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if old.get("provenance") != provenance:
-            raise RuntimeError("Existing Stage-B split was built with different provenance")
     payload = {
         "schema_version": SCHEMA_VERSION,
         "provenance": provenance,

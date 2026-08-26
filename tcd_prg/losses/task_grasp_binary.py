@@ -15,7 +15,7 @@ def stageb_split_metrics(score: np.ndarray, target: np.ndarray) -> dict[str, flo
     target = np.asarray(target, bool)
     if not len(score) or score.shape != target.shape:
         raise ValueError("Stage-B validation scores and targets must be aligned and non-empty")
-    thresholds = np.unique(np.r_[0.0, score, 1.0])
+    thresholds = np.unique(score)
     best = (-1.0, 0.5, 0.0, 0.0)
     for threshold in thresholds:
         predicted = score >= threshold
