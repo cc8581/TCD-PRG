@@ -29,6 +29,7 @@ def evaluate_stageb_geometry(
     region_valid: np.ndarray,
     translation_world: np.ndarray,
     rotation_world: np.ndarray,
+    width_m: float,
     gripper_points_tcp: np.ndarray,
     gripper_part_id: np.ndarray,
 ) -> StageBGeometryResult:
@@ -50,9 +51,12 @@ def evaluate_stageb_geometry(
     local = world_to_grasp_numpy(xyz, translation_world, rotation)
     target_local = local[target]
     reasons: list[str] = []
+    if not np.isfinite(width_m) or not 0.0 < float(width_m) <= 0.095:
+        raise ValueError("candidate width is outside AG-160-95 limits")
+    half_width = float(width_m) * 0.5
 
     closing = (
-        (np.abs(target_local[:, 0]) <= 0.0475)
+        (np.abs(target_local[:, 0]) <= half_width)
         & (np.abs(target_local[:, 1]) <= 0.026)
         & (target_local[:, 2] >= -0.060)
         & (target_local[:, 2] <= 0.012)
@@ -70,8 +74,10 @@ def evaluate_stageb_geometry(
 
     gripper = np.asarray(gripper_points_tcp, np.float32)
     part = np.asarray(gripper_part_id, np.int64)
-    if gripper.shape != (128, 3) or part.shape != (128,):
-        raise ValueError("invalid fixed AG-160-95 geometry")
+    if gripper.ndim != 2 or gripper.shape[1:] != (3,) or part.shape != (len(gripper),):
+        raise ValueError("invalid AG-160-95 label geometry")
+    if len(gripper) < 1_000:
+        raise ValueError("offline Stage-B labels require dense AG-160-95 geometry")
     non_target = valid & ~target
     other = local[non_target]
     approach_collision = (
@@ -125,9 +131,11 @@ def evaluate_stageb_geometry(
         right = contact_points[:, 0] <= contact_points[:, 0].min() + 0.004
         functional = np.asarray(region_target, bool)[contact_world_index]
         known = np.asarray(region_valid, bool)[contact_world_index]
-        if not (
-            bool((functional & known & left).any()) and bool((functional & known & right).any())
-        ):
+        left_known = known & left
+        right_known = known & right
+        if not left_known.any() or not right_known.any():
+            raise ValueError("unknown functional region at contact")
+        if not (functional & left_known).any() or not (functional & right_known).any():
             reasons.append("contact_outside_functional_region")
     else:
         reasons.append("contact_outside_functional_region")

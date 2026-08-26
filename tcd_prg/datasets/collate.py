@@ -12,20 +12,59 @@ from .types import GlobalGraspLabels, UnifiedSample
 
 
 def collate_stageb_binary(
-    samples: list[Any], *, grid_size_m: float | None = None,
-    training: bool = False, point_count: int = 0,
+    samples: list[Any],
+    *,
+    grid_size_m: float | None = None,
+    training: bool = False,
+    point_count: int = 0,
 ) -> dict[str, Any]:
     """Collate scene/task inputs and the concrete candidates labelled offline."""
+    del training
     batch = collate_unified(
-        [item.sample for item in samples], grid_size_m=grid_size_m,
-        training=training, point_count=point_count, include_graspnet=False,
+        [item.sample for item in samples],
+        grid_size_m=grid_size_m,
+        training=False,
+        point_count=point_count,
+        include_graspnet=False,
+    )
+    fixed = {
+        "xyz": ("context_xyz", 0.0),
+        "rgb": ("context_rgb", 0.0),
+        "point_mask": ("context_point_mask", False),
+        "source_view": ("context_source_view", -1),
+        "target_mask": ("context_target_mask", False),
+        "region_target": ("context_region_target", False),
+        "region_valid": ("context_region_valid", False),
+        "grid_coord": ("context_grid_coord", 0),
+    }
+    for output_key, (context_key, fill) in fixed.items():
+        value, _ = _pad([item.context[context_key] for item in samples], fill)
+        batch[output_key] = value
+    batch["xyz"] = batch["xyz"].float()
+    batch["rgb"] = batch["rgb"].float()
+    batch["point_mask"] = batch["point_mask"].bool()
+    batch["source_view"] = batch["source_view"].long()
+    batch["target_mask"] = batch["target_mask"].bool()
+    batch["region_target"] = batch["region_target"].bool()
+    batch["region_valid"] = batch["region_valid"].bool()
+    batch["grid_coord"] = batch["grid_coord"].int()
+    batch["target_prompt_xyz"] = torch.from_numpy(
+        np.stack([item.context["target_prompt_xyz"] for item in samples])
+    ).float()
+    batch["target_prompt_label"] = torch.ones(
+        batch["target_prompt_xyz"].shape[:2], dtype=torch.long
+    )
+    batch["target_prompt_valid"] = torch.ones(
+        batch["target_prompt_xyz"].shape[:2], dtype=torch.bool
     )
     translation, valid = _pad([item.translation_world for item in samples], np.nan)
     rotation, _ = _pad([item.rotation_matrix for item in samples], np.nan)
+    width, _ = _pad([item.width_m for item in samples], np.nan)
     label, _ = _pad([item.label for item in samples], False)
     batch["stageb_candidates"] = {
         "translation_world": translation.float(),
         "rotation_matrix": rotation.float(),
+        "width_m": width.float(),
         "valid": valid.bool(),
     }
     batch["stageb_candidate_valid"] = valid.bool()
@@ -141,10 +180,7 @@ def _camera_view_payload(
     eye, target, up, camera_valid = [], [], [], []
     for observation in observations:
         source_view = observation.source_view
-        usable = (
-            source_view is not None
-            and view_index < len(observation.camera_parameters)
-        )
+        usable = source_view is not None and view_index < len(observation.camera_parameters)
         if usable:
             source_indices = np.flatnonzero(source_view == view_index)
         else:
@@ -153,9 +189,7 @@ def _camera_view_payload(
             selected, grid = grid_sample(
                 observation.xyz[source_indices], float(grid_size_m), training
             )
-            selected, _ = _limit_point_sample(
-                selected, grid, point_count, training
-            )
+            selected, _ = _limit_point_sample(selected, grid, point_count, training)
             source_indices = source_indices[selected]
         elif len(source_indices):
             local = np.arange(len(source_indices), dtype=np.int64)
@@ -194,9 +228,13 @@ def _camera_view_payload(
 
 
 def collate_unified(
-    samples: list[UnifiedSample], *, grid_size_m: float | None = None,
-    training: bool = False, point_count: int = 0,
-    graspnet_point_count: int = 0, graspnet_view_index: int = 2,
+    samples: list[UnifiedSample],
+    *,
+    grid_size_m: float | None = None,
+    training: bool = False,
+    point_count: int = 0,
+    graspnet_point_count: int = 0,
+    graspnet_view_index: int = 2,
     include_graspnet: bool = True,
 ) -> dict[str, Any]:
     if not samples:
@@ -204,29 +242,32 @@ def collate_unified(
     observations = [x.observation for x in samples]
     candidates = [x.candidates for x in samples]
     if grid_size_m is not None:
-        point_samples = [
-            grid_sample(x.xyz, float(grid_size_m), training) for x in observations
-        ]
+        point_samples = [grid_sample(x.xyz, float(grid_size_m), training) for x in observations]
         limited = [
-            _limit_point_sample(item[0], item[1], point_count, training)
-            for item in point_samples
+            _limit_point_sample(item[0], item[1], point_count, training) for item in point_samples
         ]
         point_indices = [item[0] for item in limited]
         grid_coord, _ = _pad([item[1] for item in limited])
     else:
         point_indices = [
-            _limit_point_sample(
-                np.arange(len(x.xyz), dtype=np.int64), None, point_count, training
-            )[0]
+            _limit_point_sample(np.arange(len(x.xyz), dtype=np.int64), None, point_count, training)[
+                0
+            ]
             for x in observations
         ]
         grid_coord = None
     # 所有变长轴都同时生成显式 mask，后续网络不得把 padding 当作真实点或候选。
     xyz, point_mask = _pad([x.xyz[i] for x, i in zip(observations, point_indices, strict=True)])
     rgb, _ = _pad([x.rgb[i] for x, i in zip(observations, point_indices, strict=True)])
-    instance, _ = _pad([x.instance_id[i] for x, i in zip(observations, point_indices, strict=True)], -1)
-    target_mask, _ = _pad([x.target_mask[i] for x, i in zip(observations, point_indices, strict=True)], False)
-    have_region = all(x.region_target is not None and x.region_valid is not None for x in observations)
+    instance, _ = _pad(
+        [x.instance_id[i] for x, i in zip(observations, point_indices, strict=True)], -1
+    )
+    target_mask, _ = _pad(
+        [x.target_mask[i] for x, i in zip(observations, point_indices, strict=True)], False
+    )
+    have_region = all(
+        x.region_target is not None and x.region_valid is not None for x in observations
+    )
     object_pose, object_mask = _pad([x.object_pose for x in observations])
     object_present, _ = _pad([x.object_present for x in observations], False)
     object_active, _ = _pad([x.object_active for x in observations], False)
@@ -254,9 +295,7 @@ def collate_unified(
             fill = np.nan
         action_parameters[key], _ = _pad([x.action_parameters[key] for x in candidates], fill)
     object_count = object_pose.shape[1]
-    push_object_known = torch.zeros(
-        (len(samples), object_count), dtype=torch.bool
-    )
+    push_object_known = torch.zeros((len(samples), object_count), dtype=torch.bool)
     push_object_positive = torch.zeros_like(push_object_known)
     for row, sample in enumerate(samples):
         state_group = sample.push_object_state
@@ -283,11 +322,7 @@ def collate_unified(
     )
     source_view, _ = _pad(
         [
-            (
-                x.source_view[i]
-                if x.source_view is not None
-                else np.full(len(i), -1, np.int16)
-            )
+            (x.source_view[i] if x.source_view is not None else np.full(len(i), -1, np.int16))
             for x, i in zip(observations, point_indices, strict=True)
         ],
         -1,
@@ -308,13 +343,15 @@ def collate_unified(
         "object_category_id": object_category_id.long(),
         "target_model_id": [
             str(x.metadata.get("object_model_id", ("",))[x.target_object])
-            if x.target_object < len(x.metadata.get("object_model_id", ())) else ""
+            if x.target_object < len(x.metadata.get("object_model_id", ()))
+            else ""
             for x in observations
         ],
         "target_object_scale": torch.tensor(
             [
                 float(x.metadata.get("object_scale", (1.0,))[x.target_object])
-                if x.target_object < len(x.metadata.get("object_scale", ())) else 1.0
+                if x.target_object < len(x.metadata.get("object_scale", ()))
+                else 1.0
                 for x in observations
             ],
             dtype=torch.float32,
@@ -364,12 +401,18 @@ def collate_unified(
         # them through avoids a second GPU unique/sort pass in the PTv3 adapter.
         result["grid_coord"] = grid_coord.to(torch.int32)
     if have_region:
-        region_target, _ = _pad([  # type: ignore[index]
-            x.region_target[i] for x, i in zip(observations, point_indices, strict=True)
-        ], False)
-        region_valid, _ = _pad([  # type: ignore[index]
-            x.region_valid[i] for x, i in zip(observations, point_indices, strict=True)
-        ], False)
+        region_target, _ = _pad(
+            [  # type: ignore[index]
+                x.region_target[i] for x, i in zip(observations, point_indices, strict=True)
+            ],
+            False,
+        )
+        region_valid, _ = _pad(
+            [  # type: ignore[index]
+                x.region_valid[i] for x, i in zip(observations, point_indices, strict=True)
+            ],
+            False,
+        )
         result["region_target"] = region_target.bool()
         result["region_valid"] = region_valid.bool()
         result["visibility_target"] = torch.tensor(
@@ -383,7 +426,9 @@ def collate_unified(
         dtype=torch.bool,
     )
     if any(sample.global_grasps is not None for sample in samples):
-        template = next(sample.global_grasps for sample in samples if sample.global_grasps is not None)
+        template = next(
+            sample.global_grasps for sample in samples if sample.global_grasps is not None
+        )
         assert template is not None
 
         packed = [sample.global_grasps or _empty_global_grasps_like(template) for sample in samples]
@@ -394,7 +439,9 @@ def collate_unified(
             "source_grasp_index": _pad([x.source_grasp_index for x in packed], -1)[0].long(),
             "contact_point_world": _pad([x.contact_point_world for x in packed], np.nan)[0].float(),
             "grasp_pose_world": _pad([x.grasp_pose_world for x in packed], np.nan)[0].float(),
-            "approach_direction_world": _pad([x.approach_direction_world for x in packed], np.nan)[0].float(),
+            "approach_direction_world": _pad([x.approach_direction_world for x in packed], np.nan)[
+                0
+            ].float(),
             "width_m": _pad([x.width_m for x in packed], np.nan)[0].float(),
             "intrinsic_stable": _pad([x.intrinsic_stable for x in packed], False)[0].bool(),
             "scene_executable": scene_executable.to(torch.int8),
@@ -410,15 +457,20 @@ def collate_unified(
 
 
 def collate_global_grasp(
-    samples: list[Any], *, grid_size_m: float | None = None,
-    training: bool = False, point_count: int = 0,
-    graspnet_point_count: int = 0, graspnet_view_index: int = 2,
+    samples: list[Any],
+    *,
+    grid_size_m: float | None = None,
+    training: bool = False,
+    point_count: int = 0,
+    graspnet_point_count: int = 0,
+    graspnet_view_index: int = 2,
 ) -> dict[str, Any]:
     """Minimal collator for the independent Global Grasp stream.
 
     The tensor values consumed by the neutral scene backbone and
     ``build_global_grasp_labels`` are constructed with the same helpers and
-    dtypes as ``collate_unified``.  Task-policy graph/verifier fields are intentionally not materialized.
+    dtypes as ``collate_unified``. Task-policy graph/verifier fields are
+    intentionally not materialized.
     """
 
     if not samples:
@@ -429,12 +481,9 @@ def collate_global_grasp(
         raise RuntimeError("Global-only batch contains a sample without Global labels")
 
     if grid_size_m is not None:
-        point_samples = [
-            grid_sample(obs.xyz, float(grid_size_m), training) for obs in observations
-        ]
+        point_samples = [grid_sample(obs.xyz, float(grid_size_m), training) for obs in observations]
         limited = [
-            _limit_point_sample(item[0], item[1], point_count, training)
-            for item in point_samples
+            _limit_point_sample(item[0], item[1], point_count, training) for item in point_samples
         ]
         point_indices = [item[0] for item in limited]
         grid_coord, _ = _pad([item[1] for item in limited])
@@ -450,9 +499,7 @@ def collate_global_grasp(
     xyz, point_mask = _pad(
         [obs.xyz[index] for obs, index in zip(observations, point_indices, strict=True)]
     )
-    rgb, _ = _pad(
-        [obs.rgb[index] for obs, index in zip(observations, point_indices, strict=True)]
-    )
+    rgb, _ = _pad([obs.rgb[index] for obs, index in zip(observations, point_indices, strict=True)])
     instance_id, _ = _pad(
         [obs.instance_id[index] for obs, index in zip(observations, point_indices, strict=True)],
         -1,
@@ -461,13 +508,9 @@ def collate_global_grasp(
         [obs.target_mask[index] for obs, index in zip(observations, point_indices, strict=True)],
         False,
     )
-    object_present, object_mask = _pad(
-        [obs.object_present for obs in observations], False
-    )
+    object_present, object_mask = _pad([obs.object_present for obs in observations], False)
     object_active, _ = _pad([obs.object_active for obs in observations], False)
-    object_category_id, _ = _pad(
-        [obs.object_category_id for obs in observations], -1
-    )
+    object_category_id, _ = _pad([obs.object_category_id for obs in observations], -1)
 
     # ``packed`` was checked above; keep the local alias type-agnostic so this
     # remains compatible with both GlobalGraspSample and legacy UnifiedSample.
@@ -505,22 +548,20 @@ def collate_global_grasp(
         ),
         "global_grasp_labels": {
             "object_index": _pad([label.object_index for label in labels], -1)[0].long(),
-            "source_grasp_index": _pad(
-                [label.source_grasp_index for label in labels], -1
-            )[0].long(),
-            "contact_point_world": _pad(
-                [label.contact_point_world for label in labels], np.nan
-            )[0].float(),
-            "grasp_pose_world": _pad(
-                [label.grasp_pose_world for label in labels], np.nan
-            )[0].float(),
+            "source_grasp_index": _pad([label.source_grasp_index for label in labels], -1)[
+                0
+            ].long(),
+            "contact_point_world": _pad([label.contact_point_world for label in labels], np.nan)[
+                0
+            ].float(),
+            "grasp_pose_world": _pad([label.grasp_pose_world for label in labels], np.nan)[
+                0
+            ].float(),
             "approach_direction_world": _pad(
                 [label.approach_direction_world for label in labels], np.nan
             )[0].float(),
             "width_m": _pad([label.width_m for label in labels], np.nan)[0].float(),
-            "intrinsic_stable": _pad(
-                [label.intrinsic_stable for label in labels], False
-            )[0].bool(),
+            "intrinsic_stable": _pad([label.intrinsic_stable for label in labels], False)[0].bool(),
             "scene_executable": scene_executable.to(torch.int8),
             "anchor_visible_distance_m": _pad(
                 [label.anchor_visible_distance_m for label in labels], np.nan
@@ -548,4 +589,3 @@ def collate_global_grasp(
     if grid_coord is not None:
         result["grid_coord"] = grid_coord.to(torch.int32)
     return result
-

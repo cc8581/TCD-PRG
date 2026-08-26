@@ -8,10 +8,11 @@ training:
   max_optimizer_steps: 15000
   frozen_modules: [encoder, region_head, graspnet, push]
 
-  max_train_groups: 8
+  max_train_groups: null
+  max_validation_groups: null
   batch_size: 8
   gradient_accumulation_steps: 1
-  validation_interval: 0
+  validation_interval: 1000
 
 losses:
   instance: 0.0

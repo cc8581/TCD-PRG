@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 
 from tcd_prg.config import load_config
 from tcd_prg.datasets import ActionStateGroupDataset
+from tcd_prg.datasets.stageb_manifest import SCHEMA_VERSION, build_provenance
 from tcd_prg.geometry.stageb_grasp import evaluate_stageb_geometry
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter
@@ -58,25 +59,30 @@ def model_view(batch: dict) -> dict:
 
 
 def balance_binary_records(root: Path, records: list[dict], seed: int) -> list[dict]:
-    """Deterministically retain a positive:negative ratio from 1:1 to 1:2."""
+    """Balance within task-region strata, never globally."""
     payloads = []
-    positive_locations: list[tuple[int, int]] = []
-    negative_locations: list[tuple[int, int]] = []
+    strata: dict[int, dict[bool, list[tuple[int, int]]]] = {}
     for record_index, record in enumerate(records):
         path = root / record["path"]
         payload = {key: value for key, value in np.load(path).items()}
         labels = payload["task_valid"].astype(bool)
-        positive_locations.extend((record_index, int(index)) for index in np.flatnonzero(labels))
-        negative_locations.extend((record_index, int(index)) for index in np.flatnonzero(~labels))
+        key = int(record.get("task_region_id", -1))
+        bucket = strata.setdefault(key, {True: [], False: []})
+        bucket[True].extend((record_index, int(index)) for index in np.flatnonzero(labels))
+        bucket[False].extend((record_index, int(index)) for index in np.flatnonzero(~labels))
         payloads.append(payload)
-    if not positive_locations or not negative_locations:
-        raise RuntimeError("Stage-B split must contain both positive and negative geometry labels")
     rng = np.random.default_rng(seed)
-    rng.shuffle(positive_locations)
-    rng.shuffle(negative_locations)
-    positive_count = min(len(positive_locations), len(negative_locations))
-    kept_positive = set(positive_locations[:positive_count])
-    kept_negative = set(negative_locations[: 2 * positive_count])
+    kept_positive: set[tuple[int, int]] = set()
+    kept_negative: set[tuple[int, int]] = set()
+    for key, bucket in sorted(strata.items()):
+        positive, negative = bucket[True], bucket[False]
+        if not positive or not negative:
+            raise RuntimeError(f"Stage-B stratum {key} must contain both binary labels")
+        rng.shuffle(positive)
+        rng.shuffle(negative)
+        positive_count = min(len(positive), len(negative))
+        kept_positive.update(positive[:positive_count])
+        kept_negative.update(negative[: 2 * positive_count])
     balanced: list[dict] = []
     for record_index, (record, payload) in enumerate(zip(records, payloads, strict=True)):
         label = payload["task_valid"].astype(bool)
@@ -88,12 +94,11 @@ def balance_binary_records(root: Path, records: list[dict], seed: int) -> list[d
         if not keep.any():
             (root / record["path"]).unlink()
             continue
-        np.savez_compressed(
-            root / record["path"],
-            translation_world=payload["translation_world"][keep],
-            rotation_matrix=payload["rotation_matrix"][keep],
-            task_valid=payload["task_valid"][keep],
-        )
+        balanced_payload = {
+            key: (value[keep] if value.ndim and value.shape[0] == len(label) else value)
+            for key, value in payload.items()
+        }
+        np.savez_compressed(root / record["path"], **balanced_payload)
         balanced.append(
             {
                 **record,
@@ -136,7 +141,7 @@ def main() -> None:
     load_predecessor_weights(model, checkpoint, "grasp")
     device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
     model.to(device).eval()
-    ag_geometry = np.load(config.model.task_grasp_gripper_geometry)
+    ag_geometry = np.load(config.model.stageb_label_gripper_geometry)
     root = Path(args.output)
     records_dir = root / "records"
     records_dir.mkdir(parents=True, exist_ok=True)
@@ -173,6 +178,7 @@ def main() -> None:
                     batch["region_valid"][0].cpu().numpy(),
                     proposals["translation_world"][0, candidate].cpu().numpy(),
                     proposals["rotation_matrix"][0, candidate].cpu().numpy(),
+                    float(proposals["width_m"][0, candidate]),
                     ag_geometry["points_tcp"],
                     ag_geometry["part_id"],
                 )
@@ -204,7 +210,20 @@ def main() -> None:
             .cpu()
             .numpy()
             .astype(np.float32),
+            width_m=proposals["width_m"][0, proposal_index].cpu().numpy().astype(np.float32),
             task_valid=np.asarray([labels[i] for i in selected], np.bool_),
+            context_xyz=batch["xyz"][0].cpu().numpy().astype(np.float32),
+            context_rgb=batch["rgb"][0].cpu().numpy().astype(np.float32),
+            context_point_mask=batch["point_mask"][0].cpu().numpy().astype(np.bool_),
+            context_source_view=batch["source_view"][0].cpu().numpy().astype(np.int16),
+            context_target_mask=batch["target_mask"][0].cpu().numpy().astype(np.bool_),
+            context_region_target=batch["region_target"][0].cpu().numpy().astype(np.bool_),
+            context_region_valid=batch["region_valid"][0].cpu().numpy().astype(np.bool_),
+            context_grid_coord=batch["grid_coord"][0].cpu().numpy().astype(np.int32),
+            target_prompt_xyz=view["task_inputs"]["target_prompt_xyz"][0]
+            .cpu()
+            .numpy()
+            .astype(np.float32),
         )
         for local in selected:
             audit.write(
@@ -225,6 +244,8 @@ def main() -> None:
                 "state_id": unit.state_id,
                 "task_index": unit.task_index,
                 "group_index": unit.group_index,
+                "task_region_id": int(batch["task_region_id"][0]),
+                "object_category_id": int(batch["task_category_id"][0]),
                 "path": str(path.relative_to(root)).replace("\\", "/"),
             }
         )
@@ -247,7 +268,16 @@ def main() -> None:
         else []
     )
     existing = [row for row in existing if row["split"] != args.split]
-    payload = {"schema_version": "tcd_prg_stageb_binary_v1", "records": existing + records}
+    provenance = build_provenance(config, args.checkpoint)
+    if manifest_path.is_file():
+        old = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if old.get("provenance") != provenance:
+            raise RuntimeError("Existing Stage-B split was built with different provenance")
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "provenance": provenance,
+        "records": existing + records,
+    }
     temporary = manifest_path.with_name(f"{manifest_path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, manifest_path)

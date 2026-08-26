@@ -20,6 +20,7 @@ def inputs(batch: int, candidates: int, points: int, dim: int, device: torch.dev
     proposal = {
         "translation_world": translation,
         "rotation_matrix": rotation,
+        "width_m": torch.rand(batch, candidates, device=device) * 0.075 + 0.02,
         "valid": torch.ones(batch, candidates, dtype=torch.bool, device=device),
     }
     return (

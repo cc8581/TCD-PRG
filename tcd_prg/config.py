@@ -171,6 +171,7 @@ class ModelConfig:
     task_grasp_scene_points: int = 256
     task_grasp_gripper_points: int = 128
     task_grasp_gripper_geometry: str = "assets/robots/FR5_AG-160-95/ag16095_open_tcp_128.npz"
+    stageb_label_gripper_geometry: str = "assets/robots/FR5_AG-160-95/ag16095_open_tcp_4096.npz"
     pick_remove_candidates: int = 16
     push_candidates: int = 16
     # push_candidates 是接触点预算；每个点再展开多个方向，最终总量受 max_push_candidates 限制。
@@ -219,7 +220,10 @@ class TrainingConfig:
     # Task/state selection is primary.  Strata only guide which group to use
     # inside an already-selected state; they never replace that task/state.
     action_batch_coverage_strata: tuple[str, ...] = (
-        "direct_grasp", "pick_remove", "push", "push_failure",
+        "direct_grasp",
+        "pick_remove",
+        "push",
+        "push_failure",
         "unresolved_or_unknown",
     )
     # Optional stage-level filter over the immutable action-group snapshot.
@@ -248,13 +252,15 @@ class TrainingConfig:
     max_validation_groups: int | None = None
     # Used only when max_validation_groups is finite.  The resulting exact
     # subset is persisted to validation_subset.json and reused on resume.
-    validation_stratum_quota: dict[str, int] = field(default_factory=lambda: {
-        "direct_grasp": 64,
-        "pick_remove": 64,
-        "push": 48,
-        "push_failure": 48,
-        "unresolved_or_unknown": 32,
-    })
+    validation_stratum_quota: dict[str, int] = field(
+        default_factory=lambda: {
+            "direct_grasp": 64,
+            "pick_remove": 64,
+            "push": 48,
+            "push_failure": 48,
+            "unresolved_or_unknown": 32,
+        }
+    )
     # Restrict the published scene snapshot before deterministic splitting.
     scene_start: int = 0
     scene_count: int | None = None
@@ -266,15 +272,17 @@ class TrainingConfig:
     unfreeze_at_optimizer_step: int | None = None
     ddp_backend: str = "auto"
     ddp_find_unused_parameters: bool = True
-    validation_family_weights: dict[str, float] = field(default_factory=lambda: {
-        "instance": 0.1,
-        "region": 0.1,
-        "task_grasp": 0.25,
-        "push_object": 0.1,
-        "push_contact": 0.05,
-        "push_direction": 0.05,
-        "push_potential": 0.1,
-    })
+    validation_family_weights: dict[str, float] = field(
+        default_factory=lambda: {
+            "instance": 0.1,
+            "region": 0.1,
+            "task_grasp": 0.25,
+            "push_object": 0.1,
+            "push_contact": 0.05,
+            "push_direction": 0.05,
+            "push_potential": 0.1,
+        }
+    )
 
 
 @dataclass(slots=True)
@@ -325,25 +333,32 @@ class LossConfig:
     push_contact: float = 0.25
     push_direction: float = 0.25
     push_potential: float = 0.25
-    internal: dict[str, float] = field(default_factory=lambda: {
-        "instance_objectness": 1.0,
-        "instance_mask": 2.0,
-        "instance_dice": 2.0,
-        "instance_category": 1.0,
-        "target_query": 1.0,
-        "instance_auxiliary": 0.5,
-        "region_focal": 1.0,
-        "region_dice": 1.0,
-        "region_visibility": 0.2,
-        "task_grasp_bce": 1.0,
-    })
+    internal: dict[str, float] = field(
+        default_factory=lambda: {
+            "instance_objectness": 1.0,
+            "instance_mask": 2.0,
+            "instance_dice": 2.0,
+            "instance_category": 1.0,
+            "target_query": 1.0,
+            "instance_auxiliary": 0.5,
+            "region_focal": 1.0,
+            "region_dice": 1.0,
+            "region_visibility": 0.2,
+            "task_grasp_bce": 1.0,
+        }
+    )
 
     def family_weights(self) -> dict[str, float]:
         return {
             name: float(getattr(self, name))
             for name in (
-                "instance", "region", "task_grasp", "push_object",
-                "push_contact", "push_direction", "push_potential",
+                "instance",
+                "region",
+                "task_grasp",
+                "push_object",
+                "push_contact",
+                "push_direction",
+                "push_potential",
             )
         }
 
@@ -411,9 +426,7 @@ class TCDPRGConfig:
 
     def validate(self) -> None:
         if self.training.stage not in {"perception", "grasp", "push", "joint"}:
-            raise ValueError(
-                "training.stage must be one of perception, grasp, push, or joint"
-            )
+            raise ValueError("training.stage must be one of perception, grasp, push, or joint")
         stage_families = {
             "perception": {"instance", "region"},
             "grasp": {"task_grasp"},
@@ -424,8 +437,13 @@ class TCDPRGConfig:
             configured_families = {
                 name
                 for name in (
-                    "instance", "region", "task_grasp", "push_object",
-                    "push_contact", "push_direction", "push_potential",
+                    "instance",
+                    "region",
+                    "task_grasp",
+                    "push_object",
+                    "push_contact",
+                    "push_direction",
+                    "push_potential",
                 )
                 if float(getattr(self.losses, name)) > 0
             }
@@ -451,7 +469,10 @@ class TCDPRGConfig:
         if self.training.validation_interval < 0:
             raise ValueError("training.validation_interval must be non-negative")
         expected_strata = {
-            "direct_grasp", "pick_remove", "push", "push_failure",
+            "direct_grasp",
+            "pick_remove",
+            "push",
+            "push_failure",
             "unresolved_or_unknown",
         }
         coverage_strata = tuple(self.training.action_batch_coverage_strata)
@@ -492,13 +513,12 @@ class TCDPRGConfig:
                 raise ValueError(
                     "training.validation_stratum_quota must define exactly the five action strata"
                 )
-            if any(
-                int(value) < 0 for value in self.training.validation_stratum_quota.values()
-            ):
+            if any(int(value) < 0 for value in self.training.validation_stratum_quota.values()):
                 raise ValueError("training.validation_stratum_quota values must be non-negative")
-            if sum(
-                int(value) for value in self.training.validation_stratum_quota.values()
-            ) != self.training.max_validation_groups:
+            if (
+                sum(int(value) for value in self.training.validation_stratum_quota.values())
+                != self.training.max_validation_groups
+            ):
                 raise ValueError(
                     "training.validation_stratum_quota must sum to max_validation_groups"
                 )
@@ -555,7 +575,11 @@ class TCDPRGConfig:
         if self.backbone.backend not in {"point_transformer_v3", "legacy"}:
             raise ValueError("backbone.backend must be point_transformer_v3 or legacy")
         if self.backbone.pretrained_format not in {
-            "auto", "tcd_prg", "sonata", "pointcept", "ptv3"
+            "auto",
+            "tcd_prg",
+            "sonata",
+            "pointcept",
+            "ptv3",
         }:
             raise ValueError("Unsupported backbone.pretrained_format")
         if not 0.0 <= self.backbone.pretrained_min_parameter_fraction <= 1.0:
@@ -582,19 +606,25 @@ class TCDPRGConfig:
             raise ValueError("Invalid AG gripper opening range")
         if self.model.contact_heatmap_sigma_m <= 0:
             raise ValueError("contact_heatmap_sigma_m must be positive")
-        if min(
-            self.model.grasp_nms_translation_m,
-            self.model.grasp_nms_rotation_deg,
-            self.model.grasp_nms_width_m,
-            self.model.grasp_nms_approach_deg,
-        ) <= 0:
+        if (
+            min(
+                self.model.grasp_nms_translation_m,
+                self.model.grasp_nms_rotation_deg,
+                self.model.grasp_nms_width_m,
+                self.model.grasp_nms_approach_deg,
+            )
+            <= 0
+        ):
             raise ValueError("All grasp NMS thresholds must be positive")
-        if min(
-            self.model.global_grasp_nms_translation_m,
-            self.model.global_grasp_nms_rotation_deg,
-            self.model.global_grasp_nms_width_m,
-            self.model.global_grasp_nms_approach_deg,
-        ) <= 0:
+        if (
+            min(
+                self.model.global_grasp_nms_translation_m,
+                self.model.global_grasp_nms_rotation_deg,
+                self.model.global_grasp_nms_width_m,
+                self.model.global_grasp_nms_approach_deg,
+            )
+            <= 0
+        ):
             raise ValueError("Global grasp NMS thresholds must be positive")
         if not 0.0 < self.model.task_grasp_probability_threshold < 1.0:
             raise ValueError("task_grasp_probability_threshold must be in (0,1)")
@@ -609,19 +639,20 @@ class TCDPRGConfig:
         if min(self.model.push_nms_contact_m, self.model.push_nms_direction_deg) <= 0:
             raise ValueError("PUSH NMS thresholds must be positive")
         if not 1 <= self.model.push_directions_per_contact <= self.model.num_direction_bins:
-            raise ValueError(
-                "push_directions_per_contact must be in [1,num_direction_bins]"
-            )
+            raise ValueError("push_directions_per_contact must be in [1,num_direction_bins]")
         if self.model.push_candidates <= 0 or self.model.max_push_candidates <= 0:
             raise ValueError("PUSH contact and final candidate budgets must be positive")
         if self.model.push_direction_contact_topk <= 0:
             raise ValueError("push_direction_contact_topk must be positive")
         if self.model.global_grasp_input_mode not in {"scene_only", "instance_assisted"}:
             raise ValueError("global_grasp_input_mode must be scene_only or instance_assisted")
-        if min(
-            self.sampling.global_positive_grasps_per_object,
-            self.sampling.global_negative_grasps_per_object,
-        ) < 0:
+        if (
+            min(
+                self.sampling.global_positive_grasps_per_object,
+                self.sampling.global_negative_grasps_per_object,
+            )
+            < 0
+        ):
             raise ValueError("Global grasp stratum sizes cannot be negative")
         if self.sampling.global_positive_grasps_per_object == 0:
             raise ValueError("Global grasp training requires positive samples")
@@ -643,15 +674,18 @@ class TCDPRGConfig:
             raise ValueError("target prompt radius/sigma must be positive")
         if self.model.target_prompt_jitter_std_m < 0:
             raise ValueError("target_prompt_jitter_std_m must be non-negative")
-        if min(
-            self.model.target_prompt_weight,
-            self.model.target_category_weight,
-            self.model.target_objectness_weight,
-            self.model.target_center_weight,
-            self.model.target_learned_weight,
-            self.model.target_reid_weight,
-            self.model.target_reid_center_weight,
-        ) < 0:
+        if (
+            min(
+                self.model.target_prompt_weight,
+                self.model.target_category_weight,
+                self.model.target_objectness_weight,
+                self.model.target_center_weight,
+                self.model.target_learned_weight,
+                self.model.target_reid_weight,
+                self.model.target_reid_center_weight,
+            )
+            < 0
+        ):
             raise ValueError("target selector weights must be non-negative")
         if self.model.target_reid_max_center_distance_m <= 0:
             raise ValueError("target_reid_max_center_distance_m must be positive")
@@ -661,21 +695,27 @@ class TCDPRGConfig:
             raise ValueError("target_prompt_min_margin must be non-negative")
         if self.model.target_same_category_loss_boost < 1.0:
             raise ValueError("target_same_category_loss_boost must be >= 1")
-        if min(
-            self.model.task_grasp_scene_points,
-            self.model.task_grasp_gripper_points,
-        ) <= 0:
+        if (
+            min(
+                self.model.task_grasp_scene_points,
+                self.model.task_grasp_gripper_points,
+            )
+            <= 0
+        ):
             raise ValueError("Task-grasp point budgets must be positive")
-        if min(
-            self.graspnet.scene_input_points,
-            self.graspnet.target_input_points,
-            self.graspnet.global_proposals,
-            self.graspnet.target_proposals,
-            self.graspnet.num_view,
-            self.graspnet.num_angle,
-            self.graspnet.num_depth,
-            self.graspnet.target_min_crop_points,
-        ) <= 0:
+        if (
+            min(
+                self.graspnet.scene_input_points,
+                self.graspnet.target_input_points,
+                self.graspnet.global_proposals,
+                self.graspnet.target_proposals,
+                self.graspnet.num_view,
+                self.graspnet.num_angle,
+                self.graspnet.num_depth,
+                self.graspnet.target_min_crop_points,
+            )
+            <= 0
+        ):
             raise ValueError("GraspNet point/proposal/discretization counts must be positive")
         if self.graspnet.camera_view_index < 0:
             raise ValueError("GraspNet camera_view_index must be non-negative")
@@ -704,13 +744,9 @@ class TCDPRGConfig:
             raise ValueError("task_grasp_bce must be positive")
         if self.model.push_direction_transformer_layers <= 0:
             raise ValueError("push_direction_transformer_layers must be positive")
-        if (
-            self.model.push_direction_feature_dim
-            % self.model.push_direction_transformer_heads
-        ):
+        if self.model.push_direction_feature_dim % self.model.push_direction_transformer_heads:
             raise ValueError(
-                "push_direction_feature_dim must be divisible by "
-                "push_direction_transformer_heads"
+                "push_direction_feature_dim must be divisible by push_direction_transformer_heads"
             )
         if len(self.model.push_utility_component_weights) != 5:
             raise ValueError(
@@ -772,11 +808,14 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> TCDPRGC
         (config.cache, "directory"),
         (config.cache, "index_directory"),
         (config.backbone, "source_root"),
+        (config.graspnet, "source_root"),
+        (config.graspnet, "checkpoint"),
         (config.baseline, "gapg_root"),
         (config.baseline, "grasp_checkpoint"),
         (config.baseline, "push_checkpoint"),
         (config.baseline, "graspnet_checkpoint"),
         (config.model, "task_grasp_gripper_geometry"),
+        (config.model, "stageb_label_gripper_geometry"),
         (config, "output_dir"),
     )
     for owner, name in path_fields:

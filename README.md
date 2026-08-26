@@ -161,6 +161,9 @@ tcd-prg-train --config configs/stage/perception.yaml `
 tcd-prg-build-stageb --config configs/stage/grasp.yaml `
   --checkpoint outputs/perception/last.pt `
   --output runtime/stageb_binary --split train
+tcd-prg-build-stageb --config configs/stage/grasp.yaml `
+  --checkpoint outputs/perception/last.pt `
+  --output runtime/stageb_binary --split val
 
 # Stage B-T: binary evaluator; initialize from A and freeze perception/GraspNet
 tcd-prg-train --config configs/stage/grasp.yaml `
@@ -180,8 +183,13 @@ transfer without optimizer state.
 
 Stage B trains only on concrete GraspNet proposals stored with strict 0/1
 `task_valid` labels. Invalid data-generation attempts are dropped and never become
-a third class. Other stages retain their native action-state units.
-Validation uses only the loss families enabled by the selected stage.
+a third class. Each record freezes the sampled scene context, target prompt, pose
+and proposal width used during label generation. Labels use dense AG CAD geometry,
+and the manifest binds them to checkpoint, configuration, geometry and code hashes.
+Both train and validation splits are mandatory for formal Stage B. Validation
+aggregates candidate-level TP/FP/FN, AUROC and AUPRC over the complete split and
+writes the best-F1 decision threshold to the run output. Other stages retain their
+native action-state units.
 
 ## Evaluation and inference
 

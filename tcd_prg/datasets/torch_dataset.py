@@ -24,6 +24,7 @@ from torch.utils.data import Dataset, Sampler
 from tcd_prg.constants import ActionType, CandidateStatus
 
 from .base import DatasetAdapter
+from .stageb_manifest import SCHEMA_VERSION
 from .types import GlobalGraspSample, PushObjectStateGroup, UnifiedSample
 
 
@@ -32,29 +33,44 @@ class StageBBinarySample:
     sample: UnifiedSample
     translation_world: np.ndarray
     rotation_matrix: np.ndarray
+    width_m: np.ndarray
     label: np.ndarray
+    context: dict[str, np.ndarray]
 
 
 class StageBBinaryDataset(Dataset[StageBBinarySample]):
     """Immutable GraspNet-proposal binary records for Stage-B training."""
 
-    def __init__(self, adapter: DatasetAdapter, root: str | Path, split: str = "train", max_groups: int | None = None) -> None:
+    def __init__(
+        self,
+        adapter: DatasetAdapter,
+        root: str | Path,
+        split: str = "train",
+        max_groups: int | None = None,
+        expected_provenance: dict[str, str] | None = None,
+    ) -> None:
         self.adapter = adapter
         self.root = Path(root)
         manifest_path = self.root / "manifest.json"
         if not manifest_path.is_file():
             raise FileNotFoundError(f"Stage-B binary manifest does not exist: {manifest_path}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("schema_version") != "tcd_prg_stageb_binary_v1":
+        if manifest.get("schema_version") != SCHEMA_VERSION:
             raise ValueError("Unsupported Stage-B binary dataset schema")
+        actual_provenance = manifest.get("provenance", {})
+        if expected_provenance is not None and any(
+            actual_provenance.get(key) != value for key, value in expected_provenance.items()
+        ):
+            raise RuntimeError(
+                "Stage-B dataset provenance does not match current checkpoints/config"
+            )
         records = [record for record in manifest["records"] if record["split"] == split]
         if max_groups is not None:
             records = records[:max_groups]
         if not records:
             raise RuntimeError(f"Stage-B binary dataset has no {split!r} records")
         if any(
-            "candidate_count" not in record or "positive_count" not in record
-            for record in records
+            "candidate_count" not in record or "positive_count" not in record for record in records
         ):
             raise ValueError("Stage-B manifest is missing binary balance counts")
         positives = sum(int(record["positive_count"]) for record in records)
@@ -69,8 +85,11 @@ class StageBBinaryDataset(Dataset[StageBBinarySample]):
         self.selected_group_count = len(records)
         self.units = tuple(
             StateGroupUnit(
-                int(record["scene_id"]), int(record["state_id"]),
-                int(record["task_index"]), int(record["group_index"]), "binary_grasp",
+                int(record["scene_id"]),
+                int(record["state_id"]),
+                int(record["task_index"]),
+                int(record["group_index"]),
+                "binary_grasp",
             )
             for record in records
         )
@@ -90,9 +109,15 @@ class StageBBinaryDataset(Dataset[StageBBinarySample]):
         payload = np.load(path)
         translation = payload["translation_world"].astype(np.float32)
         rotation = payload["rotation_matrix"].astype(np.float32)
+        width = payload["width_m"].astype(np.float32)
         label = payload["task_valid"].astype(np.bool_)
         count = len(label)
-        if translation.shape != (count, 3) or rotation.shape != (count, 3, 3) or count == 0:
+        if (
+            translation.shape != (count, 3)
+            or rotation.shape != (count, 3, 3)
+            or width.shape != (count,)
+            or count == 0
+        ):
             raise ValueError(f"Invalid Stage-B binary record: {path}")
         if not np.isfinite(translation).all() or not np.isfinite(rotation).all():
             raise ValueError(f"Non-finite Stage-B pose in {path}")
@@ -101,11 +126,27 @@ class StageBBinaryDataset(Dataset[StageBBinarySample]):
         ):
             raise ValueError(f"Stage-B manifest count mismatch: {path}")
         sample = self.adapter.load_sample(
-            int(record["scene_id"]), int(record["state_id"]),
-            int(record["task_index"]), int(record["group_index"]),
+            int(record["scene_id"]),
+            int(record["state_id"]),
+            int(record["task_index"]),
+            int(record["group_index"]),
             include_global_grasps=False,
         )
-        return StageBBinarySample(sample, translation, rotation, label)
+        context_keys = (
+            "context_xyz",
+            "context_rgb",
+            "context_point_mask",
+            "context_source_view",
+            "context_target_mask",
+            "context_region_target",
+            "context_region_valid",
+            "context_grid_coord",
+            "target_prompt_xyz",
+        )
+        if any(key not in payload for key in context_keys):
+            raise ValueError(f"Stage-B record is missing fixed evaluator context: {path}")
+        context = {key: payload[key] for key in context_keys}
+        return StageBBinarySample(sample, translation, rotation, width, label, context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,8 +353,7 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
                 if allowed_strata:
                     allowed = frozenset(str(value) for value in allowed_strata)
                     raw_units = [
-                        unit for unit in raw_units
-                        if strata.get(unit, "unclassified") in allowed
+                        unit for unit in raw_units if strata.get(unit, "unclassified") in allowed
                     ]
                     if not raw_units:
                         raise RuntimeError(
@@ -352,16 +392,12 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
         push_iterator = adapter.iter_action_groups(split)
         if scene_ids is not None:
             allowed_push_scenes = frozenset(int(scene_id) for scene_id in scene_ids)
-            push_iterator = (
-                item for item in push_iterator if int(item[0]) in allowed_push_scenes
-            )
+            push_iterator = (item for item in push_iterator if int(item[0]) in allowed_push_scenes)
         push_state_units: dict[tuple[int, int, int], list[StateGroupUnit]] = defaultdict(list)
         for raw_unit in push_iterator:
             unit = StateGroupUnit(*raw_unit)
             push_state_units[(unit.scene_id, unit.state_id, unit.task_index)].append(unit)
-        self._push_state_units = {
-            key: tuple(values) for key, values in push_state_units.items()
-        }
+        self._push_state_units = {key: tuple(values) for key, values in push_state_units.items()}
         self._push_state_cache: dict[tuple[int, int, int], PushObjectStateGroup] = {}
         self.global_grasp_mode = global_grasp_mode
         representatives: dict[tuple[int, int], int] = {}
@@ -422,9 +458,7 @@ class ActionStateGroupDataset(Dataset[UnifiedSample]):
                     group = self.adapter.load_action_group(
                         state_unit.scene_id, state_unit.group_index
                     )
-                push = group.valid_mask & (
-                    group.action_type == int(ActionType.PUSH)
-                )
+                push = group.valid_mask & (group.action_type == int(ActionType.PUSH))
                 evaluated = push & (
                     group.evaluation_status != int(CandidateStatus.UNKNOWN_UNTESTED)
                 )
@@ -504,13 +538,9 @@ class GlobalStateDataset(Dataset[UnifiedSample]):
         self.adapter = action_dataset.adapter
         representative: dict[tuple[int, int, int], StateGroupUnit] = {}
         for unit in action_dataset.units:
-            representative.setdefault(
-                (unit.scene_id, unit.state_id, unit.task_index), unit
-            )
+            representative.setdefault((unit.scene_id, unit.state_id, unit.task_index), unit)
 
-        supervised_method = getattr(
-            self.adapter, "global_grasp_supervised_task_states", None
-        )
+        supervised_method = getattr(self.adapter, "global_grasp_supervised_task_states", None)
         if supervised_method is not None:
             supervised = supervised_method(
                 action_dataset.split,
@@ -540,9 +570,7 @@ class GlobalStateDataset(Dataset[UnifiedSample]):
             scene_state_rep: dict[tuple[int, int], StateGroupUnit] = {}
             for unit in action_dataset.units:
                 scene_state_rep.setdefault((unit.scene_id, unit.state_id), unit)
-            units = [
-                unit for key, unit in scene_state_rep.items() if key in supervised
-            ]
+            units = [unit for key, unit in scene_state_rep.items() if key in supervised]
 
         self.units = tuple(units)
         if not self.units:

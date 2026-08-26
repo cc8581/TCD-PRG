@@ -440,16 +440,12 @@ class Trainer:
                     metric_counts[key] = metric_counts.get(key, 0) + int(value)
             validation_details = {
                 key: (
-                    value
-                    if key in self.COUNT_TERMS
-                    else value / max(1, metric_counts.get(key, 0))
+                    value if key in self.COUNT_TERMS else value / max(1, metric_counts.get(key, 0))
                 )
                 for key, value in metric_sums.items()
             }
             evaluation_records = [
-                record
-                for item in summaries
-                for record in item.get("evaluation_records", [])
+                record for item in summaries for record in item.get("evaluation_records", [])
             ]
             if evaluation_records:
                 evaluator = OfflineModelEvaluator(
@@ -499,6 +495,21 @@ class Trainer:
             self.save_checkpoint(self.output_dir / "best.pt")
 
         if self.is_primary:
+            if improved and "task_grasp_validation_threshold" in validation_details:
+                threshold_path = self.output_dir / "stageb_decision_threshold.json"
+                temporary = threshold_path.with_suffix(".json.tmp")
+                temporary.write_text(
+                    json.dumps(
+                        {
+                            "optimizer_step": step,
+                            "threshold": validation_details["task_grasp_validation_threshold"],
+                            "f1": validation_details.get("task_grasp_validation_f1"),
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                temporary.replace(threshold_path)
             validation_record = {
                 "schema_version": 3,
                 "timestamp_utc": self._timestamp(),
@@ -543,8 +554,7 @@ class Trainer:
             )
             if self.is_primary:
                 print(
-                    f"[early-stop] step={step:07d} "
-                    f"best={self.state.best_validation:.6f}",
+                    f"[early-stop] step={step:07d} best={self.state.best_validation:.6f}",
                     flush=True,
                 )
             return True

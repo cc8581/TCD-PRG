@@ -6,13 +6,15 @@ import numpy as np
 import pytest
 import torch
 
-from tcd_prg.config import ModelConfig
+from tcd_prg.config import ModelConfig, load_config
 from tcd_prg.geometry.stageb_grasp import evaluate_stageb_geometry, world_to_grasp_numpy
+from tcd_prg.losses.task_grasp_binary import stageb_split_metrics
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.models.task_grasp import TaskGraspEvaluator, world_to_grasp
 from tcd_prg.scripts.build_stageb_binary import balance_binary_records
 
 ASSET = Path("assets/robots/FR5_AG-160-95/ag16095_open_tcp_128.npz")
+DENSE_ASSET = Path("assets/robots/FR5_AG-160-95/ag16095_open_tcp_4096.npz")
 
 
 def evaluator_inputs(batch: int = 2, candidates: int = 3, points: int = 40, dim: int = 16):
@@ -23,6 +25,7 @@ def evaluator_inputs(batch: int = 2, candidates: int = 3, points: int = 40, dim:
     proposals = {
         "translation_world": translation,
         "rotation_matrix": rotation,
+        "width_m": torch.full((batch, candidates), 0.05),
         "valid": torch.ones(batch, candidates, dtype=torch.bool),
     }
     return (
@@ -35,6 +38,21 @@ def evaluator_inputs(batch: int = 2, candidates: int = 3, points: int = 40, dim:
         torch.randn(batch, dim),
         torch.randn(batch, dim),
     )
+
+
+def test_formal_stageb_config_uses_full_data_and_validation() -> None:
+    config = load_config("configs/stage/grasp.yaml")
+    assert config.training.max_train_groups is None
+    assert config.training.max_validation_groups is None
+    assert config.training.validation_interval == 1000
+
+
+def test_split_metrics_select_threshold_from_complete_split() -> None:
+    metrics = stageb_split_metrics(np.asarray([0.1, 0.4, 0.6, 0.9]), np.asarray([0, 1, 0, 1], bool))
+    assert metrics["task_grasp_validation_f1"] == pytest.approx(0.8)
+    assert metrics["task_grasp_validation_threshold"] == pytest.approx(0.4)
+    assert np.isfinite(metrics["task_grasp_validation_auroc"])
+    assert np.isfinite(metrics["task_grasp_validation_auprc"])
 
 
 def test_world_grasp_roundtrip() -> None:
@@ -68,7 +86,7 @@ def test_geometry_protocol_binary_region_gate() -> None:
     x = np.asarray([-0.03, -0.02, -0.01, -0.007, 0.007, 0.01, 0.02, 0.03], np.float32)
     xyz = np.stack((x, np.zeros_like(x), np.full_like(x, -0.02)), -1)
     mask = np.ones(len(x), bool)
-    geometry = np.load(ASSET)
+    geometry = np.load(DENSE_ASSET)
     positive = evaluate_stageb_geometry(
         xyz,
         mask,
@@ -77,6 +95,7 @@ def test_geometry_protocol_binary_region_gate() -> None:
         mask,
         np.zeros(3),
         np.eye(3),
+        0.095,
         geometry["points_tcp"],
         geometry["part_id"],
     )
@@ -88,12 +107,29 @@ def test_geometry_protocol_binary_region_gate() -> None:
         mask,
         np.zeros(3),
         np.eye(3),
+        0.095,
         geometry["points_tcp"],
         geometry["part_id"],
     )
     assert positive.task_valid
     assert not negative.task_valid
     assert "contact_outside_functional_region" in negative.reasons
+
+    unknown = mask.copy()
+    unknown[x < 0] = False
+    with pytest.raises(ValueError, match="unknown functional region at contact"):
+        evaluate_stageb_geometry(
+            xyz,
+            mask,
+            mask,
+            mask,
+            unknown,
+            np.zeros(3),
+            np.eye(3),
+            0.095,
+            geometry["points_tcp"],
+            geometry["part_id"],
+        )
 
 
 def test_binary_record_balance_is_exact_and_deterministic(tmp_path) -> None:
@@ -104,6 +140,7 @@ def test_binary_record_balance_is_exact_and_deterministic(tmp_path) -> None:
             path,
             translation_world=np.zeros((len(label), 3), np.float32),
             rotation_matrix=np.tile(np.eye(3, dtype=np.float32), (len(label), 1, 1)),
+            width_m=np.full(len(label), 0.05, np.float32),
             task_valid=label,
         )
         records.append({"path": path.name})
@@ -128,6 +165,30 @@ def test_vectorized_candidates_equal_independent_forward_and_logits_finite() -> 
     assert torch.allclose(vector, torch.cat(individual, 1), atol=1e-6)
 
 
+def test_evaluator_is_invariant_to_scene_point_permutation() -> None:
+    evaluator = TaskGraspEvaluator(16, ASSET).eval()
+    inputs = evaluator_inputs(batch=1, candidates=2, points=40)
+    permutation = torch.randperm(40)
+    permuted = list(inputs)
+    for index in (1, 2, 3, 4, 5):
+        permuted[index] = inputs[index][:, permutation]
+    with torch.no_grad():
+        first = evaluator(*inputs)["task_valid_logit"]
+        second = evaluator(*permuted)["task_valid_logit"]
+    assert torch.allclose(first, second, atol=1e-5)
+
+
+def test_local_cloud_keeps_sparse_points_padded() -> None:
+    evaluator = TaskGraspEvaluator(16, ASSET).eval()
+    xyz = torch.tensor([[[0.0, 0.0, 0.0], [0.01, 0.0, 0.0], [1.0, 1.0, 1.0]]])
+    translation = torch.zeros(1, 1, 3)
+    rotation = torch.eye(3).reshape(1, 1, 3, 3)
+    _, _, mask = evaluator._local_cloud(
+        xyz, torch.ones(1, 3, dtype=torch.bool), translation, rotation
+    )
+    assert int(mask[0, 0, : evaluator.scene_points].sum()) == 2
+
+
 def test_stageb_backward_updates_only_evaluator(fake_graspnet, tiny_batch) -> None:
     model = TCDPRGModel(ModelConfig(feature_dim=32, task_dim=16))
     for name, parameter in model.named_parameters():
@@ -144,6 +205,7 @@ def test_stageb_backward_updates_only_evaluator(fake_graspnet, tiny_batch) -> No
             1,
         ),
         "valid": torch.tensor([[True, True, False]]),
+        "width_m": torch.tensor([[0.04, 0.05, float("nan")]]),
     }
     output = model.forward_grasp(batch)["task_grasp"]
     torch.nn.functional.binary_cross_entropy_with_logits(

@@ -23,6 +23,28 @@ def world_to_grasp(
     )
 
 
+def masked_farthest_point_sample(xyz: Tensor, mask: Tensor, count: int) -> tuple[Tensor, Tensor]:
+    """Deterministic geometry-based FPS with padding kept explicitly invalid."""
+    batch, _, _ = xyz.shape
+    indices = torch.zeros((batch, count), dtype=torch.long, device=xyz.device)
+    valid_count = mask.sum(-1)
+    selected_mask = torch.arange(count, device=xyz.device)[None] < valid_count[:, None]
+    mass = valid_count.clamp_min(1).to(xyz.dtype)[:, None]
+    centroid = (xyz * mask[..., None]).sum(1) / mass
+    initial = ((xyz - centroid[:, None]) ** 2).sum(-1).masked_fill(~mask, -1.0)
+    current = initial.argmax(-1)
+    minimum = torch.full(mask.shape, torch.inf, dtype=xyz.dtype, device=xyz.device)
+    rows = torch.arange(batch, device=xyz.device)
+    for step in range(count):
+        indices[:, step] = current
+        center = xyz[rows, current]
+        distance = ((xyz - center[:, None]) ** 2).sum(-1)
+        minimum = torch.minimum(minimum, distance).masked_fill(~mask, -1.0)
+        minimum[rows, current] = -1.0
+        current = minimum.argmax(-1)
+    return indices, selected_mask
+
+
 class PointNetSetAbstraction(nn.Module):
     """Small deterministic PointNet++ set-abstraction layer implemented in PyTorch."""
 
@@ -39,10 +61,8 @@ class PointNetSetAbstraction(nn.Module):
         )
 
     def forward(self, xyz: Tensor, feature: Tensor, mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        count = xyz.shape[1]
-        index = torch.linspace(0, max(0, count - 1), self.centers, device=xyz.device).long()
-        center = xyz[:, index]
-        center_mask = mask[:, index]
+        index, center_mask = masked_farthest_point_sample(xyz, mask, self.centers)
+        center = xyz.gather(1, index[..., None].expand(-1, -1, 3))
         distance = torch.cdist(center.float(), xyz.float()).to(xyz.dtype)
         neighbor = (distance <= self.radius_m) & mask[:, None] & center_mask[:, :, None]
         relative = xyz[:, None] - center[:, :, None]
@@ -78,7 +98,7 @@ class TaskGraspEvaluator(nn.Module):
         self.scene_points = int(scene_points)
         self.sa1 = PointNetSetAbstraction(4, 96, centers=64, radius_m=0.045)
         self.sa2 = PointNetSetAbstraction(96, 128, centers=16, radius_m=0.090)
-        self.pose = nn.Sequential(nn.Linear(9, dim), nn.LayerNorm(dim), nn.GELU())
+        self.pose = nn.Sequential(nn.Linear(10, dim), nn.LayerNorm(dim), nn.GELU())
         self.semantic = nn.Sequential(nn.Linear(4 * dim, 2 * dim), nn.LayerNorm(2 * dim), nn.GELU())
         self.head = nn.Sequential(
             nn.Linear(128 + 3 * dim, 2 * dim),
@@ -108,20 +128,14 @@ class TaskGraspEvaluator(nn.Module):
             & point_mask[:, None]
         )
         b, k, n, _ = local.shape
-        selected = local.new_zeros((b, k, self.scene_points, 3))
-        selected_mask = torch.zeros(
-            (b, k, self.scene_points), dtype=torch.bool, device=local.device
+        flat_local = torch.nan_to_num(local.reshape(b * k, n, 3))
+        flat_inside = inside.reshape(b * k, n)
+        local_index, selected_mask = masked_farthest_point_sample(
+            flat_local, flat_inside, self.scene_points
         )
-        for row in range(b):
-            for candidate in range(k):
-                index = torch.nonzero(inside[row, candidate], as_tuple=False).flatten()
-                if not len(index):
-                    continue
-                take = torch.linspace(
-                    0, len(index) - 1, self.scene_points, device=local.device
-                ).long()
-                selected[row, candidate] = local[row, candidate, index[take]]
-                selected_mask[row, candidate] = True
+        selected = flat_local.gather(1, local_index[..., None].expand(-1, -1, 3))
+        selected = selected.reshape(b, k, self.scene_points, 3)
+        selected_mask = selected_mask.reshape(b, k, self.scene_points)
         gripper = self.gripper_points_tcp.to(local)[None, None].expand(b, k, -1, -1)
         cloud = torch.cat((selected, gripper), 2)
         part = torch.zeros((b, k, cloud.shape[2]), dtype=torch.long, device=local.device)
@@ -178,8 +192,9 @@ class TaskGraspEvaluator(nn.Module):
         target_center = torch.einsum("bn,bnd->bd", target_weight, xyz) / target_weight.sum(
             -1, keepdim=True
         ).clamp_min(1e-6)
+        width = proposals["width_m"].unsqueeze(-1)
         pose_input = torch.nan_to_num(
-            torch.cat((translation - target_center[:, None], rotation_6d(rotation)), -1)
+            torch.cat((translation - target_center[:, None], rotation_6d(rotation), width), -1)
         )
         pose = self.pose(pose_input)
         context = torch.cat((geometry, semantic[:, None].expand(-1, k, -1), pose), -1)

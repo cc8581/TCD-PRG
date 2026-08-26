@@ -1,4 +1,4 @@
-"""Build the fixed 128-point open AG-160-95 cloud from repository CAD hulls."""
+"""Build an open AG-160-95 surface cloud from repository CAD hulls."""
 
 from __future__ import annotations
 
@@ -41,10 +41,15 @@ def sample_part(paths: list[Path], count: int, rng: np.random.Generator) -> np.n
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default="assets/robots/FR5_AG-160-95/ag16095_open_tcp_128.npz")
+    parser.add_argument("--points", type=int, default=128)
     args = parser.parse_args()
     root = Path("assets/robots/FR5_AG-160-95/meshes/ag16095/cad_open_reference_collision")
     rng = np.random.default_rng(16095)
-    counts = {"base": 64, "left": 32, "right": 32}
+    if args.points < 16:
+        raise ValueError("--points must be at least 16")
+    base = args.points // 2
+    left = (args.points - base) // 2
+    counts = {"base": base, "left": left, "right": args.points - base - left}
     points = []
     parts = []
     for part_id, (name, count) in enumerate(counts.items(), start=1):

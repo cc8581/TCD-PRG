@@ -23,8 +23,10 @@ from tcd_prg.datasets import (
     DistributedTaskStateBatchSampler,
     StageBBinaryDataset,
 )
+from tcd_prg.datasets.stageb_manifest import build_provenance
 from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.losses import TCDPRGObjective
+from tcd_prg.losses.task_grasp_binary import stageb_split_metrics
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.observation.cached import CachedObservationProvider
 from tcd_prg.pretrained import load_pretrained_backbone, prepare_pretrained_checkpoint
@@ -72,9 +74,7 @@ def load_or_create_validation_scene_subset(
     if count is None:
         return available
     if count <= 0 or count > len(available):
-        raise ValueError(
-            f"training.validation_scene_count={count} must be in [1,{len(available)}]"
-        )
+        raise ValueError(f"training.validation_scene_count={count} must be in [1,{len(available)}]")
     path = Path(manifest_path)
     fingerprint = hashlib.sha256(
         json.dumps(available, separators=(",", ":")).encode("utf-8")
@@ -113,9 +113,7 @@ def load_or_create_validation_scene_subset(
             "scene_ids": list(selected),
         }
         temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(temporary, path)
     return selected
 
@@ -132,15 +130,11 @@ def restrict_action_dataset_to_stage(
         allowed = frozenset(str(value) for value in allowed_strata)
         units = tuple(unit for unit in units if unit.stratum in allowed)
         if not units:
-            raise RuntimeError(
-                f"Stage filter {sorted(allowed)} removed every action-state group"
-            )
+            raise RuntimeError(f"Stage filter {sorted(allowed)} removed every action-state group")
     if deduplicate_state_task:
         unique = {}
         for unit in units:
-            unique.setdefault(
-                (unit.scene_id, unit.state_id, unit.task_index), unit
-            )
+            unique.setdefault((unit.scene_id, unit.state_id, unit.task_index), unit)
         units = tuple(unique.values())
     dataset.units = units
     dataset.selected_group_count = len(units)
@@ -162,9 +156,7 @@ def validate_checkpoint_gate(
     if resume_payload is not None:
         source = resume_payload.get("training_stage")
         if source != stage:
-            raise RuntimeError(
-                f"Resume requires a {stage!r} checkpoint, got {source!r}"
-            )
+            raise RuntimeError(f"Resume requires a {stage!r} checkpoint, got {source!r}")
         return
     predecessor = _STAGE_PREDECESSOR.get(stage)
     if predecessor is None:
@@ -172,9 +164,7 @@ def validate_checkpoint_gate(
             raise RuntimeError(f"Stage {stage!r} must not use --initialize")
         return
     if initialize_payload is None:
-        raise RuntimeError(
-            f"Stage {stage!r} requires --initialize from Stage {predecessor!r}"
-        )
+        raise RuntimeError(f"Stage {stage!r} requires --initialize from Stage {predecessor!r}")
     source = initialize_payload.get("training_stage")
     if source != predecessor:
         raise RuntimeError(
@@ -182,9 +172,7 @@ def validate_checkpoint_gate(
         )
 
 
-def load_predecessor_weights(
-    model: torch.nn.Module, payload: dict, target_stage: str
-) -> None:
+def load_predecessor_weights(model: torch.nn.Module, payload: dict, target_stage: str) -> None:
     """Load exactly the modules learned by the preceding stage."""
     prefixes = {
         "grasp": ("encoder.", "region_head."),
@@ -194,8 +182,7 @@ def load_predecessor_weights(
     current = model.state_dict()
     required = {name for name in current if name.startswith(prefixes)}
     incompatible = {
-        name for name in required
-        if name not in source or source[name].shape != current[name].shape
+        name for name in required if name not in source or source[name].shape != current[name].shape
     }
     if incompatible:
         raise RuntimeError(
@@ -203,6 +190,7 @@ def load_predecessor_weights(
             + ", ".join(sorted(incompatible)[:8])
         )
     model.load_state_dict({name: source[name] for name in required}, strict=False)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -226,12 +214,12 @@ def main() -> None:
             "Formal training requires observation.provider=cached for bounded read-through caching"
         )
     resume_payload = (
-        torch.load(args.resume, map_location="cpu", weights_only=False)
-        if args.resume else None
+        torch.load(args.resume, map_location="cpu", weights_only=False) if args.resume else None
     )
     initialize_payload = (
         torch.load(args.initialize, map_location="cpu", weights_only=False)
-        if args.initialize else None
+        if args.initialize
+        else None
     )
     validate_checkpoint_gate(
         config.training.stage,
@@ -283,6 +271,7 @@ def main() -> None:
         torch.distributed.barrier()
     observation_cache = validate_read_through_observation_cache(adapter)
     stageb = config.training.stage == "grasp"
+    stageb_provenance = build_provenance(config, args.initialize) if stageb else None
     perception_only_stage = (
         config.losses.task_grasp == 0
         and config.losses.push_object == 0
@@ -292,13 +281,20 @@ def main() -> None:
     )
     train_dataset = (
         StageBBinaryDataset(
-            adapter, config.dataset.stageb_binary_root, "train",
+            adapter,
+            config.dataset.stageb_binary_root,
+            "train",
             config.training.max_train_groups,
+            stageb_provenance,
         )
-        if stageb else ActionStateGroupDataset(
-            adapter, split="train", max_groups=config.training.max_train_groups,
+        if stageb
+        else ActionStateGroupDataset(
+            adapter,
+            split="train",
+            max_groups=config.training.max_train_groups,
             allowed_strata=config.training.allowed_action_strata,
-            deduplicate_state_task=perception_only_stage, global_grasp_mode="never",
+            deduplicate_state_task=perception_only_stage,
+            global_grasp_mode="never",
         )
     )
     validation_scene_ids = (
@@ -315,8 +311,11 @@ def main() -> None:
         validation_dataset = None
     elif stageb:
         validation_dataset = StageBBinaryDataset(
-            adapter, config.dataset.stageb_binary_root, "val",
+            adapter,
+            config.dataset.stageb_binary_root,
+            "val",
             config.training.max_validation_groups,
+            stageb_provenance,
         )
     else:
         validation_dataset = ActionStateGroupDataset(
@@ -330,7 +329,8 @@ def main() -> None:
             stratum_quota=config.training.validation_stratum_quota,
             subset_manifest_path=(
                 os.path.join(config.output_dir, "validation_subset.json")
-                if config.training.max_validation_groups is not None else None
+                if config.training.max_validation_groups is not None
+                else None
             ),
             global_grasp_mode="never",
             global_grasp_width_bounds=(
@@ -364,22 +364,31 @@ def main() -> None:
             )
     train_collator = (
         StageBBinaryBatchCollator(config, training=True)
-        if stageb else UnifiedBatchCollator(config, training=True)
+        if stageb
+        else UnifiedBatchCollator(config, training=True)
     )
     validation_collator = (
         StageBBinaryBatchCollator(config, training=False)
-        if stageb else UnifiedBatchCollator(config, training=False)
+        if stageb
+        else UnifiedBatchCollator(config, training=False)
     )
     if stageb:
         train_sampler = (
             torch.utils.data.DistributedSampler(
-                train_dataset, num_replicas=world_size, rank=rank,
-                shuffle=True, seed=config.training.seed,
-            ) if world_size > 1 else None
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                seed=config.training.seed,
+            )
+            if world_size > 1
+            else None
         )
         train_loader = DataLoader(
-            train_dataset, batch_size=config.training.batch_size,
-            shuffle=train_sampler is None, sampler=train_sampler,
+            train_dataset,
+            batch_size=config.training.batch_size,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
             num_workers=config.training.num_workers,
             pin_memory=config.training.pin_memory,
             persistent_workers=config.training.num_workers > 0,
@@ -425,7 +434,10 @@ def main() -> None:
         else None
     )
     model = TCDPRGModel(
-        config.model, config.ablation, config.backbone, config.graspnet,
+        config.model,
+        config.ablation,
+        config.backbone,
+        config.graspnet,
     )
     pretrained_report = None
     resume_pretrained_names: list[str] = []
@@ -444,12 +456,8 @@ def main() -> None:
         if not resume_pretrained_names:
             pretrained_report_path = Path(config.output_dir) / "pretrained_backbone.json"
             if pretrained_report_path.is_file():
-                persisted_report = json.loads(
-                    pretrained_report_path.read_text(encoding="utf-8")
-                )
-                resume_pretrained_names = list(
-                    persisted_report.get("matched_parameter_names", [])
-                )
+                persisted_report = json.loads(pretrained_report_path.read_text(encoding="utf-8"))
+                resume_pretrained_names = list(persisted_report.get("matched_parameter_names", []))
         resume_training = (
             resume_config.get("training", {}) if isinstance(resume_config, dict) else {}
         )
@@ -524,14 +532,10 @@ def main() -> None:
     # This avoids optimizer state and DDP reducer bookkeeping for branches that
     # the stage never executes. Dynamic unfreeze experiments retain Trainer's
     # delayed freeze path so those parameters stay inside the optimizer.
-    if (
-        config.training.frozen_modules
-        and config.training.unfreeze_at_optimizer_step is None
-    ):
+    if config.training.frozen_modules and config.training.unfreeze_at_optimizer_step is None:
         for parameter_name, parameter in model.named_parameters():
             if any(
-                parameter_name == prefix
-                or parameter_name.startswith(prefix + ".")
+                parameter_name == prefix or parameter_name.startswith(prefix + ".")
                 for prefix in config.training.frozen_modules
             ):
                 parameter.requires_grad_(False)
@@ -552,7 +556,8 @@ def main() -> None:
                 + ", ".join(missing_names[:8])
             )
         low_lr_parameters = [
-            named_parameters[name] for name in pretrained_parameter_names
+            named_parameters[name]
+            for name in pretrained_parameter_names
             if named_parameters[name].requires_grad
         ]
         low_lr = config.optimizer.backbone_learning_rate
@@ -561,8 +566,7 @@ def main() -> None:
         low_lr = config.optimizer.learning_rate
     low_lr_ids = {id(parameter) for parameter in low_lr_parameters}
     other_parameters = [
-        p for p in model.parameters()
-        if p.requires_grad and id(p) not in low_lr_ids
+        p for p in model.parameters() if p.requires_grad and id(p) not in low_lr_ids
     ]
     optimizer_groups = []
     if low_lr_parameters:
@@ -570,16 +574,16 @@ def main() -> None:
             {"params": low_lr_parameters, "lr": low_lr, "name": "pretrained_trunk"}
         )
     if other_parameters:
-        optimizer_groups.append({
-            "params": other_parameters,
-            "lr": config.optimizer.learning_rate,
-            "name": "new_modules",
-        })
+        optimizer_groups.append(
+            {
+                "params": other_parameters,
+                "lr": config.optimizer.learning_rate,
+                "name": "new_modules",
+            }
+        )
     if not optimizer_groups:
         raise RuntimeError("Selected training stage has no trainable parameters")
-    optimizer = torch.optim.AdamW(
-        optimizer_groups, weight_decay=config.optimizer.weight_decay
-    )
+    optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=config.optimizer.weight_decay)
 
     def learning_rate(step: int) -> float:
         # 线性 warmup 后按优化器步执行 cosine decay；AMP skip 不会推进此调度器。
@@ -673,10 +677,21 @@ def main() -> None:
         )
         validation_batches = len(validation_loader)
         validation_groups = len(validation_loader.sampler)
+        stageb_scores: list[np.ndarray] = []
+        stageb_targets: list[np.ndarray] = []
         with torch.no_grad():
             for validation_step, raw in enumerate(validation_loader, start=1):
                 batch = trainer._move(raw, trainer.device)
                 _, terms, model_output = objective(module, batch, return_output=True)
+                if stageb:
+                    valid = batch["stageb_candidate_valid"].bool()
+                    stageb_scores.append(
+                        model_output["task_grasp"]["task_valid_probability"][valid]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    stageb_targets.append(batch["stageb_label"][valid].detach().cpu().numpy())
                 evaluator.update(batch, model_output, terms)
                 score = sum(
                     weight * float(terms[f"loss_{family}"])
@@ -701,6 +716,12 @@ def main() -> None:
                         f"score={total / max(1, count):.6f}",
                         flush=True,
                     )
+        if stageb_scores:
+            aggregate = stageb_split_metrics(
+                np.concatenate(stageb_scores), np.concatenate(stageb_targets)
+            )
+            metric_sums.update(aggregate)
+            metric_counts.update({key: 1 for key in aggregate})
         module.train()
         return {
             "score_sum": total,
@@ -714,8 +735,7 @@ def main() -> None:
         train_loader,
         validate=validate if validation_loader is not None else None,
         groups_per_effective_epoch=(
-            len(train_dataset)
-            if stageb else train_batch_sampler.global_samples_per_epoch
+            len(train_dataset) if stageb else train_batch_sampler.global_samples_per_epoch
         ),
     )
     final_checkpoint = os.path.join(config.output_dir, "last.pt")
