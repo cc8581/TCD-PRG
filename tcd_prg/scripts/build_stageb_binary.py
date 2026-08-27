@@ -94,6 +94,13 @@ def balance_binary_records(root: Path, records: list[dict], seed: int) -> list[d
     return balanced
 
 
+def finalize_split_records(
+    root: Path, split: str, records: list[dict], seed: int
+) -> list[dict]:
+    """Balance optimization data only; keep validation at natural proposal prior."""
+    return balance_binary_records(root, records, seed) if split == "train" else records
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/stage/grasp.yaml")
@@ -144,7 +151,9 @@ def main() -> None:
         sensor = model_sensor(batch)
         condition = stageb_condition_from_gt(batch)
         proposals = model.generate_target_grasp_proposals(sensor, condition)
-        keep = torch.nonzero(proposals["valid"][0], as_tuple=False).flatten()[:32]
+        # Label the complete deployment proposal distribution, including the
+        # diversity tail emitted after the quality prefix.
+        keep = torch.nonzero(proposals["valid"][0], as_tuple=False).flatten()
         if not len(keep):
             diagnostic = {
                 "record": index,
@@ -245,7 +254,7 @@ def main() -> None:
         raise RuntimeError(
             "Stage-B construction produced no valid binary records; inspect build_audit.jsonl"
         )
-    records = balance_binary_records(root, records, config.training.seed)
+    records = finalize_split_records(root, args.split, records, config.training.seed)
     old_manifest = (
         json.loads(manifest_path.read_text(encoding="utf-8"))
         if manifest_path.is_file()

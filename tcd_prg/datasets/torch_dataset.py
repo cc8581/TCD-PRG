@@ -78,7 +78,9 @@ class StageBBinaryDataset(Dataset[StageBBinarySample]):
         positives = sum(int(record["positive_count"]) for record in records)
         candidates = sum(int(record["candidate_count"]) for record in records)
         negatives = candidates - positives
-        if positives <= 0 or negatives < positives or negatives > 2 * positives:
+        if positives <= 0 or negatives <= 0:
+            raise ValueError("Stage-B binary dataset split must contain both labels")
+        if split == "train" and (negatives < positives or negatives > 2 * positives):
             raise ValueError(
                 "Stage-B binary dataset must keep positive:negative between 1:1 and 1:2"
             )
