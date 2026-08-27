@@ -6,13 +6,15 @@ import numpy as np
 import pytest
 import torch
 
-from tcd_prg.config import ModelConfig, load_config
+from tcd_prg.config import AblationConfig, LossConfig, ModelConfig, load_config
+from tcd_prg.datasets.capabilities import DatasetCapabilities
 from tcd_prg.geometry.stageb_grasp import (
     any_distance_below,
     evaluate_stageb_geometry,
     world_to_grasp_numpy,
 )
 from tcd_prg.losses.task_grasp_binary import stageb_split_metrics
+from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import StageBCondition, TCDPRGModel, stageb_condition_from_gt
 from tcd_prg.models.task_grasp import TaskGraspEvaluator, world_to_grasp
 from tcd_prg.scripts.build_stageb_binary import balance_binary_records
@@ -246,6 +248,8 @@ def test_stageb_backward_updates_only_evaluator(fake_graspnet, tiny_batch) -> No
     batch = dict(tiny_batch)
     batch["region_valid"] = batch["point_mask"].clone()
     batch["region_target"] = batch["target_mask"].clone()
+    batch["visibility_target"] = torch.ones(1)
+    batch["visibility_valid"] = torch.ones(1, dtype=torch.bool)
     translation = torch.cat((batch["xyz"][:, :2].clone(), torch.full((1, 1, 3), float("nan"))), 1)
     batch["grasp_candidates"] = {
         "translation_world": translation,
@@ -259,6 +263,7 @@ def test_stageb_backward_updates_only_evaluator(fake_graspnet, tiny_batch) -> No
         "valid": torch.tensor([[True, True, False]]),
         "width_m": torch.tensor([[0.04, 0.05, float("nan")]]),
     }
+    batch["stageb_condition"] = stageb_condition_from_gt(batch)
     output = model.forward_grasp(batch)["task_grasp"]
     torch.nn.functional.binary_cross_entropy_with_logits(
         output["task_valid_logit"][:, :2], torch.tensor([[0.0, 1.0]])
@@ -270,6 +275,40 @@ def test_stageb_backward_updates_only_evaluator(fake_graspnet, tiny_batch) -> No
     )
     assert all(parameter.grad is None for parameter in model.encoder.parameters())
     assert all(parameter.grad is None for parameter in model.graspnet.parameters())
+
+
+def test_formal_objective_stageb_path_forward_and_backward(fake_graspnet, tiny_batch) -> None:
+    config = ModelConfig(feature_dim=32, task_dim=16)
+    model = TCDPRGModel(config)
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_(name.startswith("task_grasp."))
+    batch = dict(tiny_batch)
+    batch["region_valid"] = batch["point_mask"].clone()
+    batch["region_target"] = batch["target_mask"].clone()
+    batch["visibility_target"] = torch.ones(1)
+    batch["visibility_valid"] = torch.ones(1, dtype=torch.bool)
+    batch["stageb_candidates"] = {
+        "translation_world": batch["xyz"][:, :2].clone(),
+        "rotation_matrix": torch.eye(3).reshape(1, 1, 3, 3).expand(1, 2, -1, -1),
+        "valid": torch.ones((1, 2), dtype=torch.bool),
+        "width_m": torch.tensor([[0.04, 0.05]]),
+    }
+    batch["stageb_candidate_valid"] = torch.ones((1, 2), dtype=torch.bool)
+    batch["stageb_label"] = torch.tensor([[False, True]])
+    objective = TCDPRGObjective(
+        DatasetCapabilities(has_task_grasps=True),
+        config,
+        AblationConfig(),
+        LossConfig(
+            instance=0.0, region=0.0, task_grasp=1.0,
+            push_object=0.0, push_contact=0.0, push_direction=0.0, push_potential=0.0,
+        ),
+    )
+    loss, _terms, output = objective(model, batch, return_output=True)
+    loss.backward()
+    assert isinstance(output["stageb_condition"], StageBCondition)
+    assert torch.isfinite(loss)
+    assert any(parameter.grad is not None for parameter in model.task_grasp.parameters())
 
 
 def test_gt_condition_has_the_public_stageb_contract(tiny_batch) -> None:

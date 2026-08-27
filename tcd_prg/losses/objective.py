@@ -6,6 +6,8 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from tcd_prg.models.stageb_condition import stageb_condition_from_gt
+
 from tcd_prg.config import (
     AblationConfig, LossConfig, ModelConfig, RegionHeadConfig
 )
@@ -271,6 +273,8 @@ class TCDPRGObjective(nn.Module):
             else None
         )
         model_view = self._model_view(batch)
+        if forward_mode == "grasp":
+            model_view["stageb_condition"] = stageb_condition_from_gt(batch)
         if training_hints is not None:
             model_view["training_hints"] = {
                 "push_direction_point_mask": training_hints[

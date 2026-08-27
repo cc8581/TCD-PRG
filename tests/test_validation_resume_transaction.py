@@ -176,7 +176,7 @@ def test_stageb_resume_rejects_different_dataset_provenance(tmp_path):
         max_steps=1,
         interval=1,
         stage="grasp",
-        provenance={"stage_a_checkpoint_sha256": "first"},
+        provenance={"compatibility": {"protocol": "first"}, "audit": {"producer_git_commits": ["a"]}},
     )
     source.save_checkpoint(tmp_path / "last.pt")
     resumed, _ = _make_trainer(
@@ -184,7 +184,24 @@ def test_stageb_resume_rejects_different_dataset_provenance(tmp_path):
         max_steps=1,
         interval=1,
         stage="grasp",
-        provenance={"stage_a_checkpoint_sha256": "second"},
+        provenance={"compatibility": {"protocol": "second"}, "audit": {"producer_git_commits": ["b"]}},
     )
     with pytest.raises(RuntimeError, match="provenance"):
         resumed.load_checkpoint(tmp_path / "last.pt")
+
+
+def test_stageb_resume_ignores_audit_commit_difference(tmp_path):
+    source, _ = _make_trainer(
+        tmp_path / "source",
+        max_steps=2,
+        interval=1,
+        provenance={"compatibility": {"protocol": "same"}, "audit": {"producer_git_commits": ["a"]}},
+    )
+    source.save_checkpoint(tmp_path / "last.pt")
+    resumed, _ = _make_trainer(
+        tmp_path / "resumed",
+        max_steps=2,
+        interval=1,
+        provenance={"compatibility": {"protocol": "same"}, "audit": {"producer_git_commits": ["b"]}},
+    )
+    resumed.load_checkpoint(tmp_path / "last.pt")

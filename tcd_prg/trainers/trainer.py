@@ -19,6 +19,7 @@ from torch import Tensor, nn
 from tcd_prg.config import TCDPRGConfig
 from tcd_prg.evaluators.offline import OfflineModelEvaluator
 from tcd_prg.losses.task_grasp_binary import stageb_split_metrics
+from tcd_prg.datasets.stageb_manifest import compatibility_provenance
 
 from .ema import ModelEMA
 from .reproducibility import seed_everything
@@ -111,7 +112,7 @@ class Trainer:
         loss_step: Callable[[nn.Module, Mapping[str, Any]], tuple[Tensor, Mapping[str, Tensor]]],
         scheduler: Any | None = None,
         output_dir: str | Path | None = None,
-        stageb_provenance: Mapping[str, str] | None = None,
+        stageb_provenance: Mapping[str, Any] | None = None,
     ) -> None:
         config.validate()
         self.config = config
@@ -1106,7 +1107,8 @@ class Trainer:
             )
         if (
             checkpoint_stage == "grasp"
-            and payload.get("stageb_provenance") != self.stageb_provenance
+            and compatibility_provenance(payload.get("stageb_provenance", {}))
+            != compatibility_provenance(self.stageb_provenance)
         ):
             raise RuntimeError("Stage-B resume checkpoint provenance does not match the dataset")
         source = self.model.module if hasattr(self.model, "module") else self.model

@@ -13,7 +13,11 @@ from torch.utils.data import DataLoader
 
 from tcd_prg.config import load_config
 from tcd_prg.datasets import ActionStateGroupDataset
-from tcd_prg.datasets.stageb_manifest import SCHEMA_VERSION, build_provenance
+from tcd_prg.datasets.stageb_manifest import (
+    SCHEMA_VERSION,
+    build_provenance,
+    compatibility_provenance,
+)
 from tcd_prg.geometry.stageb_grasp import evaluate_stageb_geometry
 from tcd_prg.models import TCDPRGModel, stageb_condition_from_gt
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter
@@ -104,7 +108,9 @@ def main() -> None:
     provenance = build_provenance(config)
     if manifest_path.is_file():
         old = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if old.get("provenance") != provenance:
+        if compatibility_provenance(old.get("provenance", {})) != compatibility_provenance(
+            provenance
+        ):
             raise RuntimeError("Existing Stage-B split was built with different provenance")
     adapter = create_adapter(config, allow_render=False)
     dataset = ActionStateGroupDataset(
@@ -240,12 +246,20 @@ def main() -> None:
             "Stage-B construction produced no valid binary records; inspect build_audit.jsonl"
         )
     records = balance_binary_records(root, records, config.training.seed)
-    existing = (
-        json.loads(manifest_path.read_text(encoding="utf-8"))["records"]
+    old_manifest = (
+        json.loads(manifest_path.read_text(encoding="utf-8"))
         if manifest_path.is_file()
-        else []
+        else {}
     )
+    existing = old_manifest.get("records", [])
     existing = [row for row in existing if row["split"] != args.split]
+    prior_commits = old_manifest.get("provenance", {}).get("audit", {}).get(
+        "producer_git_commits", []
+    )
+    current_commits = provenance["audit"]["producer_git_commits"]
+    provenance["audit"]["producer_git_commits"] = sorted(
+        {str(value) for value in (*prior_commits, *current_commits)}
+    )
     payload = {
         "schema_version": SCHEMA_VERSION,
         "provenance": provenance,

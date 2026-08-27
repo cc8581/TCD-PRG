@@ -24,7 +24,7 @@ from torch.utils.data import Dataset, Sampler
 from tcd_prg.constants import ActionType, CandidateStatus
 
 from .base import DatasetAdapter
-from .stageb_manifest import SCHEMA_VERSION
+from .stageb_manifest import SCHEMA_VERSION, compatibility_provenance
 from .types import GlobalGraspSample, PushObjectStateGroup, UnifiedSample
 
 
@@ -47,7 +47,7 @@ class StageBBinaryDataset(Dataset[StageBBinarySample]):
         root: str | Path,
         split: str = "train",
         max_groups: int | None = None,
-        expected_provenance: dict[str, str] | None = None,
+        expected_provenance: dict[str, object] | None = None,
     ) -> None:
         self.adapter = adapter
         self.root = Path(root)
@@ -58,8 +58,9 @@ class StageBBinaryDataset(Dataset[StageBBinarySample]):
         if manifest.get("schema_version") != SCHEMA_VERSION:
             raise ValueError("Unsupported Stage-B binary dataset schema")
         actual_provenance = manifest.get("provenance", {})
-        if expected_provenance is not None and any(
-            actual_provenance.get(key) != value for key, value in expected_provenance.items()
+        if expected_provenance is not None and (
+            compatibility_provenance(actual_provenance)
+            != compatibility_provenance(expected_provenance)
         ):
             raise RuntimeError(
                 "Stage-B dataset provenance does not match current checkpoints/config"

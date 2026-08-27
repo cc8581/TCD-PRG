@@ -25,7 +25,7 @@ from .backbones import (
 from .graspnet import FrozenGraspNetProposalGenerator
 from .push import PushHead
 from .region import TaskRegionHead
-from .stageb_condition import StageBCondition, stageb_condition_from_gt
+from .stageb_condition import StageBCondition
 from .task_grasp import TaskGraspEvaluator
 
 
@@ -585,9 +585,12 @@ class TCDPRGModel(nn.Module):
     def forward_grasp(
         self, batch: Mapping[str, Any]
     ) -> dict[str, Any]:
-        """Stage B training from GT condition, without executing Stage A."""
+        """Stage B from the public condition supplied at the module boundary."""
         sensor = self._sensor(batch)
-        condition = stageb_condition_from_gt(batch)
+        condition = batch.get("stageb_condition")
+        if not isinstance(condition, StageBCondition):
+            raise TypeError("Stage-B forward requires a StageBCondition")
+        condition.validate(sensor["xyz"].shape[1])
         task_grasp = self.forward_task_grasp_from_condition(
             sensor, condition, batch.get("grasp_candidates")
         )
