@@ -76,6 +76,14 @@ def test_policy_heads_match_training_contract(tiny_batch) -> None:
     assert "pick_remove" not in output
 
 
+def test_stagec_push_forward_keeps_frozen_instance_predictions(tiny_batch) -> None:
+    model = TCDPRGModel(_config()).eval()
+    output = model(tiny_batch, forward_mode="push")
+    assert output["instance"] is output["encoded"].instance
+    assert output["instance"].mask_logits.shape[0] == tiny_batch["xyz"].shape[0]
+    assert output["instance"].mask_logits.shape[1] == _config().instance_queries
+
+
 def test_camera2_to_task_evaluator_to_dense_candidate_end_to_end(tiny_batch) -> None:
     config = _config()
     config.instance_objectness_threshold = 0.0

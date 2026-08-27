@@ -184,12 +184,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank", type=int)
     parser.add_argument("--local-rank", "--local_rank", type=int)
     parser.add_argument("--ddp-init-method")
+    parser.add_argument(
+        "--validate-only", action="store_true",
+        help="Run one validation pass from --resume and skip optimizer updates.",
+    )
     parser.add_argument("overrides", nargs="*")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.validate_only and not args.resume:
+        raise ValueError("--validate-only requires --resume")
     config = load_config(args.config, args.overrides)
     if config.observation.provider != "cached":
         raise ValueError(
@@ -768,6 +774,37 @@ def main() -> None:
             result["stageb_deployment_scores"] = np.concatenate(stageb_deployment_scores)
             result["stageb_deployment_targets"] = np.concatenate(stageb_deployment_targets)
         return result
+
+    if args.validate_only:
+        validation = validate(trainer.ema.model if trainer.ema else trainer.model)
+        if rank == 0:
+            serializable = {
+                "score_sum": float(validation["score_sum"]),
+                "score_count": int(validation["score_count"]),
+                "metric_sums": {
+                    str(key): float(value)
+                    for key, value in validation.get("metric_sums", {}).items()
+                },
+                "metric_counts": {
+                    str(key): int(value)
+                    for key, value in validation.get("metric_counts", {}).items()
+                },
+            }
+            if "stageb_scores" in validation:
+                serializable.update(
+                    {
+                        "stageb_candidates": int(len(validation["stageb_scores"])),
+                        "stageb_deployment_candidates": int(
+                            len(validation["stageb_deployment_scores"])
+                        ),
+                    }
+                )
+            output = os.path.join(config.output_dir, "validation_only.json")
+            Path(output).write_text(
+                json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print(json.dumps(serializable, ensure_ascii=False), flush=True)
+        return
 
     state = trainer.train(
         train_loader,

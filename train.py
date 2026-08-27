@@ -25,6 +25,43 @@ if str(PROJECT) not in sys.path:
 DEFAULT_CONFIG = PROJECT / "configs" / "config.yaml"
 DEFAULT_PATHS_CONFIG = PROJECT / "configs" / "local_paths.yaml"
 
+STAGE_OVERRIDES: dict[str, tuple[str, ...]] = {
+    "perception": (
+        "training.frozen_modules=[task_grasp,graspnet,push]",
+        "training.allowed_action_strata=[]",
+        "training.action_batch_coverage_strata=[]",
+        "losses.instance=1.0",
+        "losses.region=1.0",
+        "losses.task_grasp=0.0",
+        "losses.push_object=0.0",
+        "losses.push_contact=0.0",
+        "losses.push_direction=0.0",
+        "losses.push_potential=0.0",
+    ),
+    "grasp": (
+        "training.frozen_modules=[encoder,region_head,graspnet,push]",
+        "losses.instance=0.0",
+        "losses.region=0.0",
+        "losses.task_grasp=1.0",
+        "losses.push_object=0.0",
+        "losses.push_contact=0.0",
+        "losses.push_direction=0.0",
+        "losses.push_potential=0.0",
+    ),
+    "push": (
+        "training.frozen_modules=[encoder,region_head,task_grasp,graspnet]",
+        "training.allowed_action_strata=[push,push_failure]",
+        "training.action_batch_coverage_strata=[push,push_failure]",
+        "losses.instance=0.0",
+        "losses.region=0.0",
+        "losses.task_grasp=0.0",
+        "losses.push_object=0.25",
+        "losses.push_contact=0.25",
+        "losses.push_direction=0.25",
+        "losses.push_potential=0.25",
+    ),
+}
+
 def _load_local_paths(path: Path) -> dict[str, str]:
     if not path.is_file():
         return {}
@@ -155,6 +192,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--paths-config", type=Path, default=DEFAULT_PATHS_CONFIG)
+    parser.add_argument(
+        "--stage", choices=("all", "perception", "grasp", "push"), default="all",
+        help="Run one stage, or all three sequentially.",
+    )
+    parser.add_argument(
+        "--validate-only", action="store_true",
+        help="Run validation for --checkpoint/--resume without training.",
+    )
     # 下面这些值均可直接覆盖；不传时使用 local_paths.yaml 中的本机配置。
     parser.add_argument(
         "--batch-size", "--batch_size", dest="batch_size", type=int, default=None,
@@ -203,13 +248,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Directory for checkpoints, JSONL metrics, and TensorBoard logs. "
         "On resume, defaults to the checkpoint parent directory.",
     )
-    parser.add_argument("--resume", type=Path, default=defaults["resume"], help="Checkpoint used to resume the complete training state.")
+    parser.add_argument("--resume", "--checkpoint", dest="resume", type=Path, default=defaults["resume"], help="Checkpoint used to resume or validate.")
     parser.add_argument("--stage-a-checkpoint", type=Path, default=defaults["stage_a_checkpoint"])
     parser.add_argument("--stage-b-checkpoint", type=Path, default=defaults["stage_b_checkpoint"])
     parser.add_argument(
         "--data-fraction", type=float, default=None,
         help="Override training.data_fraction with a deterministic fraction in (0, 1].",
     )
+    parser.add_argument("overrides", nargs="*", help="Additional dotted YAML overrides.")
     args = parser.parse_args(argv)
     # resume checkpoint parent becomes the default output directory
     if args.output_dir is None:
@@ -220,6 +266,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     if args.gpus <= 0:
         parser.error("--gpus must be positive")
+    if args.validate_only and args.stage == "all":
+        parser.error("--validate-only requires an explicit --stage")
+    if args.validate_only and args.resume is None:
+        parser.error("--validate-only requires --checkpoint/--resume")
     if args.resume and (args.stage_a_checkpoint or args.stage_b_checkpoint):
         parser.error("--resume and Stage-C component checkpoints are mutually exclusive")
     return args
@@ -234,13 +284,21 @@ def _training_arguments(
         output = PROJECT / "outputs" / f"ptv3_full_{stamp}"
     output = output.resolve()
     arguments = ["--config", str(args.config.resolve())]
+    overrides: list[str] = []
+    stage = getattr(args, "stage", "all")
+    if stage != "all":
+        overrides.extend(STAGE_OVERRIDES[stage])
+    overrides.extend(getattr(args, "overrides", ()))
+    if stage != "all":
+        overrides.append(f"training.stage={stage}")
+    if getattr(args, "validate_only", False):
+        arguments.append("--validate-only")
     if args.resume:
         arguments.extend(("--resume", str(args.resume.resolve())))
     if args.stage_a_checkpoint:
         arguments.extend(("--stage-a-checkpoint", str(args.stage_a_checkpoint.resolve())))
     if args.stage_b_checkpoint:
         arguments.extend(("--stage-b-checkpoint", str(args.stage_b_checkpoint.resolve())))
-    arguments.extend(path_overrides)
     arguments.append(_quoted_override("output_dir", output))
     named_training_overrides = {
         "batch_size": "batch_size",
@@ -254,12 +312,89 @@ def _training_arguments(
     for argument_name, config_name in named_training_overrides.items():
         value = getattr(args, argument_name, None)
         if value is not None:
-            arguments.append(f"training.{config_name}={value:g}")
+            overrides.append(f"training.{config_name}={value:g}")
+    arguments.extend(path_overrides)
+    arguments.extend(overrides)
     return arguments
+
+
+def _pipeline_command(
+    args: argparse.Namespace,
+    stage: str,
+    output_dir: Path,
+    *,
+    stage_a_checkpoint: Path | None = None,
+    stage_b_checkpoint: Path | None = None,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(PROJECT / "train.py"),
+        "--stage", stage,
+        "--config", str(args.config.resolve()),
+        "--output-dir", str(output_dir.resolve()),
+        "--paths-config", str(args.paths_config.resolve()),
+        "--dataset-root", str(args.dataset_root),
+        "--acronym-root", str(args.acronym_root),
+        "--stageb-binary-root", str(args.stageb_binary_root),
+        "--functional-region-root", str(args.functional_region_root),
+        "--pybullet-python", str(args.pybullet_python),
+        "--observation-cache-dir", str(args.observation_cache_dir),
+        "--cache-index-directory", str(args.cache_index_directory),
+        "--gpus", str(args.gpus),
+    ]
+    if stage_a_checkpoint is not None:
+        command.extend(("--stage-a-checkpoint", str(stage_a_checkpoint.resolve())))
+    if stage_b_checkpoint is not None:
+        command.extend(("--stage-b-checkpoint", str(stage_b_checkpoint.resolve())))
+    for name in (
+        "batch_size", "num_workers", "validation_num_workers", "gradient_accumulation_steps",
+        "max_optimizer_steps", "validation_interval", "data_fraction",
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            option = name.replace("_", "-")
+            command.extend((f"--{option}", str(value)))
+    command.extend(args.overrides)
+    return command
+
+
+def _run_all_stages(args: argparse.Namespace) -> None:
+    if args.resume is not None or args.stage_a_checkpoint or args.stage_b_checkpoint:
+        raise ValueError("The all-stage pipeline starts fresh; use --stage for resume/component checkpoints")
+    root = args.output_dir.resolve()
+    stage_outputs = {
+        "perception": root / "perception",
+        "grasp": root / "grasp",
+        "push": root / "push",
+    }
+    subprocess.run(
+        _pipeline_command(args, "perception", stage_outputs["perception"]),
+        check=True, cwd=PROJECT,
+    )
+    stage_a = stage_outputs["perception"] / "best.pt"
+    if not stage_a.is_file():
+        stage_a = stage_outputs["perception"] / "last.pt"
+    subprocess.run(
+        _pipeline_command(args, "grasp", stage_outputs["grasp"]),
+        check=True, cwd=PROJECT,
+    )
+    stage_b = stage_outputs["grasp"] / "best.pt"
+    if not stage_b.is_file():
+        stage_b = stage_outputs["grasp"] / "last.pt"
+    subprocess.run(
+        _pipeline_command(
+            args, "push", stage_outputs["push"],
+            stage_a_checkpoint=stage_a, stage_b_checkpoint=stage_b,
+        ),
+        check=True, cwd=PROJECT,
+    )
 
 
 def main() -> None:
     args = _parse_args()
+    if args.stage == "all":
+        _run_all_stages(args)
+        return
     # 在创建 DDP 子进程前先核对显卡数量，避免部分 worker 启动后才失败。
     if args.gpus > 1:
         import torch
