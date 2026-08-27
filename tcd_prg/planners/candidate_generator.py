@@ -8,7 +8,7 @@ import torch
 from torch import Tensor
 
 from tcd_prg.config import ModelConfig
-from tcd_prg.constants import ActionType, PUSH_DISTANCE_M
+from tcd_prg.constants import PUSH_DISTANCE_M, ActionType
 from tcd_prg.geometry.grasp_nms import task_grasp_nms
 from tcd_prg.geometry.se3 import matrix_to_quaternion_xyzw
 
@@ -154,13 +154,21 @@ class DenseCandidateGenerator:
         score: Tensor,
         valid: Tensor,
     ) -> Tensor:
-        """Deployment pre-threshold TASK_GRASP selection: NMS then top-k."""
+        """Deployment selection: valid candidates, then NMS and top-k."""
+        eligible = torch.nonzero(valid.bool(), as_tuple=False).flatten()
+        if not len(eligible):
+            return eligible
         pose = torch.cat((translation, matrix_to_quaternion_xyzw(rotation)), -1)
         objects = torch.zeros_like(score, dtype=torch.long)
-        selected = self._nms_indices(
-            pose, width, score, objects, self.config.task_grasp_candidates, global_grasp=False
+        selected_local = self._nms_indices(
+            pose[eligible],
+            width[eligible],
+            score[eligible],
+            objects[eligible],
+            self.config.task_grasp_candidates,
+            global_grasp=False,
         )
-        return selected[valid[selected].bool()]
+        return eligible[selected_local]
 
     def apply_push_nms(
         self, candidates: dict[str, Tensor], candidate_scores: Tensor

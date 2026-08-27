@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 
 import numpy as np
@@ -9,22 +10,23 @@ import torch
 
 from tcd_prg.config import AblationConfig, LossConfig, ModelConfig, load_config
 from tcd_prg.datasets.capabilities import DatasetCapabilities
+from tcd_prg.datasets.stageb_manifest import SCHEMA_VERSION, build_provenance
+from tcd_prg.datasets.torch_dataset import StageBBinaryDataset
 from tcd_prg.geometry.stageb_grasp import (
     any_distance_below,
     evaluate_stageb_geometry,
     world_to_grasp_numpy,
 )
-from tcd_prg.losses.task_grasp_binary import stageb_split_metrics
 from tcd_prg.losses import TCDPRGObjective
-from tcd_prg.datasets.stageb_manifest import build_provenance
+from tcd_prg.losses.task_grasp_binary import stageb_split_metrics
 from tcd_prg.models import StageBCondition, TCDPRGModel, stageb_condition_from_gt
 from tcd_prg.models.task_grasp import TaskGraspEvaluator, world_to_grasp
+from tcd_prg.planners.candidate_generator import DenseCandidateGenerator
 from tcd_prg.scripts.build_stageb_binary import (
     assert_no_train_validation_leakage,
     balance_binary_records,
     finalize_split_records,
 )
-from tcd_prg.planners.candidate_generator import DenseCandidateGenerator
 from tcd_prg.trainers.trainer import aggregate_stageb_validation_payloads
 
 ASSET = Path("assets/robots/FR5_AG-160-95/ag16095_open_tcp_128.npz")
@@ -201,10 +203,37 @@ def test_validation_records_keep_natural_label_distribution(tmp_path) -> None:
     label = np.asarray([1, 0, 0, 0], bool)
     path = tmp_path / "record.npz"
     np.savez_compressed(path, task_valid=label)
-    records = [{"path": path.name}]
+    records = [
+        {
+            "split": "val",
+            "scene_id": 1,
+            "state_id": 2,
+            "task_index": 3,
+            "group_index": 4,
+            "task_region_id": 5,
+            "object_category_id": 6,
+            "path": path.name,
+            "candidate_count": len(label),
+            "positive_count": int(label.sum()),
+        }
+    ]
     kept = finalize_split_records(tmp_path, "val", records, seed=3)
     assert kept == records
     assert np.array_equal(np.load(path)["task_valid"], label)
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "provenance": {},
+                "records": kept,
+            }
+        ),
+        encoding="utf-8",
+    )
+    dataset = StageBBinaryDataset(object(), tmp_path, split="val")
+    assert len(dataset) == 1
+    assert dataset.records[0]["candidate_count"] == 4
+    assert dataset.records[0]["positive_count"] == 1
 
 
 def test_stageb_compatibility_ignores_paths_but_tracks_sampling_semantics() -> None:
@@ -249,6 +278,22 @@ def test_deployment_calibration_selection_applies_task_nms_and_cap() -> None:
     score = torch.tensor([0.9, 0.8, 0.7])
     selected = selector.select_task_grasp_indices(
         translation, rotation, width, score, torch.ones(3, dtype=torch.bool)
+    )
+    assert selected.tolist() == [0, 2]
+
+
+def test_invalid_task_grasp_cannot_suppress_valid_or_consume_cap() -> None:
+    config = ModelConfig(task_grasp_candidates=2)
+    selector = DenseCandidateGenerator(config)
+    translation = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.001, 0.0, 0.0], [0.1, 0.0, 0.0]]
+    )
+    rotation = torch.eye(3).expand(3, -1, -1).clone()
+    width = torch.full((3,), 0.05)
+    score = torch.tensor([0.9, 0.99, 0.7])
+    valid = torch.tensor([True, False, True])
+    selected = selector.select_task_grasp_indices(
+        translation, rotation, width, score, valid
     )
     assert selected.tolist() == [0, 2]
 

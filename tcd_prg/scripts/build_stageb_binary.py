@@ -255,6 +255,8 @@ def main() -> None:
                 "task_region_id": int(batch["task_region_id"][0]),
                 "object_category_id": int(batch["task_category_id"][0]),
                 "path": str(path.relative_to(root)).replace("\\", "/"),
+                "candidate_count": len(selected),
+                "positive_count": int(sum(labels[i] for i in selected)),
             }
         )
         positive_count = sum(labels[i] for i in selected)
