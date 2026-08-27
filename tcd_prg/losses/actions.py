@@ -29,25 +29,25 @@ class PushLoss(nn.Module):
         contact_positive = labels["contact_valid"].bool() & (labels["contact_target"] > 0)
         contact_negative = labels["contact_valid"].bool() & ~contact_positive
         valid_object_rows = object_positive.any(-1)
-        def object_recall(k: int) -> Tensor:
+        def object_hits(k: int) -> Tensor:
             count = min(k, output["object_logits"].shape[-1])
             selected = output["object_logits"].masked_fill(~labels["object_valid_mask"].bool(), -30.0).topk(count, -1).indices
             hit = object_positive.gather(1, selected).any(-1)
-            return hit[valid_object_rows].float().mean() if bool(valid_object_rows.any()) else output["object_logits"].new_zeros(())
-        positive_direction = labels["direction_positive"].any(-1)
-        positive_rows = positive_direction.any(-1)
-        direction_covered = labels["direction_valid"].bool() & positive_direction
-        direction_coverage = (direction_covered.any(-1)[positive_rows].float().mean() if bool(positive_rows.any()) else output["object_logits"].new_zeros(()))
+            return (hit & valid_object_rows).sum().float()
         object_bce = safe_bce_with_logits(output["object_logits"], labels["object_positive"].float(), labels["object_valid_mask"])
         object_rank = multi_positive_listwise_loss(output["object_logits"], labels["object_positive"], labels["object_valid_mask"])
         return {
             "push_object": object_bce + object_rank,
             "push_object_bce_diagnostic": object_bce,
             "push_object_rank_diagnostic": object_rank,
-            "push_object_positive_recall_at_1": object_recall(1),
-            "push_object_positive_recall_at_4": object_recall(4),
-            "push_direction_positive_coverage": direction_coverage,
-            "push_utility_valid_coverage": (labels["utility_valid"].bool() & positive_direction).sum().float() / positive_direction.sum().clamp_min(1).float(),
+            "push_object_positive_rows_count": valid_object_rows.sum().float(),
+            "push_object_positive_hits_at_1_count": object_hits(1),
+            "push_object_positive_hits_at_4_count": object_hits(4),
+            "push_positive_actions_total_count": labels["positive_evaluated_push"].sum().float(),
+            "push_positive_actions_direction_covered_count": labels["positive_direction_covered"].sum().float(),
+            "push_positive_actions_utility_covered_count": labels["positive_utility_covered"].sum().float(),
+            "push_object_bce_active_rows_count": labels["object_valid_mask"].any(-1).sum().float(),
+            "push_object_rank_active_rows_count": object_effective.sum().float(),
             "push_contact": safe_bce_with_logits(
                 output["contact_logits"], labels["contact_target"].float(), labels["contact_valid"]
             ),

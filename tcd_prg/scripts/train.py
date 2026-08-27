@@ -155,6 +155,32 @@ def validate_checkpoint_gate(
     return
 
 
+def build_optimizer_parameter_groups(model, config, pretrained_parameter_names=()):
+    """Build stage-aware groups without assuming every model owns an encoder."""
+    named = dict(model.named_parameters())
+    missing = [name for name in pretrained_parameter_names if name not in named]
+    if missing:
+        raise RuntimeError("Checkpoint pre-trained parameter names do not match this model: " + ", ".join(missing[:8]))
+    if pretrained_parameter_names:
+        low = [named[name] for name in pretrained_parameter_names if named[name].requires_grad]
+        low_lr = config.optimizer.backbone_learning_rate
+    elif config.training.stage == "push":
+        low, low_lr = [], config.optimizer.learning_rate
+    else:
+        low = [parameter for parameter in model.encoder.parameters() if parameter.requires_grad]
+        low_lr = config.optimizer.learning_rate
+    low_ids = {id(parameter) for parameter in low}
+    other = [parameter for parameter in model.parameters() if parameter.requires_grad and id(parameter) not in low_ids]
+    groups = []
+    if low:
+        groups.append({"params": low, "lr": low_lr, "name": "pretrained_trunk"})
+    if other:
+        groups.append({"params": other, "lr": config.optimizer.learning_rate, "name": "new_modules"})
+    if not groups:
+        raise RuntimeError("Selected training stage has no trainable parameters")
+    return groups
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
@@ -507,44 +533,7 @@ def main() -> None:
         if pretrained_report is not None
         else resume_pretrained_names
     )
-    if pretrained_parameter_names:
-        named_parameters = dict(model.named_parameters())
-        missing_names = [
-            name for name in pretrained_parameter_names if name not in named_parameters
-        ]
-        if missing_names:
-            raise RuntimeError(
-                "Checkpoint pre-trained parameter names do not match this model: "
-                + ", ".join(missing_names[:8])
-            )
-        low_lr_parameters = [
-            named_parameters[name]
-            for name in pretrained_parameter_names
-            if named_parameters[name].requires_grad
-        ]
-        low_lr = config.optimizer.backbone_learning_rate
-    else:
-        low_lr_parameters = [p for p in model.encoder.parameters() if p.requires_grad]
-        low_lr = config.optimizer.learning_rate
-    low_lr_ids = {id(parameter) for parameter in low_lr_parameters}
-    other_parameters = [
-        p for p in model.parameters() if p.requires_grad and id(p) not in low_lr_ids
-    ]
-    optimizer_groups = []
-    if low_lr_parameters:
-        optimizer_groups.append(
-            {"params": low_lr_parameters, "lr": low_lr, "name": "pretrained_trunk"}
-        )
-    if other_parameters:
-        optimizer_groups.append(
-            {
-                "params": other_parameters,
-                "lr": config.optimizer.learning_rate,
-                "name": "new_modules",
-            }
-        )
-    if not optimizer_groups:
-        raise RuntimeError("Selected training stage has no trainable parameters")
+    optimizer_groups = build_optimizer_parameter_groups(model, config, pretrained_parameter_names)
     optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=config.optimizer.weight_decay)
 
     def learning_rate(step: int) -> float:
@@ -694,8 +683,12 @@ def main() -> None:
                 total += score * groups
                 count += groups
                 for key, value in terms.items():
-                    metric_sums[key] = metric_sums.get(key, 0.0) + float(value) * groups
-                    metric_counts[key] = metric_counts.get(key, 0) + groups
+                    if key in Trainer.COUNT_TERMS:
+                        metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
+                        metric_counts[key] = metric_counts.get(key, 0) + 1
+                    else:
+                        metric_sums[key] = metric_sums.get(key, 0.0) + float(value) * groups
+                        metric_counts[key] = metric_counts.get(key, 0) + groups
                 if rank == 0 and (
                     validation_step == 1
                     or validation_step % config.logging.validation_log_interval == 0
@@ -748,8 +741,6 @@ def main() -> None:
                         ),
                     }
                 )
-                if config.training.stage == "push":
-                    score += 1.0 - float(terms.get("push_direction_positive_coverage", 0.0))
             output = os.path.join(config.output_dir, "validation_only.json")
             Path(output).write_text(
                 json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8"

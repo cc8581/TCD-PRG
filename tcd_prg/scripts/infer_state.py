@@ -60,7 +60,7 @@ def main() -> None:
             device
         )
         config.model.task_grasp_probability_threshold = load_staged_tcd_prg(
-            model, args.stage_a_checkpoint, args.stage_b_checkpoint, args.stage_c_checkpoint)
+            model, args.stage_a_checkpoint, args.stage_b_checkpoint, args.stage_c_checkpoint, config)
         model.to(device)
         # Candidate scoring remains robot-agnostic. The deterministic
         # controller exact-certifies grasp actions and falls through on rejection.

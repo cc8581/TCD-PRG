@@ -236,6 +236,7 @@ training:
   gradient_clip_norm: 20.0 # 梯度裁剪，避免梯度爆炸；PTv3 前向可能产生极端梯度。
   ema_decay: 0.999
   early_stopping_patience: 15
+  push_coverage_penalty_weight: 1.0
   deterministic: False
   num_workers: 8  # train/global 两路常驻 worker；按吞吐和主机内存调整
   # Windows 验证时 train/global worker 仍常驻。设为 0 可避免再启动第三组

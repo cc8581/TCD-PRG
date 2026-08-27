@@ -491,18 +491,19 @@ class DenseCandidateGenerator:
                 utility = push["utility_delta"][
                     batch_row, expanded_point, direction_bin
                 ]
-                utility_factor = (
-                    torch.sigmoid(utility / float(self.config.push_utility_temperature))
-                    if self.use_push_potential
-                    else torch.ones_like(utility)
-                )
+                if self.use_push_potential:
+                    utility_factor = torch.sigmoid(utility / float(self.config.push_utility_temperature))
+                    utility_eligible = utility > float(self.config.push_utility_threshold)
+                else:
+                    utility_factor = torch.ones_like(utility)
+                    utility_eligible = torch.ones_like(utility, dtype=torch.bool)
                 composite = (
                     object_score
                     * contact_score
                     * direction_score
                     * utility_factor
                 )
-                eligible = (utility > float(self.config.push_utility_threshold)) & (composite >= float(self.config.push_candidate_probability_threshold))
+                eligible = utility_eligible & (composite >= float(self.config.push_candidate_probability_threshold))
                 expanded_point = expanded_point[eligible]; direction_bin = direction_bin[eligible]
                 direction_score = direction_score[eligible]; contact_score = contact_score[eligible]
                 pushed_object = pushed_object[eligible]; utility = utility[eligible]; composite = composite[eligible]

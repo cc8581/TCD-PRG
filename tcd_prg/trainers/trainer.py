@@ -85,6 +85,14 @@ class Trainer:
         "push_direction_effective_rows",
         "push_direction_residual_targets",
         "push_potential_valid_candidates",
+        "push_object_positive_rows_count",
+        "push_object_positive_hits_at_1_count",
+        "push_object_positive_hits_at_4_count",
+        "push_positive_actions_total_count",
+        "push_positive_actions_direction_covered_count",
+        "push_positive_actions_utility_covered_count",
+        "push_object_bce_active_rows_count",
+        "push_object_rank_active_rows_count",
     }
     LOSS_GROUPS = (
         ("instance", ("weighted_loss_instance",)),
@@ -478,6 +486,16 @@ class Trainer:
                 )
                 for key, value in metric_sums.items()
             }
+            positive_total = validation_details.get("push_positive_actions_total_count", 0.0)
+            if positive_total > 0:
+                direction_coverage = validation_details.get("push_positive_actions_direction_covered_count", 0.0) / positive_total
+                validation_details["push_direction_positive_coverage"] = direction_coverage
+                validation_details["push_utility_valid_coverage"] = validation_details.get("push_positive_actions_utility_covered_count", 0.0) / positive_total
+                score += float(self.config.training.push_coverage_penalty_weight) * (1.0 - direction_coverage)
+            positive_rows = validation_details.get("push_object_positive_rows_count", 0.0)
+            if positive_rows > 0:
+                validation_details["push_object_positive_recall_at_1"] = validation_details.get("push_object_positive_hits_at_1_count", 0.0) / positive_rows
+                validation_details["push_object_positive_recall_at_4"] = validation_details.get("push_object_positive_hits_at_4_count", 0.0) / positive_rows
             validation_details.update(aggregate_stageb_validation_payloads(summaries))
             evaluation_records = [
                 record for item in summaries for record in item.get("evaluation_records", [])
@@ -1146,10 +1164,11 @@ class Trainer:
         ):
             raise RuntimeError("Stage-B resume checkpoint provenance does not match the dataset")
         source = self.model.module if hasattr(self.model, "module") else self.model
-        push_only = checkpoint_stage == "push" and all(
-            name.startswith("push.") for name in payload["model"]
-        )
-        source.load_state_dict(payload["model"], strict=not push_only)
+        if checkpoint_stage == "push" and set(source.state_dict()) != set(payload["model"]):
+            missing = sorted(set(source.state_dict()) - set(payload["model"]))
+            extra = sorted(set(payload["model"]) - set(source.state_dict()))
+            raise RuntimeError(f"Stage-C checkpoint parameter mismatch: missing={missing[:5]} extra={extra[:5]}")
+        source.load_state_dict(payload["model"], strict=True)
         self.task_grasp_probability_threshold = float(
             payload.get(
                 "task_grasp_probability_threshold",
@@ -1162,7 +1181,7 @@ class Trainer:
             self.scheduler.load_state_dict(payload["scheduler"])
         self.scaler.load_state_dict(payload["scaler"])
         if self.ema and payload["ema"] is not None:
-            self.ema.model.load_state_dict(payload["ema"], strict=not push_only)
+            self.ema.model.load_state_dict(payload["ema"], strict=True)
         self.state = TrainerState(**payload["trainer_state"])
         # ``map_location=self.device`` also moves serialized RNG byte tensors
         # to CUDA.  PyTorch's RNG restoration APIs require CPU ByteTensors even

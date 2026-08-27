@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import torch
 from torch import nn
+from tcd_prg.datasets.stageb_manifest import compatibility_provenance, stageb_compatibility
 
 STAGE_PREFIXES = {"perception": ("encoder.", "region_head."), "grasp": ("task_grasp.",), "push": ("push.",)}
 
@@ -22,11 +23,29 @@ def _load_stage(model: nn.Module, path: str | Path, stage: str) -> dict:
     model.load_state_dict({name: source[name] for name in required}, strict=False)
     return payload
 
+def _require_fields(payload: dict, runtime_config, sections: dict[str, tuple[str, ...]], stage: str) -> None:
+    saved = payload.get("config", {})
+    for section, fields in sections.items():
+        current_section = getattr(runtime_config, section)
+        saved_section = saved.get(section, {})
+        for field in fields:
+            if saved_section.get(field) != getattr(current_section, field):
+                raise RuntimeError(f"{stage} runtime mismatch: {section}.{field}")
+
 def load_staged_tcd_prg(model: nn.Module, stage_a_checkpoint: str | Path,
-                        stage_b_checkpoint: str | Path, stage_c_checkpoint: str | Path) -> float:
-    _load_stage(model, stage_a_checkpoint, "perception")
+                        stage_b_checkpoint: str | Path, stage_c_checkpoint: str | Path,
+                        runtime_config) -> float:
+    stage_a = _load_stage(model, stage_a_checkpoint, "perception")
     stage_b = _load_stage(model, stage_b_checkpoint, "grasp")
-    _load_stage(model, stage_c_checkpoint, "push")
+    stage_c = _load_stage(model, stage_c_checkpoint, "push")
+    perception_fields = ("instance_queries", "instance_objectness_threshold", "target_query_temperature", "target_prompt_radius_m", "target_prompt_sigma_m", "target_prompt_weight", "target_category_weight", "target_objectness_weight", "target_center_weight", "target_reid_weight", "target_prompt_min_support", "target_prompt_min_margin")
+    _require_fields(stage_a, runtime_config, {"model": perception_fields, "ablation": ("use_task_region_condition",), "backbone": ("grid_size_m",)}, "perception")
+    _require_fields(stage_c, runtime_config, {"model": ("instance_queries", "num_categories", "num_task_regions", "num_direction_bins", "push_direction_contact_topk", "push_object_topk", "push_utility_temperature")}, "push")
+    saved_stageb = compatibility_provenance(stage_b.get("stageb_provenance", {}))
+    runtime_stageb = stageb_compatibility(runtime_config)
+    for key in ("scene_preprocess", "target_graspnet", "proposal_label_protocol"):
+        if saved_stageb.get(key) != runtime_stageb.get(key):
+            raise RuntimeError(f"grasp runtime provenance mismatch: {key}")
     if "task_grasp_probability_threshold" not in stage_b:
         raise RuntimeError("Stage-B checkpoint is missing its calibrated deployment threshold")
     return float(stage_b["task_grasp_probability_threshold"])

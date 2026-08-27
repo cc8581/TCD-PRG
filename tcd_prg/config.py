@@ -242,6 +242,7 @@ class TrainingConfig:
     gradient_clip_norm: float = 20.0
     ema_decay: float | None = 0.999
     early_stopping_patience: int = 20
+    push_coverage_penalty_weight: float = 1.0
     deterministic: bool = True
     num_workers: int = 4
     # Validation runs while the train/global persistent workers are still
@@ -651,6 +652,8 @@ class TCDPRGConfig:
             raise ValueError("push_direction_contact_topk must be positive")
         if self.model.push_utility_temperature <= 0:
             raise ValueError("push_utility_temperature must be positive")
+        if self.training.push_coverage_penalty_weight < 0:
+            raise ValueError("push_coverage_penalty_weight must be non-negative")
         if not 0.0 <= self.model.push_candidate_probability_threshold < 1.0:
             raise ValueError("push_candidate_probability_threshold must be in [0,1)")
         if self.model.global_grasp_input_mode not in {"scene_only", "instance_assisted"}:
