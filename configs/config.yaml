@@ -300,6 +300,8 @@ evaluation:
   global_nms_rotation_deg: 15.0
   global_nms_width_m: 0.005
   global_metrics_after_nms: true # deprecated compatibility; diagnostics always apply NMS
+  push_match_contact_m: 0.024
+  push_match_direction_deg: 15.0
 
 ablation:
   use_task_region_condition: true

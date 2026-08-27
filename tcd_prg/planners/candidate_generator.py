@@ -13,6 +13,8 @@ from tcd_prg.geometry.grasp_nms import task_grasp_nms
 from tcd_prg.geometry.se3 import matrix_to_quaternion_xyzw
 from tcd_prg.models.push.head import push_contact_joint_score
 
+from .push_decoder import decode_push_candidates, push_nms_mask
+
 
 class DenseCandidateGenerator:
     def __init__(
@@ -30,6 +32,12 @@ class DenseCandidateGenerator:
             "width_m": torch.empty(0, device=device), "proposal_score": torch.empty(0, device=device),
             "point_index": torch.empty(0, dtype=torch.long, device=device), "direction_bin": torch.empty(0, dtype=torch.long, device=device),
             "direction_score": torch.empty(0, device=device),
+            "object_score": torch.empty(0, device=device),
+            "contact_score": torch.empty(0, device=device),
+            "utility": torch.empty(0, device=device),
+            "direction_residual": torch.empty(0, 2, device=device),
+            "push_effective_logit": torch.empty(0, device=device),
+            "push_robustness_logit": torch.empty(0, device=device),
         }
 
     @staticmethod
@@ -191,57 +199,19 @@ class DenseCandidateGenerator:
         self, candidates: dict[str, Tensor], candidate_scores: Tensor
     ) -> Tensor:
         keep = candidates["valid"].clone()
-        cosine_threshold = math.cos(
-            math.radians(self.config.push_nms_direction_deg)
-        )
         for row in range(keep.shape[0]):
             push = torch.nonzero(
                 keep[row]
                 & (candidates["type"][row] == int(ActionType.PUSH)),
                 as_tuple=False,
             ).flatten()
-            ordered = push[
-                candidate_scores[row, push].argsort(
-                    descending=True, stable=True
-                )
-            ]
-            accepted: list[int] = []
-            for index in ordered.tolist():
-                duplicate = False
-                for prior in accepted:
-                    same_object = bool(
-                        candidates["object"][row, index]
-                        == candidates["object"][row, prior]
-                    )
-                    contact_distance = torch.linalg.vector_norm(
-                        candidates["contact_world"][row, index]
-                        - candidates["contact_world"][row, prior]
-                    )
-                    first = torch.nn.functional.normalize(
-                        candidates["direction_world"][row, index, :2],
-                        dim=-1,
-                    )
-                    second = torch.nn.functional.normalize(
-                        candidates["direction_world"][row, prior, :2],
-                        dim=-1,
-                    )
-                    similar_direction = bool(
-                        (first * second).sum() >= cosine_threshold
-                    )
-                    if (
-                        same_object
-                        and bool(
-                            contact_distance
-                            < self.config.push_nms_contact_m
-                        )
-                        and similar_direction
-                    ):
-                        duplicate = True
-                        break
-                if duplicate:
-                    keep[row, index] = False
-                else:
-                    accepted.append(index)
+            decoded = {
+                "object": candidates["object"][row, push],
+                "contact_world": candidates["contact_world"][row, push],
+                "direction_world": candidates["direction_world"][row, push],
+                "proposal_score": candidate_scores[row, push],
+            }
+            keep[row, push] = push_nms_mask(decoded, self.config)
         return keep
 
     def global_predictions(
@@ -294,6 +264,13 @@ class DenseCandidateGenerator:
     ) -> dict[str, Tensor]:
         rows: list[dict[str, Tensor]] = []
         sensor = output.get("sensor", batch.get("model_inputs", batch))
+        _, decoded_push_rows = decode_push_candidates(
+            sensor,
+            output["push_condition"],
+            output["push"],
+            self.config,
+            use_push_potential=self.use_push_potential,
+        )
 
         for batch_row in range(sensor["xyz"].shape[0]):
             xyz = sensor["xyz"][batch_row]
@@ -316,6 +293,12 @@ class DenseCandidateGenerator:
             score_parts: list[Tensor] = []
             direction_bin_parts: list[Tensor] = []
             direction_score_parts: list[Tensor] = []
+            object_score_parts: list[Tensor] = []
+            contact_score_parts: list[Tensor] = []
+            utility_parts: list[Tensor] = []
+            direction_residual_parts: list[Tensor] = []
+            critic_effective_parts: list[Tensor] = []
+            critic_robustness_parts: list[Tensor] = []
 
             # Terminal task grasp candidates belong to the predicted target query.
             task = output["task_grasp"]
@@ -376,6 +359,14 @@ class DenseCandidateGenerator:
                 direction_score_parts.append(
                     torch.full_like(task_score[selected], float("nan"))
                 )
+                object_score_parts.append(torch.full_like(task_score[selected], float("nan")))
+                contact_score_parts.append(torch.full_like(task_score[selected], float("nan")))
+                utility_parts.append(torch.full_like(task_score[selected], float("nan")))
+                direction_residual_parts.append(torch.full(
+                    (len(selected), 2), float("nan"), device=xyz.device
+                ))
+                critic_effective_parts.append(torch.full_like(task_score[selected], float("nan")))
+                critic_robustness_parts.append(torch.full_like(task_score[selected], float("nan")))
 
             # Generic remove grasps are assigned to predicted object queries.
             global_head = output["global_grasp"]
@@ -451,97 +442,24 @@ class DenseCandidateGenerator:
                 direction_score_parts.append(torch.full_like(
                     candidate_score[local], float("nan")
                 ))
+                object_score_parts.append(torch.full_like(candidate_score[local], float("nan")))
+                contact_score_parts.append(torch.full_like(candidate_score[local], float("nan")))
+                utility_parts.append(torch.full_like(candidate_score[local], float("nan")))
+                direction_residual_parts.append(torch.full(
+                    (len(selected), 2), float("nan"), device=xyz.device
+                ))
+                critic_effective_parts.append(torch.full_like(candidate_score[local], float("nan")))
+                critic_robustness_parts.append(torch.full_like(candidate_score[local], float("nan")))
 
-            # PUSH candidates are shortlisted by the learned Object head;
-            # no dependency graph gates or reweights them.
-            push = output["push"]
-            direction_domain = push["direction_point_mask"][batch_row]
-            push_object_probability = torch.sigmoid(push["object_logits"][batch_row])
-            push_objects = torch.nonzero(active, as_tuple=False).flatten()
-            if len(push_objects):
-                push_objects = push_objects[
-                    push_object_probability[push_objects]
-                    .argsort(descending=True, stable=True)[: self.config.push_object_topk]
-                ]
-            push_index = self._top_per_object(
-                push["contact_logits"][batch_row],
-                instance_probability,
-                push_objects,
-                point_mask & direction_domain,
-                self.config.push_candidates,
-            )
-            if len(push_index):
-                direction_probability = torch.sigmoid(
-                    push["direction_logits"][batch_row, push_index]
-                )
-                directions_per_contact = min(
-                    self.config.push_directions_per_contact,
-                    direction_probability.shape[-1],
-                )
-                direction_score, direction_bin = direction_probability.topk(
-                    directions_per_contact, dim=-1
-                )
-                expanded_point = push_index[:, None].expand(
-                    -1, directions_per_contact
-                ).reshape(-1)
-                direction_bin = direction_bin.reshape(-1)
-                direction_score = direction_score.reshape(-1)
-                contact_score = torch.sigmoid(
-                    push["contact_logits"][batch_row, expanded_point]
-                )
-
-                # Object identity must stay inside the learned object shortlist.
-                membership = instance_probability[
-                    push_objects[:, None], expanded_point[None]
-                ].T
-                pushed_object = push_objects[membership.argmax(-1)]
-                object_score = push_object_probability[pushed_object]
-                utility = push["utility_delta"][
-                    batch_row, expanded_point, direction_bin
-                ]
-                if self.use_push_potential:
-                    utility_factor = torch.sigmoid(utility / float(self.config.push_utility_temperature))
-                    utility_eligible = utility > float(self.config.push_utility_threshold)
-                else:
-                    utility_factor = torch.ones_like(utility)
-                    utility_eligible = torch.ones_like(utility, dtype=torch.bool)
-                composite = (
-                    object_score
-                    * contact_score
-                    * direction_score
-                    * utility_factor
-                )
-                eligible = utility_eligible & (composite >= float(self.config.push_candidate_probability_threshold))
-                expanded_point = expanded_point[eligible]; direction_bin = direction_bin[eligible]
-                direction_score = direction_score[eligible]; contact_score = contact_score[eligible]
-                pushed_object = pushed_object[eligible]; utility = utility[eligible]; composite = composite[eligible]
-                if len(expanded_point) > self.config.max_push_candidates:
-                    keep = composite.topk(self.config.max_push_candidates).indices
-                    expanded_point = expanded_point[keep]
-                    direction_bin = direction_bin[keep]
-                    direction_score = direction_score[keep]
-                    contact_score = contact_score[keep]
-                    pushed_object = pushed_object[keep]
-                    utility = utility[keep]
-                    composite = composite[keep]
-
-                angle = (
-                    direction_bin.float() + 0.5
-                ) * 2.0 * math.pi / self.config.num_direction_bins
-                center = torch.stack((torch.cos(angle), torch.sin(angle)), -1)
-                residual = push["direction_residual"][
-                    batch_row, expanded_point, direction_bin
-                ]
-                planar = torch.nn.functional.normalize(center + residual, dim=-1)
-                direction = torch.cat(
-                    (planar, torch.zeros(len(planar), 1, device=xyz.device)), -1
-                )
+            decoded_push = decoded_push_rows[batch_row]
+            if len(decoded_push["point_index"]):
+                expanded_point = decoded_push["point_index"]
                 type_parts.append(torch.full_like(
                     expanded_point, int(ActionType.PUSH)
                 ))
-                object_parts.append(pushed_object)
-                contact_parts.append(xyz[expanded_point])
-                direction_parts.append(direction)
+                object_parts.append(decoded_push["object"])
+                contact_parts.append(decoded_push["contact_world"])
+                direction_parts.append(decoded_push["direction_world"])
                 pose_parts.append(torch.full(
                     (len(expanded_point), 7), float("nan"), device=xyz.device,
                 ))
@@ -551,10 +469,16 @@ class DenseCandidateGenerator:
                 width_parts.append(torch.full(
                     (len(expanded_point),), float("nan"), device=xyz.device,
                 ))
-                score_parts.append(composite)
+                score_parts.append(decoded_push["proposal_score"])
                 point_parts.append(expanded_point)
-                direction_bin_parts.append(direction_bin)
-                direction_score_parts.append(direction_score)
+                direction_bin_parts.append(decoded_push["direction_bin"])
+                direction_score_parts.append(decoded_push["direction_score"])
+                object_score_parts.append(decoded_push["object_score"])
+                contact_score_parts.append(decoded_push["contact_score"])
+                utility_parts.append(decoded_push["utility"])
+                direction_residual_parts.append(decoded_push["direction_residual"])
+                critic_effective_parts.append(decoded_push["push_effective_logit"])
+                critic_robustness_parts.append(decoded_push["push_robustness_logit"])
 
             def joined(
                 parts: list[Tensor],
@@ -604,6 +528,14 @@ class DenseCandidateGenerator:
                 "direction_score": joined(
                     direction_score_parts, (0,), xyz.dtype
                 ),
+                "object_score": joined(object_score_parts, (0,), xyz.dtype),
+                "contact_score": joined(contact_score_parts, (0,), xyz.dtype),
+                "utility": joined(utility_parts, (0,), xyz.dtype),
+                "direction_residual": joined(
+                    direction_residual_parts, (0, 2), xyz.dtype
+                ),
+                "push_effective_logit": joined(critic_effective_parts, (0,), xyz.dtype),
+                "push_robustness_logit": joined(critic_robustness_parts, (0,), xyz.dtype),
             })
 
         max_candidates = max(
@@ -616,6 +548,12 @@ class DenseCandidateGenerator:
             "direction_bin": -1,
             "width_m": float("nan"),
             "direction_score": float("nan"),
+            "object_score": float("nan"),
+            "contact_score": float("nan"),
+            "utility": float("nan"),
+            "direction_residual": float("nan"),
+            "push_effective_logit": float("nan"),
+            "push_robustness_logit": float("nan"),
             "proposal_score": -1.0,
             "contact_world": float("nan"),
             "direction_world": float("nan"),

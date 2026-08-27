@@ -76,6 +76,32 @@ def finalize_push_validation_metrics(details: Mapping[str, float]) -> dict[str, 
         result["push_object_positive_recall_at_4"] = (
             result.get("push_object_positive_hits_at_4_count", 0.0) / positive_rows
         )
+    proposal_total = result.get("push_proposal_positive_total_count", 0.0)
+    if proposal_total > 0:
+        result["push_proposal_positive_recall_pre_nms_at_32"] = (
+            result.get("push_proposal_positive_pre_nms_hits_count", 0.0)
+            / proposal_total
+        )
+        result["push_final_positive_recall_at_32"] = (
+            result.get("push_proposal_positive_final_hits_count", 0.0)
+            / proposal_total
+        )
+    integrated_total = result.get(
+        "integrated_push_proposal_positive_total_count", 0.0
+    )
+    if integrated_total > 0:
+        result["integrated_push_proposal_positive_recall_pre_nms_at_32"] = (
+            result.get(
+                "integrated_push_proposal_positive_pre_nms_hits_count", 0.0
+            )
+            / integrated_total
+        )
+        result["integrated_push_final_positive_recall_at_32"] = (
+            result.get(
+                "integrated_push_proposal_positive_final_hits_count", 0.0
+            )
+            / integrated_total
+        )
     return result
 
 
@@ -122,6 +148,12 @@ class Trainer:
         "push_object_rank_active_rows_count",
         "push_direction_bce_active_rows_count",
         "push_direction_rank_active_rows_count",
+        "push_proposal_positive_total_count",
+        "push_proposal_positive_pre_nms_hits_count",
+        "push_proposal_positive_final_hits_count",
+        "integrated_push_proposal_positive_total_count",
+        "integrated_push_proposal_positive_pre_nms_hits_count",
+        "integrated_push_proposal_positive_final_hits_count",
     }
     LOSS_GROUPS = (
         ("instance", ("weighted_loss_instance",)),

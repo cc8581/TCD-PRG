@@ -29,6 +29,10 @@ from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import StandalonePushModel, TCDPRGModel
 from tcd_prg.observation.cached import CachedObservationProvider
 from tcd_prg.planners.candidate_generator import DenseCandidateGenerator
+from tcd_prg.planners.push_decoder import (
+    decode_push_candidates,
+    proposal_recall_counts,
+)
 from tcd_prg.pretrained import load_pretrained_backbone, prepare_pretrained_checkpoint
 from tcd_prg.runtime import (
     StageBBinaryBatchCollator,
@@ -454,6 +458,9 @@ def main() -> None:
         resume_training = (
             resume_config.get("training", {}) if isinstance(resume_config, dict) else {}
         )
+        resume_model = resume_config.get("model", {}) if isinstance(resume_config, dict) else {}
+        resume_evaluation = resume_config.get("evaluation", {}) if isinstance(resume_config, dict) else {}
+        resume_ablation = resume_config.get("ablation", {}) if isinstance(resume_config, dict) else {}
         if isinstance(resume_training, dict):
             old_validation_signature = (
                 resume_training.get("validation_scene_count"),
@@ -463,6 +470,17 @@ def main() -> None:
                 resume_training.get("validation_family_weights"),
                 tuple(resume_training.get("allowed_action_strata", ())),
                 resume_training.get("validation_stratum_quota"),
+                resume_model.get("push_object_topk"),
+                resume_model.get("push_candidates"),
+                resume_model.get("push_directions_per_contact"),
+                resume_model.get("max_push_candidates"),
+                resume_model.get("push_candidate_probability_threshold"),
+                resume_model.get("push_utility_threshold"),
+                resume_model.get("push_nms_contact_m"),
+                resume_model.get("push_nms_direction_deg"),
+                resume_evaluation.get("push_match_contact_m"),
+                resume_evaluation.get("push_match_direction_deg"),
+                resume_ablation.get("use_push_potential"),
             )
             current_validation_signature = (
                 config.training.validation_scene_count,
@@ -472,6 +490,17 @@ def main() -> None:
                 config.training.validation_family_weights,
                 tuple(config.training.allowed_action_strata),
                 config.training.validation_stratum_quota,
+                config.model.push_object_topk,
+                config.model.push_candidates,
+                config.model.push_directions_per_contact,
+                config.model.max_push_candidates,
+                config.model.push_candidate_probability_threshold,
+                config.model.push_utility_threshold,
+                config.model.push_nms_contact_m,
+                config.model.push_nms_direction_deg,
+                config.evaluation.push_match_contact_m,
+                config.evaluation.push_match_direction_deg,
+                config.ablation.use_push_potential,
             )
             resume_validation_protocol_changed = (
                 old_validation_signature != current_validation_signature
@@ -651,6 +680,34 @@ def main() -> None:
             for validation_step, raw in enumerate(validation_loader, start=1):
                 batch = trainer._move(raw, trainer.device)
                 _, terms, model_output = objective(module, batch, return_output=True)
+                terms = dict(terms)
+                if config.training.stage == "push":
+                    pre_nms, final = decode_push_candidates(
+                        model_output["sensor"],
+                        model_output["push_condition"],
+                        model_output["push"],
+                        config.model,
+                        use_push_potential=config.ablation.use_push_potential,
+                    )
+                    pre_hits, proposal_total = proposal_recall_counts(
+                        pre_nms,
+                        batch,
+                        contact_threshold_m=config.evaluation.push_match_contact_m,
+                        direction_threshold_deg=config.evaluation.push_match_direction_deg,
+                    )
+                    final_hits, final_total = proposal_recall_counts(
+                        final,
+                        batch,
+                        contact_threshold_m=config.evaluation.push_match_contact_m,
+                        direction_threshold_deg=config.evaluation.push_match_direction_deg,
+                    )
+                    if not bool(torch.equal(proposal_total, final_total)):
+                        raise RuntimeError("PUSH proposal recall denominator changed across NMS")
+                    terms.update({
+                        "push_proposal_positive_total_count": proposal_total,
+                        "push_proposal_positive_pre_nms_hits_count": pre_hits,
+                        "push_proposal_positive_final_hits_count": final_hits,
+                    })
                 if stageb:
                     valid = (
                         batch["stageb_candidate_valid"].bool()

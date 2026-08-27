@@ -321,6 +321,10 @@ class EvaluationConfig:
     # Deprecated compatibility field; internal diagnostics always apply the
     # explicit NMS configuration above and standard GraspNet uses graspnetAPI.
     global_metrics_after_nms: bool = True
+    # PUSH GT matching is an evaluation protocol and intentionally independent
+    # from decoder NMS thresholds.
+    push_match_contact_m: float = 0.024
+    push_match_direction_deg: float = 15.0
 
 
 @dataclass(slots=True)
@@ -648,6 +652,8 @@ class TCDPRGConfig:
             raise ValueError("push_directions_per_contact must be in [1,num_direction_bins]")
         if self.model.push_candidates <= 0 or self.model.max_push_candidates <= 0:
             raise ValueError("PUSH contact and final candidate budgets must be positive")
+        if self.model.max_push_candidates != 32:
+            raise ValueError("Formal Stage-C proposal protocol requires max_push_candidates=32")
         if self.model.push_direction_contact_topk <= 0:
             raise ValueError("push_direction_contact_topk must be positive")
         if self.model.push_utility_temperature <= 0:
@@ -701,6 +707,10 @@ class TCDPRGConfig:
             raise ValueError("target selector weights must be non-negative")
         if self.model.target_reid_max_center_distance_m <= 0:
             raise ValueError("target_reid_max_center_distance_m must be positive")
+        if self.evaluation.push_match_contact_m <= 0:
+            raise ValueError("evaluation.push_match_contact_m must be positive")
+        if not 0 < self.evaluation.push_match_direction_deg <= 180:
+            raise ValueError("evaluation.push_match_direction_deg must be in (0,180]")
         if not 0.0 <= self.model.target_prompt_min_support <= 1.0:
             raise ValueError("target_prompt_min_support must be in [0,1]")
         if self.model.target_prompt_min_margin < 0:
