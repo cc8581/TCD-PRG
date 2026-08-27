@@ -362,14 +362,14 @@ def _nearest_selected_push_points(
     return index, valid
 
 
-def build_object_query_push_supervision(
+def build_push_supervision(
     output: dict[str, Tensor],
     batch: dict[str, Tensor],
     config,
-    match: InstanceMatch,
+    condition,
     training_hints: dict[str, Tensor] | None = None,
 ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-    """Build PUSH supervision without feeding GT object ids/contacts into PushHead."""
+    """Build GT-slot PUSH supervision; no perception query matching is involved."""
     import math
     from tcd_prg.constants import ActionType, CandidateStatus
 
@@ -385,7 +385,8 @@ def build_object_query_push_supervision(
     # top-k selection actually computed a direction token.
     if training_hints is None:
         point_index, direction_parameter_valid = _nearest_selected_push_points(
-            output, batch, candidate
+            output, batch, candidate,
+            max_distance_m=float(config.push_contact_match_max_distance_m),
         )
     else:
         point_index = training_hints["push_gt_point_index"].long()
@@ -411,13 +412,8 @@ def build_object_query_push_supervision(
         angle * bins / (2 * math.pi)
     ).long().remainder(bins)
 
-    gt_object_logits, gt_object_predicted = (
-        gather_query_logits_to_gt_objects(
-            output["object_logits"], match
-        )
-    )
     gathered = {
-        "object_logits": gt_object_logits,
+        "object_logits": output["object_logits"],
         "contact_logits": output["contact_logits"],
         "point_index": point_index,
         "direction_logits": output["direction_logits"][
@@ -504,10 +500,10 @@ def build_object_query_push_supervision(
         object_evaluated = batch["push_object_known"].bool().clone()
         object_positive = batch["push_object_positive"].bool().clone()
     else:
-        object_positive = torch.zeros_like(gt_object_logits, dtype=torch.bool)
-        object_evaluated = torch.zeros_like(gt_object_logits, dtype=torch.bool)
+        object_positive = torch.zeros_like(output["object_logits"], dtype=torch.bool)
+        object_evaluated = torch.zeros_like(output["object_logits"], dtype=torch.bool)
         # Compatibility path for external action-group batches.
-        gt_object_count = match.gt_to_query.shape[1]
+        gt_object_count = object_positive.shape[1]
         for batch_row in range(action_type.shape[0]):
             eval_objects = batch["acted_object"][batch_row, evaluated_push[batch_row]]
             eval_objects = eval_objects[
@@ -617,13 +613,8 @@ def build_object_query_push_supervision(
         torch.nan_to_num(failures) > 0.5
     ).any(-1)
 
-    # Only GT objects that have a matched predicted query participate in object
-    # ranking. Active/present is supervision validity, not forward input.
-    gt_active = (
-        batch["object_mask"]
-        & batch["object_active"]
-        & gt_object_predicted
-    )
+    # Condition slots are deterministically GT slots during standalone Stage C.
+    gt_active = condition.object_valid & batch["object_active"].bool()
     return gathered, {
         "object_positive": object_positive,
         "object_valid_mask": (

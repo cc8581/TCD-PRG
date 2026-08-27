@@ -7,6 +7,7 @@ import torch
 from torch import Tensor, nn
 
 from tcd_prg.models.stageb_condition import stageb_condition_from_gt
+from tcd_prg.models.push_condition import push_condition_from_gt
 
 from tcd_prg.config import (
     AblationConfig, LossConfig, ModelConfig, RegionHeadConfig
@@ -17,7 +18,7 @@ from .actions import PushLoss
 from .instance import (
     InstanceSetLoss,
     build_instance_targets,
-    build_object_query_push_supervision,
+    build_push_supervision,
 )
 from .labels import (
     build_push_training_hints,
@@ -268,13 +269,15 @@ class TCDPRGObjective(nn.Module):
         # GT contact forcing is a training-only sparse-compute aid. Validation
         # and inference must depend exclusively on predicted contact top-k.
         training_hints = (
-            build_push_training_hints(batch)
+            build_push_training_hints(batch, self.model_config.push_contact_match_max_distance_m)
             if model.training and has_push
             else None
         )
         model_view = self._model_view(batch)
         if forward_mode == "grasp":
             model_view["stageb_condition"] = stageb_condition_from_gt(batch)
+        if forward_mode == "push":
+            model_view["push_condition"] = push_condition_from_gt(batch, self.model_config.instance_queries)
         if training_hints is not None:
             model_view["training_hints"] = {
                 "push_direction_point_mask": training_hints[
@@ -302,19 +305,6 @@ class TCDPRGObjective(nn.Module):
             activity["active_loss_instance"] = (
                 instance_targets["visible"].any(-1).float().mean()
             )
-        elif has_push:
-            # Stage C needs only the frozen GT-object -> predicted-query assignment
-            # for loss-side Push object supervision. Avoid computing the full
-            # instance BCE/Dice/category objective when its family is disabled.
-            instance_targets = build_instance_targets(
-                batch, output["instance"].mask_logits.shape[1]
-            )
-            match = self.instance.match(
-                output["instance"],
-                instance_targets,
-                output["encoded"].target_query_logits,
-            )
-            output["instance_match"] = match
 
         region_labels = build_region_labels(batch)
         if region_labels is not None and self.total.enabled("region"):
@@ -344,13 +334,13 @@ class TCDPRGObjective(nn.Module):
             activity["active_loss_task_grasp"] = batch["stageb_candidate_valid"].any(-1).float().mean()
 
         if has_push:
-            if output.get("push") is None or match is None:
-                raise RuntimeError("Push loss enabled but Push/instance match is unavailable")
-            push_output, push_labels = build_object_query_push_supervision(
+            if output.get("push") is None:
+                raise RuntimeError("Push loss enabled but Push output is unavailable")
+            push_output, push_labels = build_push_supervision(
                 output["push"],
                 batch,
                 self.model_config,
-                match,
+                output["push_condition"],
                 training_hints=training_hints,
             )
             push_losses = self.push(push_output, push_labels)

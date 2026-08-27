@@ -8,7 +8,7 @@ import torch
 from tcd_prg.config import AblationConfig, GraspNetConfig, ModelConfig
 from tcd_prg.constants import ActionType
 from tcd_prg.evaluators import OfflineModelEvaluator
-from tcd_prg.models import TCDPRGModel
+from tcd_prg.models import TCDPRGModel, push_condition_from_gt
 from tcd_prg.models.push import PushHead
 from tcd_prg.planners import DenseCandidateGenerator
 
@@ -76,12 +76,22 @@ def test_policy_heads_match_training_contract(tiny_batch) -> None:
     assert "pick_remove" not in output
 
 
-def test_stagec_push_forward_keeps_frozen_instance_predictions(tiny_batch) -> None:
+def test_stagec_push_forward_uses_public_gt_condition(tiny_batch) -> None:
     model = TCDPRGModel(_config()).eval()
-    output = model(tiny_batch, forward_mode="push")
-    assert output["instance"] is output["encoded"].instance
-    assert output["instance"].mask_logits.shape[0] == tiny_batch["xyz"].shape[0]
-    assert output["instance"].mask_logits.shape[1] == _config().instance_queries
+    batch = dict(tiny_batch)
+    batch["region_target"] = torch.zeros_like(batch["point_mask"])
+    batch["region_valid"] = torch.zeros_like(batch["point_mask"])
+    batch["push_condition"] = push_condition_from_gt(batch, _config().instance_queries)
+    output = model(batch, forward_mode="push")
+    assert output["encoded"] is None and output["instance"] is None
+    assert output["push"]["object_logits"].shape == (tiny_batch["xyz"].shape[0], _config().instance_queries)
+
+
+def test_perception_returns_push_condition(tiny_batch) -> None:
+    output = TCDPRGModel(_config()).eval()(tiny_batch, forward_mode="perception")
+    condition = output["push_condition"]
+    assert condition.object_probability.shape[:2] == (tiny_batch["xyz"].shape[0], _config().instance_queries)
+    assert condition.target_probability.shape == tiny_batch["point_mask"].shape
 
 
 def test_camera2_to_task_evaluator_to_dense_candidate_end_to_end(tiny_batch) -> None:

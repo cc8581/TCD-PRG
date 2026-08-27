@@ -161,6 +161,8 @@ class ModelConfig:
     num_direction_bins: int = 16
     # 每个抓取 query 直接预测平移、连续 SO(3)、夹爪宽度和条件化质量。
     contact_heatmap_sigma_m: float = 0.008
+    # Shared train/validation association gate for contact -> visible point.
+    push_contact_match_max_distance_m: float = 0.024
     max_grasp_width_m: float = 0.095
     min_grasp_width_m: float = 0.0
     candidate_topk: int = 64

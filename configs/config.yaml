@@ -128,6 +128,7 @@ model:
   target_same_category_loss_boost: 2.0
   num_direction_bins: 16
   contact_heatmap_sigma_m: 0.008
+  push_contact_match_max_distance_m: 0.024
   min_grasp_width_m: 0.0
   max_grasp_width_m: 0.095
   candidate_topk: 64

@@ -1092,14 +1092,22 @@ class Trainer:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         source = self.model.module if hasattr(self.model, "module") else self.model
+        # Stage C is independently trainable/deployable: persist exactly the
+        # Push module rather than a misleading snapshot of frozen A/B modules.
+        model_state = source.state_dict()
+        ema_state = self.ema.model.state_dict() if self.ema else None
+        if self.config.training.stage == "push":
+            model_state = {key: value for key, value in model_state.items() if key.startswith("push.")}
+            if ema_state is not None:
+                ema_state = {key: value for key, value in ema_state.items() if key.startswith("push.")}
         payload = {
             "schema_version": 12,
             "training_stage": self.config.training.stage,
-            "model": source.state_dict(),
+            "model": model_state,
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler else None,
             "scaler": self.scaler.state_dict(),
-            "ema": self.ema.model.state_dict() if self.ema else None,
+            "ema": ema_state,
             "trainer_state": asdict(self.state),
             "config": asdict(self.config),
             "rng_cpu": torch.get_rng_state(),
@@ -1138,7 +1146,10 @@ class Trainer:
         ):
             raise RuntimeError("Stage-B resume checkpoint provenance does not match the dataset")
         source = self.model.module if hasattr(self.model, "module") else self.model
-        source.load_state_dict(payload["model"])
+        push_only = checkpoint_stage == "push" and all(
+            name.startswith("push.") for name in payload["model"]
+        )
+        source.load_state_dict(payload["model"], strict=not push_only)
         self.task_grasp_probability_threshold = float(
             payload.get(
                 "task_grasp_probability_threshold",
@@ -1151,7 +1162,7 @@ class Trainer:
             self.scheduler.load_state_dict(payload["scheduler"])
         self.scaler.load_state_dict(payload["scaler"])
         if self.ema and payload["ema"] is not None:
-            self.ema.model.load_state_dict(payload["ema"])
+            self.ema.model.load_state_dict(payload["ema"], strict=not push_only)
         self.state = TrainerState(**payload["trainer_state"])
         # ``map_location=self.device`` also moves serialized RNG byte tensors
         # to CUDA.  PyTorch's RNG restoration APIs require CPU ByteTensors even

@@ -177,8 +177,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--resume")
-    parser.add_argument("--stage-a-checkpoint", help="Stage-A component checkpoint for Stage C")
-    parser.add_argument("--stage-b-checkpoint", help="Stage-B component checkpoint for Stage C")
     # Windows 原生启动器显式传递进程拓扑；torchrun 的环境变量仅作为 Linux 兼容路径。
     parser.add_argument("--world-size", type=int)
     parser.add_argument("--rank", type=int)
@@ -204,32 +202,10 @@ def main() -> None:
     resume_payload = (
         torch.load(args.resume, map_location="cpu", weights_only=False) if args.resume else None
     )
-    stage_a_payload = (
-        torch.load(args.stage_a_checkpoint, map_location="cpu", weights_only=False)
-        if args.stage_a_checkpoint else None
-    )
-    stage_b_payload = (
-        torch.load(args.stage_b_checkpoint, map_location="cpu", weights_only=False)
-        if args.stage_b_checkpoint else None
-    )
-    if config.training.stage == "push" and resume_payload is None:
-        if stage_a_payload is None or stage_b_payload is None:
-            raise RuntimeError("Stage C requires --stage-a-checkpoint and --stage-b-checkpoint")
-        if stage_a_payload.get("training_stage") != "perception":
-            raise RuntimeError("--stage-a-checkpoint must be a perception checkpoint")
-        if stage_b_payload.get("training_stage") != "grasp":
-            raise RuntimeError("--stage-b-checkpoint must be a grasp checkpoint")
-    elif stage_a_payload is not None or stage_b_payload is not None:
-        raise RuntimeError("Stage component checkpoints are only valid for a fresh Stage C run")
     validate_checkpoint_gate(
         config.training.stage,
         resume_payload=resume_payload,
     )
-    threshold_payload = stage_b_payload
-    if threshold_payload is not None and "task_grasp_probability_threshold" in threshold_payload:
-        config.model.task_grasp_probability_threshold = float(
-            threshold_payload["task_grasp_probability_threshold"]
-        )
     world_size = (
         args.world_size if args.world_size is not None else int(os.environ.get("WORLD_SIZE", "1"))
     )
@@ -493,14 +469,7 @@ def main() -> None:
                 "unfreeze_at_optimizer_step",
                 config.training.unfreeze_at_optimizer_step,
             )
-    if stage_a_payload is not None and stage_b_payload is not None:
-        if int(stage_a_payload.get("schema_version", -1)) != 12:
-            raise RuntimeError("Stage-A component checkpoint must use schema 12")
-        if int(stage_b_payload.get("schema_version", -1)) != 12:
-            raise RuntimeError("Stage-B component checkpoint must use schema 12")
-        load_checkpoint_modules(model, stage_a_payload, ("encoder.", "region_head."))
-        load_checkpoint_modules(model, stage_b_payload, ("task_grasp.",))
-    elif not args.resume and config.training.stage != "grasp":
+    if not args.resume and config.training.stage not in {"grasp", "push"}:
         distributed = torch.distributed.is_initialized()
         checkpoint_path = None
         # Only rank zero may resolve a missing managed checkpoint. Other ranks

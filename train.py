@@ -113,8 +113,6 @@ def _launcher_defaults(paths_config: Path) -> dict[str, str | Path | None]:
             local.get("output_root", PROJECT / "outputs")
         ) / f"formal_{stamp}",
         "resume": None,
-        "stage_a_checkpoint": None,
-        "stage_b_checkpoint": None,
     }
 
 
@@ -249,8 +247,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "On resume, defaults to the checkpoint parent directory.",
     )
     parser.add_argument("--resume", "--checkpoint", dest="resume", type=Path, default=defaults["resume"], help="Checkpoint used to resume or validate.")
-    parser.add_argument("--stage-a-checkpoint", type=Path, default=defaults["stage_a_checkpoint"])
-    parser.add_argument("--stage-b-checkpoint", type=Path, default=defaults["stage_b_checkpoint"])
     parser.add_argument(
         "--data-fraction", type=float, default=None,
         help="Override training.data_fraction with a deterministic fraction in (0, 1].",
@@ -270,8 +266,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--validate-only requires an explicit --stage")
     if args.validate_only and args.resume is None:
         parser.error("--validate-only requires --checkpoint/--resume")
-    if args.resume and (args.stage_a_checkpoint or args.stage_b_checkpoint):
-        parser.error("--resume and Stage-C component checkpoints are mutually exclusive")
     return args
 
 
@@ -295,10 +289,6 @@ def _training_arguments(
         arguments.append("--validate-only")
     if args.resume:
         arguments.extend(("--resume", str(args.resume.resolve())))
-    if args.stage_a_checkpoint:
-        arguments.extend(("--stage-a-checkpoint", str(args.stage_a_checkpoint.resolve())))
-    if args.stage_b_checkpoint:
-        arguments.extend(("--stage-b-checkpoint", str(args.stage_b_checkpoint.resolve())))
     arguments.append(_quoted_override("output_dir", output))
     named_training_overrides = {
         "batch_size": "batch_size",
@@ -322,9 +312,6 @@ def _pipeline_command(
     args: argparse.Namespace,
     stage: str,
     output_dir: Path,
-    *,
-    stage_a_checkpoint: Path | None = None,
-    stage_b_checkpoint: Path | None = None,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -342,10 +329,6 @@ def _pipeline_command(
         "--cache-index-directory", str(args.cache_index_directory),
         "--gpus", str(args.gpus),
     ]
-    if stage_a_checkpoint is not None:
-        command.extend(("--stage-a-checkpoint", str(stage_a_checkpoint.resolve())))
-    if stage_b_checkpoint is not None:
-        command.extend(("--stage-b-checkpoint", str(stage_b_checkpoint.resolve())))
     for name in (
         "batch_size", "num_workers", "validation_num_workers", "gradient_accumulation_steps",
         "max_optimizer_steps", "validation_interval", "data_fraction",
@@ -359,8 +342,8 @@ def _pipeline_command(
 
 
 def _run_all_stages(args: argparse.Namespace) -> None:
-    if args.resume is not None or args.stage_a_checkpoint or args.stage_b_checkpoint:
-        raise ValueError("The all-stage pipeline starts fresh; use --stage for resume/component checkpoints")
+    if args.resume is not None:
+        raise ValueError("The all-stage pipeline starts fresh; use --stage for resume")
     root = args.output_dir.resolve()
     stage_outputs = {
         "perception": root / "perception",
@@ -371,21 +354,12 @@ def _run_all_stages(args: argparse.Namespace) -> None:
         _pipeline_command(args, "perception", stage_outputs["perception"]),
         check=True, cwd=PROJECT,
     )
-    stage_a = stage_outputs["perception"] / "best.pt"
-    if not stage_a.is_file():
-        stage_a = stage_outputs["perception"] / "last.pt"
     subprocess.run(
         _pipeline_command(args, "grasp", stage_outputs["grasp"]),
         check=True, cwd=PROJECT,
     )
-    stage_b = stage_outputs["grasp"] / "best.pt"
-    if not stage_b.is_file():
-        stage_b = stage_outputs["grasp"] / "last.pt"
     subprocess.run(
-        _pipeline_command(
-            args, "push", stage_outputs["push"],
-            stage_a_checkpoint=stage_a, stage_b_checkpoint=stage_b,
-        ),
+        _pipeline_command(args, "push", stage_outputs["push"]),
         check=True, cwd=PROJECT,
     )
 

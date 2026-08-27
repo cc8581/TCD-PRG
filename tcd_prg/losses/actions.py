@@ -28,10 +28,12 @@ class PushLoss(nn.Module):
         direction_effective = direction_positive.any(-1) & direction_negative.any(-1)
         contact_positive = labels["contact_valid"].bool() & (labels["contact_target"] > 0)
         contact_negative = labels["contact_valid"].bool() & ~contact_positive
+        object_bce = safe_bce_with_logits(output["object_logits"], labels["object_positive"].float(), labels["object_valid_mask"])
+        object_rank = multi_positive_listwise_loss(output["object_logits"], labels["object_positive"], labels["object_valid_mask"])
         return {
-            "push_object": multi_positive_listwise_loss(
-                output["object_logits"], labels["object_positive"], labels["object_valid_mask"]
-            ),
+            "push_object": object_bce + object_rank,
+            "push_object_bce_diagnostic": object_bce,
+            "push_object_rank_diagnostic": object_rank,
             "push_contact": safe_bce_with_logits(
                 output["contact_logits"], labels["contact_target"].float(), labels["contact_valid"]
             ),

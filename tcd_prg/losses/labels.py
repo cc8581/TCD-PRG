@@ -50,7 +50,7 @@ def _nearest_point_indices(
 
 
 @torch.no_grad()
-def build_push_training_hints(batch: dict[str, Tensor]) -> dict[str, Tensor]:
+def build_push_training_hints(batch: dict[str, Tensor], max_distance_m: float | None = None) -> dict[str, Tensor]:
     """Map only evaluated GT PUSH contacts to visible points once per batch.
 
     The model receives only the union mask used to compute sparse Direction tokens.
@@ -93,7 +93,10 @@ def build_push_training_hints(batch: dict[str, Tensor]) -> dict[str, Tensor]:
         ).square().sum(-1)
         distance_sq = distance_sq.masked_fill(~domain, float("inf"))
         nearest = distance_sq.argmin(-1)
+        nearest_distance = distance_sq.gather(1, nearest[:, None]).sqrt().squeeze(1)
         valid = domain.any(-1)
+        if max_distance_m is not None:
+            valid &= nearest_distance <= float(max_distance_m)
         selected_candidates = candidate_index[valid]
         selected_points = nearest[valid]
         point_index[row, selected_candidates] = selected_points

@@ -26,6 +26,7 @@ from .graspnet import FrozenGraspNetProposalGenerator
 from .push import PushHead
 from .region import TaskRegionHead
 from .stageb_condition import StageBCondition
+from .push_condition import PushCondition
 from .task_grasp import TaskGraspEvaluator
 
 
@@ -146,6 +147,8 @@ class TCDPRGModel(nn.Module):
             c.push_direction_transformer_heads,
             c.push_direction_contact_topk,
             c.push_object_topk,
+            c.num_categories,
+            c.num_task_regions,
         )
     @staticmethod
     def _sensor(batch: Mapping[str, Any]) -> dict[str, Tensor]:
@@ -528,27 +531,11 @@ class TCDPRGModel(nn.Module):
             )
         return task_grasp
 
-    def _forward_push(
-        self,
-        encoded: Any,
-        sensor: dict[str, Tensor],
-        region: dict[str, Tensor],
-        training_hints: Mapping[str, Tensor] | None = None,
-    ) -> dict[str, Tensor]:
+    def forward_push_from_condition(self, sensor: dict[str, Tensor], condition: PushCondition, training_hints: Mapping[str, Tensor] | None = None) -> dict[str, Tensor]:
+        """Shared Stage-C path for GT standalone training and A+C inference."""
+        condition.validate(sensor["xyz"].shape[1])
         hints = training_hints or {}
-        return self.push(
-            encoded.point_features,
-            sensor["xyz"],
-            encoded.instance.mask_probability,
-            sensor["point_mask"],
-            encoded.object_tokens,
-            encoded.object_mask,
-            encoded.task_token,
-            encoded.target_token,
-            encoded.target_instance_probability,
-            region["region_probability"],
-            forced_direction_point_mask=hints.get("push_direction_point_mask"),
-        )
+        return self.push(sensor, condition, hints.get("push_direction_point_mask"))
 
     def forward_instances(
         self, batch: Mapping[str, Any]
@@ -570,8 +557,14 @@ class TCDPRGModel(nn.Module):
             task_category_id=task["task_category_id"],
             task_region_id=task["task_region_id"],
         ).validate(sensor["xyz"].shape[1])
+        push_condition = PushCondition(
+            encoded.instance.mask_probability, encoded.object_mask,
+            encoded.target_instance_probability, region["region_probability"],
+            self._target_identity_gate(encoded), task["task_category_id"], task["task_region_id"],
+        ).validate(sensor["xyz"].shape[1])
         return {
             "stageb_condition": stageb_condition,
+            "push_condition": push_condition,
             "encoded": encoded,
             "sensor": sensor,
             "task": task,
@@ -612,18 +605,15 @@ class TCDPRGModel(nn.Module):
     def forward_push(
         self, batch: Mapping[str, Any]
     ) -> dict[str, Any]:
-        """Stage C: perception + Push only; GraspNet/TaskGrasp are not executed."""
-        encoded, sensor, task = self._encode_scene(batch)
-        region = self._forward_region(encoded, sensor)
-        push = self._forward_push(
-            encoded, sensor, region, batch.get("training_hints")
-        )
+        """Stage C consumes only the public PushCondition boundary."""
+        sensor = self._sensor(batch)
+        condition = batch.get("push_condition")
+        if not isinstance(condition, PushCondition):
+            raise TypeError("Stage-C forward requires a PushCondition")
+        push = self.forward_push_from_condition(sensor, condition, batch.get("training_hints"))
         return {
-            "encoded": encoded,
-            "sensor": sensor,
-            "task": task,
-            "instance": encoded.instance,
-            "region": region,
+            "push_condition": condition, "encoded": None, "sensor": sensor,
+            "task": {"task_category_id": condition.task_category_id, "task_region_id": condition.task_region_id}, "instance": None, "region": None,
             "task_grasp": None,
             "global_grasp": None,
             "push": push,
@@ -659,11 +649,11 @@ class TCDPRGModel(nn.Module):
         )
         task_grasp = self.forward_task_grasp_from_condition(sensor, condition)
         global_grasp = self._forward_global_grasp(encoded, sensor)
-        push = self._forward_push(
-            encoded, sensor, region, batch.get("training_hints")
-        )
+        push_condition = PushCondition(encoded.instance.mask_probability, encoded.object_mask, encoded.target_instance_probability, region["region_probability"], self._target_identity_gate(encoded), task["task_category_id"], task["task_region_id"])
+        push = self.forward_push_from_condition(sensor, push_condition, batch.get("training_hints"))
         return {
             "stageb_condition": condition,
+            "push_condition": push_condition,
             "encoded": encoded,
             "sensor": sensor,
             "task": task,

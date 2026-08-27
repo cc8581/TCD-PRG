@@ -11,6 +11,7 @@ from tcd_prg.config import ModelConfig
 from tcd_prg.constants import PUSH_DISTANCE_M, ActionType
 from tcd_prg.geometry.grasp_nms import task_grasp_nms
 from tcd_prg.geometry.se3 import matrix_to_quaternion_xyzw
+from tcd_prg.models.push.head import push_contact_joint_score
 
 
 class DenseCandidateGenerator:
@@ -41,10 +42,7 @@ class DenseCandidateGenerator:
             points = torch.nonzero(domain, as_tuple=False).flatten()
             count = min(per_object, len(points))
             if count:
-                joint = (
-                    score[points].clamp_min(1e-6).log()
-                    + membership[points].clamp_min(1e-6).log()
-                )
+                joint = push_contact_joint_score(score[points], membership[points])
                 selected.append(points[torch.topk(joint, k=count).indices])
         if not selected:
             return torch.empty(0, dtype=torch.long, device=score.device)
@@ -276,19 +274,23 @@ class DenseCandidateGenerator:
         output: dict[str, Any],
     ) -> dict[str, Tensor]:
         rows: list[dict[str, Tensor]] = []
-        encoded = output["encoded"]
+        encoded = output.get("encoded")
         sensor = output.get("sensor", batch.get("model_inputs", batch))
 
         for batch_row in range(sensor["xyz"].shape[0]):
             xyz = sensor["xyz"][batch_row]
             point_mask = sensor["point_mask"][batch_row]
-            instance_probability = (
-                encoded.instance.mask_probability[batch_row]
-            )
-            active = encoded.object_mask[batch_row]
-            target_object = int(
-                encoded.target_query_weights[batch_row].argmax()
-            )
+            push_condition = output.get("push_condition")
+            if push_condition is None:  # legacy offline fixtures / older full outputs
+                if encoded is None:
+                    raise KeyError("Candidate generation requires push_condition")
+                instance_probability = encoded.instance.mask_probability[batch_row]
+                active = encoded.object_mask[batch_row]
+                target_object = int(encoded.target_query_weights[batch_row].argmax())
+            else:
+                instance_probability = push_condition.object_probability[batch_row]
+                active = push_condition.object_valid[batch_row]
+                target_object = int((instance_probability * push_condition.target_probability[batch_row][None]).sum(-1).argmax())
             type_parts: list[Tensor] = []
             object_parts: list[Tensor] = []
             contact_parts: list[Tensor] = []
@@ -439,6 +441,7 @@ class DenseCandidateGenerator:
             # PUSH candidates are shortlisted by the learned Object head;
             # no dependency graph gates or reweights them.
             push = output["push"]
+            direction_domain = push.get("direction_point_mask", point_mask[None].expand_as(push["contact_logits"]))[batch_row]
             push_object_probability = torch.sigmoid(push["object_logits"][batch_row])
             push_objects = torch.nonzero(active, as_tuple=False).flatten()
             if len(push_objects):
@@ -447,16 +450,12 @@ class DenseCandidateGenerator:
                     .argsort(descending=True, stable=True)[: self.config.push_object_topk]
                 ]
             push_index = self._top_per_object(
-                torch.sigmoid(push["contact_logits"][batch_row]),
+                push["contact_logits"][batch_row],
                 instance_probability,
                 push_objects,
-                point_mask,
+                point_mask & direction_domain,
                 self.config.push_candidates,
             )
-            if len(push_index):
-                push_index = push_index[
-                    push["direction_point_mask"][batch_row, push_index]
-                ]
             if len(push_index):
                 direction_probability = torch.softmax(
                     push["direction_logits"][batch_row, push_index], dim=-1
