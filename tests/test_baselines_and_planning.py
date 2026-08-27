@@ -5,13 +5,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tcd_prg.baselines import GAPGPolicyWrapper, OneShotSequencePolicy
+from tcd_prg.baselines import GAPGPolicyWrapper
 from tcd_prg.config import ModelConfig
 from tcd_prg.constants import ActionType
-from tcd_prg.evaluators import OfflineModelEvaluator
-from tcd_prg.paths import PROJECT_ROOT
-from tcd_prg.planners import ClosedLoopPlanner, DenseCandidateGenerator
 from tcd_prg.models import PushCondition
+from tcd_prg.paths import PROJECT_ROOT
+from tcd_prg.planners import DenseCandidateGenerator
 
 
 def _predicted_encoded(instance_probability, object_mask, dim=8, target=0):
@@ -138,3 +137,14 @@ def test_push_action_nms_uses_router_order_for_near_duplicate_actions() -> None:
     }
     keep = generator.apply_push_nms(candidates, torch.tensor([[0.2, 0.9, 0.1]]))
     assert keep.tolist() == [[False, True, True]]
+
+
+def test_push_contact_global_trim_preserves_object_membership_score() -> None:
+    selected = DenseCandidateGenerator._top_per_object(
+        torch.tensor([8.0, 2.0]),
+        torch.tensor([[0.001, 0.9], [0.002, 0.0]]),
+        torch.tensor([0, 1]),
+        torch.tensor([True, True]),
+        total=1,
+    )
+    assert selected.tolist() == [1]

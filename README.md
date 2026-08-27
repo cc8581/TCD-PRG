@@ -149,8 +149,10 @@ delegated to the official GraspNet protocol.
 
 ## Training
 
-Stage A and Stage B train independently behind the shared `StageBCondition`
-contract. Stage C composes their trained components once before training Push.
+Stage A, Stage B and Stage C train independently behind public condition
+contracts. Stage C uses GT-derived `PushCondition` during standalone training;
+deployment composes the three checkpoints without copying Stage A/B weights into
+the Stage C training checkpoint.
 
 ```powershell
 # Stage A: perception / instance / target region
@@ -167,17 +169,14 @@ tcd-prg-build-stageb --config configs/stage/grasp.yaml `
 tcd-prg-train --config configs/stage/grasp.yaml `
   output_dir=outputs/grasp
 
-# Stage C: compose A+B once, then train PUSH
+# Stage C: independent PUSH predictor with GT-derived PushCondition
 tcd-prg-train --config configs/stage/push.yaml `
-  --stage-a-checkpoint outputs/perception/best.pt `
-  --stage-b-checkpoint outputs/grasp/best.pt `
   output_dir=outputs/push
 ```
 
-The Stage-C checkpoint contains the composed trained perception/grasp parameters
-and the newly trained PUSH branch, so it is the deployment checkpoint. `--resume`
-is for continuing the same stage; the two Stage-C component arguments are for weight
-transfer without optimizer state.
+The Stage-C checkpoint contains only the standalone PUSH module. `--resume` is
+for continuing the same stage. Deployment requires compatible Stage A, Stage B
+and Stage C checkpoints and checks their runtime semantics before composition.
 
 Stage B trains only on concrete GraspNet proposals stored with strict 0/1
 `task_valid` labels. Invalid data-generation attempts are dropped and never become
@@ -193,10 +192,13 @@ native action-state units.
 ## Evaluation and inference
 
 ```powershell
-tcd-prg-eval --config configs/config.yaml --checkpoint outputs/full/best.pt `
-  --split test --output-dir outputs/evaluation/full
+tcd-prg-eval --config configs/config.yaml --checkpoint outputs/perception/best.pt `
+  --split test --output-dir outputs/evaluation/perception
 
-tcd-prg-infer --config configs/config.yaml --checkpoint outputs/full/best.pt `
+tcd-prg-infer --config configs/config.yaml `
+  --stage-a-checkpoint outputs/perception/best.pt `
+  --stage-b-checkpoint outputs/grasp/best.pt `
+  --stage-c-checkpoint outputs/push/best.pt `
   --scene-id 0 --state-id 0 --task-index 0
 
 tcd-prg-replay --config configs/config.yaml --scene-id 0 --task-index 0

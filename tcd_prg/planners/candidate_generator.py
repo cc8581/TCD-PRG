@@ -58,8 +58,16 @@ class DenseCandidateGenerator:
         if not selected:
             return torch.empty(0, dtype=torch.long, device=score.device)
         candidates = torch.unique(torch.cat(selected), sorted=True)
+        # Preserve the same contact/object joint semantics when the balanced
+        # per-object pool is truncated globally. Raw contact logits alone can
+        # otherwise promote a point with weak membership in every shortlisted
+        # object over a geometrically consistent contact.
+        candidate_membership = object_probability[object_ids][:, candidates]
+        candidate_joint = push_contact_joint_score(
+            score[candidates][None], candidate_membership
+        ).amax(0)
         return candidates[
-            score[candidates].topk(min(total, len(candidates))).indices
+            candidate_joint.topk(min(total, len(candidates))).indices
         ]
 
     @staticmethod
