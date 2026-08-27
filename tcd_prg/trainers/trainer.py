@@ -31,11 +31,26 @@ def aggregate_stageb_validation_payloads(
     """Compute nonlinear Stage-B metrics once over all gathered DDP ranks."""
     scores = [np.asarray(item["stageb_scores"]) for item in summaries if "stageb_scores" in item]
     targets = [np.asarray(item["stageb_targets"]) for item in summaries if "stageb_targets" in item]
+    deployment_scores = [
+        np.asarray(item["stageb_deployment_scores"])
+        for item in summaries if "stageb_deployment_scores" in item
+    ]
+    deployment_targets = [
+        np.asarray(item["stageb_deployment_targets"])
+        for item in summaries if "stageb_deployment_targets" in item
+    ]
     if not scores:
         return {}
     if len(scores) != len(targets):
         raise RuntimeError("Incomplete distributed Stage-B validation payload")
-    return stageb_split_metrics(np.concatenate(scores), np.concatenate(targets))
+    if not deployment_scores and not deployment_targets:
+        return stageb_split_metrics(np.concatenate(scores), np.concatenate(targets))
+    if len(deployment_scores) != len(scores) or len(deployment_targets) != len(scores):
+        raise RuntimeError("Incomplete deployment-calibration Stage-B validation payload")
+    return stageb_split_metrics(
+        np.concatenate(scores), np.concatenate(targets),
+        np.concatenate(deployment_scores), np.concatenate(deployment_targets),
+    )
 
 
 @dataclass(slots=True)

@@ -101,6 +101,20 @@ def finalize_split_records(
     return balance_binary_records(root, records, seed) if split == "train" else records
 
 
+def assert_no_train_validation_leakage(records: list[dict]) -> None:
+    """A task state may belong to exactly one Stage-B split."""
+    split_by_key: dict[tuple[int, int, int], str] = {}
+    for record in records:
+        key = (int(record["scene_id"]), int(record["state_id"]), int(record["task_index"]))
+        split = str(record["split"])
+        prior = split_by_key.setdefault(key, split)
+        if prior != split:
+            raise RuntimeError(
+                "Stage-B train/validation leakage detected for "
+                f"scene/state/task={key}: {prior!r} and {split!r}"
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/stage/grasp.yaml")
@@ -274,6 +288,7 @@ def main() -> None:
         "provenance": provenance,
         "records": existing + records,
     }
+    assert_no_train_validation_leakage(payload["records"])
     temporary = manifest_path.with_name(f"{manifest_path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, manifest_path)

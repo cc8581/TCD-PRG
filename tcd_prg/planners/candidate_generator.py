@@ -146,6 +146,22 @@ class DenseCandidateGenerator:
             )[:amount]
         ]
 
+    def select_task_grasp_indices(
+        self,
+        translation: Tensor,
+        rotation: Tensor,
+        width: Tensor,
+        score: Tensor,
+        valid: Tensor,
+    ) -> Tensor:
+        """Deployment pre-threshold TASK_GRASP selection: NMS then top-k."""
+        pose = torch.cat((translation, matrix_to_quaternion_xyzw(rotation)), -1)
+        objects = torch.zeros_like(score, dtype=torch.long)
+        selected = self._nms_indices(
+            pose, width, score, objects, self.config.task_grasp_candidates, global_grasp=False
+        )
+        return selected[valid[selected].bool()]
+
     def apply_push_nms(
         self, candidates: dict[str, Tensor], candidate_scores: Tensor
     ) -> Tensor:
@@ -279,29 +295,27 @@ class DenseCandidateGenerator:
 
             # Terminal task grasp candidates belong to the predicted target query.
             task = output["task_grasp"]
+            task_score = task["task_valid_probability"][batch_row]
             task_pose = torch.cat(
                 (
                     task["translation_world"][batch_row],
-                    matrix_to_quaternion_xyzw(
-                        task["rotation_matrix"][batch_row]
-                    ),
+                    matrix_to_quaternion_xyzw(task["rotation_matrix"][batch_row]),
                 ),
                 -1,
             )
-            task_score = task["task_valid_probability"][batch_row]
-            task_objects = torch.full_like(
-                task_score, target_object, dtype=torch.long
+            task_objects = torch.full_like(task_score, target_object, dtype=torch.long)
+            task_valid = (
+                task["valid"][batch_row]
+                if "valid" in task
+                else torch.ones_like(task_score, dtype=torch.bool)
             )
-            selected = self._nms_indices(
-                task_pose,
+            selected = self.select_task_grasp_indices(
+                task["translation_world"][batch_row],
+                task["rotation_matrix"][batch_row],
                 task["width_m"][batch_row],
                 task_score,
-                task_objects,
-                self.config.task_grasp_candidates,
-                global_grasp=False,
+                task_valid,
             )
-            if "valid" in task:
-                selected = selected[task["valid"][batch_row, selected]]
             selected = selected[
                 task_score[selected] >= self.config.task_grasp_probability_threshold
             ]

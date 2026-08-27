@@ -136,6 +136,17 @@ class StageBBinaryDataset(Dataset[StageBBinarySample]):
             int(record["group_index"]),
             include_global_grasps=False,
         )
+        observation = sample.observation
+        live_region = int(observation.task_region_id)
+        target_object = int(observation.target_object)
+        live_category = int(observation.object_category_id[target_object])
+        if live_region != int(record["task_region_id"]) or live_category != int(
+            record["object_category_id"]
+        ):
+            raise RuntimeError(
+                "Stage-B immutable record task semantics disagree with the live dataset: "
+                f"{path}"
+            )
         context_keys = (
             "context_xyz",
             "context_rgb",

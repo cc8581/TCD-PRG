@@ -9,7 +9,7 @@ from typing import Any, Mapping
 
 from tcd_prg.config import TCDPRGConfig
 
-SCHEMA_VERSION = "tcd_prg_stageb_binary_v5"
+SCHEMA_VERSION = "tcd_prg_stageb_binary_v6"
 GEOMETRY_PROTOCOL_VERSION = "ag16095_geometric_close_v2"
 CAMERA_TRANSFER_PROTOCOL_VERSION = "fused_nearest_camera2_v1"
 PROPOSAL_SAMPLING_VERSION = "all_valid_target_proposals_v1"
@@ -37,9 +37,19 @@ def stageb_compatibility(config: TCDPRGConfig) -> dict[str, Any]:
             "render_width": config.observation.render_width,
             "render_height": config.observation.render_height,
         },
+        "dataset_partition": {
+            "split_seed": config.training.seed,
+            "split_ratios": list(config.training.split_ratios),
+            "data_fraction": config.training.data_fraction,
+            "scene_start": config.training.scene_start,
+            "scene_count": config.training.scene_count,
+        },
         "target_graspnet": {
             "checkpoint_sha256": sha256_file(graspnet.checkpoint),
             "target_input_points": graspnet.target_input_points,
+            "camera_source_point_budget": max(
+                graspnet.scene_input_points, graspnet.target_input_points
+            ),
             "target_proposals": graspnet.target_proposals,
             "target_selection_mode": graspnet.target_selection_mode,
             "diversity_quality_fraction": graspnet.diversity_quality_fraction,

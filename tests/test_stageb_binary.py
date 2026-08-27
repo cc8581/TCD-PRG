@@ -19,7 +19,12 @@ from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.datasets.stageb_manifest import build_provenance
 from tcd_prg.models import StageBCondition, TCDPRGModel, stageb_condition_from_gt
 from tcd_prg.models.task_grasp import TaskGraspEvaluator, world_to_grasp
-from tcd_prg.scripts.build_stageb_binary import balance_binary_records, finalize_split_records
+from tcd_prg.scripts.build_stageb_binary import (
+    assert_no_train_validation_leakage,
+    balance_binary_records,
+    finalize_split_records,
+)
+from tcd_prg.planners.candidate_generator import DenseCandidateGenerator
 from tcd_prg.trainers.trainer import aggregate_stageb_validation_payloads
 
 ASSET = Path("assets/robots/FR5_AG-160-95/ag16095_open_tcp_128.npz")
@@ -62,6 +67,15 @@ def test_split_metrics_select_threshold_from_complete_split() -> None:
     assert metrics["task_grasp_validation_threshold"] == pytest.approx(0.4)
     assert np.isfinite(metrics["task_grasp_validation_auroc"])
     assert np.isfinite(metrics["task_grasp_validation_auprc"])
+
+
+def test_split_metrics_calibrates_threshold_on_deployment_selected_candidates() -> None:
+    metrics = stageb_split_metrics(
+        np.asarray([0.9, 0.8, 0.7]), np.asarray([1, 0, 0], bool),
+        np.asarray([0.3, 0.6]), np.asarray([1, 0], bool),
+    )
+    assert metrics["task_grasp_validation_threshold"] == pytest.approx(0.3)
+    assert metrics["task_grasp_raw_f1"] == pytest.approx(1.0)
 
 
 def test_world_grasp_roundtrip() -> None:
@@ -203,6 +217,40 @@ def test_stageb_compatibility_ignores_paths_but_tracks_sampling_semantics() -> N
     changed = copy.deepcopy(config)
     changed.backbone.grid_size_m *= 2
     assert build_provenance(config)["compatibility"] != build_provenance(changed)["compatibility"]
+
+
+def test_stageb_compatibility_tracks_partition_and_camera_source_budget() -> None:
+    config = load_config("configs/stage/grasp.yaml")
+    changed_partition = copy.deepcopy(config)
+    changed_partition.training.seed += 1
+    assert build_provenance(config)["compatibility"] != build_provenance(
+        changed_partition
+    )["compatibility"]
+    changed_budget = copy.deepcopy(config)
+    changed_budget.graspnet.scene_input_points += 1
+    assert build_provenance(config)["compatibility"] != build_provenance(changed_budget)["compatibility"]
+
+
+def test_stageb_manifest_rejects_cross_split_task_leakage() -> None:
+    records = [
+        {"split": "train", "scene_id": 1, "state_id": 2, "task_index": 3},
+        {"split": "val", "scene_id": 1, "state_id": 2, "task_index": 3},
+    ]
+    with pytest.raises(RuntimeError, match="leakage"):
+        assert_no_train_validation_leakage(records)
+
+
+def test_deployment_calibration_selection_applies_task_nms_and_cap() -> None:
+    config = ModelConfig(task_grasp_candidates=2)
+    selector = DenseCandidateGenerator(config)
+    translation = torch.tensor([[0.0, 0.0, 0.0], [0.001, 0.0, 0.0], [0.1, 0.0, 0.0]])
+    rotation = torch.eye(3).expand(3, -1, -1).clone()
+    width = torch.full((3,), 0.05)
+    score = torch.tensor([0.9, 0.8, 0.7])
+    selected = selector.select_task_grasp_indices(
+        translation, rotation, width, score, torch.ones(3, dtype=torch.bool)
+    )
+    assert selected.tolist() == [0, 2]
 
 
 def test_vectorized_candidates_equal_independent_forward_and_logits_finite() -> None:

@@ -28,6 +28,7 @@ from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import TCDPRGModel
 from tcd_prg.observation.cached import CachedObservationProvider
+from tcd_prg.planners.candidate_generator import DenseCandidateGenerator
 from tcd_prg.pretrained import load_pretrained_backbone, prepare_pretrained_checkpoint
 from tcd_prg.runtime import (
     StageBBinaryBatchCollator,
@@ -691,12 +692,18 @@ def main() -> None:
         validation_groups = len(validation_loader.sampler)
         stageb_scores: list[np.ndarray] = []
         stageb_targets: list[np.ndarray] = []
+        stageb_deployment_scores: list[np.ndarray] = []
+        stageb_deployment_targets: list[np.ndarray] = []
+        deployment_selector = DenseCandidateGenerator(config.model) if stageb else None
         with torch.no_grad():
             for validation_step, raw in enumerate(validation_loader, start=1):
                 batch = trainer._move(raw, trainer.device)
                 _, terms, model_output = objective(module, batch, return_output=True)
                 if stageb:
-                    valid = batch["stageb_candidate_valid"].bool()
+                    valid = (
+                        batch["stageb_candidate_valid"].bool()
+                        & model_output["task_grasp"]["valid"].bool()
+                    )
                     stageb_scores.append(
                         model_output["task_grasp"]["task_valid_probability"][valid]
                         .detach()
@@ -704,6 +711,23 @@ def main() -> None:
                         .numpy()
                     )
                     stageb_targets.append(batch["stageb_label"][valid].detach().cpu().numpy())
+                    task = model_output["task_grasp"]
+                    assert deployment_selector is not None
+                    for row in range(valid.shape[0]):
+                        selected = deployment_selector.select_task_grasp_indices(
+                            task["translation_world"][row],
+                            task["rotation_matrix"][row],
+                            task["width_m"][row],
+                            task["task_valid_probability"][row],
+                            valid[row],
+                        )
+                        if len(selected):
+                            stageb_deployment_scores.append(
+                                task["task_valid_probability"][row, selected].detach().cpu().numpy()
+                            )
+                            stageb_deployment_targets.append(
+                                batch["stageb_label"][row, selected].detach().cpu().numpy()
+                            )
                 evaluator.update(batch, model_output, terms)
                 score = sum(
                     weight * float(terms[f"loss_{family}"])
@@ -737,8 +761,12 @@ def main() -> None:
             "evaluation_records": evaluator.evaluator.records,
         }
         if stageb_scores:
+            if not stageb_deployment_scores:
+                raise RuntimeError("Stage-B validation has no deployment-selected candidates")
             result["stageb_scores"] = np.concatenate(stageb_scores)
             result["stageb_targets"] = np.concatenate(stageb_targets)
+            result["stageb_deployment_scores"] = np.concatenate(stageb_deployment_scores)
+            result["stageb_deployment_targets"] = np.concatenate(stageb_deployment_targets)
         return result
 
     state = trainer.train(
