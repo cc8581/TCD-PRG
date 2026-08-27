@@ -357,6 +357,8 @@ class TCDPRGObjective(nn.Module):
                     "push_multiobject_states": push_losses["push_multiobject_states"],
                     "push_positive_objects": push_losses["push_positive_objects"],
                     "push_negative_objects": push_losses["push_negative_objects"],
+                    "push_object_positive_recall_at_1": push_losses["push_object_positive_recall_at_1"],
+                    "push_object_positive_recall_at_4": push_losses["push_object_positive_recall_at_4"],
                 }
                 activity["active_loss_push_object"] = self._listwise_active_rows(
                     push_labels["object_positive"],
@@ -395,6 +397,7 @@ class TCDPRGObjective(nn.Module):
                     "push_direction_residual_targets": push_losses[
                         "push_direction_residual_targets"
                     ],
+                    "push_direction_positive_coverage": push_losses["push_direction_positive_coverage"],
                 }
                 direction_rank_rows = self._listwise_active_rows(
                     push_labels["direction_positive"],
@@ -411,6 +414,7 @@ class TCDPRGObjective(nn.Module):
                     "push_potential_valid_candidates": push_losses[
                         "push_potential_valid_candidates"
                     ],
+                    "push_utility_valid_coverage": push_losses["push_utility_valid_coverage"],
                 }
                 activity["active_loss_push_potential"] = self._row_active(
                     push_labels["utility_valid"]

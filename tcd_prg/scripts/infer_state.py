@@ -13,7 +13,7 @@ import torch
 from tcd_prg.baselines import create_baseline
 from tcd_prg.config import load_config
 from tcd_prg.constants import ActionType
-from tcd_prg.models import TCDPRGModel
+from tcd_prg.models import TCDPRGModel, load_staged_tcd_prg
 from tcd_prg.planners import TCDPRGPolicy
 from tcd_prg.runtime import (
     create_action_certifier,
@@ -36,7 +36,9 @@ def serializable(value: Any) -> Any:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
-    parser.add_argument("--checkpoint")
+    parser.add_argument("--stage-a-checkpoint")
+    parser.add_argument("--stage-b-checkpoint")
+    parser.add_argument("--stage-c-checkpoint")
     parser.add_argument("--scene-id", type=int, required=True)
     parser.add_argument("--state-id", type=int, required=True)
     parser.add_argument("--task-index", type=int, required=True)
@@ -51,18 +53,15 @@ def main() -> None:
     if config.baseline.type == "original_gapg_wrapper":
         policy = create_baseline(config)
     else:
-        if not args.checkpoint:
-            raise ValueError("--checkpoint is required for learned TCD-PRG candidates")
+        if not all((args.stage_a_checkpoint, args.stage_b_checkpoint, args.stage_c_checkpoint)):
+            raise ValueError("learned inference requires all three staged checkpoints")
         device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
         model = TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet).to(
             device
         )
-        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        if "task_grasp_probability_threshold" in checkpoint:
-            config.model.task_grasp_probability_threshold = float(
-                checkpoint["task_grasp_probability_threshold"]
-            )
-        model.load_state_dict(checkpoint.get("ema") or checkpoint["model"])
+        config.model.task_grasp_probability_threshold = load_staged_tcd_prg(
+            model, args.stage_a_checkpoint, args.stage_b_checkpoint, args.stage_c_checkpoint)
+        model.to(device)
         # Candidate scoring remains robot-agnostic. The deterministic
         # controller exact-certifies grasp actions and falls through on rejection.
         base_policy = TCDPRGPolicy(model, config)
@@ -76,7 +75,7 @@ def main() -> None:
     final_certification = None
     if certifier is not None:
         certifier.set_observation(observation)
-        while action is not None and int(action["action_type"]) != int(ActionType.PUSH):
+        while action is not None:
             accepted, reason = certifier.certify(action)
             if accepted:
                 action["certified"] = True
@@ -117,7 +116,7 @@ def main() -> None:
             candidates.get("certification_reasons", []) if isinstance(candidates, dict) else []
         ),
         "final_certification": final_certification,
-        "checkpoint": str(Path(args.checkpoint).resolve()) if args.checkpoint else None,
+        "checkpoints": ({"perception": str(Path(args.stage_a_checkpoint).resolve()), "grasp": str(Path(args.stage_b_checkpoint).resolve()), "push": str(Path(args.stage_c_checkpoint).resolve())} if args.stage_a_checkpoint else None),
         "baseline": config.baseline.type,
     }
     text = json.dumps(payload, ensure_ascii=False, indent=2)

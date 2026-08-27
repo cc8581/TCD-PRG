@@ -147,6 +147,9 @@ model:
   max_push_candidates: 32         # 展开后保留的最终 PUSH 候选上限
   push_direction_contact_topk: 32 # 每个预测实例仅对 Top-K 预测接触点计算方向/utility
   push_object_topk: 4              # 推理时只展开最高分的 Push 作用对象
+  push_utility_threshold: 0.0
+  push_candidate_probability_threshold: 0.0
+  push_utility_temperature: 1.0
   pick_remove_target_margin_m: 0.05 # 仅移除预测目标邻域内的非目标物体
   push_direction_feature_dim: 64
   push_direction_transformer_layers: 1

@@ -182,6 +182,9 @@ class ModelConfig:
     # 稀疏方向计算；训练时仅把已评价 GT contact 强制并入预测 top-k。
     push_direction_contact_topk: int = 32
     push_object_topk: int = 4
+    push_utility_threshold: float = 0.0
+    push_candidate_probability_threshold: float = 0.0
+    push_utility_temperature: float = 1.0
     pick_remove_target_margin_m: float = 0.05
     push_direction_feature_dim: int = 64
     push_direction_transformer_layers: int = 1
@@ -646,6 +649,10 @@ class TCDPRGConfig:
             raise ValueError("PUSH contact and final candidate budgets must be positive")
         if self.model.push_direction_contact_topk <= 0:
             raise ValueError("push_direction_contact_topk must be positive")
+        if self.model.push_utility_temperature <= 0:
+            raise ValueError("push_utility_temperature must be positive")
+        if not 0.0 <= self.model.push_candidate_probability_threshold < 1.0:
+            raise ValueError("push_candidate_probability_threshold must be in [0,1)")
         if self.model.global_grasp_input_mode not in {"scene_only", "instance_assisted"}:
             raise ValueError("global_grasp_input_mode must be scene_only or instance_assisted")
         if (

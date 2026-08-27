@@ -8,7 +8,7 @@ import torch
 from tcd_prg.config import AblationConfig, GraspNetConfig, ModelConfig
 from tcd_prg.constants import ActionType
 from tcd_prg.evaluators import OfflineModelEvaluator
-from tcd_prg.models import TCDPRGModel, push_condition_from_gt
+from tcd_prg.models import StandalonePushModel, TCDPRGModel, push_condition_from_gt
 from tcd_prg.models.push import PushHead
 from tcd_prg.planners import DenseCandidateGenerator
 
@@ -92,6 +92,18 @@ def test_perception_returns_push_condition(tiny_batch) -> None:
     condition = output["push_condition"]
     assert condition.object_probability.shape[:2] == (tiny_batch["xyz"].shape[0], _config().instance_queries)
     assert condition.target_probability.shape == tiny_batch["point_mask"].shape
+    assert torch.all(condition.region_probability <= condition.target_probability + 1e-6)
+
+
+def test_standalone_push_model_contains_only_push_parameters(tiny_batch) -> None:
+    config = _config(); batch = dict(tiny_batch)
+    batch["region_target"] = torch.zeros_like(batch["point_mask"])
+    batch["region_valid"] = torch.zeros_like(batch["point_mask"])
+    batch["push_condition"] = push_condition_from_gt(batch, config.instance_queries)
+    model = StandalonePushModel(config)
+    output = model(batch)
+    assert output["push"]["object_logits"].shape[-1] == config.instance_queries
+    assert all(name.startswith("push.") for name, _ in model.named_parameters())
 
 
 def test_camera2_to_task_evaluator_to_dense_candidate_end_to_end(tiny_batch) -> None:

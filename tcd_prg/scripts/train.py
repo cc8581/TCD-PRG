@@ -26,7 +26,7 @@ from tcd_prg.datasets import (
 from tcd_prg.datasets.stageb_manifest import build_provenance
 from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.losses import TCDPRGObjective
-from tcd_prg.models import TCDPRGModel
+from tcd_prg.models import StandalonePushModel, TCDPRGModel
 from tcd_prg.observation.cached import CachedObservationProvider
 from tcd_prg.planners.candidate_generator import DenseCandidateGenerator
 from tcd_prg.pretrained import load_pretrained_backbone, prepare_pretrained_checkpoint
@@ -404,12 +404,8 @@ def main() -> None:
         if validation_dataset is not None and len(validation_dataset)
         else None
     )
-    model = TCDPRGModel(
-        config.model,
-        config.ablation,
-        config.backbone,
-        config.graspnet,
-    )
+    model = (StandalonePushModel(config.model) if config.training.stage == "push" else TCDPRGModel(
+        config.model, config.ablation, config.backbone, config.graspnet))
     pretrained_report = None
     resume_pretrained_names: list[str] = []
     resume_validation_protocol_changed = False
@@ -752,6 +748,8 @@ def main() -> None:
                         ),
                     }
                 )
+                if config.training.stage == "push":
+                    score += 1.0 - float(terms.get("push_direction_positive_coverage", 0.0))
             output = os.path.join(config.output_dir, "validation_only.json")
             Path(output).write_text(
                 json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8"

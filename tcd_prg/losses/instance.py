@@ -388,6 +388,7 @@ def build_push_supervision(
     candidate = (
         batch["candidate_mask"]
         & (action_type == int(ActionType.PUSH))
+        & condition.target_valid[:, None]
     )
 
     # Contact/object heads remain dense and can use every evaluated GT action.
@@ -629,7 +630,7 @@ def build_push_supervision(
     return gathered, {
         "object_positive": object_positive,
         "object_valid_mask": (
-            gt_active & object_evaluated
+            gt_active & object_evaluated & condition.target_valid[:, None]
         ),
         "contact_target": contact_target,
         "contact_valid": contact_valid,

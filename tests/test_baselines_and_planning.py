@@ -11,6 +11,7 @@ from tcd_prg.constants import ActionType
 from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.paths import PROJECT_ROOT
 from tcd_prg.planners import ClosedLoopPlanner, DenseCandidateGenerator
+from tcd_prg.models import PushCondition
 
 
 def _predicted_encoded(instance_probability, object_mask, dim=8, target=0):
@@ -88,6 +89,7 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
         "direction_logits": torch.zeros(1, 4, 16),
         "direction_residual": torch.zeros(1, 4, 16, 2),
         "utility_delta": torch.zeros(1, 4, 16),
+        "direction_point_mask": torch.ones(1, 4, dtype=torch.bool),
     }
     encoded = _predicted_encoded(torch.ones(1, 1, 4), batch["object_mask"])
 
@@ -100,6 +102,11 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
         Model(),
         batch,
         {
+            "push_condition": PushCondition(
+                torch.zeros(1, 1, 4), torch.zeros(1, 1, dtype=torch.bool),
+                torch.zeros(1, 4), torch.zeros(1, 4), torch.zeros(1, dtype=torch.bool),
+                torch.zeros(1, dtype=torch.long), torch.zeros(1, dtype=torch.long),
+            ),
             "encoded": encoded,
             "task_grasp": point_head,
             "global_grasp": global_head,

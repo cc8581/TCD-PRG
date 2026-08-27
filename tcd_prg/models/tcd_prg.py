@@ -480,8 +480,19 @@ class TCDPRGModel(nn.Module):
             encoded.point_features,
             encoded.target_token,
             encoded.task_token,
-            encoded.target_probability,
+            encoded.target_instance_probability,
             sensor["point_mask"],
+        )
+
+    def _push_condition(self, encoded: Any, region: dict[str, Tensor], task: dict[str, Tensor]) -> PushCondition:
+        target_valid = self._target_identity_gate(encoded)
+        object_valid = encoded.object_mask.clone()
+        rows = torch.arange(object_valid.shape[0], device=object_valid.device)
+        object_valid[rows[target_valid], encoded.target_query_index[target_valid]] = True
+        return PushCondition(
+            encoded.instance.mask_probability * object_valid[:, :, None], object_valid,
+            encoded.target_instance_probability, region["region_probability"], target_valid,
+            task["task_category_id"], task["task_region_id"],
         )
 
     def generate_target_grasp_proposals(
@@ -557,11 +568,7 @@ class TCDPRGModel(nn.Module):
             task_category_id=task["task_category_id"],
             task_region_id=task["task_region_id"],
         ).validate(sensor["xyz"].shape[1])
-        push_condition = PushCondition(
-            encoded.instance.mask_probability * encoded.object_mask[:, :, None], encoded.object_mask,
-            encoded.target_instance_probability, region["region_probability"],
-            self._target_identity_gate(encoded), task["task_category_id"], task["task_region_id"],
-        ).validate(sensor["xyz"].shape[1])
+        push_condition = self._push_condition(encoded, region, task).validate(sensor["xyz"].shape[1])
         return {
             "stageb_condition": stageb_condition,
             "push_condition": push_condition,
@@ -649,7 +656,7 @@ class TCDPRGModel(nn.Module):
         )
         task_grasp = self.forward_task_grasp_from_condition(sensor, condition)
         global_grasp = self._forward_global_grasp(encoded, sensor)
-        push_condition = PushCondition(encoded.instance.mask_probability * encoded.object_mask[:, :, None], encoded.object_mask, encoded.target_instance_probability, region["region_probability"], self._target_identity_gate(encoded), task["task_category_id"], task["task_region_id"])
+        push_condition = self._push_condition(encoded, region, task)
         push = self.forward_push_from_condition(sensor, push_condition, batch.get("training_hints"))
         return {
             "stageb_condition": condition,
