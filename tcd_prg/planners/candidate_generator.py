@@ -463,8 +463,8 @@ class DenseCandidateGenerator:
                 self.config.push_candidates,
             )
             if len(push_index):
-                direction_probability = torch.softmax(
-                    push["direction_logits"][batch_row, push_index], dim=-1
+                direction_probability = torch.sigmoid(
+                    push["direction_logits"][batch_row, push_index]
                 )
                 directions_per_contact = min(
                     self.config.push_directions_per_contact,

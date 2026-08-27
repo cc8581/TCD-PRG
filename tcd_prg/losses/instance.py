@@ -613,6 +613,8 @@ def build_push_supervision(
         "object_valid_mask": (
             gt_active & object_evaluated & condition.target_valid[:, None]
         ),
+        # UNKNOWN objects remain outside supervision, but compete in deployment top-k.
+        "object_deployment_valid": gt_active & condition.target_valid[:, None],
         "contact_target": contact_target,
         "contact_valid": contact_valid,
         "direction_positive": direction_positive,
@@ -636,5 +638,6 @@ def build_push_supervision(
                 | has_failure
             )
         ),
+        "positive_utility_eligible": positive & (batch["potential_after_valid"] | has_failure),
         "positive_utility_covered": positive & direction_parameter_valid & (batch["potential_after_valid"] | has_failure),
     }

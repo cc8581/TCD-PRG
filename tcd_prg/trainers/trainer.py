@@ -53,6 +53,32 @@ def aggregate_stageb_validation_payloads(
     )
 
 
+def finalize_push_validation_metrics(details: Mapping[str, float]) -> dict[str, float]:
+    """Convert raw PUSH counters into fixed-denominator deployment diagnostics."""
+    result = {str(key): float(value) for key, value in details.items()}
+    positive_total = result.get("push_positive_actions_total_count", 0.0)
+    if positive_total > 0:
+        result["push_direction_positive_coverage"] = (
+            result.get("push_positive_actions_direction_covered_count", 0.0)
+            / positive_total
+        )
+    utility_eligible = result.get("push_positive_actions_utility_eligible_count", 0.0)
+    if utility_eligible > 0:
+        result["push_utility_valid_coverage"] = (
+            result.get("push_positive_actions_utility_covered_count", 0.0)
+            / utility_eligible
+        )
+    positive_rows = result.get("push_object_positive_rows_count", 0.0)
+    if positive_rows > 0:
+        result["push_object_positive_recall_at_1"] = (
+            result.get("push_object_positive_hits_at_1_count", 0.0) / positive_rows
+        )
+        result["push_object_positive_recall_at_4"] = (
+            result.get("push_object_positive_hits_at_4_count", 0.0) / positive_rows
+        )
+    return result
+
+
 @dataclass(slots=True)
 class TrainerState:
     # optimizer_steps 只统计成功更新；samples/states/groups 用于跨阶段核对实际数据覆盖。
@@ -91,8 +117,11 @@ class Trainer:
         "push_positive_actions_total_count",
         "push_positive_actions_direction_covered_count",
         "push_positive_actions_utility_covered_count",
+        "push_positive_actions_utility_eligible_count",
         "push_object_bce_active_rows_count",
         "push_object_rank_active_rows_count",
+        "push_direction_bce_active_rows_count",
+        "push_direction_rank_active_rows_count",
     }
     LOSS_GROUPS = (
         ("instance", ("weighted_loss_instance",)),
@@ -486,16 +515,10 @@ class Trainer:
                 )
                 for key, value in metric_sums.items()
             }
-            positive_total = validation_details.get("push_positive_actions_total_count", 0.0)
-            if positive_total > 0:
-                direction_coverage = validation_details.get("push_positive_actions_direction_covered_count", 0.0) / positive_total
-                validation_details["push_direction_positive_coverage"] = direction_coverage
-                validation_details["push_utility_valid_coverage"] = validation_details.get("push_positive_actions_utility_covered_count", 0.0) / positive_total
+            validation_details = finalize_push_validation_metrics(validation_details)
+            if "push_direction_positive_coverage" in validation_details:
+                direction_coverage = validation_details["push_direction_positive_coverage"]
                 score += float(self.config.training.push_coverage_penalty_weight) * (1.0 - direction_coverage)
-            positive_rows = validation_details.get("push_object_positive_rows_count", 0.0)
-            if positive_rows > 0:
-                validation_details["push_object_positive_recall_at_1"] = validation_details.get("push_object_positive_hits_at_1_count", 0.0) / positive_rows
-                validation_details["push_object_positive_recall_at_4"] = validation_details.get("push_object_positive_hits_at_4_count", 0.0) / positive_rows
             validation_details.update(aggregate_stageb_validation_payloads(summaries))
             evaluation_records = [
                 record for item in summaries for record in item.get("evaluation_records", [])

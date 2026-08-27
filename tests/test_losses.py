@@ -4,9 +4,11 @@ import torch
 from tcd_prg.config import AblationConfig, LossConfig, ModelConfig
 from tcd_prg.datasets.capabilities import DatasetCapabilities
 from tcd_prg.diagnostics import family_gradient_norms
+from tcd_prg.losses.actions import PushLoss
 from tcd_prg.losses.masked import multi_positive_listwise_loss, safe_smooth_l1
 from tcd_prg.losses.objective import TCDPRGObjective
 from tcd_prg.losses.total import MultiTaskLoss
+from tcd_prg.trainers import finalize_push_validation_metrics
 
 
 def test_nan_loss_is_masked() -> None:
@@ -42,6 +44,68 @@ def test_unknown_candidate_excluded_from_listwise_denominator() -> None:
     evaluated = torch.tensor([[True, True, False]])
     loss = multi_positive_listwise_loss(logits, positive, evaluated)
     assert loss < 1
+
+
+def _push_labels() -> dict[str, torch.Tensor]:
+    return {
+        "direction_positive": torch.tensor([[False, False, False]]),
+        "direction_evaluated": torch.tensor([[True, True, False]]),
+        "direction_residual_target": torch.zeros(1, 3, 2),
+        "direction_residual_valid": torch.zeros(1, 3, 2, dtype=torch.bool),
+        "object_positive": torch.tensor([[True, False, False]]),
+        "object_valid_mask": torch.tensor([[True, False, False]]),
+        "object_deployment_valid": torch.tensor([[True, True, True]]),
+        "positive_evaluated_push": torch.tensor([True]),
+        "positive_direction_covered": torch.tensor([True]),
+        "positive_utility_eligible": torch.tensor([False]),
+        "positive_utility_covered": torch.tensor([False]),
+        "contact_valid": torch.tensor([[True]]),
+        "contact_target": torch.tensor([[0.0]]),
+        "utility_valid": torch.zeros(1, 3, dtype=torch.bool),
+        "utility_delta": torch.zeros(1, 3),
+    }
+
+
+def test_all_negative_evaluated_directions_produce_bce_gradient() -> None:
+    direction_logits = torch.zeros(1, 3, requires_grad=True)
+    output = {
+        "direction_logits": direction_logits,
+        "direction_residual": torch.zeros(1, 3, 2),
+        "object_logits": torch.zeros(1, 3),
+        "contact_logits": torch.zeros(1, 1),
+        "utility_delta": torch.zeros(1, 3),
+    }
+    losses = PushLoss()(output, _push_labels())
+    losses["push_direction"].backward()
+    assert losses["push_direction_bce_diagnostic"] > 0
+    assert losses["push_direction_rank_diagnostic"] == 0
+    assert torch.count_nonzero(direction_logits.grad[0, :2]) == 2
+    assert direction_logits.grad[0, 2] == 0
+
+
+def test_unknown_objects_compete_for_deployment_recall_without_supervision() -> None:
+    labels = _push_labels()
+    output = {
+        "direction_logits": torch.zeros(1, 3),
+        "direction_residual": torch.zeros(1, 3, 2),
+        "object_logits": torch.tensor([[0.0, 10.0, 9.0]]),
+        "contact_logits": torch.zeros(1, 1),
+        "utility_delta": torch.zeros(1, 3),
+    }
+    losses = PushLoss()(output, labels)
+    assert losses["push_object_positive_hits_at_1_count"] == 0
+    assert losses["push_object_bce_active_rows_count"] == 1
+
+
+def test_push_validation_utility_coverage_uses_eligible_denominator() -> None:
+    metrics = finalize_push_validation_metrics({
+        "push_positive_actions_total_count": 10,
+        "push_positive_actions_direction_covered_count": 8,
+        "push_positive_actions_utility_eligible_count": 4,
+        "push_positive_actions_utility_covered_count": 3,
+    })
+    assert metrics["push_direction_positive_coverage"] == pytest.approx(0.8)
+    assert metrics["push_utility_valid_coverage"] == pytest.approx(0.75)
 
 
 def test_sequence_topology_mask_only_masks_order_loss() -> None:

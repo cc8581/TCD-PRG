@@ -38,9 +38,17 @@ def load_staged_tcd_prg(model: nn.Module, stage_a_checkpoint: str | Path,
     stage_a = _load_stage(model, stage_a_checkpoint, "perception")
     stage_b = _load_stage(model, stage_b_checkpoint, "grasp")
     stage_c = _load_stage(model, stage_c_checkpoint, "push")
-    perception_fields = ("instance_queries", "instance_objectness_threshold", "target_query_temperature", "target_prompt_radius_m", "target_prompt_sigma_m", "target_prompt_weight", "target_category_weight", "target_objectness_weight", "target_center_weight", "target_reid_weight", "target_prompt_min_support", "target_prompt_min_margin")
+    perception_fields = ("instance_queries", "instance_objectness_threshold", "target_query_temperature", "target_prompt_radius_m", "target_prompt_sigma_m", "target_prompt_weight", "target_category_weight", "target_objectness_weight", "target_center_weight", "target_learned_weight", "target_reid_weight", "target_reid_center_weight", "target_reid_max_center_distance_m", "target_prompt_min_support", "target_prompt_min_margin")
     _require_fields(stage_a, runtime_config, {"model": perception_fields, "ablation": ("use_task_region_condition",), "backbone": ("grid_size_m",)}, "perception")
     _require_fields(stage_c, runtime_config, {"model": ("instance_queries", "num_categories", "num_task_regions", "num_direction_bins", "push_direction_contact_topk", "push_object_topk", "push_utility_temperature")}, "push")
+    _require_fields(stage_b, runtime_config, {"model": ("task_grasp_scene_points", "task_grasp_gripper_points")}, "grasp")
+    saved_ablation = stage_c.get("config", {}).get("ablation", {})
+    saved_losses = stage_c.get("config", {}).get("losses", {})
+    if runtime_config.ablation.use_push_potential and (
+        not saved_ablation.get("use_push_potential", False)
+        or float(saved_losses.get("push_potential", 0.0)) <= 0.0
+    ):
+        raise RuntimeError("push runtime requires a Stage-C checkpoint trained with push potential")
     saved_stageb = compatibility_provenance(stage_b.get("stageb_provenance", {}))
     runtime_stageb = stageb_compatibility(runtime_config)
     for key in ("scene_preprocess", "target_graspnet", "proposal_label_protocol"):

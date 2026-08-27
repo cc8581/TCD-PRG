@@ -35,7 +35,7 @@ from tcd_prg.runtime import (
     UnifiedBatchCollator,
     create_adapter,
 )
-from tcd_prg.trainers import Trainer
+from tcd_prg.trainers import Trainer, finalize_push_validation_metrics
 
 
 def validate_read_through_observation_cache(adapter) -> dict[str, object]:
@@ -459,11 +459,19 @@ def main() -> None:
                 resume_training.get("validation_scene_count"),
                 int(resume_training.get("validation_scene_seed", 2026)),
                 resume_training.get("max_validation_groups"),
+                float(resume_training.get("push_coverage_penalty_weight", 1.0)),
+                resume_training.get("validation_family_weights"),
+                tuple(resume_training.get("allowed_action_strata", ())),
+                resume_training.get("validation_stratum_quota"),
             )
             current_validation_signature = (
                 config.training.validation_scene_count,
                 int(config.training.validation_scene_seed),
                 config.training.max_validation_groups,
+                float(config.training.push_coverage_penalty_weight),
+                config.training.validation_family_weights,
+                tuple(config.training.allowed_action_strata),
+                config.training.validation_stratum_quota,
             )
             resume_validation_protocol_changed = (
                 old_validation_signature != current_validation_signature
@@ -720,17 +728,26 @@ def main() -> None:
     if args.validate_only:
         validation = validate(trainer.ema.model if trainer.ema else trainer.model)
         if rank == 0:
+            metric_sums = {
+                str(key): float(value)
+                for key, value in validation.get("metric_sums", {}).items()
+            }
+            metric_counts = {
+                str(key): int(value)
+                for key, value in validation.get("metric_counts", {}).items()
+            }
+            metric_details = {
+                key: value
+                if key in Trainer.COUNT_TERMS
+                else value / max(1, metric_counts.get(key, 0))
+                for key, value in metric_sums.items()
+            }
             serializable = {
                 "score_sum": float(validation["score_sum"]),
                 "score_count": int(validation["score_count"]),
-                "metric_sums": {
-                    str(key): float(value)
-                    for key, value in validation.get("metric_sums", {}).items()
-                },
-                "metric_counts": {
-                    str(key): int(value)
-                    for key, value in validation.get("metric_counts", {}).items()
-                },
+                "metric_sums": metric_sums,
+                "metric_counts": metric_counts,
+                "metrics": finalize_push_validation_metrics(metric_details),
             }
             if "stageb_scores" in validation:
                 serializable.update(

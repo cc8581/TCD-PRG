@@ -385,9 +385,14 @@ class TCDPRGObjective(nn.Module):
             if self.total.enabled("push_direction"):
                 families["push_direction"] = {
                     "loss": push_losses["push_direction"],
-                    "push_direction_bin_diagnostic": push_losses[
-                        "push_direction_bin_diagnostic"
+                    "push_direction_bce_diagnostic": push_losses[
+                        "push_direction_bce_diagnostic"
                     ],
+                    "push_direction_rank_diagnostic": push_losses[
+                        "push_direction_rank_diagnostic"
+                    ],
+                    "push_direction_bce_active_rows_count": push_losses["push_direction_bce_active_rows_count"],
+                    "push_direction_rank_active_rows_count": push_losses["push_direction_rank_active_rows_count"],
                     "push_direction_residual_diagnostic": push_losses[
                         "push_direction_residual_diagnostic"
                     ],
@@ -405,7 +410,8 @@ class TCDPRGObjective(nn.Module):
                     push_labels["direction_evaluated"],
                 )
                 activity["active_loss_push_direction"] = (
-                    direction_rank_rows
+                    self._row_active(push_labels["direction_evaluated"])
+                    | direction_rank_rows
                     | self._row_active(push_labels["direction_residual_valid"])
                 ).float().mean()
 
@@ -416,6 +422,7 @@ class TCDPRGObjective(nn.Module):
                         "push_potential_valid_candidates"
                     ],
                     "push_positive_actions_utility_covered_count": push_losses["push_positive_actions_utility_covered_count"],
+                    "push_positive_actions_utility_eligible_count": push_losses["push_positive_actions_utility_eligible_count"],
                 }
                 activity["active_loss_push_potential"] = self._row_active(
                     push_labels["utility_valid"]

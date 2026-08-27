@@ -7,7 +7,12 @@ from .masked import multi_positive_listwise_loss, safe_bce_with_logits, safe_smo
 
 class PushLoss(nn.Module):
     def forward(self, output: dict[str, Tensor], labels: dict[str, Tensor]) -> dict[str, Tensor]:
-        direction_bin = multi_positive_listwise_loss(
+        direction_bce = safe_bce_with_logits(
+            output["direction_logits"],
+            labels["direction_positive"].float(),
+            labels["direction_evaluated"],
+        )
+        direction_rank = multi_positive_listwise_loss(
             output["direction_logits"],
             labels["direction_positive"],
             labels["direction_evaluated"],
@@ -31,7 +36,9 @@ class PushLoss(nn.Module):
         valid_object_rows = object_positive.any(-1)
         def object_hits(k: int) -> Tensor:
             count = min(k, output["object_logits"].shape[-1])
-            selected = output["object_logits"].masked_fill(~labels["object_valid_mask"].bool(), -30.0).topk(count, -1).indices
+            selected = output["object_logits"].masked_fill(
+                ~labels["object_deployment_valid"].bool(), float("-inf")
+            ).topk(count, -1).indices
             hit = object_positive.gather(1, selected).any(-1)
             return (hit & valid_object_rows).sum().float()
         object_bce = safe_bce_with_logits(output["object_logits"], labels["object_positive"].float(), labels["object_valid_mask"])
@@ -46,13 +53,17 @@ class PushLoss(nn.Module):
             "push_positive_actions_total_count": labels["positive_evaluated_push"].sum().float(),
             "push_positive_actions_direction_covered_count": labels["positive_direction_covered"].sum().float(),
             "push_positive_actions_utility_covered_count": labels["positive_utility_covered"].sum().float(),
+            "push_positive_actions_utility_eligible_count": labels["positive_utility_eligible"].sum().float(),
             "push_object_bce_active_rows_count": labels["object_valid_mask"].any(-1).sum().float(),
             "push_object_rank_active_rows_count": object_effective.sum().float(),
             "push_contact": safe_bce_with_logits(
                 output["contact_logits"], labels["contact_target"].float(), labels["contact_valid"]
             ),
-            "push_direction": direction_bin + direction_residual,
-            "push_direction_bin_diagnostic": direction_bin,
+            "push_direction": direction_bce + direction_rank + direction_residual,
+            "push_direction_bce_diagnostic": direction_bce,
+            "push_direction_rank_diagnostic": direction_rank,
+            "push_direction_bce_active_rows_count": labels["direction_evaluated"].any(-1).sum().float(),
+            "push_direction_rank_active_rows_count": direction_effective.sum().float(),
             "push_direction_residual_diagnostic": direction_residual,
             "push_object_effective_rows": object_effective.sum().float(),
             "push_known_objects_per_state": known_per_state.mean(),
