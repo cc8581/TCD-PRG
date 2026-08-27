@@ -11,38 +11,20 @@ def checkpoint(stage: str) -> dict:
 
 
 def test_stage_a_starts_without_checkpoint() -> None:
-    validate_checkpoint_gate("perception", resume_payload=None, initialize_payload=None)
+    validate_checkpoint_gate("perception", resume_payload=None)
 
 
-@pytest.mark.parametrize(
-    ("stage", "source"), (("grasp", "perception"), ("push", "grasp"))
-)
-def test_later_stage_requires_exact_predecessor(stage: str, source: str) -> None:
-    validate_checkpoint_gate(
-        stage, resume_payload=None, initialize_payload=checkpoint(source)
-    )
-    with pytest.raises(RuntimeError, match="requires"):
-        validate_checkpoint_gate(stage, resume_payload=None, initialize_payload=None)
-    with pytest.raises(RuntimeError, match="requires"):
-        validate_checkpoint_gate(
-            stage, resume_payload=None, initialize_payload=checkpoint(stage)
-        )
+def test_stage_b_starts_without_stage_a_checkpoint() -> None:
+    validate_checkpoint_gate("grasp", resume_payload=None)
 
 
 def test_resume_requires_same_stage() -> None:
     validate_checkpoint_gate(
-        "grasp", resume_payload=checkpoint("grasp"), initialize_payload=None
+        "grasp", resume_payload=checkpoint("grasp")
     )
     with pytest.raises(RuntimeError, match="Resume requires"):
         validate_checkpoint_gate(
-            "grasp", resume_payload=checkpoint("perception"), initialize_payload=None
-        )
-
-
-def test_stage_a_rejects_initialize() -> None:
-    with pytest.raises(RuntimeError, match="must not use"):
-        validate_checkpoint_gate(
-            "perception", resume_payload=None, initialize_payload=checkpoint("perception")
+            "grasp", resume_payload=checkpoint("perception")
         )
 
 

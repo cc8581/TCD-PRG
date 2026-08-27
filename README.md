@@ -108,7 +108,7 @@ python train.py --config configs/stage/perception.yaml
 The launcher supplies the Windows RTX 3090 defaults, creates a timestamped
 output directory, and accepts ordinary `key=value` overrides. Its default is
 one optimizer update per batch (no gradient accumulation). Use `--resume`,
-`--initialize`, or `--gpus N` when required; it always starts formal training
+the Stage-C component checkpoint arguments, or `--gpus N` when required; it always starts formal training
 and has no dry-run mode.
 
 ```powershell
@@ -149,43 +149,42 @@ delegated to the official GraspNet protocol.
 
 ## Training
 
-Formal training is intentionally sequential. Each later stage initializes from the
-prior checkpoint but only executes the branch it trains.
+Stage A and Stage B train independently behind the shared `StageBCondition`
+contract. Stage C composes their trained components once before training Push.
 
 ```powershell
 # Stage A: perception / instance / target region
 tcd-prg-train --config configs/stage/perception.yaml `
   output_dir=outputs/perception
 
-# One-time Stage B-D expansion: Stage-A crop -> frozen GraspNet -> binary geometry labels
+# One-time Stage B-D expansion: GT condition -> frozen GraspNet -> binary geometry labels
 tcd-prg-build-stageb --config configs/stage/grasp.yaml `
-  --checkpoint outputs/perception/last.pt `
   --output runtime/stageb_binary --split train
 tcd-prg-build-stageb --config configs/stage/grasp.yaml `
-  --checkpoint outputs/perception/last.pt `
   --output runtime/stageb_binary --split val
 
-# Stage B-T: binary evaluator; initialize from A and freeze perception/GraspNet
+# Stage B-T: independent binary evaluator
 tcd-prg-train --config configs/stage/grasp.yaml `
-  --initialize outputs/perception/last.pt `
   output_dir=outputs/grasp
 
-# Stage C: PUSH; initialize from B and freeze perception + grasp
+# Stage C: compose A+B once, then train PUSH
 tcd-prg-train --config configs/stage/push.yaml `
-  --initialize outputs/grasp/best.pt `
+  --stage-a-checkpoint outputs/perception/best.pt `
+  --stage-b-checkpoint outputs/grasp/best.pt `
   output_dir=outputs/push
 ```
 
-The Stage-C checkpoint contains the inherited trained perception/grasp parameters
+The Stage-C checkpoint contains the composed trained perception/grasp parameters
 and the newly trained PUSH branch, so it is the deployment checkpoint. `--resume`
-is for continuing the same stage; `--initialize` is for stage-to-stage weight
+is for continuing the same stage; the two Stage-C component arguments are for weight
 transfer without optimizer state.
 
 Stage B trains only on concrete GraspNet proposals stored with strict 0/1
 `task_valid` labels. Invalid data-generation attempts are dropped and never become
-a third class. Each record freezes the sampled scene context, target prompt, pose
+a third class. Each record freezes the sampled scene context, GT condition, pose
 and proposal width used during label generation. Labels use dense AG CAD geometry,
-and the manifest binds them to checkpoint, configuration, geometry and code hashes.
+and the manifest binds them to dataset, GraspNet, transfer, configuration, geometry
+and code hashes. It contains no Stage-A checkpoint identity.
 Both train and validation splits are mandatory for formal Stage B. Validation
 aggregates candidate-level TP/FP/FN, AUROC and AUPRC over the complete split and
 writes the best-F1 decision threshold to the run output. Other stages retain their

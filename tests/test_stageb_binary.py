@@ -13,7 +13,7 @@ from tcd_prg.geometry.stageb_grasp import (
     world_to_grasp_numpy,
 )
 from tcd_prg.losses.task_grasp_binary import stageb_split_metrics
-from tcd_prg.models import TCDPRGModel
+from tcd_prg.models import StageBCondition, TCDPRGModel, stageb_condition_from_gt
 from tcd_prg.models.task_grasp import TaskGraspEvaluator, world_to_grasp
 from tcd_prg.scripts.build_stageb_binary import balance_binary_records
 from tcd_prg.trainers.trainer import aggregate_stageb_validation_payloads
@@ -35,13 +35,13 @@ def evaluator_inputs(batch: int = 2, candidates: int = 3, points: int = 40, dim:
     }
     return (
         proposals,
-        torch.randn(batch, points, dim),
         xyz,
+        torch.rand(batch, points, 3),
         torch.ones(batch, points, dtype=torch.bool),
         torch.rand(batch, points),
         torch.rand(batch, points),
-        torch.randn(batch, dim),
-        torch.randn(batch, dim),
+        torch.randint(0, 4, (batch,)),
+        torch.randint(0, 4, (batch,)),
     )
 
 
@@ -211,7 +211,8 @@ def test_local_cloud_keeps_sparse_voxels_padded() -> None:
     translation = torch.zeros(1, 1, 3)
     rotation = torch.eye(3).reshape(1, 1, 3, 3)
     _, _, mask = evaluator._local_cloud(
-        xyz, torch.ones(1, 3, dtype=torch.bool), translation, rotation
+        xyz, torch.zeros_like(xyz), torch.ones(1, 3, dtype=torch.bool),
+        torch.ones(1, 3), torch.ones(1, 3), translation, rotation
     )
     assert int(mask[0, 0, : evaluator.scene_points].sum()) == 1
 
@@ -227,7 +228,10 @@ def test_voxel_preselection_preserves_far_approach_obstacle() -> None:
     xyz = torch.cat((near, obstacle), 1)
     cloud, _, mask = evaluator._local_cloud(
         xyz,
+        torch.zeros_like(xyz),
         torch.ones((1, len(xyz[0])), dtype=torch.bool),
+        torch.ones((1, len(xyz[0]))),
+        torch.ones((1, len(xyz[0]))),
         torch.zeros((1, 1, 3)),
         torch.eye(3).reshape(1, 1, 3, 3),
     )
@@ -240,6 +244,8 @@ def test_stageb_backward_updates_only_evaluator(fake_graspnet, tiny_batch) -> No
     for name, parameter in model.named_parameters():
         parameter.requires_grad_(name.startswith("task_grasp."))
     batch = dict(tiny_batch)
+    batch["region_valid"] = batch["point_mask"].clone()
+    batch["region_target"] = batch["target_mask"].clone()
     translation = torch.cat((batch["xyz"][:, :2].clone(), torch.full((1, 1, 3), float("nan"))), 1)
     batch["grasp_candidates"] = {
         "translation_world": translation,
@@ -264,3 +270,53 @@ def test_stageb_backward_updates_only_evaluator(fake_graspnet, tiny_batch) -> No
     )
     assert all(parameter.grad is None for parameter in model.encoder.parameters())
     assert all(parameter.grad is None for parameter in model.graspnet.parameters())
+
+
+def test_gt_condition_has_the_public_stageb_contract(tiny_batch) -> None:
+    batch = dict(tiny_batch)
+    batch["region_valid"] = batch["point_mask"].clone()
+    batch["region_target"] = batch["target_mask"].clone()
+    condition = stageb_condition_from_gt(batch)
+    assert isinstance(condition, StageBCondition)
+    assert condition.target_probability.shape == batch["point_mask"].shape
+    assert condition.region_probability.shape == batch["point_mask"].shape
+    assert condition.target_valid.dtype == torch.bool
+    assert set(condition.target_probability.unique().tolist()) <= {0.0, 1.0}
+
+
+def test_task_grasp_signature_has_no_stagea_latents() -> None:
+    import inspect
+
+    parameters = inspect.signature(TaskGraspEvaluator.forward).parameters
+    assert not {"point_features", "target_token", "task_token", "object_tokens"} & set(parameters)
+
+
+def test_perception_returns_stageb_condition(fake_graspnet, tiny_batch) -> None:
+    model = TCDPRGModel(ModelConfig(feature_dim=32, task_dim=16)).eval()
+    with torch.no_grad():
+        condition = model.forward_perception(tiny_batch)["stageb_condition"]
+    assert isinstance(condition, StageBCondition)
+    condition.validate(tiny_batch["xyz"].shape[1])
+
+
+def test_identical_condition_uses_identical_crop_proposals_and_logits(
+    fake_graspnet, tiny_batch
+) -> None:
+    model = TCDPRGModel(ModelConfig(feature_dim=32, task_dim=16)).eval()
+    batch = dict(tiny_batch)
+    batch["region_valid"] = batch["point_mask"].clone()
+    batch["region_target"] = batch["target_mask"].clone()
+    gt = stageb_condition_from_gt(batch)
+    perfect_prediction = StageBCondition(
+        gt.target_probability.clone(), gt.region_probability.clone(), gt.target_valid.clone(),
+        gt.task_category_id.clone(), gt.task_region_id.clone(),
+    )
+    sensor = model._sensor(batch)
+    with torch.no_grad():
+        first = model.generate_target_grasp_proposals(sensor, gt)
+        second = model.generate_target_grasp_proposals(sensor, perfect_prediction)
+        first_score = model.forward_task_grasp_from_condition(sensor, gt, first)
+        second_score = model.forward_task_grasp_from_condition(sensor, perfect_prediction, second)
+    assert torch.equal(first["target_crop_mask"], second["target_crop_mask"])
+    assert torch.equal(first["translation_world"], second["translation_world"])
+    assert torch.equal(first_score["task_valid_logit"], second_score["task_valid_logit"])

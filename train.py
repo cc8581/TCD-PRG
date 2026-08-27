@@ -76,7 +76,8 @@ def _launcher_defaults(paths_config: Path) -> dict[str, str | Path | None]:
             local.get("output_root", PROJECT / "outputs")
         ) / f"formal_{stamp}",
         "resume": None,
-        "initialize": None,
+        "stage_a_checkpoint": None,
+        "stage_b_checkpoint": None,
     }
 
 
@@ -202,9 +203,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Directory for checkpoints, JSONL metrics, and TensorBoard logs. "
         "On resume, defaults to the checkpoint parent directory.",
     )
-    # resume 恢复优化器/调度器等完整状态；initialize 仅加载模型权重，二者不可同时使用。
     parser.add_argument("--resume", type=Path, default=defaults["resume"], help="Checkpoint used to resume the complete training state.")
-    parser.add_argument("--initialize", type=Path, default=defaults["initialize"], help="Checkpoint used only to initialize model weights.")
+    parser.add_argument("--stage-a-checkpoint", type=Path, default=defaults["stage_a_checkpoint"])
+    parser.add_argument("--stage-b-checkpoint", type=Path, default=defaults["stage_b_checkpoint"])
     parser.add_argument(
         "--data-fraction", type=float, default=None,
         help="Override training.data_fraction with a deterministic fraction in (0, 1].",
@@ -219,8 +220,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     if args.gpus <= 0:
         parser.error("--gpus must be positive")
-    if args.resume and args.initialize:
-        parser.error("--resume and --initialize are mutually exclusive")
+    if args.resume and (args.stage_a_checkpoint or args.stage_b_checkpoint):
+        parser.error("--resume and Stage-C component checkpoints are mutually exclusive")
     return args
 
 
@@ -235,8 +236,10 @@ def _training_arguments(
     arguments = ["--config", str(args.config.resolve())]
     if args.resume:
         arguments.extend(("--resume", str(args.resume.resolve())))
-    if args.initialize:
-        arguments.extend(("--initialize", str(args.initialize.resolve())))
+    if args.stage_a_checkpoint:
+        arguments.extend(("--stage-a-checkpoint", str(args.stage_a_checkpoint.resolve())))
+    if args.stage_b_checkpoint:
+        arguments.extend(("--stage-b-checkpoint", str(args.stage_b_checkpoint.resolve())))
     arguments.extend(path_overrides)
     arguments.append(_quoted_override("output_dir", output))
     named_training_overrides = {

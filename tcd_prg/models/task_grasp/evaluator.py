@@ -47,11 +47,12 @@ def masked_farthest_point_sample(xyz: Tensor, mask: Tensor, count: int) -> tuple
 
 def deterministic_voxel_representatives(
     xyz: Tensor,
+    feature: Tensor,
     mask: Tensor,
     lower: tuple[float, float, float],
     upper: tuple[float, float, float],
     voxel_size_m: float,
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor]:
     """Choose the observed point nearest each fixed voxel center, independent of order."""
     lower_tensor = xyz.new_tensor(lower)
     upper_tensor = xyz.new_tensor(upper)
@@ -79,7 +80,12 @@ def deterministic_voxel_representatives(
     count = xyz.new_zeros((xyz.shape[0], voxel_count))
     count.scatter_add_(1, voxel, winning.to(xyz.dtype))
     representative = total / count.clamp_min(1)[..., None]
-    return representative, count > 0
+    feature_total = feature.new_zeros((feature.shape[0], voxel_count, feature.shape[-1]))
+    feature_total.scatter_add_(
+        1, voxel[..., None].expand(-1, -1, feature.shape[-1]), feature * winning[..., None]
+    )
+    representative_feature = feature_total / count.clamp_min(1)[..., None]
+    return representative, representative_feature, count > 0
 
 
 class PointNetSetAbstraction(nn.Module):
@@ -119,6 +125,8 @@ class TaskGraspEvaluator(nn.Module):
         self,
         dim: int,
         gripper_geometry_path: str | Path,
+        num_categories: int = 64,
+        num_regions: int = 64,
         scene_points: int = 256,
         gripper_points: int = 128,
         voxel_size_m: float = 0.017,
@@ -135,12 +143,17 @@ class TaskGraspEvaluator(nn.Module):
         self.register_buffer("gripper_part_id", part, persistent=True)
         self.scene_points = int(scene_points)
         self.voxel_size_m = float(voxel_size_m)
-        self.sa1 = PointNetSetAbstraction(4, 96, centers=64, radius_m=0.045)
+        self.sa1 = PointNetSetAbstraction(9, 96, centers=64, radius_m=0.045)
         self.sa2 = PointNetSetAbstraction(96, 128, centers=16, radius_m=0.090)
         self.pose = nn.Sequential(nn.Linear(10, dim), nn.LayerNorm(dim), nn.GELU())
-        self.semantic = nn.Sequential(nn.Linear(4 * dim, 2 * dim), nn.LayerNorm(2 * dim), nn.GELU())
+        self.category_embedding = nn.Embedding(num_categories, dim)
+        self.region_embedding = nn.Embedding(num_regions, dim)
+        self.task_projection = nn.Sequential(
+            nn.Linear(2 * dim, dim), nn.LayerNorm(dim), nn.GELU()
+        )
+        self.semantic = nn.Sequential(nn.Linear(9, dim), nn.LayerNorm(dim), nn.GELU())
         self.head = nn.Sequential(
-            nn.Linear(128 + 3 * dim, 2 * dim),
+            nn.Linear(128 + 2 * dim, 2 * dim),
             nn.LayerNorm(2 * dim),
             nn.GELU(),
             nn.Linear(2 * dim, dim),
@@ -148,13 +161,15 @@ class TaskGraspEvaluator(nn.Module):
             nn.Linear(dim, 1),
         )
 
-    @staticmethod
-    def _weighted_pool(feature: Tensor, weight: Tensor) -> Tensor:
-        mass = weight.sum(-1, keepdim=True)
-        return torch.einsum("bn,bnd->bd", weight, feature) / mass.clamp_min(1e-6)
-
     def _local_cloud(
-        self, xyz: Tensor, point_mask: Tensor, translation: Tensor, rotation: Tensor
+        self,
+        xyz: Tensor,
+        rgb: Tensor,
+        point_mask: Tensor,
+        target_probability: Tensor,
+        region_probability: Tensor,
+        translation: Tensor,
+        rotation: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         local = world_to_grasp(xyz, translation, rotation)
         # Contains the complete label-side approach corridor plus 5 mm margin.
@@ -169,8 +184,15 @@ class TaskGraspEvaluator(nn.Module):
         b, k, n, _ = local.shape
         flat_local = torch.nan_to_num(local.reshape(b * k, n, 3))
         flat_inside = inside.reshape(b * k, n)
-        preselected_local, preselected_mask = deterministic_voxel_representatives(
+        scene_identity = torch.zeros((*xyz.shape[:2], 4), dtype=xyz.dtype, device=xyz.device)
+        scene_identity[..., 0] = 1
+        scene_feature = torch.cat(
+            (rgb, target_probability[..., None], region_probability[..., None], scene_identity), -1
+        )
+        flat_scene_feature = scene_feature[:, None].expand(-1, k, -1, -1).reshape(b * k, n, 9)
+        preselected_local, preselected_feature, preselected_mask = deterministic_voxel_representatives(
             flat_local,
+            flat_scene_feature,
             flat_inside,
             (-0.090, -0.045, -0.230),
             (0.090, 0.045, 0.025),
@@ -180,13 +202,19 @@ class TaskGraspEvaluator(nn.Module):
             preselected_local, preselected_mask, self.scene_points
         )
         selected = preselected_local.gather(1, local_index[..., None].expand(-1, -1, 3))
+        selected_feature = preselected_feature.gather(
+            1, local_index[..., None].expand(-1, -1, preselected_feature.shape[-1])
+        )
         selected = selected.reshape(b, k, self.scene_points, 3)
+        selected_feature = selected_feature.reshape(b, k, self.scene_points, 9)
         selected_mask = selected_mask.reshape(b, k, self.scene_points)
         gripper = self.gripper_points_tcp.to(local)[None, None].expand(b, k, -1, -1)
         cloud = torch.cat((selected, gripper), 2)
-        part = torch.zeros((b, k, cloud.shape[2]), dtype=torch.long, device=local.device)
-        part[:, :, self.scene_points :] = self.gripper_part_id.to(local.device)[None, None]
-        feature = torch.nn.functional.one_hot(part, num_classes=4).to(local.dtype)
+        gripper_feature = torch.zeros((b, k, gripper.shape[2], 9), dtype=local.dtype, device=local.device)
+        gripper_feature[..., 5:] = torch.nn.functional.one_hot(
+            self.gripper_part_id.to(local.device), num_classes=4
+        ).to(local.dtype)[None, None]
+        feature = torch.cat((selected_feature, gripper_feature), 2)
         mask = torch.cat(
             (
                 selected_mask,
@@ -199,13 +227,13 @@ class TaskGraspEvaluator(nn.Module):
     def forward(
         self,
         proposals: dict[str, Tensor],
-        point_features: Tensor,
         xyz: Tensor,
+        rgb: Tensor,
         point_mask: Tensor,
-        region_probability: Tensor,
         target_probability: Tensor,
-        task_token: Tensor,
-        target_token: Tensor,
+        region_probability: Tensor,
+        task_category_id: Tensor,
+        task_region_id: Tensor,
     ) -> dict[str, Tensor]:
         translation = proposals["translation_world"]
         rotation = proposals["rotation_matrix"]
@@ -213,11 +241,12 @@ class TaskGraspEvaluator(nn.Module):
             "valid", torch.ones(translation.shape[:2], dtype=torch.bool, device=translation.device)
         ).bool()
         cloud, local_feature, local_mask = self._local_cloud(
-            xyz, point_mask.bool(), translation, rotation
+            xyz, rgb, point_mask.bool(), target_probability, region_probability,
+            translation, rotation
         )
         b, k, p, _ = cloud.shape
         flat_xyz = cloud.reshape(b * k, p, 3)
-        flat_feature = local_feature.reshape(b * k, p, 4)
+        flat_feature = local_feature.reshape(b * k, p, 9)
         flat_mask = local_mask.reshape(b * k, p)
         center, feature, mask = self.sa1(flat_xyz, flat_feature, flat_mask)
         _, feature, mask = self.sa2(center, feature, mask)
@@ -228,13 +257,16 @@ class TaskGraspEvaluator(nn.Module):
             b, k, -1
         )
 
-        target_weight = target_probability * point_mask.to(target_probability.dtype)
-        region_weight = target_weight * region_probability
-        target_pool = self._weighted_pool(point_features, target_weight)
-        region_pool = self._weighted_pool(point_features, region_weight)
-        semantic = self.semantic(
-            torch.cat((target_pool, region_pool, task_token, target_token), -1)
+        scene_semantic = self.semantic(local_feature[:, :, : self.scene_points]).masked_fill(
+            ~local_mask[:, :, : self.scene_points, None], 0.0
         )
+        scene_semantic = scene_semantic.sum(2) / local_mask[:, :, : self.scene_points].sum(
+            2, keepdim=True
+        ).clamp_min(1)
+        task_semantic = self.task_projection(torch.cat((
+            self.category_embedding(task_category_id), self.region_embedding(task_region_id)
+        ), -1))
+        target_weight = target_probability * point_mask.to(target_probability.dtype)
         target_center = torch.einsum("bn,bnd->bd", target_weight, xyz) / target_weight.sum(
             -1, keepdim=True
         ).clamp_min(1e-6)
@@ -243,7 +275,7 @@ class TaskGraspEvaluator(nn.Module):
             torch.cat((translation - target_center[:, None], rotation_6d(rotation), width), -1)
         )
         pose = self.pose(pose_input)
-        context = torch.cat((geometry, semantic[:, None].expand(-1, k, -1), pose), -1)
+        context = torch.cat((geometry, scene_semantic + task_semantic[:, None], pose), -1)
         logit = self.head(torch.nan_to_num(context)).squeeze(-1).masked_fill(~valid, -30.0)
         return {
             **proposals,

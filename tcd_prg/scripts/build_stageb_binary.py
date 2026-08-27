@@ -15,13 +15,12 @@ from tcd_prg.config import load_config
 from tcd_prg.datasets import ActionStateGroupDataset
 from tcd_prg.datasets.stageb_manifest import SCHEMA_VERSION, build_provenance
 from tcd_prg.geometry.stageb_grasp import evaluate_stageb_geometry
-from tcd_prg.models import TCDPRGModel
+from tcd_prg.models import TCDPRGModel, stageb_condition_from_gt
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter
-from tcd_prg.scripts.train import load_predecessor_weights
 
 
-def model_view(batch: dict) -> dict:
-    model_inputs = {
+def model_sensor(batch: dict) -> dict:
+    return {
         key: batch[key]
         for key in (
             "xyz",
@@ -37,24 +36,6 @@ def model_view(batch: dict) -> dict:
             "camera2_valid",
         )
         if key in batch
-    }
-    target = batch["point_mask"] & batch["target_mask"]
-    prompt = torch.zeros((len(target), 1, 3), dtype=batch["xyz"].dtype, device=batch["xyz"].device)
-    prompt_valid = torch.zeros((len(target), 1), dtype=torch.bool, device=batch["xyz"].device)
-    for row in range(len(target)):
-        index = torch.nonzero(target[row], as_tuple=False).flatten()
-        if len(index):
-            prompt[row, 0] = batch["xyz"][row, index[len(index) // 2]]
-            prompt_valid[row, 0] = True
-    return {
-        "model_inputs": model_inputs,
-        "task_inputs": {
-            "task_category_id": batch["task_category_id"],
-            "task_region_id": batch["task_region_id"],
-            "target_prompt_xyz": prompt,
-            "target_prompt_label": torch.ones_like(prompt_valid, dtype=torch.long),
-            "target_prompt_valid": prompt_valid,
-        },
     }
 
 
@@ -112,7 +93,6 @@ def balance_binary_records(root: Path, records: list[dict], seed: int) -> list[d
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/stage/grasp.yaml")
-    parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--split", choices=("train", "val"), default="train")
     parser.add_argument("--max-groups", type=int)
@@ -121,7 +101,7 @@ def main() -> None:
     config = load_config(args.config, args.overrides)
     root = Path(args.output)
     manifest_path = root / "manifest.json"
-    provenance = build_provenance(config, args.checkpoint)
+    provenance = build_provenance(config)
     if manifest_path.is_file():
         old = json.loads(manifest_path.read_text(encoding="utf-8"))
         if old.get("provenance") != provenance:
@@ -142,10 +122,6 @@ def main() -> None:
         collate_fn=UnifiedBatchCollator(config, training=False, include_graspnet=True),
     )
     model = TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if checkpoint.get("training_stage") != "perception":
-        raise RuntimeError("Stage-B data construction requires a Stage-A perception checkpoint")
-    load_predecessor_weights(model, checkpoint, "grasp")
     device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
     model.to(device).eval()
     ag_geometry = np.load(config.model.stageb_label_gripper_geometry)
@@ -159,8 +135,9 @@ def main() -> None:
             key: (value.to(device) if torch.is_tensor(value) else value)
             for key, value in batch.items()
         }
-        view = model_view(batch)
-        proposals = model.generate_task_proposals(view)
+        sensor = model_sensor(batch)
+        condition = stageb_condition_from_gt(batch)
+        proposals = model.generate_target_grasp_proposals(sensor, condition)
         keep = torch.nonzero(proposals["valid"][0], as_tuple=False).flatten()[:32]
         if not len(keep):
             diagnostic = {
@@ -226,10 +203,6 @@ def main() -> None:
             context_region_target=batch["region_target"][0].cpu().numpy().astype(np.bool_),
             context_region_valid=batch["region_valid"][0].cpu().numpy().astype(np.bool_),
             context_grid_coord=batch["grid_coord"][0].cpu().numpy().astype(np.int32),
-            target_prompt_xyz=view["task_inputs"]["target_prompt_xyz"][0]
-            .cpu()
-            .numpy()
-            .astype(np.float32),
         )
         for local in selected:
             audit.write(

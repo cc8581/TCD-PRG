@@ -29,7 +29,8 @@ def test_launcher_path_arguments_have_local_config_defaults(tmp_path) -> None:
     assert args.output_dir.parent == PROJECT / "outputs"
     assert args.output_dir.name.startswith("formal_")
     assert args.resume is None
-    assert args.initialize is None
+    assert args.stage_a_checkpoint is None
+    assert args.stage_b_checkpoint is None
     assert args.batch_size is None
     assert args.num_workers is None
     assert args.validation_num_workers is None
@@ -46,7 +47,8 @@ def test_formal_launcher_defaults_and_user_override_order(tmp_path) -> None:
         config=config,
         output_dir=tmp_path / "output",
         resume=None,
-        initialize=None,
+        stage_a_checkpoint=None,
+        stage_b_checkpoint=None,
         data_fraction=None,
     ))
     assert not any(argument.startswith("backbone.") for argument in arguments)

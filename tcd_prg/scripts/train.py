@@ -139,45 +139,26 @@ def restrict_action_dataset_to_stage(
     dataset.selected_group_count = len(units)
 
 
-_STAGE_PREDECESSOR = {"grasp": "perception", "push": "grasp"}
-
-
 def validate_checkpoint_gate(
     stage: str,
     *,
     resume_payload: dict | None,
-    initialize_payload: dict | None,
 ) -> None:
-    """Enforce the one-way A -> B -> C checkpoint transition."""
+    """Enforce independent A/B starts and the remaining B -> C transition."""
 
-    if resume_payload is not None and initialize_payload is not None:
-        raise ValueError("--resume and --initialize are mutually exclusive")
     if resume_payload is not None:
         source = resume_payload.get("training_stage")
         if source != stage:
             raise RuntimeError(f"Resume requires a {stage!r} checkpoint, got {source!r}")
         return
-    predecessor = _STAGE_PREDECESSOR.get(stage)
-    if predecessor is None:
-        if initialize_payload is not None:
-            raise RuntimeError(f"Stage {stage!r} must not use --initialize")
-        return
-    if initialize_payload is None:
-        raise RuntimeError(f"Stage {stage!r} requires --initialize from Stage {predecessor!r}")
-    source = initialize_payload.get("training_stage")
-    if source != predecessor:
-        raise RuntimeError(
-            f"Stage {stage!r} requires a Stage {predecessor!r} checkpoint, got {source!r}"
-        )
+    return
 
 
-def load_predecessor_weights(model: torch.nn.Module, payload: dict, target_stage: str) -> None:
-    """Load exactly the modules learned by the preceding stage."""
-    prefixes = {
-        "grasp": ("encoder.", "region_head."),
-        "push": ("encoder.", "region_head.", "task_grasp."),
-    }[target_stage]
-    source = payload["model"]
+def load_checkpoint_modules(
+    model: torch.nn.Module, payload: dict, prefixes: tuple[str, ...]
+) -> None:
+    """Load an explicit trained component set from one stage checkpoint."""
+    source = payload.get("ema") or payload["model"]
     current = model.state_dict()
     required = {name for name in current if name.startswith(prefixes)}
     incompatible = {
@@ -185,7 +166,7 @@ def load_predecessor_weights(model: torch.nn.Module, payload: dict, target_stage
     }
     if incompatible:
         raise RuntimeError(
-            "Predecessor checkpoint is incompatible with required modules: "
+            "Component checkpoint is incompatible with required modules: "
             + ", ".join(sorted(incompatible)[:8])
         )
     model.load_state_dict({name: source[name] for name in required}, strict=False)
@@ -195,7 +176,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--resume")
-    parser.add_argument("--initialize", help="Load model/EMA weights without optimizer state")
+    parser.add_argument("--stage-a-checkpoint", help="Stage-A component checkpoint for Stage C")
+    parser.add_argument("--stage-b-checkpoint", help="Stage-B component checkpoint for Stage C")
     # Windows 原生启动器显式传递进程拓扑；torchrun 的环境变量仅作为 Linux 兼容路径。
     parser.add_argument("--world-size", type=int)
     parser.add_argument("--rank", type=int)
@@ -215,19 +197,31 @@ def main() -> None:
     resume_payload = (
         torch.load(args.resume, map_location="cpu", weights_only=False) if args.resume else None
     )
-    initialize_payload = (
-        torch.load(args.initialize, map_location="cpu", weights_only=False)
-        if args.initialize
-        else None
+    stage_a_payload = (
+        torch.load(args.stage_a_checkpoint, map_location="cpu", weights_only=False)
+        if args.stage_a_checkpoint else None
     )
+    stage_b_payload = (
+        torch.load(args.stage_b_checkpoint, map_location="cpu", weights_only=False)
+        if args.stage_b_checkpoint else None
+    )
+    if config.training.stage == "push" and resume_payload is None:
+        if stage_a_payload is None or stage_b_payload is None:
+            raise RuntimeError("Stage C requires --stage-a-checkpoint and --stage-b-checkpoint")
+        if stage_a_payload.get("training_stage") != "perception":
+            raise RuntimeError("--stage-a-checkpoint must be a perception checkpoint")
+        if stage_b_payload.get("training_stage") != "grasp":
+            raise RuntimeError("--stage-b-checkpoint must be a grasp checkpoint")
+    elif stage_a_payload is not None or stage_b_payload is not None:
+        raise RuntimeError("Stage component checkpoints are only valid for a fresh Stage C run")
     validate_checkpoint_gate(
         config.training.stage,
         resume_payload=resume_payload,
-        initialize_payload=initialize_payload,
     )
-    if initialize_payload is not None and "task_grasp_probability_threshold" in initialize_payload:
+    threshold_payload = stage_b_payload
+    if threshold_payload is not None and "task_grasp_probability_threshold" in threshold_payload:
         config.model.task_grasp_probability_threshold = float(
-            initialize_payload["task_grasp_probability_threshold"]
+            threshold_payload["task_grasp_probability_threshold"]
         )
     world_size = (
         args.world_size if args.world_size is not None else int(os.environ.get("WORLD_SIZE", "1"))
@@ -281,7 +275,7 @@ def main() -> None:
             if not stageb_provenance:
                 raise RuntimeError("Stage-B resume checkpoint is missing dataset provenance")
         else:
-            stageb_provenance = build_provenance(config, args.initialize)
+            stageb_provenance = build_provenance(config)
     perception_only_stage = (
         config.losses.task_grasp == 0
         and config.losses.push_object == 0
@@ -492,12 +486,14 @@ def main() -> None:
                 "unfreeze_at_optimizer_step",
                 config.training.unfreeze_at_optimizer_step,
             )
-    if args.initialize:
-        assert initialize_payload is not None
-        if int(initialize_payload.get("schema_version", -1)) != 12:
-            raise RuntimeError("Initialization checkpoint must use schema 12")
-        load_predecessor_weights(model, initialize_payload, config.training.stage)
-    elif not args.resume:
+    if stage_a_payload is not None and stage_b_payload is not None:
+        if int(stage_a_payload.get("schema_version", -1)) != 12:
+            raise RuntimeError("Stage-A component checkpoint must use schema 12")
+        if int(stage_b_payload.get("schema_version", -1)) != 12:
+            raise RuntimeError("Stage-B component checkpoint must use schema 12")
+        load_checkpoint_modules(model, stage_a_payload, ("encoder.", "region_head."))
+        load_checkpoint_modules(model, stage_b_payload, ("task_grasp.",))
+    elif not args.resume and config.training.stage != "grasp":
         distributed = torch.distributed.is_initialized()
         checkpoint_path = None
         # Only rank zero may resolve a missing managed checkpoint. Other ranks

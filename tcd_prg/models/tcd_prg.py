@@ -25,6 +25,7 @@ from .backbones import (
 from .graspnet import FrozenGraspNetProposalGenerator
 from .push import PushHead
 from .region import TaskRegionHead
+from .stageb_condition import StageBCondition, stageb_condition_from_gt
 from .task_grasp import TaskGraspEvaluator
 
 
@@ -132,6 +133,8 @@ class TCDPRGModel(nn.Module):
         self.task_grasp = TaskGraspEvaluator(
             c.feature_dim,
             project_path(c.task_grasp_gripper_geometry),
+            num_categories=c.num_categories,
+            num_regions=c.num_task_regions,
             scene_points=c.task_grasp_scene_points,
             gripper_points=c.task_grasp_gripper_points,
         )
@@ -478,28 +481,36 @@ class TCDPRGModel(nn.Module):
             sensor["point_mask"],
         )
 
-    def _forward_task_grasps(
+    def generate_target_grasp_proposals(
         self,
-        encoded: Any,
         sensor: dict[str, Tensor],
-        region: dict[str, Tensor],
-        candidates: Mapping[str, Tensor] | None = None,
+        condition: StageBCondition,
     ) -> dict[str, Tensor]:
-        if candidates is None:
-            target_identity_valid = self._target_identity_gate(encoded)
-            target_proposals = self._forward_camera_graspnet(
-                sensor,
-                target_probability=encoded.target_instance_probability,
-                instance_probability=encoded.instance.mask_probability,
-                strict_target_crop=True,
-                proposal_count=self.graspnet_config.target_proposals,
-                input_points=self.graspnet_config.target_input_points,
-                selection_mode=self.graspnet_config.target_selection_mode,
-                target_identity_valid=target_identity_valid,
-                target_crop_mask_override=None,
-            )
-        else:
-            target_proposals = {key: value for key, value in candidates.items()}
+        condition.validate(sensor["xyz"].shape[1])
+        return self._forward_camera_graspnet(
+            sensor,
+            target_probability=condition.target_probability,
+            instance_probability=condition.target_probability[:, None],
+            strict_target_crop=True,
+            proposal_count=self.graspnet_config.target_proposals,
+            input_points=self.graspnet_config.target_input_points,
+            selection_mode=self.graspnet_config.target_selection_mode,
+            target_identity_valid=condition.target_valid,
+            target_crop_mask_override=None,
+        )
+
+    def forward_task_grasp_from_condition(
+        self,
+        sensor: dict[str, Tensor],
+        condition: StageBCondition,
+        proposals: Mapping[str, Tensor] | None = None,
+    ) -> dict[str, Tensor]:
+        condition.validate(sensor["xyz"].shape[1])
+        target_proposals = (
+            self.generate_target_grasp_proposals(sensor, condition)
+            if proposals is None
+            else {key: value for key, value in proposals.items()}
+        )
         fp32_proposals = {
             key: value.float() if value.is_floating_point() else value
             for key, value in target_proposals.items()
@@ -507,13 +518,13 @@ class TCDPRGModel(nn.Module):
         with torch.autocast(device_type=sensor["xyz"].device.type, enabled=False):
             task_grasp = self.task_grasp(
                 fp32_proposals,
-                encoded.point_features.float(),
                 sensor["xyz"].float(),
+                sensor["rgb"].float(),
                 sensor["point_mask"],
-                region["region_probability"].float(),
-                encoded.target_probability.float(),
-                encoded.task_token.float(),
-                encoded.target_token.float(),
+                condition.target_probability.float(),
+                condition.region_probability.float(),
+                condition.task_category_id,
+                condition.task_region_id,
             )
         return task_grasp
 
@@ -552,7 +563,15 @@ class TCDPRGModel(nn.Module):
         """Stage A: instance/target/region only; no GraspNet or Push execution."""
         encoded, sensor, task = self._encode_scene(batch)
         region = self._forward_region(encoded, sensor)
+        stageb_condition = StageBCondition(
+            target_probability=encoded.target_instance_probability,
+            region_probability=region["region_probability"],
+            target_valid=self._target_identity_gate(encoded),
+            task_category_id=task["task_category_id"],
+            task_region_id=task["task_region_id"],
+        ).validate(sensor["xyz"].shape[1])
         return {
+            "stageb_condition": stageb_condition,
             "encoded": encoded,
             "sensor": sensor,
             "task": task,
@@ -566,38 +585,26 @@ class TCDPRGModel(nn.Module):
     def forward_grasp(
         self, batch: Mapping[str, Any]
     ) -> dict[str, Any]:
-        """Stage B: perception + Grasp only; Push is not executed."""
-        encoded, sensor, task = self._encode_scene(batch)
-        region = self._forward_region(encoded, sensor)
-        task_grasp = self._forward_task_grasps(
-            encoded, sensor, region, batch.get("grasp_candidates")
+        """Stage B training from GT condition, without executing Stage A."""
+        sensor = self._sensor(batch)
+        condition = stageb_condition_from_gt(batch)
+        task_grasp = self.forward_task_grasp_from_condition(
+            sensor, condition, batch.get("grasp_candidates")
         )
         return {
-            "encoded": encoded,
+            "stageb_condition": condition,
+            "encoded": None,
             "sensor": sensor,
-            "task": task,
-            "instance": encoded.instance,
-            "region": region,
+            "task": {
+                "task_category_id": condition.task_category_id,
+                "task_region_id": condition.task_region_id,
+            },
+            "instance": None,
+            "region": None,
             "task_grasp": task_grasp,
             "global_grasp": None,
             "push": None,
         }
-
-    @torch.no_grad()
-    def generate_task_proposals(self, batch: Mapping[str, Any]) -> dict[str, Tensor]:
-        """Frozen Stage-A crop followed by the deployment GraspNet proposal path."""
-        encoded, sensor, _ = self._encode_scene(batch)
-        return self._forward_camera_graspnet(
-            sensor,
-            target_probability=encoded.target_instance_probability,
-            instance_probability=encoded.instance.mask_probability,
-            strict_target_crop=True,
-            proposal_count=self.graspnet_config.target_proposals,
-            input_points=self.graspnet_config.target_input_points,
-            selection_mode=self.graspnet_config.target_selection_mode,
-            target_identity_valid=self._target_identity_gate(encoded),
-            target_crop_mask_override=None,
-        )
 
     def forward_push(
         self, batch: Mapping[str, Any]
@@ -640,12 +647,20 @@ class TCDPRGModel(nn.Module):
 
         encoded, sensor, task = self._encode_scene(batch)
         region = self._forward_region(encoded, sensor)
-        task_grasp = self._forward_task_grasps(encoded, sensor, region)
+        condition = StageBCondition(
+            encoded.target_instance_probability,
+            region["region_probability"],
+            self._target_identity_gate(encoded),
+            task["task_category_id"],
+            task["task_region_id"],
+        )
+        task_grasp = self.forward_task_grasp_from_condition(sensor, condition)
         global_grasp = self._forward_global_grasp(encoded, sensor)
         push = self._forward_push(
             encoded, sensor, region, batch.get("training_hints")
         )
         return {
+            "stageb_condition": condition,
             "encoded": encoded,
             "sensor": sensor,
             "task": task,

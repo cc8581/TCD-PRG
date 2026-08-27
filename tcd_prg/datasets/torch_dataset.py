@@ -142,7 +142,6 @@ class StageBBinaryDataset(Dataset[StageBBinarySample]):
             "context_region_target",
             "context_region_valid",
             "context_grid_coord",
-            "target_prompt_xyz",
         )
         if any(key not in payload for key in context_keys):
             raise ValueError(f"Stage-B record is missing fixed evaluator context: {path}")

@@ -1,4 +1,4 @@
-# Stage B: frozen perception, binary TaskGraspEvaluator training only.
+# Stage B: checkpoint-independent binary TaskGraspEvaluator training.
 defaults:
   - ../config.yaml
   - _self_

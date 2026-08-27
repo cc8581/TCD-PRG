@@ -48,15 +48,6 @@ def collate_stageb_binary(
     batch["region_target"] = batch["region_target"].bool()
     batch["region_valid"] = batch["region_valid"].bool()
     batch["grid_coord"] = batch["grid_coord"].int()
-    batch["target_prompt_xyz"] = torch.from_numpy(
-        np.stack([item.context["target_prompt_xyz"] for item in samples])
-    ).float()
-    batch["target_prompt_label"] = torch.ones(
-        batch["target_prompt_xyz"].shape[:2], dtype=torch.long
-    )
-    batch["target_prompt_valid"] = torch.ones(
-        batch["target_prompt_xyz"].shape[:2], dtype=torch.bool
-    )
     translation, valid = _pad([item.translation_world for item in samples], np.nan)
     rotation, _ = _pad([item.rotation_matrix for item in samples], np.nan)
     width, _ = _pad([item.width_m for item in samples], np.nan)

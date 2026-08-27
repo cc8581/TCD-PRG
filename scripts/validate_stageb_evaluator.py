@@ -15,6 +15,7 @@ from tcd_prg.models.task_grasp import TaskGraspEvaluator
 
 
 def inputs(batch: int, candidates: int, points: int, dim: int, device: torch.device):
+    del dim
     xyz = torch.randn(batch, points, 3, device=device) * 0.025
     translation = torch.randn(batch, candidates, 3, device=device) * 0.02
     rotation = (
@@ -28,13 +29,13 @@ def inputs(batch: int, candidates: int, points: int, dim: int, device: torch.dev
     }
     return (
         proposal,
-        torch.randn(batch, points, dim, device=device),
         xyz,
+        torch.rand(batch, points, 3, device=device),
         torch.ones(batch, points, dtype=torch.bool, device=device),
         torch.rand(batch, points, device=device),
         torch.rand(batch, points, device=device),
-        torch.randn(batch, dim, device=device),
-        torch.randn(batch, dim, device=device),
+        torch.zeros(batch, dtype=torch.long, device=device),
+        torch.zeros(batch, dtype=torch.long, device=device),
     )
 
 
@@ -156,10 +157,15 @@ def main() -> None:
             "task_inputs": {
                 "task_category_id": torch.zeros(8, dtype=torch.long, device=device),
                 "task_region_id": torch.zeros(8, dtype=torch.long, device=device),
-                "target_prompt_xyz": scene_xyz[:, :1],
-                "target_prompt_label": torch.ones((8, 1), dtype=torch.long, device=device),
-                "target_prompt_valid": torch.ones((8, 1), dtype=torch.bool, device=device),
             },
+            "target_mask": torch.ones((8, 16384), dtype=torch.bool, device=device),
+            "region_target": torch.ones((8, 16384), dtype=torch.bool, device=device),
+            "region_valid": torch.ones((8, 16384), dtype=torch.bool, device=device),
+            "point_mask": torch.ones((8, 16384), dtype=torch.bool, device=device),
+            "xyz": scene_xyz,
+            "rgb": torch.rand_like(scene_xyz),
+            "task_category_id": torch.zeros(8, dtype=torch.long, device=device),
+            "task_region_id": torch.zeros(8, dtype=torch.long, device=device),
             "grasp_candidates": proposals,
         }
         if device.type == "cuda":

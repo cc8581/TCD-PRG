@@ -10,8 +10,9 @@ from pathlib import Path
 
 from tcd_prg.config import TCDPRGConfig
 
-SCHEMA_VERSION = "tcd_prg_stageb_binary_v2"
+SCHEMA_VERSION = "tcd_prg_stageb_binary_v3"
 GEOMETRY_PROTOCOL_VERSION = "ag16095_geometric_close_v2"
+CAMERA_TRANSFER_PROTOCOL_VERSION = "fused_nearest_camera2_v1"
 
 
 def sha256_file(path: str | Path) -> str:
@@ -24,22 +25,18 @@ def sha256_file(path: str | Path) -> str:
 
 def config_fingerprint(config: TCDPRGConfig) -> str:
     relevant = {
-        "scene_points": config.dataset.scene_points,
-        "backbone": asdict(config.backbone),
+        "dataset": asdict(config.dataset),
+        "observation_renderer_version": config.observation.renderer_version,
         "graspnet": asdict(config.graspnet),
         "model": {
-            "feature_dim": config.model.feature_dim,
-            "task_dim": config.model.task_dim,
-            "target_prompt_jitter_std_m": config.model.target_prompt_jitter_std_m,
+            "stageb_label_gripper_geometry": config.model.stageb_label_gripper_geometry,
         },
     }
     payload = json.dumps(relevant, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
 
 
-def build_provenance(
-    config: TCDPRGConfig, stage_a_checkpoint: str | Path | None = None
-) -> dict[str, str]:
+def build_provenance(config: TCDPRGConfig) -> dict[str, str]:
     try:
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
@@ -48,11 +45,10 @@ def build_provenance(
         commit = "unavailable"
     result = {
         "graspnet_checkpoint_sha256": sha256_file(config.graspnet.checkpoint),
+        "camera_transfer_protocol_version": CAMERA_TRANSFER_PROTOCOL_VERSION,
         "geometry_protocol_version": GEOMETRY_PROTOCOL_VERSION,
         "gripper_geometry_sha256": sha256_file(config.model.stageb_label_gripper_geometry),
         "config_fingerprint": config_fingerprint(config),
         "git_commit": commit,
     }
-    if stage_a_checkpoint is not None:
-        result["stage_a_checkpoint_sha256"] = sha256_file(stage_a_checkpoint)
     return result
