@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from scripts.validate_stageb_evaluator import training_candidate_statistics
 from tcd_prg.config import AblationConfig, LossConfig, ModelConfig, load_config
 from tcd_prg.datasets.capabilities import DatasetCapabilities
 from tcd_prg.datasets.stageb_manifest import SCHEMA_VERSION, build_provenance
@@ -63,6 +64,29 @@ def test_formal_stageb_config_uses_full_data_and_validation() -> None:
     assert config.training.validation_interval == 1000
 
 
+def test_stageb_profile_uses_manifest_training_candidate_distribution(tmp_path) -> None:
+    counts = [1, 2, 3, 4, 100]
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "records": [
+                    {"split": "train", "candidate_count": count}
+                    for count in counts
+                ]
+                + [{"split": "val", "candidate_count": 999}]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert training_candidate_statistics(tmp_path) == {
+        "p50": 3,
+        "p90": 100,
+        "p95": 100,
+        "p99": 100,
+        "max": 100,
+    }
+
+
 def test_split_metrics_select_threshold_from_complete_split() -> None:
     metrics = stageb_split_metrics(np.asarray([0.1, 0.4, 0.6, 0.9]), np.asarray([0, 1, 0, 1], bool))
     assert metrics["task_grasp_validation_f1"] == pytest.approx(0.8)
@@ -78,6 +102,18 @@ def test_split_metrics_calibrates_threshold_on_deployment_selected_candidates() 
     )
     assert metrics["task_grasp_validation_threshold"] == pytest.approx(0.3)
     assert metrics["task_grasp_raw_f1"] == pytest.approx(1.0)
+
+
+def test_split_metrics_fail_closed_when_deployment_subset_has_no_positive() -> None:
+    metrics = stageb_split_metrics(
+        np.asarray([0.9, 0.8, 0.7, 0.1]),
+        np.asarray([1, 0, 0, 1], bool),
+        np.asarray([0.9, 0.7, 0.2]),
+        np.asarray([0, 0, 0], bool),
+    )
+    assert metrics["task_grasp_deployment_has_positive"] == 0.0
+    assert metrics["task_grasp_validation_f1"] == 0.0
+    assert metrics["task_grasp_validation_threshold"] > 0.9
 
 
 def test_world_grasp_roundtrip() -> None:

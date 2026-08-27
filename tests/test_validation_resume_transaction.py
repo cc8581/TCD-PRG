@@ -170,6 +170,28 @@ def test_best_stageb_threshold_is_saved_in_checkpoint(tmp_path):
     assert threshold["threshold"] == 0.4
 
 
+def test_all_negative_deployment_subset_does_not_replace_threshold(tmp_path):
+    trainer, batch = _make_trainer(tmp_path, max_steps=1, interval=1)
+    initial_threshold = trainer.task_grasp_probability_threshold
+
+    def validate(_module):
+        return {
+            "score_sum": 1.0,
+            "score_count": 1,
+            "metric_sums": {},
+            "metric_counts": {},
+            "stageb_scores": np.asarray([0.9, 0.8, 0.2, 0.1]),
+            "stageb_targets": np.asarray([1, 0, 0, 1], bool),
+            "stageb_deployment_scores": np.asarray([0.8, 0.2]),
+            "stageb_deployment_targets": np.asarray([0, 0], bool),
+        }
+
+    trainer.train([batch], validate=validate)
+    payload = torch.load(tmp_path / "best.pt", map_location="cpu", weights_only=False)
+    assert payload["task_grasp_probability_threshold"] == initial_threshold
+    assert not (tmp_path / "stageb_decision_threshold.json").exists()
+
+
 def test_stageb_resume_rejects_different_dataset_provenance(tmp_path):
     source, _ = _make_trainer(
         tmp_path,

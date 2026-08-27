@@ -24,18 +24,25 @@ def stageb_split_metrics(
     calibration_target = target if deployment_target is None else np.asarray(deployment_target, bool)
     if not len(calibration_score) or calibration_score.shape != calibration_target.shape:
         raise ValueError("Stage-B deployment calibration scores and targets must align")
-    thresholds = np.unique(calibration_score)
-    best = (-1.0, 0.5, 0.0, 0.0)
-    for threshold in thresholds:
-        predicted = calibration_score >= threshold
-        tp = int((predicted & calibration_target).sum())
-        fp = int((predicted & ~calibration_target).sum())
-        fn = int((~predicted & calibration_target).sum())
-        precision = tp / (tp + fp) if tp + fp else 0.0
-        recall = tp / (tp + fn) if tp + fn else 0.0
-        f1 = 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.0
-        if f1 > best[0]:
-            best = (f1, float(threshold), precision, recall)
+    has_deployable_positive = bool(calibration_target.any())
+    if has_deployable_positive:
+        thresholds = np.unique(calibration_score)
+        best = (-1.0, 0.5, 0.0, 0.0)
+        for threshold in thresholds:
+            predicted = calibration_score >= threshold
+            tp = int((predicted & calibration_target).sum())
+            fp = int((predicted & ~calibration_target).sum())
+            fn = int((~predicted & calibration_target).sum())
+            precision = tp / (tp + fp) if tp + fp else 0.0
+            recall = tp / (tp + fn) if tp + fn else 0.0
+            f1 = 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.0
+            if f1 > best[0]:
+                best = (f1, float(threshold), precision, recall)
+    else:
+        # No selected candidate is a positive calibration example. Reject all
+        # for this report, and let Trainer retain the last calibrated threshold.
+        reject_all = float(np.nextafter(calibration_score.max(), np.inf))
+        best = (0.0, reject_all, 0.0, 0.0)
     result = {
         "task_grasp_validation_f1": best[0],
         "task_grasp_validation_threshold": best[1],
@@ -48,6 +55,7 @@ def stageb_split_metrics(
         result.update({
             "task_grasp_raw_f1": _best_f1(score, target)[0],
             "task_grasp_deployment_selected_candidates": float(len(calibration_score)),
+            "task_grasp_deployment_has_positive": float(has_deployable_positive),
         })
     return result
 

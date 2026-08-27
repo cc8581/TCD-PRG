@@ -17,9 +17,9 @@ import torch
 from torch import Tensor, nn
 
 from tcd_prg.config import TCDPRGConfig
+from tcd_prg.datasets.stageb_manifest import compatibility_provenance
 from tcd_prg.evaluators.offline import OfflineModelEvaluator
 from tcd_prg.losses.task_grasp_binary import stageb_split_metrics
-from tcd_prg.datasets.stageb_manifest import compatibility_provenance
 
 from .ema import ModelEMA
 from .reproducibility import seed_everything
@@ -526,7 +526,14 @@ class Trainer:
         self.state.last_completed_validation_step = step
         self.state.pending_validation_step = 0
 
-        if improved and "task_grasp_validation_threshold" in validation_details:
+        threshold_is_calibrated = bool(
+            validation_details.get("task_grasp_deployment_has_positive", 1.0)
+        )
+        if (
+            improved
+            and threshold_is_calibrated
+            and "task_grasp_validation_threshold" in validation_details
+        ):
             self.task_grasp_probability_threshold = float(
                 validation_details["task_grasp_validation_threshold"]
             )
@@ -537,7 +544,11 @@ class Trainer:
             self.save_checkpoint(self.output_dir / "best.pt")
 
         if self.is_primary:
-            if improved and "task_grasp_validation_threshold" in validation_details:
+            if (
+                improved
+                and threshold_is_calibrated
+                and "task_grasp_validation_threshold" in validation_details
+            ):
                 threshold_path = self.output_dir / "stageb_decision_threshold.json"
                 temporary = threshold_path.with_suffix(".json.tmp")
                 temporary.write_text(
