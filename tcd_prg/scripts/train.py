@@ -155,24 +155,6 @@ def validate_checkpoint_gate(
     return
 
 
-def load_checkpoint_modules(
-    model: torch.nn.Module, payload: dict, prefixes: tuple[str, ...]
-) -> None:
-    """Load an explicit trained component set from one stage checkpoint."""
-    source = payload.get("ema") or payload["model"]
-    current = model.state_dict()
-    required = {name for name in current if name.startswith(prefixes)}
-    incompatible = {
-        name for name in required if name not in source or source[name].shape != current[name].shape
-    }
-    if incompatible:
-        raise RuntimeError(
-            "Component checkpoint is incompatible with required modules: "
-            + ", ".join(sorted(incompatible)[:8])
-        )
-    model.load_state_dict({name: source[name] for name in required}, strict=False)
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
@@ -195,6 +177,8 @@ def main() -> None:
     if args.validate_only and not args.resume:
         raise ValueError("--validate-only requires --resume")
     config = load_config(args.config, args.overrides)
+    if config.training.stage == "joint":
+        raise RuntimeError("Legacy joint training is incompatible with standalone Stage-B/Stage-C condition protocols; train perception, grasp and push independently.")
     if config.observation.provider != "cached":
         raise ValueError(
             "Formal training requires observation.provider=cached for bounded read-through caching"

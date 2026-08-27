@@ -258,8 +258,8 @@ class TCDPRGObjective(nn.Module):
         has_push = bool(enabled & push_families)
         has_grasp = "task_grasp" in enabled
         if has_push and has_grasp:
-            forward_mode = "full"
-        elif has_push:
+            raise RuntimeError("Joint Stage-B/Stage-C training is incompatible with independent condition protocols; train grasp and push separately.")
+        if has_push:
             forward_mode = "push"
         elif has_grasp:
             forward_mode = "grasp"

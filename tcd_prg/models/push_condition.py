@@ -28,6 +28,11 @@ class PushCondition:
             raise ValueError("PushCondition batch tensors have incompatible shapes")
         if not torch.isfinite(self.object_probability).all() or not torch.isfinite(self.target_probability).all() or not torch.isfinite(self.region_probability).all():
             raise ValueError("PushCondition probabilities must be finite")
+        for name, value in (("object_probability", self.object_probability), ("target_probability", self.target_probability), ("region_probability", self.region_probability)):
+            if bool(((value < -1e-5) | (value > 1.0 + 1e-5)).any()):
+                raise ValueError(f"PushCondition {name} must lie in [0, 1]")
+        if bool(self.object_probability.masked_select(~self.object_valid[:, :, None]).abs().gt(1e-5).any()):
+            raise ValueError("PushCondition invalid object slots must have zero probability")
         if bool((self.region_probability > self.target_probability + 1e-5).any()):
             raise ValueError("PushCondition region_probability must be target constrained")
         return self
@@ -41,7 +46,9 @@ def push_condition_from_gt(batch: Mapping[str, Tensor], query_count: int) -> Pus
     probability = torch.zeros((b, query_count, n), dtype=batch["xyz"].dtype, device=point_mask.device)
     valid = torch.zeros((b, query_count), dtype=torch.bool, device=point_mask.device)
     object_mask = batch["object_mask"].bool()
-    for slot in range(min(query_count, object_mask.shape[1])):
+    if object_mask.shape[1] > query_count:
+        raise ValueError(f"GT object count {object_mask.shape[1]} exceeds PushCondition slot count {query_count}")
+    for slot in range(object_mask.shape[1]):
         membership = point_mask & (instance_id == slot)
         probability[:, slot] = membership.to(probability.dtype)
         valid[:, slot] = object_mask[:, slot] & membership.any(-1)

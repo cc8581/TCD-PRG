@@ -362,6 +362,16 @@ def _nearest_selected_push_points(
     return index, valid
 
 
+def _pad_gt_object_axis(value: Tensor, query_count: int, fill_value: bool = False) -> Tensor:
+    """Align collated GT-object metadata [B,O] to the fixed Stage-C Q axis."""
+    batch_size, object_count = value.shape
+    if object_count > query_count:
+        raise ValueError(f"GT object count {object_count} exceeds PushCondition slot count {query_count}")
+    result = torch.full((batch_size, query_count), fill_value, dtype=value.dtype, device=value.device)
+    result[:, :object_count] = value
+    return result
+
+
 def build_push_supervision(
     output: dict[str, Tensor],
     batch: dict[str, Tensor],
@@ -496,9 +506,10 @@ def build_push_supervision(
                     ) * neighborhood,
                 )
 
+    query_count = condition.object_valid.shape[1]
     if "push_object_known" in batch and "push_object_positive" in batch:
-        object_evaluated = batch["push_object_known"].bool().clone()
-        object_positive = batch["push_object_positive"].bool().clone()
+        object_evaluated = _pad_gt_object_axis(batch["push_object_known"].bool(), query_count)
+        object_positive = _pad_gt_object_axis(batch["push_object_positive"].bool(), query_count)
     else:
         object_positive = torch.zeros_like(output["object_logits"], dtype=torch.bool)
         object_evaluated = torch.zeros_like(output["object_logits"], dtype=torch.bool)
@@ -614,7 +625,7 @@ def build_push_supervision(
     ).any(-1)
 
     # Condition slots are deterministically GT slots during standalone Stage C.
-    gt_active = condition.object_valid & batch["object_active"].bool()
+    gt_active = condition.object_valid & _pad_gt_object_axis(batch["object_active"].bool(), query_count)
     return gathered, {
         "object_positive": object_positive,
         "object_valid_mask": (

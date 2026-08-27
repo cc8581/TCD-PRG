@@ -22,6 +22,17 @@ class DenseCandidateGenerator:
         self.use_push_potential = bool(use_push_potential)
 
     @staticmethod
+    def _empty_row(device: torch.device) -> dict[str, Tensor]:
+        return {
+            "type": torch.empty(0, dtype=torch.long, device=device), "object": torch.empty(0, dtype=torch.long, device=device),
+            "contact_world": torch.empty(0, 3, device=device), "direction_world": torch.empty(0, 3, device=device),
+            "pose_world": torch.empty(0, 7, device=device), "destination_world": torch.empty(0, 3, device=device),
+            "width_m": torch.empty(0, device=device), "proposal_score": torch.empty(0, device=device),
+            "point_index": torch.empty(0, dtype=torch.long, device=device), "direction_bin": torch.empty(0, dtype=torch.long, device=device),
+            "direction_score": torch.empty(0, device=device),
+        }
+
+    @staticmethod
     def _top_per_object(
         score: Tensor,
         object_probability: Tensor,   # [Q,N]
@@ -274,23 +285,18 @@ class DenseCandidateGenerator:
         output: dict[str, Any],
     ) -> dict[str, Tensor]:
         rows: list[dict[str, Tensor]] = []
-        encoded = output.get("encoded")
         sensor = output.get("sensor", batch.get("model_inputs", batch))
 
         for batch_row in range(sensor["xyz"].shape[0]):
             xyz = sensor["xyz"][batch_row]
             point_mask = sensor["point_mask"][batch_row]
-            push_condition = output.get("push_condition")
-            if push_condition is None:  # legacy offline fixtures / older full outputs
-                if encoded is None:
-                    raise KeyError("Candidate generation requires push_condition")
-                instance_probability = encoded.instance.mask_probability[batch_row]
-                active = encoded.object_mask[batch_row]
-                target_object = int(encoded.target_query_weights[batch_row].argmax())
-            else:
-                instance_probability = push_condition.object_probability[batch_row]
-                active = push_condition.object_valid[batch_row]
-                target_object = int((instance_probability * push_condition.target_probability[batch_row][None]).sum(-1).argmax())
+            push_condition = output["push_condition"]
+            instance_probability = push_condition.object_probability[batch_row]
+            active = push_condition.object_valid[batch_row]
+            target_object = int((instance_probability * push_condition.target_probability[batch_row][None]).sum(-1).argmax())
+            if not bool(push_condition.target_valid[batch_row]):
+                rows.append(self._empty_row(xyz.device))
+                continue
             type_parts: list[Tensor] = []
             object_parts: list[Tensor] = []
             contact_parts: list[Tensor] = []
@@ -441,7 +447,7 @@ class DenseCandidateGenerator:
             # PUSH candidates are shortlisted by the learned Object head;
             # no dependency graph gates or reweights them.
             push = output["push"]
-            direction_domain = push.get("direction_point_mask", point_mask[None].expand_as(push["contact_logits"]))[batch_row]
+            direction_domain = push["direction_point_mask"][batch_row]
             push_object_probability = torch.sigmoid(push["object_logits"][batch_row])
             push_objects = torch.nonzero(active, as_tuple=False).flatten()
             if len(push_objects):

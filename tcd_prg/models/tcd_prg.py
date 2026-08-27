@@ -558,7 +558,7 @@ class TCDPRGModel(nn.Module):
             task_region_id=task["task_region_id"],
         ).validate(sensor["xyz"].shape[1])
         push_condition = PushCondition(
-            encoded.instance.mask_probability, encoded.object_mask,
+            encoded.instance.mask_probability * encoded.object_mask[:, :, None], encoded.object_mask,
             encoded.target_instance_probability, region["region_probability"],
             self._target_identity_gate(encoded), task["task_category_id"], task["task_region_id"],
         ).validate(sensor["xyz"].shape[1])
@@ -649,7 +649,7 @@ class TCDPRGModel(nn.Module):
         )
         task_grasp = self.forward_task_grasp_from_condition(sensor, condition)
         global_grasp = self._forward_global_grasp(encoded, sensor)
-        push_condition = PushCondition(encoded.instance.mask_probability, encoded.object_mask, encoded.target_instance_probability, region["region_probability"], self._target_identity_gate(encoded), task["task_category_id"], task["task_region_id"])
+        push_condition = PushCondition(encoded.instance.mask_probability * encoded.object_mask[:, :, None], encoded.object_mask, encoded.target_instance_probability, region["region_probability"], self._target_identity_gate(encoded), task["task_category_id"], task["task_region_id"])
         push = self.forward_push_from_condition(sensor, push_condition, batch.get("training_hints"))
         return {
             "stageb_condition": condition,
