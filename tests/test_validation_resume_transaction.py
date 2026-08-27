@@ -3,15 +3,24 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 import torch
 
-from tcd_prg.config import LoggingConfig, TCDPRGConfig, TrainingConfig
+from tcd_prg.config import LoggingConfig, LossConfig, TCDPRGConfig, TrainingConfig
 from tcd_prg.trainers import Trainer
 
 
-def _make_trainer(tmp_path, *, max_steps: int, interval: int):
+def _make_trainer(
+    tmp_path,
+    *,
+    max_steps: int,
+    interval: int,
+    stage: str = "joint",
+    provenance: dict[str, str] | None = None,
+):
     config = TCDPRGConfig(
         training=TrainingConfig(
+            stage=stage,
             device="cpu",
             amp=False,
             max_optimizer_steps=max_steps,
@@ -19,6 +28,19 @@ def _make_trainer(tmp_path, *, max_steps: int, interval: int):
             validation_interval=interval,
         ),
         logging=LoggingConfig(backend="none", log_interval=100),
+        losses=(
+            LossConfig(
+                instance=0.0,
+                region=0.0,
+                task_grasp=1.0,
+                push_object=0.0,
+                push_contact=0.0,
+                push_direction=0.0,
+                push_potential=0.0,
+            )
+            if stage == "grasp"
+            else LossConfig()
+        ),
         output_dir=str(tmp_path),
     )
     model = torch.nn.Linear(1, 1)
@@ -29,7 +51,7 @@ def _make_trainer(tmp_path, *, max_steps: int, interval: int):
         loss = module(current["x"]).square().mean()
         return loss, {"loss_total": loss}
 
-    return Trainer(model, optimizer, config, loss_step), batch
+    return Trainer(model, optimizer, config, loss_step, stageb_provenance=provenance), batch
 
 
 def test_resume_boundary_retries_unfinished_validation_before_training(tmp_path):
@@ -146,3 +168,23 @@ def test_best_stageb_threshold_is_saved_in_checkpoint(tmp_path):
     assert payload["task_grasp_probability_threshold"] == 0.4
     threshold = json.loads((tmp_path / "stageb_decision_threshold.json").read_text())
     assert threshold["threshold"] == 0.4
+
+
+def test_stageb_resume_rejects_different_dataset_provenance(tmp_path):
+    source, _ = _make_trainer(
+        tmp_path,
+        max_steps=1,
+        interval=1,
+        stage="grasp",
+        provenance={"stage_a_checkpoint_sha256": "first"},
+    )
+    source.save_checkpoint(tmp_path / "last.pt")
+    resumed, _ = _make_trainer(
+        tmp_path,
+        max_steps=1,
+        interval=1,
+        stage="grasp",
+        provenance={"stage_a_checkpoint_sha256": "second"},
+    )
+    with pytest.raises(RuntimeError, match="provenance"):
+        resumed.load_checkpoint(tmp_path / "last.pt")

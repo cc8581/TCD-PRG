@@ -45,6 +45,43 @@ def masked_farthest_point_sample(xyz: Tensor, mask: Tensor, count: int) -> tuple
     return indices, selected_mask
 
 
+def deterministic_voxel_representatives(
+    xyz: Tensor,
+    mask: Tensor,
+    lower: tuple[float, float, float],
+    upper: tuple[float, float, float],
+    voxel_size_m: float,
+) -> tuple[Tensor, Tensor]:
+    """Choose the observed point nearest each fixed voxel center, independent of order."""
+    lower_tensor = xyz.new_tensor(lower)
+    upper_tensor = xyz.new_tensor(upper)
+    grid_shape = torch.ceil((upper_tensor - lower_tensor) / voxel_size_m).long()
+    voxel_count = int(grid_shape.prod())
+    coordinate = torch.floor((xyz - lower_tensor) / voxel_size_m).long()
+    coordinate = torch.minimum(
+        torch.maximum(coordinate, torch.zeros_like(coordinate)), grid_shape - 1
+    )
+    voxel = coordinate[..., 0] + grid_shape[0] * (
+        coordinate[..., 1] + grid_shape[1] * coordinate[..., 2]
+    )
+    center = lower_tensor + (coordinate.to(xyz.dtype) + 0.5) * voxel_size_m
+    center_distance = ((xyz - center) ** 2).sum(-1).masked_fill(~mask, torch.inf)
+    minimum = torch.full(
+        (xyz.shape[0], voxel_count),
+        torch.inf,
+        dtype=center_distance.dtype,
+        device=xyz.device,
+    )
+    minimum.scatter_reduce_(1, voxel, center_distance, reduce="amin", include_self=True)
+    winning = mask & (center_distance <= minimum.gather(1, voxel))
+    total = xyz.new_zeros((xyz.shape[0], voxel_count, 3))
+    total.scatter_add_(1, voxel[..., None].expand(-1, -1, 3), xyz * winning[..., None])
+    count = xyz.new_zeros((xyz.shape[0], voxel_count))
+    count.scatter_add_(1, voxel, winning.to(xyz.dtype))
+    representative = total / count.clamp_min(1)[..., None]
+    return representative, count > 0
+
+
 class PointNetSetAbstraction(nn.Module):
     """Small deterministic PointNet++ set-abstraction layer implemented in PyTorch."""
 
@@ -84,7 +121,7 @@ class TaskGraspEvaluator(nn.Module):
         gripper_geometry_path: str | Path,
         scene_points: int = 256,
         gripper_points: int = 128,
-        preselection_points: int = 1024,
+        voxel_size_m: float = 0.017,
     ) -> None:
         super().__init__()
         payload = np.load(Path(gripper_geometry_path))
@@ -97,7 +134,7 @@ class TaskGraspEvaluator(nn.Module):
         self.register_buffer("gripper_points_tcp", points, persistent=True)
         self.register_buffer("gripper_part_id", part, persistent=True)
         self.scene_points = int(scene_points)
-        self.preselection_points = max(self.scene_points, int(preselection_points))
+        self.voxel_size_m = float(voxel_size_m)
         self.sa1 = PointNetSetAbstraction(4, 96, centers=64, radius_m=0.045)
         self.sa2 = PointNetSetAbstraction(96, 128, centers=16, radius_m=0.090)
         self.pose = nn.Sequential(nn.Linear(10, dim), nn.LayerNorm(dim), nn.GELU())
@@ -120,23 +157,25 @@ class TaskGraspEvaluator(nn.Module):
         self, xyz: Tensor, point_mask: Tensor, translation: Tensor, rotation: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
         local = world_to_grasp(xyz, translation, rotation)
-        # Covers the real open AG CAD from TCP z=-0.19 to the fingertip plus a
-        # small forward margin. x is closing, y is height, z is approach.
+        # Contains the complete label-side approach corridor plus 5 mm margin.
+        # x is closing, y is height, z is approach.
         inside = (
             (local[..., 0].abs() <= 0.090)
             & (local[..., 1].abs() <= 0.045)
-            & (local[..., 2] >= -0.205)
+            & (local[..., 2] >= -0.230)
             & (local[..., 2] <= 0.025)
             & point_mask[:, None]
         )
         b, k, n, _ = local.shape
         flat_local = torch.nan_to_num(local.reshape(b * k, n, 3))
         flat_inside = inside.reshape(b * k, n)
-        preselection_count = min(self.preselection_points, n)
-        distance = flat_local.square().sum(-1).masked_fill(~flat_inside, torch.inf)
-        preselection = distance.topk(preselection_count, largest=False, sorted=False).indices
-        preselected_local = flat_local.gather(1, preselection[..., None].expand(-1, -1, 3))
-        preselected_mask = flat_inside.gather(1, preselection)
+        preselected_local, preselected_mask = deterministic_voxel_representatives(
+            flat_local,
+            flat_inside,
+            (-0.090, -0.045, -0.230),
+            (0.090, 0.045, 0.025),
+            self.voxel_size_m,
+        )
         local_index, selected_mask = masked_farthest_point_sample(
             preselected_local, preselected_mask, self.scene_points
         )

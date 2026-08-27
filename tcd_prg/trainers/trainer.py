@@ -111,6 +111,7 @@ class Trainer:
         loss_step: Callable[[nn.Module, Mapping[str, Any]], tuple[Tensor, Mapping[str, Tensor]]],
         scheduler: Any | None = None,
         output_dir: str | Path | None = None,
+        stageb_provenance: Mapping[str, str] | None = None,
     ) -> None:
         config.validate()
         self.config = config
@@ -124,6 +125,7 @@ class Trainer:
         self.loss_step = loss_step
         self.state = TrainerState()
         self.task_grasp_probability_threshold = float(config.model.task_grasp_probability_threshold)
+        self.stageb_provenance = dict(stageb_provenance) if stageb_provenance else None
         self.output_dir = Path(output_dir or config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         # JSONL 是逐步完整记录，终端输出只是低频核心摘要，两者职责不同。
@@ -1077,6 +1079,7 @@ class Trainer:
             "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "rng_by_rank": rng_by_rank,
             "task_grasp_probability_threshold": self.task_grasp_probability_threshold,
+            "stageb_provenance": self.stageb_provenance,
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
         torch.save(payload, temporary)
@@ -1101,6 +1104,11 @@ class Trainer:
                 "Resume checkpoint stage mismatch: "
                 f"checkpoint={checkpoint_stage!r}, requested={self.config.training.stage!r}"
             )
+        if (
+            checkpoint_stage == "grasp"
+            and payload.get("stageb_provenance") != self.stageb_provenance
+        ):
+            raise RuntimeError("Stage-B resume checkpoint provenance does not match the dataset")
         source = self.model.module if hasattr(self.model, "module") else self.model
         source.load_state_dict(payload["model"])
         self.task_grasp_probability_threshold = float(

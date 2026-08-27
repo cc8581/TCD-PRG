@@ -274,7 +274,14 @@ def main() -> None:
         torch.distributed.barrier()
     observation_cache = validate_read_through_observation_cache(adapter)
     stageb = config.training.stage == "grasp"
-    stageb_provenance = build_provenance(config, args.initialize) if stageb else None
+    stageb_provenance = None
+    if stageb:
+        if resume_payload is not None:
+            stageb_provenance = resume_payload.get("stageb_provenance")
+            if not stageb_provenance:
+                raise RuntimeError("Stage-B resume checkpoint is missing dataset provenance")
+        else:
+            stageb_provenance = build_provenance(config, args.initialize)
     perception_only_stage = (
         config.losses.task_grasp == 0
         and config.losses.push_object == 0
@@ -638,7 +645,13 @@ def main() -> None:
                 indent=2,
             )
     trainer = Trainer(
-        model, optimizer, config, objective, scheduler=scheduler, output_dir=config.output_dir
+        model,
+        optimizer,
+        config,
+        objective,
+        scheduler=scheduler,
+        output_dir=config.output_dir,
+        stageb_provenance=stageb_provenance,
     )
     if args.resume:
         trainer.load_checkpoint(args.resume)

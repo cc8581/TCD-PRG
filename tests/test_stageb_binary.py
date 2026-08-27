@@ -205,7 +205,7 @@ def test_evaluator_is_invariant_to_scene_point_permutation() -> None:
     assert torch.allclose(first, second, atol=1e-5)
 
 
-def test_local_cloud_keeps_sparse_points_padded() -> None:
+def test_local_cloud_keeps_sparse_voxels_padded() -> None:
     evaluator = TaskGraspEvaluator(16, ASSET).eval()
     xyz = torch.tensor([[[0.0, 0.0, 0.0], [0.01, 0.0, 0.0], [1.0, 1.0, 1.0]]])
     translation = torch.zeros(1, 1, 3)
@@ -213,7 +213,26 @@ def test_local_cloud_keeps_sparse_points_padded() -> None:
     _, _, mask = evaluator._local_cloud(
         xyz, torch.ones(1, 3, dtype=torch.bool), translation, rotation
     )
-    assert int(mask[0, 0, : evaluator.scene_points].sum()) == 2
+    assert int(mask[0, 0, : evaluator.scene_points].sum()) == 1
+
+
+def test_voxel_preselection_preserves_far_approach_obstacle() -> None:
+    evaluator = TaskGraspEvaluator(16, ASSET).eval()
+    generator = torch.Generator().manual_seed(11)
+    near = torch.rand((1, 1500, 3), generator=generator)
+    near[..., 0] = (near[..., 0] - 0.5) * 0.08
+    near[..., 1] = (near[..., 1] - 0.5) * 0.04
+    near[..., 2] = -0.02 - near[..., 2] * 0.03
+    obstacle = torch.tensor([[[0.07, 0.03, -0.220]]])
+    xyz = torch.cat((near, obstacle), 1)
+    cloud, _, mask = evaluator._local_cloud(
+        xyz,
+        torch.ones((1, len(xyz[0])), dtype=torch.bool),
+        torch.zeros((1, 1, 3)),
+        torch.eye(3).reshape(1, 1, 3, 3),
+    )
+    selected = cloud[0, 0, : evaluator.scene_points][mask[0, 0, : evaluator.scene_points]]
+    assert bool((selected[:, 2] < -0.205).any())
 
 
 def test_stageb_backward_updates_only_evaluator(fake_graspnet, tiny_batch) -> None:

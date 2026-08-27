@@ -64,6 +64,7 @@ class StageBBinaryDataset(Dataset[StageBBinarySample]):
             raise RuntimeError(
                 "Stage-B dataset provenance does not match current checkpoints/config"
             )
+        self.provenance = dict(actual_provenance)
         records = [record for record in manifest["records"] if record["split"] == split]
         if max_groups is not None:
             records = records[:max_groups]
