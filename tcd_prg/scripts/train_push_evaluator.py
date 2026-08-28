@@ -14,8 +14,14 @@ from tcd_prg.config import load_config
 from tcd_prg.constants import ActionType, CandidateStatus
 from tcd_prg.datasets import ActionStateGroupDataset
 from tcd_prg.evaluators import push_effectiveness_metrics
+from tcd_prg.evaluators.push_effectiveness import (
+    proposal_positive_match_masks,
+    push_candidate_ranking_counts,
+)
 from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
-from tcd_prg.models import StandalonePushModel
+from tcd_prg.models import StandalonePushModel, push_condition_from_gt
+from tcd_prg.models.staged_checkpoint import push_checkpoint_fingerprint
+from tcd_prg.planners.push_decoder import decode_push_candidates
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter
 from tcd_prg.trainers import freeze_push_proposal, push_effectiveness_batch_loss
 
@@ -48,9 +54,10 @@ def _evaluate(
     loader: DataLoader,
     *,
     device: torch.device,
-    instance_queries: int,
+    config,
     loss_function: PushEffectivenessLoss,
 ) -> dict[str, float]:
+    """Validate logged classification and deployment-equivalent ranking."""
     model.eval()
     probabilities: list[torch.Tensor] = []
     targets: list[torch.Tensor] = []
@@ -58,12 +65,15 @@ def _evaluate(
     weighted_loss = 0.0
     evaluated = 0
     group_offset = 0
+    candidate_sets = 0
+    candidate_hit1 = 0
+    candidate_hit5 = 0
     for cpu_batch in loader:
         batch = _device(cpu_batch, device)
         loss, details = push_effectiveness_batch_loss(
             model,
             batch,
-            instance_queries=instance_queries,
+            instance_queries=config.model.instance_queries,
             loss_function=loss_function,
         )
         logits = details["effective_logit"].detach()
@@ -78,6 +88,36 @@ def _evaluate(
             evaluated += count
         sensor = batch.get("model_inputs", batch)
         group_offset += int(sensor["point_mask"].shape[0])
+
+        proposal_batch = dict(batch)
+        proposal_batch["push_condition"] = push_condition_from_gt(
+            batch, config.model.instance_queries
+        )
+        proposal = model(proposal_batch, forward_mode="push")
+        _, final_rows = decode_push_candidates(
+            proposal["sensor"],
+            proposal["push_condition"],
+            proposal["push"],
+            config.model,
+            use_push_potential=config.ablation.use_push_potential,
+        )
+        for row_index, row in enumerate(final_rows):
+            if len(row["point_index"]):
+                candidate_logits = model.push_evaluator(
+                    proposal["push"], row, batch_index=row_index
+                )
+                row["effective_logit"] = candidate_logits
+                row["effective_probability"] = torch.sigmoid(candidate_logits)
+        positive_masks = proposal_positive_match_masks(
+            final_rows,
+            batch,
+            contact_threshold_m=config.evaluation.push_match_contact_m,
+            direction_threshold_deg=config.evaluation.push_match_direction_deg,
+        )
+        ranking = push_candidate_ranking_counts(final_rows, positive_masks)
+        candidate_sets += int(ranking["push_evaluator_candidate_set_count"])
+        candidate_hit1 += int(ranking["push_evaluator_hit_at_1_count"])
+        candidate_hit5 += int(ranking["push_evaluator_recall_at_5_count"])
     if not evaluated:
         raise RuntimeError("Validation split contains no evaluated PUSH actions")
     probability = torch.cat(probabilities)
@@ -85,9 +125,23 @@ def _evaluate(
     if not bool(target.any()) or not bool((~target).any()):
         raise RuntimeError("Validation split requires both positive and negative PUSH actions")
     metrics = push_effectiveness_metrics(probability, target, torch.cat(group_ids))
-    result = {key: float(value.detach().cpu()) for key, value in metrics.items()}
+    logged_names = {
+        "push_evaluator_hit_at_1": "push_evaluator_logged_hit_at_1",
+        "push_evaluator_recall_at_5": "push_evaluator_logged_recall_at_5",
+        "push_evaluator_precision_at_1": "push_evaluator_logged_precision_at_1",
+    }
+    result = {
+        logged_names.get(key, key): float(value.detach().cpu()) for key, value in metrics.items()
+    }
     result["push_evaluator_loss"] = weighted_loss / evaluated
     result["push_evaluator_evaluated_count"] = float(evaluated)
+    result["push_evaluator_oracle_candidate_set_count"] = float(candidate_sets)
+    result["push_evaluator_oracle_hit_at_1"] = (
+        candidate_hit1 / candidate_sets if candidate_sets else float("nan")
+    )
+    result["push_evaluator_oracle_recall_at_5"] = (
+        candidate_hit5 / candidate_sets if candidate_sets else float("nan")
+    )
     return result
 
 
@@ -124,7 +178,8 @@ def main() -> None:
         raise RuntimeError("Formal PUSH evaluator training requires a non-empty val split")
     model = StandalonePushModel(config.model).to(device)
     payload = torch.load(args.proposal_checkpoint, map_location="cpu", weights_only=False)
-    state = payload.get("model", payload)
+    state = payload.get("ema") or payload.get("model", payload)
+    proposal_fingerprint, proposal_source = push_checkpoint_fingerprint(args.proposal_checkpoint)
     proposal_state = {key: value for key, value in state.items() if key.startswith("push.")}
     missing, unexpected = model.load_state_dict(proposal_state, strict=False)
     if unexpected or any(not key.startswith("push_evaluator.") for key in missing):
@@ -160,12 +215,14 @@ def main() -> None:
         for cpu_batch in loader:
             batch = _device(cpu_batch, device)
             optimizer.zero_grad(set_to_none=True)
-            loss, _ = push_effectiveness_batch_loss(
+            loss, details = push_effectiveness_batch_loss(
                 model,
                 batch,
                 instance_queries=config.model.instance_queries,
                 loss_function=loss_function,
             )
+            if not int(details["effective_logit"].numel()):
+                continue
             loss.backward()
             optimizer.step()
             step += 1
@@ -174,7 +231,7 @@ def main() -> None:
                     model,
                     validation_loader,
                     device=device,
-                    instance_queries=config.model.instance_queries,
+                    config=config,
                     loss_function=loss_function,
                 )
                 last_validation_step = step
@@ -195,7 +252,7 @@ def main() -> None:
             model,
             validation_loader,
             device=device,
-            instance_queries=config.model.instance_queries,
+            config=config,
             loss_function=loss_function,
         )
         print(f"[push-evaluator-val step={step}] {metrics}", flush=True)
@@ -221,6 +278,8 @@ def main() -> None:
             "optimizer_steps": step,
             "validation_metrics": best_metrics,
             "selection_metric": "push_evaluator_auprc",
+            "proposal_state_fingerprint": proposal_fingerprint,
+            "proposal_state_source": proposal_source,
         },
         output,
     )

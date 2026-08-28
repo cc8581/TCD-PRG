@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import torch
@@ -125,9 +126,46 @@ def load_staged_tcd_prg(
     return float(stage_b["task_grasp_probability_threshold"])
 
 
-def load_push_evaluator(model: nn.Module, checkpoint: str | Path) -> None:
-    """Load the separately trained complete-action PUSH evaluator."""
+def push_checkpoint_fingerprint(checkpoint: str | Path) -> tuple[str, str]:
+    """Fingerprint the exact Stage-C state used by deployment."""
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    source = payload.get("ema") or payload.get("model", payload)
+    source_kind = "ema" if payload.get("ema") else "model"
+    tensors = {name: value for name, value in source.items() if name.startswith("push.")}
+    if not tensors:
+        raise RuntimeError(f"{checkpoint} does not contain Stage-C push.* tensors")
+    digest = hashlib.sha256()
+    for name in sorted(tensors):
+        tensor = tensors[name].detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest(), source_kind
+
+
+def load_push_evaluator(
+    model: nn.Module,
+    checkpoint: str | Path,
+    *,
+    proposal_checkpoint: str | Path | None = None,
+) -> None:
+    """Load an evaluator and optionally verify its exact Stage-C provenance."""
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if payload.get("training_stage") != "push_evaluator":
         raise RuntimeError(f"{checkpoint} is not a push_evaluator checkpoint")
+    if proposal_checkpoint is not None:
+        expected = payload.get("proposal_state_fingerprint")
+        expected_source = payload.get("proposal_state_source")
+        if not expected:
+            raise RuntimeError(
+                "PUSH evaluator checkpoint lacks proposal provenance; retrain it "
+                "against the Stage-C checkpoint used for deployment"
+            )
+        actual, actual_source = push_checkpoint_fingerprint(proposal_checkpoint)
+        if actual != expected or (expected_source is not None and expected_source != actual_source):
+            raise RuntimeError(
+                "PUSH evaluator/Stage-C mismatch: evaluator and deployment use "
+                "different proposal states"
+            )
     model.push_evaluator.load_state_dict(payload["model"], strict=True)

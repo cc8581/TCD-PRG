@@ -9,6 +9,10 @@ import torch
 from torch import Tensor, nn
 
 from tcd_prg.config import TCDPRGConfig
+from tcd_prg.evaluators.push_effectiveness import (
+    proposal_positive_match_masks,
+    push_candidate_ranking_counts,
+)
 from tcd_prg.losses.instance import InstanceSetLoss, build_instance_targets
 from tcd_prg.planners.push_decoder import (
     decode_push_candidates,
@@ -35,6 +39,16 @@ def integrated_push_proposal_counts(
         config.model,
         use_push_potential=config.ablation.use_push_potential,
     )
+    push_evaluator = getattr(stage_c, "push_evaluator", None)
+    if push_evaluator is None and hasattr(stage_c, "module"):
+        push_evaluator = getattr(stage_c.module, "push_evaluator", None)
+    if push_evaluator is None:
+        raise RuntimeError("Integrated PUSH evaluation requires a push_evaluator")
+    for row_index, row in enumerate(final):
+        if len(row["point_index"]):
+            logits = push_evaluator(proposal["push"], row, batch_index=row_index)
+            row["effective_logit"] = logits
+            row["effective_probability"] = torch.sigmoid(logits)
 
     targets = build_instance_targets(dict(batch), config.model.instance_queries)
     matcher = InstanceSetLoss(matching_points=config.model.instance_matching_points)
@@ -72,22 +86,36 @@ def integrated_push_proposal_counts(
             result.append(converted)
         return result
 
+    associated_pre = associated(pre_nms)
+    associated_final = associated(final)
     pre_hits, total = proposal_recall_counts(
-        associated(pre_nms),
+        associated_pre,
         dict(batch),
         contact_threshold_m=config.evaluation.push_match_contact_m,
         direction_threshold_deg=config.evaluation.push_match_direction_deg,
     )
     final_hits, final_total = proposal_recall_counts(
-        associated(final),
+        associated_final,
         dict(batch),
         contact_threshold_m=config.evaluation.push_match_contact_m,
         direction_threshold_deg=config.evaluation.push_match_direction_deg,
     )
     if not bool(torch.equal(total, final_total)):
         raise RuntimeError("Integrated PUSH denominator changed across NMS")
+    positive_masks = proposal_positive_match_masks(
+        associated_final,
+        dict(batch),
+        contact_threshold_m=config.evaluation.push_match_contact_m,
+        direction_threshold_deg=config.evaluation.push_match_direction_deg,
+    )
+    ranking = push_candidate_ranking_counts(final, positive_masks)
     return {
         "integrated_push_proposal_positive_total_count": total,
         "integrated_push_proposal_positive_pre_nms_hits_count": pre_hits,
         "integrated_push_proposal_positive_final_hits_count": final_hits,
+        "integrated_push_evaluator_candidate_set_count": ranking[
+            "push_evaluator_candidate_set_count"
+        ],
+        "integrated_push_evaluator_hit_at_1_count": ranking["push_evaluator_hit_at_1_count"],
+        "integrated_push_evaluator_recall_at_5_count": ranking["push_evaluator_recall_at_5_count"],
     }

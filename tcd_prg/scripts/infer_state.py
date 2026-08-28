@@ -74,7 +74,11 @@ def main() -> None:
             args.stage_c_checkpoint,
             config,
         )
-        load_push_evaluator(model, args.push_evaluator_checkpoint)
+        load_push_evaluator(
+            model,
+            args.push_evaluator_checkpoint,
+            proposal_checkpoint=args.stage_c_checkpoint,
+        )
         model.to(device)
         # Candidate scoring remains robot-agnostic. The deterministic
         # controller exact-certifies grasp actions and falls through on rejection.
