@@ -302,6 +302,7 @@ evaluation:
   global_metrics_after_nms: true # deprecated compatibility; diagnostics always apply NMS
   push_match_contact_m: 0.024
   push_match_direction_deg: 15.0
+  instance_match_iou_threshold: 0.5
 
 ablation:
   use_task_region_condition: true

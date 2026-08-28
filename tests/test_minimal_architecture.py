@@ -75,7 +75,7 @@ def test_certifier_resolves_query_to_physical_object_from_geometry() -> None:
     assert physical == 7
 
 
-def test_one_shot_uses_candidate_proposal_scores_without_router() -> None:
+def test_one_shot_uses_effectiveness_for_push_ranking() -> None:
     class CandidatePolicy:
         def __init__(self) -> None:
             self.encodes = 0
@@ -95,6 +95,7 @@ def test_one_shot_uses_candidate_proposal_scores_without_router() -> None:
                     "type": torch.tensor([[0, 1, 2]]),
                     "object": torch.tensor([[1, 2, 0]]),
                     "proposal_score": torch.tensor([[0.8, 0.6, 0.9]]),
+                    "effective_probability": torch.tensor([[float("nan"), 0.9, 0.1]]),
                 }
             }
 

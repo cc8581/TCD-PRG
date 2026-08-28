@@ -12,8 +12,7 @@ import torch
 
 from tcd_prg.baselines import create_baseline
 from tcd_prg.config import load_config
-from tcd_prg.constants import ActionType
-from tcd_prg.models import TCDPRGModel, load_staged_tcd_prg
+from tcd_prg.models import TCDPRGModel, load_push_evaluator, load_staged_tcd_prg
 from tcd_prg.planners import TCDPRGPolicy
 from tcd_prg.runtime import (
     create_action_certifier,
@@ -44,6 +43,7 @@ def main() -> None:
     parser.add_argument("--task-index", type=int, required=True)
     parser.add_argument("--output")
     parser.add_argument("--no-certification", action="store_true")
+    parser.add_argument("--push-evaluator-checkpoint")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
@@ -55,12 +55,20 @@ def main() -> None:
     else:
         if not all((args.stage_a_checkpoint, args.stage_b_checkpoint, args.stage_c_checkpoint)):
             raise ValueError("learned inference requires all three staged checkpoints")
+        if not args.push_evaluator_checkpoint:
+            raise ValueError("learned PUSH inference requires --push-evaluator-checkpoint")
         device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
         model = TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet).to(
             device
         )
         config.model.task_grasp_probability_threshold = load_staged_tcd_prg(
-            model, args.stage_a_checkpoint, args.stage_b_checkpoint, args.stage_c_checkpoint, config)
+            model,
+            args.stage_a_checkpoint,
+            args.stage_b_checkpoint,
+            args.stage_c_checkpoint,
+            config,
+        )
+        load_push_evaluator(model, args.push_evaluator_checkpoint)
         model.to(device)
         # Candidate scoring remains robot-agnostic. The deterministic
         # controller exact-certifies grasp actions and falls through on rejection.
@@ -116,7 +124,15 @@ def main() -> None:
             candidates.get("certification_reasons", []) if isinstance(candidates, dict) else []
         ),
         "final_certification": final_certification,
-        "checkpoints": ({"perception": str(Path(args.stage_a_checkpoint).resolve()), "grasp": str(Path(args.stage_b_checkpoint).resolve()), "push": str(Path(args.stage_c_checkpoint).resolve())} if args.stage_a_checkpoint else None),
+        "checkpoints": (
+            {
+                "perception": str(Path(args.stage_a_checkpoint).resolve()),
+                "grasp": str(Path(args.stage_b_checkpoint).resolve()),
+                "push": str(Path(args.stage_c_checkpoint).resolve()),
+            }
+            if args.stage_a_checkpoint
+            else None
+        ),
         "baseline": config.baseline.type,
     }
     text = json.dumps(payload, ensure_ascii=False, indent=2)

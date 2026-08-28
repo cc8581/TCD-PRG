@@ -37,17 +37,36 @@ def integrated_push_proposal_counts(
     )
 
     targets = build_instance_targets(dict(batch), config.model.instance_queries)
-    matcher = InstanceSetLoss(
-        matching_points=config.model.instance_matching_points
-    )
+    matcher = InstanceSetLoss(matching_points=config.model.instance_matching_points)
     match = matcher.match(perception["instance"], targets)
+    predicted_mask = perception["instance"].mask_probability >= 0.5
+    target_mask = targets["mask"].bool()
+    valid_query_to_gt = match.query_to_gt.clone()
+    for row_index in range(valid_query_to_gt.shape[0]):
+        for query_index in (
+            torch.nonzero(valid_query_to_gt[row_index] >= 0, as_tuple=False).flatten().tolist()
+        ):
+            gt_index = int(valid_query_to_gt[row_index, query_index])
+            intersection = (
+                (predicted_mask[row_index, query_index] & target_mask[row_index, gt_index])
+                .sum()
+                .float()
+            )
+            union = (
+                (predicted_mask[row_index, query_index] | target_mask[row_index, gt_index])
+                .sum()
+                .float()
+            )
+            iou = intersection / union.clamp_min(1.0)
+            if float(iou) < config.evaluation.instance_match_iou_threshold:
+                valid_query_to_gt[row_index, query_index] = -1
 
     def associated(rows: list[dict[str, Tensor]]) -> list[dict[str, Tensor]]:
         result: list[dict[str, Tensor]] = []
         for row_index, row in enumerate(rows):
             converted = dict(row)
             query = row["object"].long()
-            mapped = match.query_to_gt[row_index, query] if len(query) else query
+            mapped = valid_query_to_gt[row_index, query] if len(query) else query
             converted["object"] = mapped
             # An unmatched predicted query can never satisfy same-GT-object.
             result.append(converted)

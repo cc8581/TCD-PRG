@@ -36,8 +36,8 @@ class DenseCandidateGenerator:
             "contact_score": torch.empty(0, device=device),
             "utility": torch.empty(0, device=device),
             "direction_residual": torch.empty(0, 2, device=device),
-            "push_effective_logit": torch.empty(0, device=device),
-            "push_robustness_logit": torch.empty(0, device=device),
+            "effective_logit": torch.empty(0, device=device),
+            "effective_probability": torch.empty(0, device=device),
         }
 
     @staticmethod
@@ -271,6 +271,15 @@ class DenseCandidateGenerator:
             self.config,
             use_push_potential=self.use_push_potential,
         )
+        push_evaluator = getattr(model, "push_evaluator", None)
+        if push_evaluator is not None:
+            for batch_row, decoded in enumerate(decoded_push_rows):
+                if len(decoded["point_index"]):
+                    logits = push_evaluator(
+                        output["push"], decoded, batch_index=batch_row
+                    )
+                    decoded["effective_logit"] = logits
+                    decoded["effective_probability"] = torch.sigmoid(logits)
 
         for batch_row in range(sensor["xyz"].shape[0]):
             xyz = sensor["xyz"][batch_row]
@@ -297,8 +306,8 @@ class DenseCandidateGenerator:
             contact_score_parts: list[Tensor] = []
             utility_parts: list[Tensor] = []
             direction_residual_parts: list[Tensor] = []
-            critic_effective_parts: list[Tensor] = []
-            critic_robustness_parts: list[Tensor] = []
+            effective_logit_parts: list[Tensor] = []
+            effective_probability_parts: list[Tensor] = []
 
             # Terminal task grasp candidates belong to the predicted target query.
             task = output["task_grasp"]
@@ -365,8 +374,8 @@ class DenseCandidateGenerator:
                 direction_residual_parts.append(torch.full(
                     (len(selected), 2), float("nan"), device=xyz.device
                 ))
-                critic_effective_parts.append(torch.full_like(task_score[selected], float("nan")))
-                critic_robustness_parts.append(torch.full_like(task_score[selected], float("nan")))
+                effective_logit_parts.append(torch.full_like(task_score[selected], float("nan")))
+                effective_probability_parts.append(torch.full_like(task_score[selected], float("nan")))
 
             # Generic remove grasps are assigned to predicted object queries.
             global_head = output["global_grasp"]
@@ -448,8 +457,8 @@ class DenseCandidateGenerator:
                 direction_residual_parts.append(torch.full(
                     (len(selected), 2), float("nan"), device=xyz.device
                 ))
-                critic_effective_parts.append(torch.full_like(candidate_score[local], float("nan")))
-                critic_robustness_parts.append(torch.full_like(candidate_score[local], float("nan")))
+                effective_logit_parts.append(torch.full_like(candidate_score[local], float("nan")))
+                effective_probability_parts.append(torch.full_like(candidate_score[local], float("nan")))
 
             decoded_push = decoded_push_rows[batch_row]
             if len(decoded_push["point_index"]):
@@ -477,8 +486,8 @@ class DenseCandidateGenerator:
                 contact_score_parts.append(decoded_push["contact_score"])
                 utility_parts.append(decoded_push["utility"])
                 direction_residual_parts.append(decoded_push["direction_residual"])
-                critic_effective_parts.append(decoded_push["push_effective_logit"])
-                critic_robustness_parts.append(decoded_push["push_robustness_logit"])
+                effective_logit_parts.append(decoded_push["effective_logit"])
+                effective_probability_parts.append(decoded_push["effective_probability"])
 
             def joined(
                 parts: list[Tensor],
@@ -534,8 +543,8 @@ class DenseCandidateGenerator:
                 "direction_residual": joined(
                     direction_residual_parts, (0, 2), xyz.dtype
                 ),
-                "push_effective_logit": joined(critic_effective_parts, (0,), xyz.dtype),
-                "push_robustness_logit": joined(critic_robustness_parts, (0,), xyz.dtype),
+                "effective_logit": joined(effective_logit_parts, (0,), xyz.dtype),
+                "effective_probability": joined(effective_probability_parts, (0,), xyz.dtype),
             })
 
         max_candidates = max(
@@ -552,8 +561,8 @@ class DenseCandidateGenerator:
             "contact_score": float("nan"),
             "utility": float("nan"),
             "direction_residual": float("nan"),
-            "push_effective_logit": float("nan"),
-            "push_robustness_logit": float("nan"),
+            "effective_logit": float("nan"),
+            "effective_probability": float("nan"),
             "proposal_score": -1.0,
             "contact_world": float("nan"),
             "direction_world": float("nan"),

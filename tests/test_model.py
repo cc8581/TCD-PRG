@@ -103,7 +103,10 @@ def test_standalone_push_model_contains_only_push_parameters(tiny_batch) -> None
     model = StandalonePushModel(config)
     output = model(batch)
     assert output["push"]["object_logits"].shape[-1] == config.instance_queries
-    assert all(name.startswith("push.") for name, _ in model.named_parameters())
+    assert all(
+        name.startswith(("push.", "push_evaluator."))
+        for name, _ in model.named_parameters()
+    )
 
 
 def test_camera2_to_task_evaluator_to_dense_candidate_end_to_end(tiny_batch) -> None:

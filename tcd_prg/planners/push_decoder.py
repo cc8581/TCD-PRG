@@ -27,8 +27,8 @@ def _empty(device: torch.device, dtype: torch.dtype) -> dict[str, Tensor]:
         "direction_score": torch.empty(0, dtype=dtype, device=device),
         "utility": torch.empty(0, dtype=dtype, device=device),
         "proposal_score": torch.empty(0, dtype=dtype, device=device),
-        "push_effective_logit": torch.empty(0, dtype=dtype, device=device),
-        "push_robustness_logit": torch.empty(0, dtype=dtype, device=device),
+        "effective_logit": torch.empty(0, dtype=dtype, device=device),
+        "effective_probability": torch.empty(0, dtype=dtype, device=device),
     }
 
 
@@ -181,8 +181,6 @@ def decode_push_candidates(
         direction_world = torch.cat(
             (planar, torch.zeros(len(planar), 1, dtype=xyz.dtype, device=xyz.device)), -1
         )
-        effective_field = push.get("push_effective_logit")
-        robustness_field = push.get("push_robustness_logit")
         decoded = {
             "object": pushed_object,
             "contact_world": xyz[expanded_point],
@@ -196,16 +194,9 @@ def decode_push_candidates(
             "direction_score": direction_score,
             "utility": utility,
             "proposal_score": proposal_score,
-            "push_effective_logit": (
-                effective_field[row, expanded_point, direction_bin]
-                if effective_field is not None
-                else torch.full_like(proposal_score, -30.0)
-            ),
-            "push_robustness_logit": (
-                robustness_field[row, expanded_point, direction_bin]
-                if robustness_field is not None
-                else torch.full_like(proposal_score, -30.0)
-            ),
+            # Filled only after exact action decoding by PushEffectivenessEvaluator.
+            "effective_logit": torch.full_like(proposal_score, float("nan")),
+            "effective_probability": torch.full_like(proposal_score, float("nan")),
         }
         pre_nms_rows.append(decoded)
         nms = push_nms_mask(decoded, config)

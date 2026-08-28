@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 from torch import Tensor, nn
 from tcd_prg.config import ModelConfig
-from .push import PushHead
+from .push import PushEffectivenessEvaluator, PushHead
 from .push_condition import PushCondition
 
 class StandalonePushModel(nn.Module):
@@ -13,6 +13,9 @@ class StandalonePushModel(nn.Module):
             config.push_direction_feature_dim, config.push_direction_transformer_layers,
             config.push_direction_transformer_heads, config.push_direction_contact_topk,
             config.push_object_topk, config.num_categories, config.num_task_regions)
+        self.push_evaluator = PushEffectivenessEvaluator(
+            config.feature_dim, config.push_direction_feature_dim
+        )
 
     @staticmethod
     def _sensor(batch: Mapping[str, Any]) -> dict[str, Tensor]:

@@ -1,84 +1,23 @@
 from __future__ import annotations
 
-import json
-
-import pytest
 import torch
 
-from tcd_prg.constants import PUSH_DISTANCE_M, CandidateStatus
-from tcd_prg.datasets.push_outcome_bank import (
-    PushAction,
-    PushOutcomeBank,
-    PushOutcomeRecord,
-    PushSceneState,
-)
-from tcd_prg.losses.push_critic import PushOutcomeCriticLoss
-from tcd_prg.models.push.head import PushHead
+from tcd_prg.constants import PUSH_DISTANCE_M
+from tcd_prg.evaluators.push_effectiveness import push_effectiveness_metrics
+from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
+from tcd_prg.models.push import PushEffectivenessEvaluator, PushHead
 from tcd_prg.models.push_condition import PushCondition
 from tcd_prg.planners.push_decoder import proposal_recall_counts
 
 
-def _scene(split: str = "train", state_hash: str = "state-v1") -> PushSceneState:
-    return PushSceneState(
-        split=split,
-        scene_id=1,
-        state_id=2,
-        state_hash=state_hash,
-        object_geometry_ids=("object-a",),
-        object_poses_xyzw=((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),),
-        target_object=0,
-        task_category_id=3,
-        task_region_id=4,
-        simulator_version="pybullet-test",
-        physics_parameters={"time_step": 1.0 / 240.0},
-        robot_configuration="FR5+AG-160-95",
-        label_generation_version="test-v1",
-        random_seed=7,
-    )
-
-
-def _action() -> PushAction:
-    return PushAction(0, (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), PUSH_DISTANCE_M)
-
-
-def test_outcome_bank_preserves_unknown_and_robust_trial_confidence(tmp_path) -> None:
-    bank = PushOutcomeBank(tmp_path / "bank.jsonl")
-    record = PushOutcomeRecord(
-        _scene(), _action(), int(CandidateStatus.POSITIVE), True,
-        (0.1, 0.2), 0.01, 0.0, False, False, False,
-        robust_success_count=18, robust_trial_count=20,
-    )
-    assert bank.append([record]) == 1
-    payload = json.loads((tmp_path / "bank.jsonl").read_text(encoding="utf-8"))
-    assert payload["local_robust_success_rate"] == pytest.approx(0.9)
-    assert payload["robust_trial_count"] == 20
-    with pytest.raises(ValueError, match="Duplicate"):
-        bank.append([record])
-
-
-def test_outcome_bank_rejects_unknown_as_negative_and_nontrain_mining(tmp_path) -> None:
-    invalid_unknown = PushOutcomeRecord(
-        _scene(), _action(), int(CandidateStatus.UNKNOWN_UNTESTED), False,
-        None, None, None, None, None, None,
-    )
-    with pytest.raises(ValueError, match="UNKNOWN"):
-        invalid_unknown.validate()
-    validation_record = PushOutcomeRecord(
-        _scene("val"), _action(), int(CandidateStatus.NEGATIVE), False,
-        None, None, None, False, False, False,
-    )
-    with pytest.raises(ValueError, match="train scenes only"):
-        PushOutcomeBank(tmp_path / "bank.jsonl").append(
-            [validation_record], mining=True
-        )
-
-
 def test_proposal_recall_uses_fixed_gt_denominator_and_ignores_unknown() -> None:
-    rows = [{
-        "object": torch.tensor([1]),
-        "contact_world": torch.tensor([[0.005, 0.0, 0.0]]),
-        "direction_world": torch.tensor([[1.0, 0.0, 0.0]]),
-    }]
+    rows = [
+        {
+            "object": torch.tensor([1]),
+            "contact_world": torch.tensor([[0.005, 0.0, 0.0]]),
+            "direction_world": torch.tensor([[1.0, 0.0, 0.0]]),
+        }
+    ]
     batch = {
         "xyz": torch.zeros(1, 2, 3),
         "candidate_mask": torch.tensor([[True, True, True]]),
@@ -98,29 +37,31 @@ def test_proposal_recall_uses_fixed_gt_denominator_and_ignores_unknown() -> None
     assert total == 2
 
 
-def test_critic_loss_ignores_unknown_and_keeps_two_targets_separate() -> None:
+def test_effectiveness_loss_uses_improves_state_and_ignores_unknown() -> None:
     effective = torch.zeros(3, requires_grad=True)
-    robustness = torch.zeros(3, requires_grad=True)
-    losses = PushOutcomeCriticLoss()(
+    losses = PushEffectivenessLoss()(
         effective,
-        robustness,
         torch.tensor([1, 0, -1]),
-        torch.tensor([9, 1, 100]),
-        torch.tensor([10, 4, 100]),
+        torch.tensor([False, True, True]),
     )
-    losses["push_critic"].backward()
+    losses["push_effectiveness"].backward()
     assert effective.grad[2] == 0
-    assert robustness.grad[2] == 0
-    assert losses["push_critic_executed_count"] == 2
-    assert losses["push_critic_robust_count"] == 2
+    assert effective.grad[0] > 0
+    assert effective.grad[1] < 0
+    assert losses["push_effectiveness_evaluated_count"] == 2
 
 
-def test_critic_heads_detach_proposal_features() -> None:
+def test_exact_action_evaluator_sees_residual_and_detaches_proposal_features() -> None:
     head = PushHead(
-        dim=16, direction_bins=4, direction_dim=8,
-        direction_layers=1, direction_heads=2,
-        direction_contact_topk=1, direction_object_topk=1,
-        num_categories=4, num_task_regions=4,
+        dim=16,
+        direction_bins=4,
+        direction_dim=8,
+        direction_layers=1,
+        direction_heads=2,
+        direction_contact_topk=1,
+        direction_object_topk=1,
+        num_categories=4,
+        num_task_regions=4,
     )
     sensor = {
         "xyz": torch.tensor([[[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]]]),
@@ -137,7 +78,32 @@ def test_critic_heads_detach_proposal_features() -> None:
         torch.tensor([0]),
     )
     output = head(sensor, condition)
-    output["push_effective_logit"].sum().backward()
-    assert head.push_effective.weight.grad is not None
+    evaluator = PushEffectivenessEvaluator(16, 8)
+    candidate = {
+        "point_index": torch.tensor([0, 0]),
+        "direction_bin": torch.tensor([0, 0]),
+        "object": torch.tensor([0, 0]),
+        "contact_world": torch.zeros(2, 3),
+        "direction_world": torch.tensor([[1.0, 0.0, 0.0], [0.8, 0.6, 0.0]]),
+        "direction_residual": torch.tensor([[0.0, 0.0], [0.2, -0.1]]),
+        "push_distance": torch.full((2,), PUSH_DISTANCE_M),
+    }
+    logits = evaluator(output, candidate, batch_index=0)
+    assert logits.shape == (2,)
+    assert not torch.equal(logits[0], logits[1])
+    logits.sum().backward()
+    assert evaluator.network[0].weight.grad is not None
     assert head.direction_score.weight.grad is None
     assert head.point_encoder[0].weight.grad is None
+
+
+def test_effectiveness_metrics_report_binary_and_state_ranking_quality() -> None:
+    metrics = push_effectiveness_metrics(
+        torch.tensor([0.9, 0.2, 0.8, 0.1]),
+        torch.tensor([True, False, False, True]),
+        torch.tensor([10, 10, 20, 20]),
+    )
+    assert 0.0 <= metrics["push_evaluator_auprc"] <= 1.0
+    assert metrics["push_evaluator_auroc"] == 0.5
+    assert metrics["push_evaluator_hit_at_1"] == 0.5
+    assert metrics["push_evaluator_recall_at_5"] == 1.0

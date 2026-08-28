@@ -23,7 +23,7 @@ from .backbones import (
     TaskConditionedPointTransformer,
 )
 from .graspnet import FrozenGraspNetProposalGenerator
-from .push import PushHead
+from .push import PushEffectivenessEvaluator, PushHead
 from .region import TaskRegionHead
 from .stageb_condition import StageBCondition
 from .push_condition import PushCondition
@@ -149,6 +149,9 @@ class TCDPRGModel(nn.Module):
             c.push_object_topk,
             c.num_categories,
             c.num_task_regions,
+        )
+        self.push_evaluator = PushEffectivenessEvaluator(
+            c.feature_dim, c.push_direction_feature_dim
         )
     @staticmethod
     def _sensor(batch: Mapping[str, Any]) -> dict[str, Tensor]:

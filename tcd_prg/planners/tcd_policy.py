@@ -432,6 +432,7 @@ class TCDPRGPolicy(ManipulationPolicy):
                 push_contact_world=array("contact_world"),
                 push_direction_world=array("direction_world"),
                 push_distance_m=float(array("push_distance_m")),
+                effective_probability=float(array("effective_probability")),
             )
         else:
             action.update(
@@ -495,17 +496,20 @@ class TCDPRGPolicy(ManipulationPolicy):
             ).flatten()
             if not len(indices):
                 continue
+            ranking_score = (
+                tensors["effective_probability"]
+                if action_type == ActionType.PUSH
+                else tensors["proposal_score"]
+            )
             order = indices[
-                tensors["proposal_score"][0, indices].argsort(
+                ranking_score[0, indices].argsort(
                     descending=True, stable=True
                 )
             ]
             for index_tensor in order:
                 index = int(index_tensor)
                 action = self._action(tensors, index)
-                action["selection_score"] = float(
-                    tensors["proposal_score"][0, index]
-                )
+                action["selection_score"] = float(ranking_score[0, index])
                 point_index = int(tensors["point_index"][0, index])
                 if point_index >= 0:
                     action["association_point_world"] = (

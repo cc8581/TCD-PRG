@@ -325,6 +325,7 @@ class EvaluationConfig:
     # from decoder NMS thresholds.
     push_match_contact_m: float = 0.024
     push_match_direction_deg: float = 15.0
+    instance_match_iou_threshold: float = 0.5
 
 
 @dataclass(slots=True)
@@ -711,6 +712,8 @@ class TCDPRGConfig:
             raise ValueError("evaluation.push_match_contact_m must be positive")
         if not 0 < self.evaluation.push_match_direction_deg <= 180:
             raise ValueError("evaluation.push_match_direction_deg must be in (0,180]")
+        if not 0 <= self.evaluation.instance_match_iou_threshold <= 1:
+            raise ValueError("evaluation.instance_match_iou_threshold must be in [0,1]")
         if not 0.0 <= self.model.target_prompt_min_support <= 1.0:
             raise ValueError("target_prompt_min_support must be in [0,1]")
         if self.model.target_prompt_min_margin < 0:

@@ -1,29 +1,45 @@
 """Strict deployment composition for independently trained A/B/C checkpoints."""
+
 from __future__ import annotations
+
 from pathlib import Path
+
 import torch
 from torch import nn
+
 from tcd_prg.datasets.stageb_manifest import compatibility_provenance, stageb_compatibility
 
-STAGE_PREFIXES = {"perception": ("encoder.", "region_head."), "grasp": ("task_grasp.",), "push": ("push.",)}
+STAGE_PREFIXES = {
+    "perception": ("encoder.", "region_head."),
+    "grasp": ("task_grasp.",),
+    "push": ("push.",),
+}
+
 
 def _load_stage(model: nn.Module, path: str | Path, stage: str) -> dict:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if int(payload.get("schema_version", -1)) != 12 or payload.get("training_stage") != stage:
         raise RuntimeError(f"{path} is not a schema-12 {stage} checkpoint")
-    source = payload.get("ema") or payload["model"]; current = model.state_dict(); prefixes = STAGE_PREFIXES[stage]
+    source = payload.get("ema") or payload["model"]
+    current = model.state_dict()
+    prefixes = STAGE_PREFIXES[stage]
     required = {name for name in current if name.startswith(prefixes)}
     supplied = {name for name in source if name.startswith(prefixes)}
     if required != supplied:
-        missing, extra = sorted(required-supplied), sorted(supplied-required)
-        raise RuntimeError(f"{stage} checkpoint module mismatch: missing={missing[:5]} extra={extra[:5]}")
+        missing, extra = sorted(required - supplied), sorted(supplied - required)
+        raise RuntimeError(
+            f"{stage} checkpoint module mismatch: missing={missing[:5]} extra={extra[:5]}"
+        )
     incompatible = [name for name in required if current[name].shape != source[name].shape]
     if incompatible:
         raise RuntimeError(f"{stage} checkpoint tensor shape mismatch: {incompatible[:5]}")
     model.load_state_dict({name: source[name] for name in required}, strict=False)
     return payload
 
-def _require_fields(payload: dict, runtime_config, sections: dict[str, tuple[str, ...]], stage: str) -> None:
+
+def _require_fields(
+    payload: dict, runtime_config, sections: dict[str, tuple[str, ...]], stage: str
+) -> None:
     saved = payload.get("config", {})
     for section, fields in sections.items():
         current_section = getattr(runtime_config, section)
@@ -32,16 +48,66 @@ def _require_fields(payload: dict, runtime_config, sections: dict[str, tuple[str
             if saved_section.get(field) != getattr(current_section, field):
                 raise RuntimeError(f"{stage} runtime mismatch: {section}.{field}")
 
-def load_staged_tcd_prg(model: nn.Module, stage_a_checkpoint: str | Path,
-                        stage_b_checkpoint: str | Path, stage_c_checkpoint: str | Path,
-                        runtime_config) -> float:
+
+def load_staged_tcd_prg(
+    model: nn.Module,
+    stage_a_checkpoint: str | Path,
+    stage_b_checkpoint: str | Path,
+    stage_c_checkpoint: str | Path,
+    runtime_config,
+) -> float:
     stage_a = _load_stage(model, stage_a_checkpoint, "perception")
     stage_b = _load_stage(model, stage_b_checkpoint, "grasp")
     stage_c = _load_stage(model, stage_c_checkpoint, "push")
-    perception_fields = ("instance_queries", "instance_objectness_threshold", "target_query_temperature", "target_prompt_radius_m", "target_prompt_sigma_m", "target_prompt_weight", "target_category_weight", "target_objectness_weight", "target_center_weight", "target_learned_weight", "target_reid_weight", "target_reid_center_weight", "target_reid_max_center_distance_m", "target_prompt_min_support", "target_prompt_min_margin")
-    _require_fields(stage_a, runtime_config, {"model": perception_fields, "ablation": ("use_task_region_condition",), "backbone": ("grid_size_m",)}, "perception")
-    _require_fields(stage_c, runtime_config, {"model": ("instance_queries", "num_categories", "num_task_regions", "num_direction_bins", "push_direction_contact_topk", "push_object_topk", "push_utility_temperature")}, "push")
-    _require_fields(stage_b, runtime_config, {"model": ("task_grasp_scene_points", "task_grasp_gripper_points")}, "grasp")
+    perception_fields = (
+        "instance_queries",
+        "instance_objectness_threshold",
+        "target_query_temperature",
+        "target_prompt_radius_m",
+        "target_prompt_sigma_m",
+        "target_prompt_weight",
+        "target_category_weight",
+        "target_objectness_weight",
+        "target_center_weight",
+        "target_learned_weight",
+        "target_reid_weight",
+        "target_reid_center_weight",
+        "target_reid_max_center_distance_m",
+        "target_prompt_min_support",
+        "target_prompt_min_margin",
+    )
+    _require_fields(
+        stage_a,
+        runtime_config,
+        {
+            "model": perception_fields,
+            "ablation": ("use_task_region_condition",),
+            "backbone": ("grid_size_m",),
+        },
+        "perception",
+    )
+    _require_fields(
+        stage_c,
+        runtime_config,
+        {
+            "model": (
+                "instance_queries",
+                "num_categories",
+                "num_task_regions",
+                "num_direction_bins",
+                "push_direction_contact_topk",
+                "push_object_topk",
+                "push_utility_temperature",
+            )
+        },
+        "push",
+    )
+    _require_fields(
+        stage_b,
+        runtime_config,
+        {"model": ("task_grasp_scene_points", "task_grasp_gripper_points")},
+        "grasp",
+    )
     saved_ablation = stage_c.get("config", {}).get("ablation", {})
     saved_losses = stage_c.get("config", {}).get("losses", {})
     if runtime_config.ablation.use_push_potential and (
@@ -57,3 +123,11 @@ def load_staged_tcd_prg(model: nn.Module, stage_a_checkpoint: str | Path,
     if "task_grasp_probability_threshold" not in stage_b:
         raise RuntimeError("Stage-B checkpoint is missing its calibrated deployment threshold")
     return float(stage_b["task_grasp_probability_threshold"])
+
+
+def load_push_evaluator(model: nn.Module, checkpoint: str | Path) -> None:
+    """Load the separately trained complete-action PUSH evaluator."""
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if payload.get("training_stage") != "push_evaluator":
+        raise RuntimeError(f"{checkpoint} is not a push_evaluator checkpoint")
+    model.push_evaluator.load_state_dict(payload["model"], strict=True)
