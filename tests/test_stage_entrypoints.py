@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+
 import torch
 
 import train
 from tcd_prg.config import TCDPRGConfig
+from tcd_prg.constants import ActionType
 from tcd_prg.models import StandalonePushModel
+from tcd_prg.scripts.infer_state import requires_robot_certification
 from tcd_prg.scripts.train import build_optimizer_parameter_groups
 
 
@@ -32,11 +35,22 @@ def test_all_stage_launcher_rejects_single_stage_resume() -> None:
 
 
 def test_stagec_optimizer_step_does_not_require_encoder() -> None:
-    config = TCDPRGConfig(); config.training.stage = "push"
+    config = TCDPRGConfig()
+    config.training.stage = "push"
     model = StandalonePushModel(config.model)
     groups = build_optimizer_parameter_groups(model, config)
     assert [group["name"] for group in groups] == ["new_modules"]
     optimizer = torch.optim.AdamW(groups)
     loss = sum(parameter.square().mean() for parameter in model.parameters())
-    loss.backward(); optimizer.step()
-    assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in model.parameters())
+    loss.backward()
+    optimizer.step()
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
+
+
+def test_push_bypasses_grasp_robot_certifier() -> None:
+    assert not requires_robot_certification({"action_type": int(ActionType.PUSH)})
+    assert requires_robot_certification({"action_type": int(ActionType.TASK_GRASP)})
+    assert requires_robot_certification({"action_type": int(ActionType.PICK_REMOVE)})

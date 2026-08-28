@@ -78,25 +78,37 @@ class PushEffectivenessEvaluator(nn.Module):
         num_bins = push["proposal_direction_feature"].shape[2]
         for action in range(len(batch_index)):
             row = int(batch_index[action])
+            if row < 0 or row >= sensor["xyz"].shape[0]:
+                raise IndexError(f"PUSH evaluator batch_index out of range: {row}")
+            object_index = int(acted_object[action])
+            if object_index < 0 or object_index >= push["proposal_object_feature"].shape[1]:
+                raise IndexError(f"PUSH evaluator acted_object out of range: {object_index}")
             valid_points = torch.nonzero(sensor["point_mask"][row], as_tuple=False).flatten()
+            if not len(valid_points):
+                raise ValueError("PUSH evaluator received a scene row with no valid points")
             distance = torch.linalg.vector_norm(
                 sensor["xyz"][row, valid_points] - contact_world[action], dim=-1
             )
             point = valid_points[distance.argmin()]
-            angle = torch.atan2(direction_world[action, 1], direction_world[action, 0])
+            planar_raw = direction_world[action, :2]
+            planar_norm = torch.linalg.vector_norm(planar_raw)
+            if not bool(torch.isfinite(planar_norm)) or float(planar_norm) <= 1e-8:
+                raise ValueError("PUSH evaluator requires a finite non-zero planar direction")
+            actual = planar_raw / planar_norm
+            canonical_direction = torch.cat((actual, direction_world.new_zeros(1)), dim=0)
+            angle = torch.atan2(actual[1], actual[0])
             angle = torch.remainder(angle, 2.0 * math.pi)
             direction_bin = (
                 torch.floor(angle * num_bins / (2.0 * math.pi)).long().clamp_max(num_bins - 1)
             )
             center_angle = (direction_bin.to(angle.dtype) + 0.5) * 2.0 * math.pi / num_bins
             center = torch.stack((torch.cos(center_angle), torch.sin(center_angle)))
-            actual = torch.nn.functional.normalize(direction_world[action, :2], dim=-1)
             candidate = {
                 "point_index": point[None],
                 "direction_bin": direction_bin[None],
                 "object": acted_object[action, None].long(),
                 "contact_world": contact_world[action, None],
-                "direction_world": direction_world[action, None],
+                "direction_world": canonical_direction[None],
                 "direction_residual": (actual - center)[None],
                 "push_distance": push_distance[action, None],
             }

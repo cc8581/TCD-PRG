@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from tcd_prg.constants import PUSH_DISTANCE_M
@@ -95,6 +96,40 @@ def test_exact_action_evaluator_sees_residual_and_detaches_proposal_features() -
     assert evaluator.network[0].weight.grad is not None
     assert head.direction_score.weight.grad is None
     assert head.point_encoder[0].weight.grad is None
+
+    exact_kwargs = {
+        "batch_index": torch.tensor([0]),
+        "acted_object": torch.tensor([0]),
+        "contact_world": torch.zeros(1, 3),
+        "push_distance": torch.full((1,), PUSH_DISTANCE_M),
+    }
+    unit = evaluator.score_exact_actions(
+        sensor,
+        output,
+        direction_world=torch.tensor([[1.0, 0.0, 0.0]]),
+        **exact_kwargs,
+    )
+    scaled = evaluator.score_exact_actions(
+        sensor,
+        output,
+        direction_world=torch.tensor([[5.0, 0.0, 3.0]]),
+        **exact_kwargs,
+    )
+    assert torch.allclose(unit, scaled)
+    with pytest.raises(ValueError, match="non-zero planar direction"):
+        evaluator.score_exact_actions(
+            sensor,
+            output,
+            direction_world=torch.zeros(1, 3),
+            **exact_kwargs,
+        )
+    with pytest.raises(IndexError, match="acted_object"):
+        evaluator.score_exact_actions(
+            sensor,
+            output,
+            direction_world=torch.tensor([[1.0, 0.0, 0.0]]),
+            **{**exact_kwargs, "acted_object": torch.tensor([99])},
+        )
 
 
 def test_effectiveness_metrics_report_binary_and_state_ranking_quality() -> None:

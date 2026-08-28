@@ -12,6 +12,7 @@ import torch
 
 from tcd_prg.baselines import create_baseline
 from tcd_prg.config import load_config
+from tcd_prg.constants import ActionType
 from tcd_prg.models import TCDPRGModel, load_push_evaluator, load_staged_tcd_prg
 from tcd_prg.planners import TCDPRGPolicy
 from tcd_prg.runtime import (
@@ -30,6 +31,11 @@ def serializable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [serializable(item) for item in value]
     return value
+
+
+def requires_robot_certification(action: dict[str, Any]) -> bool:
+    """Only grasp actions use the current grasp/robot certifier."""
+    return int(action["action_type"]) != int(ActionType.PUSH)
 
 
 def main() -> None:
@@ -84,6 +90,10 @@ def main() -> None:
     if certifier is not None:
         certifier.set_observation(observation)
         while action is not None:
+            if not requires_robot_certification(action):
+                action["certification_skipped"] = True
+                action["certification_reason"] = "push_effectiveness_evaluator_only"
+                break
             accepted, reason = certifier.certify(action)
             if accepted:
                 action["certified"] = True
@@ -129,6 +139,7 @@ def main() -> None:
                 "perception": str(Path(args.stage_a_checkpoint).resolve()),
                 "grasp": str(Path(args.stage_b_checkpoint).resolve()),
                 "push": str(Path(args.stage_c_checkpoint).resolve()),
+                "push_evaluator": str(Path(args.push_evaluator_checkpoint).resolve()),
             }
             if args.stage_a_checkpoint
             else None

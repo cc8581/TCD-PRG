@@ -36,7 +36,12 @@ def push_effectiveness_batch_loss(
     selected = torch.nonzero(valid, as_tuple=False)
     if not len(selected):
         zero = next(model.push_evaluator.parameters()).sum() * 0.0
-        return zero, {"push_effectiveness": zero}
+        return zero, {
+            "push_effectiveness": zero,
+            "effective_logit": zero.new_empty(0),
+            "effective_target": torch.empty(0, dtype=torch.bool, device=zero.device),
+            "effective_group_index": torch.empty(0, dtype=torch.long, device=zero.device),
+        }
 
     sensor = batch.get("model_inputs", batch)
     contacts = batch["action_parameters"]["push_contact_world"][valid]
@@ -68,4 +73,9 @@ def push_effectiveness_batch_loss(
         batch["evaluation_status"][valid],
         batch["action_improves_state"][valid],
     )
-    return losses["push_effectiveness"], {**losses, "effective_logit": logits}
+    return losses["push_effectiveness"], {
+        **losses,
+        "effective_logit": logits,
+        "effective_target": batch["action_improves_state"][valid].bool(),
+        "effective_group_index": rows.long(),
+    }
