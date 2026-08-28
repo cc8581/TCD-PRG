@@ -86,6 +86,14 @@ class TCDPRGObjective(nn.Module):
             return valid.reshape(1)
         return valid.reshape(valid.shape[0], -1).any(-1)
 
+    @staticmethod
+    def _listwise_active_rows(positive: Tensor, valid: Tensor) -> Tensor:
+        """Rows with both a known positive and a known negative competitor."""
+        valid = valid.bool()
+        positive = positive.bool() & valid
+        negative = valid & ~positive
+        return positive.any(-1) & negative.any(-1)
+
     def _subtotal(
         self,
         values: dict[str, Tensor],

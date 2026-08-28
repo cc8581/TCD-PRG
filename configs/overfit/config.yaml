@@ -1,0 +1,27 @@
+# Small-data memorization run used before formal full-data training.
+# The top-level launcher adds the exact loss/freeze protocol for each stage.
+defaults:
+  - ../config.yaml
+  - _self_
+
+training:
+  seed: 2026
+  deterministic: true
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_optimizer_steps: 300
+  # A pure memorization check intentionally reuses only the training subset.
+  validation_interval: 0
+  num_workers: 0
+  validation_num_workers: 0
+  pin_memory: true
+  max_train_groups: 8
+
+scheduler:
+  warmup_steps: 20
+
+logging:
+  log_interval: 10
+  gradient_diagnostics_interval: 50
+
+output_dir: outputs/overfit

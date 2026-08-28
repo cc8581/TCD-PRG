@@ -109,6 +109,20 @@ def test_standalone_push_model_contains_only_push_parameters(tiny_batch) -> None
     )
 
 
+def test_standalone_push_sparse_outputs_are_autocast_safe(tiny_batch) -> None:
+    config = _config()
+    batch = dict(tiny_batch)
+    batch["region_target"] = torch.zeros_like(batch["point_mask"])
+    batch["region_valid"] = torch.zeros_like(batch["point_mask"])
+    batch["push_condition"] = push_condition_from_gt(batch, config.instance_queries)
+    # Training mode avoids the CPU-only Transformer inference fast path, while
+    # exercising the same autocast sparse assignments used by Stage C.
+    model = StandalonePushModel(config).train()
+    with torch.no_grad(), torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = model(batch)
+    assert torch.isfinite(output["push"]["proposal_direction_feature"]).all()
+
+
 def test_camera2_to_task_evaluator_to_dense_candidate_end_to_end(tiny_batch) -> None:
     config = _config()
     config.instance_objectness_threshold = 0.0

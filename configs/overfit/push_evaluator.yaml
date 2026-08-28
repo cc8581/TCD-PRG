@@ -1,0 +1,27 @@
+# Run only after the matching Stage-C proposal checkpoint exists.
+defaults:
+  - ../stage/push.yaml
+  - _self_
+
+training:
+  seed: 2026
+  deterministic: true
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_optimizer_steps: 200
+  validation_interval: 20
+  num_workers: 0
+  validation_num_workers: 0
+  max_train_groups: 64
+  max_validation_groups: 64
+  # Required by the shared strict config schema. The evaluator consumes the
+  # same 64-group cap directly and validates the observed class counts.
+  validation_stratum_quota:
+    direct_grasp: 0
+    pick_remove: 0
+    push: 32
+    push_failure: 32
+    unresolved_or_unknown: 0
+
+scheduler:
+  warmup_steps: 10

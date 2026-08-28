@@ -344,6 +344,13 @@ def _pipeline_command(
 def _run_all_stages(args: argparse.Namespace) -> None:
     if args.resume is not None:
         raise ValueError("The all-stage pipeline starts fresh; use --stage for resume")
+    stageb_manifest = args.stageb_binary_root.expanduser().resolve() / "manifest.json"
+    if not stageb_manifest.is_file():
+        raise FileNotFoundError(
+            "The all-stage pipeline requires the prebuilt Stage-B binary dataset before "
+            f"Stage A starts: {stageb_manifest}. Build both train and val splits with "
+            "tcd_prg.scripts.build_stageb_binary first."
+        )
     root = args.output_dir.resolve()
     stage_outputs = {
         "perception": root / "perception",

@@ -5,6 +5,7 @@ import sys
 from argparse import Namespace
 from pathlib import Path
 
+import train
 from scripts.launch_ddp_windows import _worker
 from train import PROJECT, _parse_args, _training_arguments
 
@@ -84,6 +85,20 @@ def test_launcher_forwards_validation_worker_override(tmp_path) -> None:
     ])
     arguments = _training_arguments(args)
     assert "training.validation_num_workers=1" in arguments
+
+
+def test_all_stage_pipeline_rejects_missing_stageb_data_before_launch(tmp_path) -> None:
+    args = _parse_args([
+        "--stage", "all",
+        "--stageb-binary-root", str(tmp_path / "missing-stageb"),
+        "--output-dir", str(tmp_path / "output"),
+    ])
+    try:
+        train._run_all_stages(args)
+    except FileNotFoundError as error:
+        assert "requires the prebuilt Stage-B binary dataset" in str(error)
+    else:
+        raise AssertionError("all-stage launch must fail before Stage A when Stage B is absent")
 
 
 def test_windows_worker_passes_ddp_state_explicitly(monkeypatch) -> None:

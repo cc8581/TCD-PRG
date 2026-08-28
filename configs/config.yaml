@@ -59,7 +59,9 @@ backbone:
   pretrained_freeze_steps: 2000
   freeze: false
   grid_size_m: 0.005
-  enable_flash_attention: True
+  # Windows CUDA 11/12 wheels use standard attention; enable only in a
+  # version-matched Linux environment with FlashAttention installed.
+  enable_flash_attention: false
   patch_size: 128
   attention_points: 1024
 

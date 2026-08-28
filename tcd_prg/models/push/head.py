@@ -212,10 +212,15 @@ class PushHead(nn.Module):
                     self.direction_context(point_context[b, selected])[:, None]
                     + self.direction_embedding.weight[None]
                 )
-                logits[selected] = self.direction_score(tokens).squeeze(-1)
-                residual[selected] = torch.tanh(self.direction_residual(tokens))
-                utility[selected] = self.utility(tokens).squeeze(-1)
-                direction_tokens[selected] = tokens
+                # Autocast may produce fp16/bf16 Transformer outputs while these
+                # sparse destination tensors inherit the fp32 point-context dtype.
+                # Indexed assignment does not promote automatically.
+                logits[selected] = self.direction_score(tokens).squeeze(-1).to(logits.dtype)
+                residual[selected] = torch.tanh(self.direction_residual(tokens)).to(
+                    residual.dtype
+                )
+                utility[selected] = self.utility(tokens).squeeze(-1).to(utility.dtype)
+                direction_tokens[selected] = tokens.to(direction_tokens.dtype)
             logits_rows.append(logits)
             residual_rows.append(residual)
             utility_rows.append(utility)

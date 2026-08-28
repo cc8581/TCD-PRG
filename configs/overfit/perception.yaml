@@ -1,0 +1,18 @@
+defaults:
+  - config.yaml
+  - _self_
+
+training:
+  stage: perception
+  frozen_modules: [task_grasp, graspnet, push]
+  allowed_action_strata: []
+  action_batch_coverage_strata: []
+
+losses:
+  instance: 1.0
+  region: 1.0
+  task_grasp: 0.0
+  push_object: 0.0
+  push_contact: 0.0
+  push_direction: 0.0
+  push_potential: 0.0

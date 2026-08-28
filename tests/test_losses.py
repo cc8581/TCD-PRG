@@ -172,6 +172,15 @@ def test_activity_helpers_report_fraction_of_supervised_rows() -> None:
     valid = torch.tensor([[True, False], [False, False]])
     assert TCDPRGObjective._row_active(valid).float().mean() == 0.5
 
+
+def test_listwise_activity_requires_positive_and_negative_competitors() -> None:
+    positive = torch.tensor([[True, False], [True, True], [False, False]])
+    valid = torch.ones_like(positive)
+    assert torch.equal(
+        TCDPRGObjective._listwise_active_rows(positive, valid),
+        torch.tensor([True, False, False]),
+    )
+
 def test_family_gradient_audit_reports_weighted_shared_norms() -> None:
     parameter = torch.tensor([1.0, -2.0], requires_grad=True)
     first = parameter.square().sum()
