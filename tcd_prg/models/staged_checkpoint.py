@@ -16,6 +16,8 @@ STAGE_PREFIXES = {
     "push": ("push.",),
 }
 
+PUSH_EVALUATOR_PROTOCOL_VERSION = 1
+
 PERCEPTION_RUNTIME_MODEL_FIELDS = (
     "instance_queries",
     "instance_decoder_layers",
@@ -41,6 +43,7 @@ PUSH_RUNTIME_MODEL_FIELDS = (
     "num_categories",
     "num_task_regions",
     "num_direction_bins",
+    "push_contact_match_max_distance_m",
     "push_direction_feature_dim",
     "push_direction_transformer_layers",
     "push_direction_transformer_heads",
@@ -105,7 +108,12 @@ def validate_perception_stage_runtime(payload: dict, runtime_config) -> None:
 
 def validate_push_stage_runtime(payload: dict, runtime_config) -> None:
     """Reject shape-invariant decoder/proposal protocol drift."""
-    _require_fields(payload, runtime_config, {"model": PUSH_RUNTIME_MODEL_FIELDS}, "push")
+    _require_fields(
+        payload,
+        runtime_config,
+        {"model": PUSH_RUNTIME_MODEL_FIELDS, "backbone": ("grid_size_m",)},
+        "push",
+    )
     saved_ablation = payload.get("config", {}).get("ablation", {})
     saved_use_potential = bool(saved_ablation.get("use_push_potential", False))
     runtime_use_potential = bool(runtime_config.ablation.use_push_potential)
@@ -186,6 +194,13 @@ def load_push_evaluator(
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if payload.get("training_stage") != "push_evaluator":
         raise RuntimeError(f"{checkpoint} is not a push_evaluator checkpoint")
+    version = int(payload.get("push_evaluator_protocol_version", -1))
+    if version != PUSH_EVALUATOR_PROTOCOL_VERSION:
+        raise RuntimeError(
+            f"{checkpoint} uses PUSH evaluator protocol {version}; "
+            f"runtime requires {PUSH_EVALUATOR_PROTOCOL_VERSION}. "
+            "Retrain the evaluator under the current exact-action protocol."
+        )
     if proposal_checkpoint is not None:
         expected = payload.get("proposal_state_fingerprint")
         expected_source = payload.get("proposal_state_source")

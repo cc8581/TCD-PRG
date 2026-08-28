@@ -30,8 +30,35 @@ def nearest_object_contact_point(
     return points[distance.argmin()]
 
 
+def canonical_push_direction(
+    direction_world: Tensor,
+    num_bins: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Canonicalize a physical final direction independently of proposal parameters."""
+    if direction_world.ndim != 2 or direction_world.shape[-1] != 3:
+        raise ValueError("PUSH direction_world must be [K,3]")
+    if num_bins <= 0:
+        raise ValueError("PUSH evaluator requires at least one direction bin")
+    planar_raw = direction_world[:, :2]
+    planar_norm = torch.linalg.vector_norm(planar_raw, dim=-1, keepdim=True)
+    if not bool(torch.isfinite(planar_norm).all()) or bool((planar_norm <= 1e-8).any()):
+        raise ValueError("PUSH evaluator requires finite non-zero planar directions")
+    actual = planar_raw / planar_norm
+    angle = torch.remainder(torch.atan2(actual[:, 1], actual[:, 0]), 2.0 * math.pi)
+    direction_bin = (
+        torch.floor(angle * num_bins / (2.0 * math.pi)).long().clamp_max(num_bins - 1)
+    )
+    center_angle = (direction_bin.to(angle.dtype) + 0.5) * 2.0 * math.pi / num_bins
+    center = torch.stack((torch.cos(center_angle), torch.sin(center_angle)), dim=-1)
+    residual = actual - center
+    canonical_world = torch.cat(
+        (actual, direction_world.new_zeros((len(actual), 1))), dim=-1
+    )
+    return canonical_world, direction_bin, residual
+
+
 class PushEffectivenessEvaluator(nn.Module):
-    """Score a decoded complete PUSH without updating proposal features."""
+    """Score a complete physical PUSH independently of Stage-C parameterization."""
 
     def __init__(self, feature_dim: int = 256, direction_dim: int = 64) -> None:
         super().__init__()
@@ -53,9 +80,14 @@ class PushEffectivenessEvaluator(nn.Module):
         batch_index: int,
     ) -> Tensor:
         point = candidates["point_index"].long()
-        direction_bin = candidates["direction_bin"].long()
         acted_object = candidates["object"].long()
-        direction_feature = push["proposal_direction_feature"][batch_index, point, direction_bin]
+        num_bins = push["proposal_direction_feature"].shape[2]
+        direction_world, direction_bin, direction_residual = canonical_push_direction(
+            candidates["direction_world"], num_bins
+        )
+        direction_feature = push["proposal_direction_feature"][
+            batch_index, point, direction_bin
+        ]
         object_feature = push["proposal_object_feature"][batch_index, acted_object]
         point_feature = push["proposal_point_feature"][batch_index, point]
         task_feature = push["proposal_task_feature"][batch_index].expand(len(point), -1)
@@ -66,8 +98,8 @@ class PushEffectivenessEvaluator(nn.Module):
             (
                 target_rel,
                 region_rel,
-                candidates["direction_world"],
-                candidates["direction_residual"],
+                direction_world,
+                direction_residual,
                 candidates["push_distance"][:, None],
             ),
             dim=-1,
@@ -96,9 +128,8 @@ class PushEffectivenessEvaluator(nn.Module):
         push_distance: Tensor,
         point_index: Tensor | None = None,
     ) -> Tensor:
-        """Condition on logged actions, preserving their exact scene-state pairing."""
+        """Condition on logged actions using the same final-action encoding as deployment."""
         rows: list[Tensor] = []
-        num_bins = push["proposal_direction_feature"].shape[2]
         for action in range(len(batch_index)):
             row = int(batch_index[action])
             if row < 0 or row >= sensor["xyz"].shape[0]:
@@ -123,26 +154,11 @@ class PushEffectivenessEvaluator(nn.Module):
                     raise ValueError(
                         "PUSH evaluator exact-action anchor does not belong to acted_object"
                     )
-            planar_raw = direction_world[action, :2]
-            planar_norm = torch.linalg.vector_norm(planar_raw)
-            if not bool(torch.isfinite(planar_norm)) or float(planar_norm) <= 1e-8:
-                raise ValueError("PUSH evaluator requires a finite non-zero planar direction")
-            actual = planar_raw / planar_norm
-            canonical_direction = torch.cat((actual, direction_world.new_zeros(1)), dim=0)
-            angle = torch.atan2(actual[1], actual[0])
-            angle = torch.remainder(angle, 2.0 * math.pi)
-            direction_bin = (
-                torch.floor(angle * num_bins / (2.0 * math.pi)).long().clamp_max(num_bins - 1)
-            )
-            center_angle = (direction_bin.to(angle.dtype) + 0.5) * 2.0 * math.pi / num_bins
-            center = torch.stack((torch.cos(center_angle), torch.sin(center_angle)))
             candidate = {
                 "point_index": point[None],
-                "direction_bin": direction_bin[None],
                 "object": acted_object[action, None].long(),
                 "contact_world": contact_world[action, None],
-                "direction_world": canonical_direction[None],
-                "direction_residual": (actual - center)[None],
+                "direction_world": direction_world[action, None],
                 "push_distance": push_distance[action, None],
             }
             rows.append(self.forward(push, candidate, batch_index=row))

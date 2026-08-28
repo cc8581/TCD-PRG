@@ -20,6 +20,44 @@ from tcd_prg.planners.push_decoder import (
 )
 
 
+def deterministic_target_prompt_batch(batch: Mapping[str, Any]) -> dict[str, Any]:
+    """Synthesize the deterministic observable target click used by validation."""
+    result = dict(batch)
+    existing = batch.get("task_inputs")
+    if isinstance(existing, Mapping) and all(
+        key in existing
+        for key in ("target_prompt_xyz", "target_prompt_label", "target_prompt_valid")
+    ):
+        return result
+
+    xyz = batch["xyz"]
+    valid_target = batch["point_mask"].bool() & batch["target_mask"].bool()
+    batch_size = xyz.shape[0]
+    prompt_xyz = xyz.new_zeros((batch_size, 1, 3))
+    prompt_label = torch.ones((batch_size, 1), dtype=torch.long, device=xyz.device)
+    prompt_valid = torch.zeros((batch_size, 1), dtype=torch.bool, device=xyz.device)
+    for row in range(batch_size):
+        candidates = torch.nonzero(valid_target[row], as_tuple=False).flatten()
+        if not len(candidates):
+            continue
+        points = xyz[row, candidates]
+        centroid = points.mean(0)
+        choice = candidates[torch.linalg.vector_norm(points - centroid, dim=-1).argmin()]
+        prompt_xyz[row, 0] = xyz[row, choice]
+        prompt_valid[row, 0] = True
+
+    task_inputs = dict(existing) if isinstance(existing, Mapping) else {}
+    task_inputs.update(
+        task_category_id=batch["task_category_id"],
+        task_region_id=batch["task_region_id"],
+        target_prompt_xyz=prompt_xyz,
+        target_prompt_label=prompt_label,
+        target_prompt_valid=prompt_valid,
+    )
+    result["task_inputs"] = task_inputs
+    return result
+
+
 @torch.no_grad()
 def integrated_push_proposal_counts(
     stage_a: nn.Module,
@@ -27,8 +65,8 @@ def integrated_push_proposal_counts(
     batch: Mapping[str, Any],
     config: TCDPRGConfig,
 ) -> dict[str, Tensor]:
-    """Run predicted PushCondition; use Hungarian matching only for metrics."""
-    perception = stage_a(batch, forward_mode="perception")
+    """Run deployment-equivalent prompted Stage A+C; matching is metrics-only."""
+    perception = stage_a(deterministic_target_prompt_batch(batch), forward_mode="perception")
     stage_c_batch = dict(batch)
     stage_c_batch["push_condition"] = perception["push_condition"]
     proposal = stage_c(stage_c_batch, forward_mode="push")
@@ -39,11 +77,14 @@ def integrated_push_proposal_counts(
         config.model,
         use_push_potential=config.ablation.use_push_potential,
     )
-    push_evaluator = getattr(stage_c, "push_evaluator", None)
-    if push_evaluator is None and hasattr(stage_c, "module"):
-        push_evaluator = getattr(stage_c.module, "push_evaluator", None)
-    if push_evaluator is None:
-        raise RuntimeError("Integrated PUSH evaluation requires a push_evaluator")
+    wrapped_stage_c = stage_c.module if hasattr(stage_c, "module") else stage_c
+    push_evaluator = getattr(wrapped_stage_c, "push_evaluator", None)
+    if push_evaluator is None or not bool(
+        getattr(wrapped_stage_c, "push_evaluator_ready", False)
+    ):
+        raise RuntimeError(
+            "Integrated PUSH evaluation requires a loaded PushEffectivenessEvaluator"
+        )
     for row_index, row in enumerate(final):
         if len(row["point_index"]):
             logits = push_evaluator(proposal["push"], row, batch_index=row_index)

@@ -11,7 +11,6 @@ import torch
 from torch.utils.data import DataLoader
 
 from tcd_prg.config import load_config
-from tcd_prg.constants import ActionType, CandidateStatus
 from tcd_prg.datasets import ActionStateGroupDataset
 from tcd_prg.evaluators import push_effectiveness_metrics
 from tcd_prg.evaluators.push_effectiveness import (
@@ -20,10 +19,18 @@ from tcd_prg.evaluators.push_effectiveness import (
 )
 from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
 from tcd_prg.models import StandalonePushModel, push_condition_from_gt
-from tcd_prg.models.staged_checkpoint import load_push_stage, push_checkpoint_fingerprint
+from tcd_prg.models.staged_checkpoint import (
+    PUSH_EVALUATOR_PROTOCOL_VERSION,
+    load_push_stage,
+    push_checkpoint_fingerprint,
+)
 from tcd_prg.planners.push_decoder import decode_push_candidates
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter
-from tcd_prg.trainers import freeze_push_proposal, push_effectiveness_batch_loss
+from tcd_prg.trainers import (
+    freeze_push_proposal,
+    push_effectiveness_batch_loss,
+    push_effectiveness_eligibility,
+)
 from tcd_prg.trainers.reproducibility import seed_everything
 
 
@@ -35,17 +42,19 @@ def _device(value: Any, device: torch.device) -> Any:
     return value
 
 
-def _counts(dataset: ActionStateGroupDataset) -> tuple[int, int]:
+def _counts(loader: DataLoader, config) -> tuple[int, int]:
+    """Count the same deterministic, representable population used by the loss."""
     positive = negative = 0
-    for sample in dataset:
-        group = sample.candidates
-        known_push = (
-            group.valid_mask
-            & (group.action_type == int(ActionType.PUSH))
-            & (group.evaluation_status != int(CandidateStatus.UNKNOWN_UNTESTED))
+    for batch in loader:
+        condition = push_condition_from_gt(batch, config.model.instance_queries)
+        eligible, _ = push_effectiveness_eligibility(
+            batch,
+            condition,
+            max_contact_distance_m=config.model.push_contact_match_max_distance_m,
         )
-        positive += int(group.action_improves_state[known_push].sum())
-        negative += int(known_push.sum()) - int(group.action_improves_state[known_push].sum())
+        target = batch["action_improves_state"][eligible].bool()
+        positive += int(target.sum())
+        negative += int((~target).sum())
     return positive, negative
 
 
@@ -78,6 +87,7 @@ def _evaluate(
             batch,
             instance_queries=config.model.instance_queries,
             loss_function=loss_function,
+            max_contact_distance_m=config.model.push_contact_match_max_distance_m,
         )
         logits = details["effective_logit"].detach()
         target = details["effective_target"].detach().bool()
@@ -181,7 +191,14 @@ def main() -> None:
         allowed_strata=config.training.allowed_action_strata,
         global_grasp_mode="never",
     )
-    positives, negatives = _counts(dataset)
+    count_loader = DataLoader(
+        dataset,
+        batch_size=config.training.batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=UnifiedBatchCollator(config, training=False, include_graspnet=False),
+    )
+    positives, negatives = _counts(count_loader, config)
     if positives == 0:
         raise RuntimeError("No evaluated positive PUSH action exists in the training split")
     if negatives == 0:
@@ -232,6 +249,7 @@ def main() -> None:
                 batch,
                 instance_queries=config.model.instance_queries,
                 loss_function=loss_function,
+                max_contact_distance_m=config.model.push_contact_match_max_distance_m,
             )
             if not int(details["effective_logit"].numel()):
                 continue
@@ -289,6 +307,7 @@ def main() -> None:
         {
             "model": best_state,
             "training_stage": "push_evaluator",
+            "push_evaluator_protocol_version": PUSH_EVALUATOR_PROTOCOL_VERSION,
             "positive_count": positives,
             "negative_count": negatives,
             "pos_weight": negatives / positives,
