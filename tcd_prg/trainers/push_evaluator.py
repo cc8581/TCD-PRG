@@ -8,6 +8,7 @@ from torch import Tensor, nn
 from tcd_prg.constants import PUSH_DISTANCE_M, ActionType, CandidateStatus
 from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
 from tcd_prg.models import push_condition_from_gt
+from tcd_prg.models.push.evaluator import nearest_object_contact_point
 
 
 def freeze_push_proposal(model: nn.Module) -> None:
@@ -28,10 +29,16 @@ def push_effectiveness_batch_loss(
     loss_function: PushEffectivenessLoss,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Encode frozen Stage C and supervise logged exact PUSH actions only."""
+    condition = push_condition_from_gt(batch, instance_queries)
+    acted_all = batch["acted_object"].long()
+    in_range = (acted_all >= 0) & (acted_all < condition.object_valid.shape[1])
+    safe_object = acted_all.clamp(0, condition.object_valid.shape[1] - 1)
+    represented = in_range & condition.object_valid.gather(1, safe_object)
     valid = (
         batch["candidate_mask"].bool()
         & (batch["action_type"] == int(ActionType.PUSH))
         & (batch["evaluation_status"] != int(CandidateStatus.UNKNOWN_UNTESTED))
+        & represented
     )
     selected = torch.nonzero(valid, as_tuple=False)
     if not len(selected):
@@ -45,17 +52,23 @@ def push_effectiveness_batch_loss(
 
     sensor = batch.get("model_inputs", batch)
     contacts = batch["action_parameters"]["push_contact_world"][valid]
+    acted_objects = batch["acted_object"][valid].long()
     rows = selected[:, 0]
     forced = torch.zeros_like(sensor["point_mask"], dtype=torch.bool)
+    anchors = torch.empty(len(rows), dtype=torch.long, device=rows.device)
     for action, row in enumerate(rows.tolist()):
-        points = torch.nonzero(sensor["point_mask"][row], as_tuple=False).flatten()
-        nearest = torch.linalg.vector_norm(
-            sensor["xyz"][row, points] - contacts[action], dim=-1
-        ).argmin()
-        forced[row, points[nearest]] = True
+        anchor = nearest_object_contact_point(
+            sensor["xyz"][row],
+            sensor["point_mask"][row],
+            condition.object_probability[row],
+            int(acted_objects[action]),
+            contacts[action],
+        )
+        anchors[action] = anchor
+        forced[row, anchor] = True
 
     model_batch = dict(batch)
-    model_batch["push_condition"] = push_condition_from_gt(batch, instance_queries)
+    model_batch["push_condition"] = condition
     model_batch["training_hints"] = {"push_direction_point_mask": forced}
     with torch.no_grad():
         output = model(model_batch, forward_mode="push")
@@ -63,10 +76,11 @@ def push_effectiveness_batch_loss(
         output["sensor"],
         output["push"],
         batch_index=rows,
-        acted_object=batch["acted_object"][valid],
+        acted_object=acted_objects,
         contact_world=contacts,
         direction_world=batch["action_parameters"]["push_direction_world"][valid],
         push_distance=contacts.new_full((len(contacts),), PUSH_DISTANCE_M),
+        point_index=anchors,
     )
     losses = loss_function(
         logits,

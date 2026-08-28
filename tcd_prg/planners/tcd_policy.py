@@ -1,4 +1,5 @@
 """Closed-loop TCD-PRG policy using sensor-only perception inputs."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,9 +9,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from tcd_prg.baselines.base import (
-    GlobalGraspPrediction, ManipulationPolicy
-)
+from tcd_prg.baselines.base import GlobalGraspPrediction, ManipulationPolicy
 from tcd_prg.config import TCDPRGConfig
 from tcd_prg.constants import ActionType
 from tcd_prg.datasets.collate import grid_sample_indices
@@ -81,9 +80,7 @@ class TCDPRGPolicy(ManipulationPolicy):
         model_inputs = {
             "xyz": torch.from_numpy(xyz[selected])[None].float(),
             "rgb": torch.from_numpy(rgb[selected])[None].float(),
-            "point_mask": torch.ones(
-                1, len(selected), dtype=torch.bool
-            ),
+            "point_mask": torch.ones(1, len(selected), dtype=torch.bool),
         }
         camera_index = self.config.graspnet.camera_view_index
         camera_usable = (
@@ -109,11 +106,7 @@ class TCDPRGPolicy(ManipulationPolicy):
                 camera_indices = camera_indices[
                     np.linspace(0, len(camera_indices) - 1, limit, dtype=np.int64)
                 ]
-        camera_xyz = (
-            xyz[camera_indices]
-            if len(camera_indices)
-            else np.zeros((1, 3), np.float32)
-        )
+        camera_xyz = xyz[camera_indices] if len(camera_indices) else np.zeros((1, 3), np.float32)
         model_inputs["graspnet_xyz_world"] = torch.from_numpy(camera_xyz)[None].float()
         model_inputs["graspnet_point_mask"] = torch.tensor(
             [[True] * len(camera_indices)] if len(camera_indices) else [[False]],
@@ -141,19 +134,17 @@ class TCDPRGPolicy(ManipulationPolicy):
             [bool(camera_usable and len(camera_indices))], dtype=torch.bool
         )
         task_inputs = {
-            "task_category_id": torch.tensor(
-                [int(task_category_id)], dtype=torch.long
-            ),
-            "task_region_id": torch.tensor(
-                [int(task_region_id)], dtype=torch.long
-            ),
+            "task_category_id": torch.tensor([int(task_category_id)], dtype=torch.long),
+            "task_region_id": torch.tensor([int(task_region_id)], dtype=torch.long),
         }
         if target_prompt_xyz is None:
-            task_inputs.update({
-                "target_prompt_xyz": torch.zeros((1, 1, 3), dtype=torch.float32),
-                "target_prompt_label": torch.ones((1, 1), dtype=torch.long),
-                "target_prompt_valid": torch.zeros((1, 1), dtype=torch.bool),
-            })
+            task_inputs.update(
+                {
+                    "target_prompt_xyz": torch.zeros((1, 1, 3), dtype=torch.float32),
+                    "target_prompt_label": torch.ones((1, 1), dtype=torch.long),
+                    "target_prompt_valid": torch.zeros((1, 1), dtype=torch.bool),
+                }
+            )
         else:
             prompt = np.asarray(target_prompt_xyz, np.float32).reshape(-1, 3)
             labels = (
@@ -163,11 +154,13 @@ class TCDPRGPolicy(ManipulationPolicy):
             )
             if len(labels) != len(prompt):
                 raise ValueError("target_prompt_label length must match target_prompt_xyz")
-            task_inputs.update({
-                "target_prompt_xyz": torch.from_numpy(prompt)[None].float(),
-                "target_prompt_label": torch.from_numpy(labels)[None].long(),
-                "target_prompt_valid": torch.ones((1, len(prompt)), dtype=torch.bool),
-            })
+            task_inputs.update(
+                {
+                    "target_prompt_xyz": torch.from_numpy(prompt)[None].float(),
+                    "target_prompt_label": torch.from_numpy(labels)[None].long(),
+                    "target_prompt_valid": torch.ones((1, len(prompt)), dtype=torch.bool),
+                }
+            )
         if continue_target:
             state = self.target_tracker.state
             if state is None:
@@ -208,18 +201,12 @@ class TCDPRGPolicy(ManipulationPolicy):
         centroid = cloud.mean(0)
         return xyz[points[np.linalg.norm(cloud - centroid, axis=-1).argmin()]].copy()
 
-    def _batch(
-        self, observation: SceneObservation
-    ) -> dict[str, Any]:
+    def _batch(self, observation: SceneObservation) -> dict[str, Any]:
         """Dataset/evaluation adapter: GT fields are deliberately ignored."""
         observation.validate()
         # Category/region are the closed-vocabulary task specification.  The
         # GT target mask/instance id/object state are not copied into model input.
-        category = int(
-            observation.object_category_id[
-                observation.target_object
-            ]
-        )
+        category = int(observation.object_category_id[observation.target_object])
         point_valid = (
             observation.point_valid
             if observation.point_valid is not None
@@ -249,10 +236,7 @@ class TCDPRGPolicy(ManipulationPolicy):
     ) -> EncodedPolicyState:
         device = {
             key: (
-                {
-                    subkey: value.to(self.device)
-                    for subkey, value in nested.items()
-                }
+                {subkey: value.to(self.device) for subkey, value in nested.items()}
                 if isinstance(nested, dict)
                 else nested
             )
@@ -275,12 +259,8 @@ class TCDPRGPolicy(ManipulationPolicy):
                 )
         return state
 
-    def encode_observation(
-        self, observation: SceneObservation
-    ) -> EncodedPolicyState:
-        return self._encode_batch(
-            self._batch(observation), observation
-        )
+    def encode_observation(self, observation: SceneObservation) -> EncodedPolicyState:
+        return self._encode_batch(self._batch(observation), observation)
 
     def segment_fused_scene(
         self,
@@ -307,14 +287,10 @@ class TCDPRGPolicy(ManipulationPolicy):
         model_inputs = {
             "xyz": torch.from_numpy(xyz_m[selected])[None].float().to(self.device),
             "rgb": torch.from_numpy(rgb[selected])[None].float().to(self.device),
-            "point_mask": torch.ones(
-                1, len(selected), dtype=torch.bool, device=self.device
-            ),
+            "point_mask": torch.ones(1, len(selected), dtype=torch.bool, device=self.device),
         }
         with torch.no_grad():
-            output = self.model(
-                {"model_inputs": model_inputs}, forward_mode="instances"
-            )
+            output = self.model({"model_inputs": model_inputs}, forward_mode="instances")
         instance = output["instance"]
         object_valid = instance.object_mask[0]
         probability = instance.mask_probability[0].clone()
@@ -331,9 +307,7 @@ class TCDPRGPolicy(ManipulationPolicy):
             # Preserve the learned query id so GUI instance ids and action
             # acted_object ids use the same runtime identity space.
             assigned_query[points] = query
-            categories[query] = int(
-                instance.category_logits[0, query].argmax().item()
-            )
+            categories[query] = int(instance.category_logits[0, query].argmax().item())
             objectness_by_instance[query] = float(
                 torch.sigmoid(instance.objectness_logits[0, query]).item()
             )
@@ -407,16 +381,9 @@ class TCDPRGPolicy(ManipulationPolicy):
         return int(max(scores, key=scores.get))
 
     @staticmethod
-    def _action(
-        candidates: dict[str, Tensor], index: int
-    ) -> dict[str, Any]:
+    def _action(candidates: dict[str, Tensor], index: int) -> dict[str, Any]:
         def array(name: str):
-            value = (
-                candidates[name][0, index]
-                .detach()
-                .cpu()
-                .numpy()
-            )
+            value = candidates[name][0, index].detach().cpu().numpy()
             return value.item() if value.ndim == 0 else value
 
         kind = int(array("type"))
@@ -438,19 +405,13 @@ class TCDPRGPolicy(ManipulationPolicy):
             action.update(
                 grasp_pose_world=array("pose_world"),
                 grasp_width_m=float(array("width_m")),
-                removal_destination_world=array(
-                    "destination_world"
-                ),
+                removal_destination_world=array("destination_world"),
             )
         return action
 
-    def generate_candidates(
-        self, encoded: EncodedPolicyState
-    ) -> dict[str, Any]:
+    def generate_candidates(self, encoded: EncodedPolicyState) -> dict[str, Any]:
         with torch.no_grad():
-            candidates = self.generator.generate(
-                self.model, encoded.device_batch, encoded.output
-            )
+            candidates = self.generator.generate(self.model, encoded.device_batch, encoded.output)
             task_mask = candidates["type"] == int(ActionType.TASK_GRASP)
             candidates["task_grasp_query_count"] = torch.full(
                 (candidates["type"].shape[0],),
@@ -458,21 +419,14 @@ class TCDPRGPolicy(ManipulationPolicy):
                 dtype=torch.long,
                 device=self.device,
             )
-            candidates["task_grasp_after_nms_count"] = (
-                candidates["valid"] & task_mask
-            ).sum(-1)
+            candidates["task_grasp_after_nms_count"] = (candidates["valid"] & task_mask).sum(-1)
             # DenseCandidateGenerator has already applied task-grasp NMS and
             # the calibrated probability threshold. One executable grasp is enough
             # for execution; dataset grasp-count labels are not runtime hard gates.
-            candidates["unique_task_grasp_count"] = (
-                candidates["valid"] & task_mask
-            ).sum(-1)
-            candidates["valid"] = self.generator.apply_push_nms(
-                candidates, candidates["proposal_score"]
-            )
+            candidates["unique_task_grasp_count"] = (candidates["valid"] & task_mask).sum(-1)
+            # PUSH rows already come from the shared decoder's post-NMS set.
             candidates["push_after_nms_count"] = (
-                candidates["valid"]
-                & (candidates["type"] == int(ActionType.PUSH))
+                candidates["valid"] & (candidates["type"] == int(ActionType.PUSH))
             ).sum(-1)
         return {
             "encoded": encoded,
@@ -480,9 +434,7 @@ class TCDPRGPolicy(ManipulationPolicy):
             "certification_reasons": [],
         }
 
-    def select_action(
-        self, candidates: dict[str, Any]
-    ) -> dict[str, Any] | None:
+    def select_action(self, candidates: dict[str, Any]) -> dict[str, Any] | None:
         tensors = candidates["candidates"]
         valid = tensors["valid"][0]
         for action_type in (
@@ -501,11 +453,11 @@ class TCDPRGPolicy(ManipulationPolicy):
                 if action_type == ActionType.PUSH
                 else tensors["proposal_score"]
             )
-            order = indices[
-                ranking_score[0, indices].argsort(
-                    descending=True, stable=True
-                )
-            ]
+            if action_type == ActionType.PUSH and not bool(
+                torch.isfinite(ranking_score[0, indices]).all()
+            ):
+                raise RuntimeError("PUSH selection requires a loaded PushEffectivenessEvaluator")
+            order = indices[ranking_score[0, indices].argsort(descending=True, stable=True)]
             for index_tensor in order:
                 index = int(index_tensor)
                 action = self._action(tensors, index)
@@ -513,39 +465,27 @@ class TCDPRGPolicy(ManipulationPolicy):
                 point_index = int(tensors["point_index"][0, index])
                 if point_index >= 0:
                     action["association_point_world"] = (
-                        candidates["encoded"].cpu_batch["model_inputs"]["xyz"]
-                        [0, point_index].detach().cpu().numpy()
+                        candidates["encoded"]
+                        .cpu_batch["model_inputs"]["xyz"][0, point_index]
+                        .detach()
+                        .cpu()
+                        .numpy()
                     )
                 return action
         return None
 
-    def predict_grasps(
-        self, encoded: EncodedPolicyState
-    ) -> list[dict[str, Any]]:
-        candidates = self.generate_candidates(
-            encoded
-        )["candidates"]
+    def predict_grasps(self, encoded: EncodedPolicyState) -> list[dict[str, Any]]:
+        candidates = self.generate_candidates(encoded)["candidates"]
         indices = torch.nonzero(
-            candidates["valid"][0]
-            & (
-                candidates["type"][0]
-                == int(ActionType.TASK_GRASP)
-            ),
+            candidates["valid"][0] & (candidates["type"][0] == int(ActionType.TASK_GRASP)),
             as_tuple=False,
         ).flatten()
-        return [
-            self._action(candidates, int(index))
-            for index in indices
-        ]
+        return [self._action(candidates, int(index)) for index in indices]
 
-    def predict_task_grasps(
-        self, encoded: EncodedPolicyState
-    ) -> list[dict[str, Any]]:
+    def predict_task_grasps(self, encoded: EncodedPolicyState) -> list[dict[str, Any]]:
         return self.predict_grasps(encoded)
 
-    def predict_global_grasps(
-        self, encoded: EncodedPolicyState
-    ) -> list[GlobalGraspPrediction]:
+    def predict_global_grasps(self, encoded: EncodedPolicyState) -> list[GlobalGraspPrediction]:
         decoded = self.generator.global_predictions(
             encoded.device_batch,
             encoded.output,
@@ -555,24 +495,12 @@ class TCDPRGPolicy(ManipulationPolicy):
         for index in range(len(decoded["scene_score"])):
             predictions.append(
                 GlobalGraspPrediction(
-                    object_index=int(
-                        decoded["object"][index]
-                    ),
-                    contact_point_world=decoded[
-                        "contact_world"
-                    ][index].detach().cpu().numpy(),
-                    grasp_pose_world=decoded[
-                        "pose_world"
-                    ][index].detach().cpu().numpy(),
-                    width_m=float(
-                        decoded["width_m"][index]
-                    ),
-                    raw_score=float(
-                        decoded["raw_score"][index]
-                    ),
-                    scene_score=float(
-                        decoded["scene_score"][index]
-                    ),
+                    object_index=int(decoded["object"][index]),
+                    contact_point_world=decoded["contact_world"][index].detach().cpu().numpy(),
+                    grasp_pose_world=decoded["pose_world"][index].detach().cpu().numpy(),
+                    width_m=float(decoded["width_m"][index]),
+                    raw_score=float(decoded["raw_score"][index]),
+                    scene_score=float(decoded["scene_score"][index]),
                     intrinsic_score=None,
                     certified=False,
                     source="tcd_prg_global",
@@ -584,9 +512,7 @@ class TCDPRGPolicy(ManipulationPolicy):
         self.preparation_actions = 0
         self.target_tracker.reset()
 
-    def update_after_action(
-        self, action: Any, observation: SceneObservation | None
-    ) -> None:
+    def update_after_action(self, action: Any, observation: SceneObservation | None) -> None:
         if isinstance(action, dict) and "action_type" in action:
             action_type = int(action["action_type"])
             if action_type != int(ActionType.TASK_GRASP):

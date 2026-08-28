@@ -33,11 +33,13 @@ def aggregate_stageb_validation_payloads(
     targets = [np.asarray(item["stageb_targets"]) for item in summaries if "stageb_targets" in item]
     deployment_scores = [
         np.asarray(item["stageb_deployment_scores"])
-        for item in summaries if "stageb_deployment_scores" in item
+        for item in summaries
+        if "stageb_deployment_scores" in item
     ]
     deployment_targets = [
         np.asarray(item["stageb_deployment_targets"])
-        for item in summaries if "stageb_deployment_targets" in item
+        for item in summaries
+        if "stageb_deployment_targets" in item
     ]
     if not scores:
         return {}
@@ -48,8 +50,10 @@ def aggregate_stageb_validation_payloads(
     if len(deployment_scores) != len(scores) or len(deployment_targets) != len(scores):
         raise RuntimeError("Incomplete deployment-calibration Stage-B validation payload")
     return stageb_split_metrics(
-        np.concatenate(scores), np.concatenate(targets),
-        np.concatenate(deployment_scores), np.concatenate(deployment_targets),
+        np.concatenate(scores),
+        np.concatenate(targets),
+        np.concatenate(deployment_scores),
+        np.concatenate(deployment_targets),
     )
 
 
@@ -59,14 +63,12 @@ def finalize_push_validation_metrics(details: Mapping[str, float]) -> dict[str, 
     positive_total = result.get("push_positive_actions_total_count", 0.0)
     if positive_total > 0:
         result["push_direction_positive_coverage"] = (
-            result.get("push_positive_actions_direction_covered_count", 0.0)
-            / positive_total
+            result.get("push_positive_actions_direction_covered_count", 0.0) / positive_total
         )
     utility_eligible = result.get("push_positive_actions_utility_eligible_count", 0.0)
     if utility_eligible > 0:
         result["push_utility_valid_coverage"] = (
-            result.get("push_positive_actions_utility_covered_count", 0.0)
-            / utility_eligible
+            result.get("push_positive_actions_utility_covered_count", 0.0) / utility_eligible
         )
     positive_rows = result.get("push_object_positive_rows_count", 0.0)
     if positive_rows > 0:
@@ -76,31 +78,25 @@ def finalize_push_validation_metrics(details: Mapping[str, float]) -> dict[str, 
         result["push_object_positive_recall_at_4"] = (
             result.get("push_object_positive_hits_at_4_count", 0.0) / positive_rows
         )
+        result["push_object_positive_recall_at_deployment_k"] = (
+            result.get("push_object_positive_hits_at_deployment_k_count", 0.0) / positive_rows
+        )
     proposal_total = result.get("push_proposal_positive_total_count", 0.0)
     if proposal_total > 0:
         result["push_proposal_positive_recall_pre_nms_at_32"] = (
-            result.get("push_proposal_positive_pre_nms_hits_count", 0.0)
-            / proposal_total
+            result.get("push_proposal_positive_pre_nms_hits_count", 0.0) / proposal_total
         )
         result["push_final_positive_recall_at_32"] = (
-            result.get("push_proposal_positive_final_hits_count", 0.0)
-            / proposal_total
+            result.get("push_proposal_positive_final_hits_count", 0.0) / proposal_total
         )
-    integrated_total = result.get(
-        "integrated_push_proposal_positive_total_count", 0.0
-    )
+    integrated_total = result.get("integrated_push_proposal_positive_total_count", 0.0)
     if integrated_total > 0:
         result["integrated_push_proposal_positive_recall_pre_nms_at_32"] = (
-            result.get(
-                "integrated_push_proposal_positive_pre_nms_hits_count", 0.0
-            )
+            result.get("integrated_push_proposal_positive_pre_nms_hits_count", 0.0)
             / integrated_total
         )
         result["integrated_push_final_positive_recall_at_32"] = (
-            result.get(
-                "integrated_push_proposal_positive_final_hits_count", 0.0
-            )
-            / integrated_total
+            result.get("integrated_push_proposal_positive_final_hits_count", 0.0) / integrated_total
         )
     return result
 
@@ -140,6 +136,7 @@ class Trainer:
         "push_object_positive_rows_count",
         "push_object_positive_hits_at_1_count",
         "push_object_positive_hits_at_4_count",
+        "push_object_positive_hits_at_deployment_k_count",
         "push_positive_actions_total_count",
         "push_positive_actions_direction_covered_count",
         "push_positive_actions_utility_covered_count",
@@ -550,7 +547,9 @@ class Trainer:
             validation_details = finalize_push_validation_metrics(validation_details)
             if "push_direction_positive_coverage" in validation_details:
                 direction_coverage = validation_details["push_direction_positive_coverage"]
-                score += float(self.config.training.push_coverage_penalty_weight) * (1.0 - direction_coverage)
+                score += float(self.config.training.push_coverage_penalty_weight) * (
+                    1.0 - direction_coverage
+                )
             validation_details.update(aggregate_stageb_validation_payloads(summaries))
             evaluation_records = [
                 record for item in summaries for record in item.get("evaluation_records", [])
@@ -1170,9 +1169,13 @@ class Trainer:
         model_state = source.state_dict()
         ema_state = self.ema.model.state_dict() if self.ema else None
         if self.config.training.stage == "push":
-            model_state = {key: value for key, value in model_state.items() if key.startswith("push.")}
+            model_state = {
+                key: value for key, value in model_state.items() if key.startswith("push.")
+            }
             if ema_state is not None:
-                ema_state = {key: value for key, value in ema_state.items() if key.startswith("push.")}
+                ema_state = {
+                    key: value for key, value in ema_state.items() if key.startswith("push.")
+                }
         payload = {
             "schema_version": 12,
             "training_stage": self.config.training.stage,
@@ -1212,17 +1215,17 @@ class Trainer:
                 "Resume checkpoint stage mismatch: "
                 f"checkpoint={checkpoint_stage!r}, requested={self.config.training.stage!r}"
             )
-        if (
-            checkpoint_stage == "grasp"
-            and compatibility_provenance(payload.get("stageb_provenance", {}))
-            != compatibility_provenance(self.stageb_provenance)
-        ):
+        if checkpoint_stage == "grasp" and compatibility_provenance(
+            payload.get("stageb_provenance", {})
+        ) != compatibility_provenance(self.stageb_provenance):
             raise RuntimeError("Stage-B resume checkpoint provenance does not match the dataset")
         source = self.model.module if hasattr(self.model, "module") else self.model
         if checkpoint_stage == "push" and set(source.state_dict()) != set(payload["model"]):
             missing = sorted(set(source.state_dict()) - set(payload["model"]))
             extra = sorted(set(payload["model"]) - set(source.state_dict()))
-            raise RuntimeError(f"Stage-C checkpoint parameter mismatch: missing={missing[:5]} extra={extra[:5]}")
+            raise RuntimeError(
+                f"Stage-C checkpoint parameter mismatch: missing={missing[:5]} extra={extra[:5]}"
+            )
         source.load_state_dict(payload["model"], strict=True)
         self.task_grasp_probability_threshold = float(
             payload.get(

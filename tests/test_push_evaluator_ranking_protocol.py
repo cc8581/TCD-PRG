@@ -41,7 +41,7 @@ def test_candidate_ranking_is_conditioned_on_proposal_success() -> None:
     )
     assert masks[0].tolist() == [False, True]
     counts = push_candidate_ranking_counts(rows, masks)
-    assert counts["push_evaluator_candidate_set_count"] == 1
+    assert counts["push_evaluator_positive_candidate_set_count"] == 1
     assert counts["push_evaluator_hit_at_1_count"] == 1
     assert counts["push_evaluator_recall_at_5_count"] == 1
 
@@ -60,7 +60,7 @@ def test_proposal_miss_is_not_charged_to_evaluator() -> None:
         rows, _batch(), contact_threshold_m=0.01, direction_threshold_deg=5.0
     )
     counts = push_candidate_ranking_counts(rows, masks)
-    assert counts["push_evaluator_candidate_set_count"] == 0
+    assert counts["push_evaluator_positive_candidate_set_count"] == 0
 
 
 def test_stage_c_fingerprint_tracks_ema_and_exact_tensor_state(tmp_path) -> None:

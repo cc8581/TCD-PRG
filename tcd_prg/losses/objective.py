@@ -1,4 +1,5 @@
 """End-to-end objective with strict sensor/task/GT separation."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -9,9 +10,7 @@ from torch import Tensor, nn
 from tcd_prg.models.stageb_condition import stageb_condition_from_gt
 from tcd_prg.models.push_condition import push_condition_from_gt
 
-from tcd_prg.config import (
-    AblationConfig, LossConfig, ModelConfig, RegionHeadConfig
-)
+from tcd_prg.config import AblationConfig, LossConfig, ModelConfig, RegionHeadConfig
 from tcd_prg.datasets.capabilities import DatasetCapabilities
 
 from .actions import PushLoss
@@ -59,35 +58,13 @@ class TCDPRGObjective(nn.Module):
 
         self.instance = InstanceSetLoss(
             matching_points=model_config.instance_matching_points,
-            objectness_weight=float(
-                self.internal_weights.get(
-                    "instance_objectness", 1.0
-                )
-            ),
-            mask_weight=float(
-                self.internal_weights.get(
-                    "instance_mask", 2.0
-                )
-            ),
-            dice_weight=float(
-                self.internal_weights.get(
-                    "instance_dice", 2.0
-                )
-            ),
-            category_weight=float(
-                self.internal_weights.get(
-                    "instance_category", 1.0
-                )
-            ),
-            target_weight=float(
-                self.internal_weights.get(
-                    "target_query", 1.0
-                )
-            ),
+            objectness_weight=float(self.internal_weights.get("instance_objectness", 1.0)),
+            mask_weight=float(self.internal_weights.get("instance_mask", 2.0)),
+            dice_weight=float(self.internal_weights.get("instance_dice", 2.0)),
+            category_weight=float(self.internal_weights.get("instance_category", 1.0)),
+            target_weight=float(self.internal_weights.get("target_query", 1.0)),
             same_category_target_weight=model_config.target_same_category_loss_boost,
-            auxiliary_weight=float(
-                self.internal_weights.get("instance_auxiliary", 0.5)
-            ),
+            auxiliary_weight=float(self.internal_weights.get("instance_auxiliary", 0.5)),
         )
         self.region = TaskRegionLoss(
             region_config.focal_alpha,
@@ -95,7 +72,7 @@ class TCDPRGObjective(nn.Module):
             region_config.dice_weight,
         )
         self.task_grasp = TaskGraspBinaryLoss()
-        self.push = PushLoss()
+        self.push = PushLoss(model_config.push_object_topk)
         self.total = MultiTaskLoss(
             capabilities,
             ablation,
@@ -115,9 +92,7 @@ class TCDPRGObjective(nn.Module):
         active: dict[str, Tensor | bool],
     ) -> dict[str, Tensor]:
         if values.keys() != active.keys():
-            raise KeyError(
-                "Loss activity keys do not match loss values"
-            )
+            raise KeyError("Loss activity keys do not match loss values")
         reference = next(iter(values.values()))
         numerator = reference.new_zeros(())
         denominator = reference.new_zeros(())
@@ -127,28 +102,15 @@ class TCDPRGObjective(nn.Module):
                 dtype=torch.bool,
                 device=value.device,
             ).any()
-            weight = float(
-                self.internal_weights.get(name, 1.0)
-            )
-            numerator = (
-                numerator
-                + weight * value * flag.to(value.dtype)
-            )
-            denominator = (
-                denominator
-                + weight * flag.to(value.dtype)
-            )
+            weight = float(self.internal_weights.get(name, 1.0))
+            numerator = numerator + weight * value * flag.to(value.dtype)
+            denominator = denominator + weight * flag.to(value.dtype)
         return {
-            "loss": numerator
-            / denominator.clamp_min(
-                torch.finfo(reference.dtype).eps
-            ),
+            "loss": numerator / denominator.clamp_min(torch.finfo(reference.dtype).eps),
             **values,
         }
 
-    def _synthesize_target_prompt(
-        self, batch: dict[str, Any]
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    def _synthesize_target_prompt(self, batch: dict[str, Any]) -> tuple[Tensor, Tensor, Tensor]:
         """Create an observable positive 3D task prompt from GT during training.
 
         The GT mask is used only to choose one coordinate, analogous to generating
@@ -178,9 +140,7 @@ class TCDPRGObjective(nn.Module):
         jitter = float(self.model_config.target_prompt_jitter_std_m)
         if self.training and jitter > 0:
             noise = torch.randn_like(prompt_xyz) * jitter
-            prompt_xyz = torch.where(
-                prompt_valid[..., None], prompt_xyz + noise, prompt_xyz
-            )
+            prompt_xyz = torch.where(prompt_valid[..., None], prompt_xyz + noise, prompt_xyz)
         return prompt_xyz, prompt_label, prompt_valid
 
     def _model_view(self, batch: dict[str, Any]) -> dict[str, Any]:
@@ -191,8 +151,12 @@ class TCDPRGObjective(nn.Module):
             "point_mask": batch["point_mask"],
         }
         for key in (
-            "source_view", "graspnet_xyz_world", "graspnet_point_mask",
-            "camera2_eye_world", "camera2_target_world", "camera2_up_world",
+            "source_view",
+            "graspnet_xyz_world",
+            "graspnet_point_mask",
+            "camera2_eye_world",
+            "camera2_target_world",
+            "camera2_up_world",
             "camera2_valid",
         ):
             if key in batch:
@@ -211,14 +175,14 @@ class TCDPRGObjective(nn.Module):
                 prompt_valid = batch["target_prompt_valid"]
             else:
                 prompt_xyz, prompt_label, prompt_valid = self._synthesize_target_prompt(batch)
-            view["task_inputs"] = {
-                key: batch[key] for key in task_keys
-            }
-            view["task_inputs"].update({
-                "target_prompt_xyz": prompt_xyz,
-                "target_prompt_label": prompt_label,
-                "target_prompt_valid": prompt_valid,
-            })
+            view["task_inputs"] = {key: batch[key] for key in task_keys}
+            view["task_inputs"].update(
+                {
+                    "target_prompt_xyz": prompt_xyz,
+                    "target_prompt_label": prompt_label,
+                    "target_prompt_valid": prompt_valid,
+                }
+            )
         if "stageb_candidates" in batch:
             view["grasp_candidates"] = {
                 key: value for key, value in batch["stageb_candidates"].items()
@@ -231,9 +195,7 @@ class TCDPRGObjective(nn.Module):
         batch: dict[str, Any],
         target_query_logits: Tensor | None,
     ):
-        targets = build_instance_targets(
-            batch, output_instance.mask_logits.shape[1]
-        )
+        targets = build_instance_targets(batch, output_instance.mask_logits.shape[1])
         values, match = self.instance(
             output_instance,
             targets,
@@ -249,16 +211,14 @@ class TCDPRGObjective(nn.Module):
         return_output: bool = False,
         return_family_losses: bool = False,
     ) -> Any:
-        enabled = {
-            name for name in self.MODULE_OBJECTIVES if self.total.enabled(name)
-        }
-        push_families = {
-            "push_object", "push_contact", "push_direction", "push_potential"
-        }
+        enabled = {name for name in self.MODULE_OBJECTIVES if self.total.enabled(name)}
+        push_families = {"push_object", "push_contact", "push_direction", "push_potential"}
         has_push = bool(enabled & push_families)
         has_grasp = "task_grasp" in enabled
         if has_push and has_grasp:
-            raise RuntimeError("Joint Stage-B/Stage-C training is incompatible with independent condition protocols; train grasp and push separately.")
+            raise RuntimeError(
+                "Joint Stage-B/Stage-C training is incompatible with independent condition protocols; train grasp and push separately."
+            )
         if has_push:
             forward_mode = "push"
         elif has_grasp:
@@ -277,12 +237,12 @@ class TCDPRGObjective(nn.Module):
         if forward_mode == "grasp":
             model_view["stageb_condition"] = stageb_condition_from_gt(batch)
         if forward_mode == "push":
-            model_view["push_condition"] = push_condition_from_gt(batch, self.model_config.instance_queries)
+            model_view["push_condition"] = push_condition_from_gt(
+                batch, self.model_config.instance_queries
+            )
         if training_hints is not None:
             model_view["training_hints"] = {
-                "push_direction_point_mask": training_hints[
-                    "push_direction_point_mask"
-                ]
+                "push_direction_point_mask": training_hints["push_direction_point_mask"]
             }
         output = model(model_view, forward_mode=forward_mode)
 
@@ -302,9 +262,7 @@ class TCDPRGObjective(nn.Module):
             )
             output["instance_match"] = match
             families["instance"] = instance_values
-            activity["active_loss_instance"] = (
-                instance_targets["visible"].any(-1).float().mean()
-            )
+            activity["active_loss_instance"] = instance_targets["visible"].any(-1).float().mean()
 
         region_labels = build_region_labels(batch)
         if region_labels is not None and self.total.enabled("region"):
@@ -318,9 +276,13 @@ class TCDPRGObjective(nn.Module):
                 },
             )
             activity["active_loss_region"] = (
-                self._row_active(region_labels["region_valid"])
-                | self._row_active(region_labels["visibility_valid"])
-            ).float().mean()
+                (
+                    self._row_active(region_labels["region_valid"])
+                    | self._row_active(region_labels["visibility_valid"])
+                )
+                .float()
+                .mean()
+            )
 
         if self.total.enabled("task_grasp"):
             if output.get("task_grasp") is None:
@@ -331,7 +293,9 @@ class TCDPRGObjective(nn.Module):
                 output["task_grasp"], batch["stageb_label"], batch["stageb_candidate_valid"]
             )
             families["task_grasp"] = score_losses
-            activity["active_loss_task_grasp"] = batch["stageb_candidate_valid"].any(-1).float().mean()
+            activity["active_loss_task_grasp"] = (
+                batch["stageb_candidate_valid"].any(-1).float().mean()
+            )
 
         if has_push:
             if output.get("push") is None:
@@ -348,72 +312,83 @@ class TCDPRGObjective(nn.Module):
             if self.total.enabled("push_object"):
                 families["push_object"] = {
                     "loss": push_losses["push_object"],
-                    "push_object_effective_rows": push_losses[
-                        "push_object_effective_rows"
-                    ],
-                    "push_known_objects_per_state": push_losses[
-                        "push_known_objects_per_state"
-                    ],
+                    "push_object_effective_rows": push_losses["push_object_effective_rows"],
+                    "push_known_objects_per_state": push_losses["push_known_objects_per_state"],
                     "push_multiobject_states": push_losses["push_multiobject_states"],
                     "push_positive_objects": push_losses["push_positive_objects"],
                     "push_negative_objects": push_losses["push_negative_objects"],
-                    "push_object_positive_rows_count": push_losses["push_object_positive_rows_count"],
-                    "push_object_positive_hits_at_1_count": push_losses["push_object_positive_hits_at_1_count"],
-                    "push_object_positive_hits_at_4_count": push_losses["push_object_positive_hits_at_4_count"],
-                    "push_object_bce_active_rows_count": push_losses["push_object_bce_active_rows_count"],
-                    "push_object_rank_active_rows_count": push_losses["push_object_rank_active_rows_count"],
+                    "push_object_positive_rows_count": push_losses[
+                        "push_object_positive_rows_count"
+                    ],
+                    "push_object_positive_hits_at_1_count": push_losses[
+                        "push_object_positive_hits_at_1_count"
+                    ],
+                    "push_object_positive_hits_at_4_count": push_losses[
+                        "push_object_positive_hits_at_4_count"
+                    ],
+                    "push_object_positive_hits_at_deployment_k_count": push_losses[
+                        "push_object_positive_hits_at_deployment_k_count"
+                    ],
+                    "push_object_bce_active_rows_count": push_losses[
+                        "push_object_bce_active_rows_count"
+                    ],
+                    "push_object_rank_active_rows_count": push_losses[
+                        "push_object_rank_active_rows_count"
+                    ],
                 }
-                activity["active_loss_push_object"] = push_labels["object_valid_mask"].any(-1).float().mean()
+                activity["active_loss_push_object"] = (
+                    push_labels["object_valid_mask"].any(-1).float().mean()
+                )
 
             if self.total.enabled("push_contact"):
                 families["push_contact"] = {
                     "loss": push_losses["push_contact"],
-                    "push_contact_positive_points": push_losses[
-                        "push_contact_positive_points"
-                    ],
-                    "push_contact_negative_points": push_losses[
-                        "push_contact_negative_points"
-                    ],
-                    "push_contact_valid_points": push_losses[
-                        "push_contact_valid_points"
-                    ],
+                    "push_contact_positive_points": push_losses["push_contact_positive_points"],
+                    "push_contact_negative_points": push_losses["push_contact_negative_points"],
+                    "push_contact_valid_points": push_losses["push_contact_valid_points"],
                 }
-                activity["active_loss_push_contact"] = self._row_active(
-                    push_labels["contact_valid"]
-                ).float().mean()
+                activity["active_loss_push_contact"] = (
+                    self._row_active(push_labels["contact_valid"]).float().mean()
+                )
 
             if self.total.enabled("push_direction"):
                 families["push_direction"] = {
                     "loss": push_losses["push_direction"],
-                    "push_direction_bce_diagnostic": push_losses[
-                        "push_direction_bce_diagnostic"
+                    "push_direction_bce_diagnostic": push_losses["push_direction_bce_diagnostic"],
+                    "push_direction_rank_diagnostic": push_losses["push_direction_rank_diagnostic"],
+                    "push_direction_bce_active_rows_count": push_losses[
+                        "push_direction_bce_active_rows_count"
                     ],
-                    "push_direction_rank_diagnostic": push_losses[
-                        "push_direction_rank_diagnostic"
+                    "push_direction_rank_active_rows_count": push_losses[
+                        "push_direction_rank_active_rows_count"
                     ],
-                    "push_direction_bce_active_rows_count": push_losses["push_direction_bce_active_rows_count"],
-                    "push_direction_rank_active_rows_count": push_losses["push_direction_rank_active_rows_count"],
                     "push_direction_residual_diagnostic": push_losses[
                         "push_direction_residual_diagnostic"
                     ],
-                    "push_direction_effective_rows": push_losses[
-                        "push_direction_effective_rows"
-                    ],
+                    "push_direction_effective_rows": push_losses["push_direction_effective_rows"],
                     "push_direction_residual_targets": push_losses[
                         "push_direction_residual_targets"
                     ],
-                    "push_positive_actions_total_count": push_losses["push_positive_actions_total_count"],
-                    "push_positive_actions_direction_covered_count": push_losses["push_positive_actions_direction_covered_count"],
+                    "push_positive_actions_total_count": push_losses[
+                        "push_positive_actions_total_count"
+                    ],
+                    "push_positive_actions_direction_covered_count": push_losses[
+                        "push_positive_actions_direction_covered_count"
+                    ],
                 }
                 direction_rank_rows = self._listwise_active_rows(
                     push_labels["direction_positive"],
                     push_labels["direction_evaluated"],
                 )
                 activity["active_loss_push_direction"] = (
-                    self._row_active(push_labels["direction_evaluated"])
-                    | direction_rank_rows
-                    | self._row_active(push_labels["direction_residual_valid"])
-                ).float().mean()
+                    (
+                        self._row_active(push_labels["direction_evaluated"])
+                        | direction_rank_rows
+                        | self._row_active(push_labels["direction_residual_valid"])
+                    )
+                    .float()
+                    .mean()
+                )
 
             if self.total.enabled("push_potential"):
                 families["push_potential"] = {
@@ -421,19 +396,21 @@ class TCDPRGObjective(nn.Module):
                     "push_potential_valid_candidates": push_losses[
                         "push_potential_valid_candidates"
                     ],
-                    "push_positive_actions_utility_covered_count": push_losses["push_positive_actions_utility_covered_count"],
-                    "push_positive_actions_utility_eligible_count": push_losses["push_positive_actions_utility_eligible_count"],
+                    "push_positive_actions_utility_covered_count": push_losses[
+                        "push_positive_actions_utility_covered_count"
+                    ],
+                    "push_positive_actions_utility_eligible_count": push_losses[
+                        "push_positive_actions_utility_eligible_count"
+                    ],
                 }
-                activity["active_loss_push_potential"] = self._row_active(
-                    push_labels["utility_valid"]
-                ).float().mean()
+                activity["active_loss_push_potential"] = (
+                    self._row_active(push_labels["utility_valid"]).float().mean()
+                )
 
         total, terms = self.total(families)
         terms.update(activity)
         terms["forward_mode_code"] = reference.new_tensor(
-            {"perception": 0.0, "grasp": 1.0, "push": 2.0, "full": 3.0}[
-                forward_mode
-            ]
+            {"perception": 0.0, "grasp": 1.0, "push": 2.0, "full": 3.0}[forward_mode]
         )
         weighted_family_losses = {
             name: float(self.total.weights[name]) * values["loss"]

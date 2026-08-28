@@ -1,4 +1,5 @@
 """Complete object-centric TCD-PRG model with sensor-only perception input."""
+
 from __future__ import annotations
 
 from typing import Any, Mapping
@@ -6,9 +7,7 @@ from typing import Any, Mapping
 import torch
 from torch import Tensor, nn
 
-from tcd_prg.config import (
-    AblationConfig, BackboneConfig, GraspNetConfig, ModelConfig
-)
+from tcd_prg.config import AblationConfig, BackboneConfig, GraspNetConfig, ModelConfig
 from tcd_prg.geometry.camera import (
     camera_to_world_points,
     camera_to_world_rotations,
@@ -30,23 +29,49 @@ from .push_condition import PushCondition
 from .task_grasp import TaskGraspEvaluator
 
 
-SENSOR_KEYS = frozenset({
-    "xyz", "rgb", "point_mask", "grid_coord", "source_view",
-    "graspnet_xyz_world", "graspnet_point_mask",
-    "camera2_eye_world", "camera2_target_world", "camera2_up_world",
-    "camera2_valid",
-})
-TASK_KEYS = frozenset({
-    "task_category_id", "task_region_id",
-    "target_prompt_xyz", "target_prompt_label", "target_prompt_valid",
-    "target_reid_token", "target_reid_center", "target_reid_valid",
-})
-FORBIDDEN_PERCEPTION_KEYS = frozenset({
-    "instance_id", "instance_id_gt", "target_mask", "target_mask_gt",
-    "target_object", "object_pose", "object_present", "object_active",
-    "object_category_id", "object_category_id_gt", "relation_graph",
-    "task_block_graph",
-})
+SENSOR_KEYS = frozenset(
+    {
+        "xyz",
+        "rgb",
+        "point_mask",
+        "grid_coord",
+        "source_view",
+        "graspnet_xyz_world",
+        "graspnet_point_mask",
+        "camera2_eye_world",
+        "camera2_target_world",
+        "camera2_up_world",
+        "camera2_valid",
+    }
+)
+TASK_KEYS = frozenset(
+    {
+        "task_category_id",
+        "task_region_id",
+        "target_prompt_xyz",
+        "target_prompt_label",
+        "target_prompt_valid",
+        "target_reid_token",
+        "target_reid_center",
+        "target_reid_valid",
+    }
+)
+FORBIDDEN_PERCEPTION_KEYS = frozenset(
+    {
+        "instance_id",
+        "instance_id_gt",
+        "target_mask",
+        "target_mask_gt",
+        "target_object",
+        "object_pose",
+        "object_present",
+        "object_active",
+        "object_category_id",
+        "object_category_id_gt",
+        "relation_graph",
+        "task_block_graph",
+    }
+)
 
 
 class TCDPRGModel(nn.Module):
@@ -110,9 +135,7 @@ class TCDPRGModel(nn.Module):
         self.graspnet = FrozenGraspNetProposalGenerator(
             source_root=graspnet_config.source_root,
             checkpoint=graspnet_config.checkpoint,
-            proposal_count=max(
-                graspnet_config.global_proposals, graspnet_config.target_proposals
-            ),
+            proposal_count=max(graspnet_config.global_proposals, graspnet_config.target_proposals),
             input_points=max(
                 graspnet_config.scene_input_points, graspnet_config.target_input_points
             ),
@@ -150,9 +173,11 @@ class TCDPRGModel(nn.Module):
             c.num_categories,
             c.num_task_regions,
         )
+        self.push_evaluator_ready = False
         self.push_evaluator = PushEffectivenessEvaluator(
             c.feature_dim, c.push_direction_feature_dim
         )
+
     @staticmethod
     def _sensor(batch: Mapping[str, Any]) -> dict[str, Tensor]:
         source = batch.get("model_inputs", batch)
@@ -179,11 +204,12 @@ class TCDPRGModel(nn.Module):
         leaked = FORBIDDEN_PERCEPTION_KEYS & set(batch["model_inputs"])
         if leaked:
             raise RuntimeError(
-                "Ground-truth fields leaked into model_inputs: "
-                + ", ".join(sorted(leaked))
+                "Ground-truth fields leaked into model_inputs: " + ", ".join(sorted(leaked))
             )
 
-    def _encode_scene(self, batch: Mapping[str, Any]) -> tuple[Any, dict[str, Tensor], dict[str, Tensor]]:
+    def _encode_scene(
+        self, batch: Mapping[str, Any]
+    ) -> tuple[Any, dict[str, Tensor], dict[str, Tensor]]:
         self.assert_no_gt_in_model_inputs(batch)
         sensor = self._sensor(batch)
         task = self._task(batch)
@@ -210,7 +236,9 @@ class TCDPRGModel(nn.Module):
         self.assert_no_gt_in_model_inputs(batch)
         sensor = self._sensor(batch)
         scene, instance = self.encoder.forward_scene_instances(
-            sensor["xyz"], sensor["rgb"], sensor["point_mask"],
+            sensor["xyz"],
+            sensor["rgb"],
+            sensor["point_mask"],
             grid_coord=sensor.get("grid_coord"),
         )
         return scene, instance, sensor
@@ -245,8 +273,12 @@ class TCDPRGModel(nn.Module):
         """Run official GraspNet on the independent Camera2 cloud."""
 
         required = {
-            "graspnet_xyz_world", "graspnet_point_mask", "camera2_eye_world",
-            "camera2_target_world", "camera2_up_world", "camera2_valid",
+            "graspnet_xyz_world",
+            "graspnet_point_mask",
+            "camera2_eye_world",
+            "camera2_target_world",
+            "camera2_up_world",
+            "camera2_valid",
         }
         missing = required - sensor.keys()
         if missing:
@@ -265,8 +297,7 @@ class TCDPRGModel(nn.Module):
         reference_mask = sensor["point_mask"].bool()
         if "source_view" in sensor:
             reference_mask = reference_mask & (
-                sensor["source_view"].long()
-                == int(self.graspnet_config.camera_view_index)
+                sensor["source_view"].long() == int(self.graspnet_config.camera_view_index)
             )
         nearest_scene, transfer_distance, transfer_valid = self._nearest_reference_index(
             camera_xyz_world,
@@ -305,8 +336,10 @@ class TCDPRGModel(nn.Module):
             camera_target_probability = target_probability.gather(
                 1, nearest_scene
             ) * transfer_valid.to(target_probability.dtype)
-            crop_mask = camera_point_mask & transfer_valid & (
-                camera_target_probability >= self.graspnet_config.target_crop_probability
+            crop_mask = (
+                camera_point_mask
+                & transfer_valid
+                & (camera_target_probability >= self.graspnet_config.target_crop_probability)
             )
             crop_count = crop_mask.sum(-1)
             target_grasp_valid = (
@@ -335,9 +368,7 @@ class TCDPRGModel(nn.Module):
         translation_world = camera_to_world_points(
             translation_camera, rotation_world_camera, sensor["camera2_eye_world"]
         )
-        rotation_world_tcd = camera_to_world_rotations(
-            rotation_camera_tcd, rotation_world_camera
-        )
+        rotation_world_tcd = camera_to_world_rotations(rotation_camera_tcd, rotation_world_camera)
         valid = proposal["valid"].bool() & target_grasp_valid[:, None]
         scene_attention, scene_found = self._nearest_scene_point(
             sensor["xyz"], sensor["point_mask"], translation_world, valid
@@ -369,60 +400,43 @@ class TCDPRGModel(nn.Module):
             "camera_transfer_distance_m": transfer_distance,
             "camera_transfer_valid": transfer_valid,
             "camera_transfer_coverage": (
-                transfer_valid.float().sum(-1)
-                / camera_point_mask.float().sum(-1).clamp_min(1.0)
+                transfer_valid.float().sum(-1) / camera_point_mask.float().sum(-1).clamp_min(1.0)
             ),
             "target_identity_valid": identity_valid,
             "graspnet_valid_proposals_per_row": valid.sum(-1),
         }
 
-    def _forward_global_grasp(
-        self, encoded: Any, sensor: dict[str, Tensor]
-    ) -> dict[str, Tensor]:
+    def _forward_global_grasp(self, encoded: Any, sensor: dict[str, Tensor]) -> dict[str, Tensor]:
         # Reuse the exact neutral features/instances produced before task FiLM.
         class _Scene:
             pass
+
         scene = _Scene()
         scene.point_features = encoded.scene_point_features
         scene.global_scene_token = encoded.scene_global_token
-        return self._forward_global_grasp_neutral(
-            scene, encoded.instance, sensor
-        )
+        return self._forward_global_grasp_neutral(scene, encoded.instance, sensor)
 
     def _target_identity_gate(self, encoded: Any) -> Tensor:
         """Fail closed unless a prompt or a valid ReID track identifies the target."""
 
         prompt_support = encoded.target_prompt_support
         if prompt_support.ndim == 2:
-            rows = torch.arange(
-                prompt_support.shape[0], device=prompt_support.device
-            )
-            prompt_support = prompt_support[
-                rows, encoded.target_query_index
-            ]
-        prompt_valid = (
-            encoded.target_prompt_used.bool()
-            & (prompt_support >= self.target_prompt_min_support)
+            rows = torch.arange(prompt_support.shape[0], device=prompt_support.device)
+            prompt_support = prompt_support[rows, encoded.target_query_index]
+        prompt_valid = encoded.target_prompt_used.bool() & (
+            prompt_support >= self.target_prompt_min_support
         )
-        reid_valid = (
-            ~encoded.target_prompt_used.bool()
-            & encoded.target_reid_used.bool()
-        )
-        return (
-            (prompt_valid | reid_valid)
-            & (encoded.target_selection_margin >= self.target_prompt_min_margin)
+        reid_valid = ~encoded.target_prompt_used.bool() & encoded.target_reid_used.bool()
+        return (prompt_valid | reid_valid) & (
+            encoded.target_selection_margin >= self.target_prompt_min_margin
         )
 
-    def forward_global_grasp(
-        self, batch: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def forward_global_grasp(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         scene, instance, sensor = self._encode_scene_instances(batch)
         return {
             "scene": scene,
             "instance": instance,
-            "global_grasp": self._forward_global_grasp_neutral(
-                scene, instance, sensor
-            ),
+            "global_grasp": self._forward_global_grasp_neutral(scene, instance, sensor),
         }
 
     @staticmethod
@@ -437,17 +451,13 @@ class TCDPRGModel(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Nearest reference point without materializing an N-by-M matrix."""
 
-        result = torch.zeros(
-            query.shape[:2], dtype=torch.long, device=query.device
-        )
+        result = torch.zeros(query.shape[:2], dtype=torch.long, device=query.device)
         nearest_distance = torch.full(
             query.shape[:2], float("inf"), dtype=torch.float32, device=query.device
         )
         for row in range(query.shape[0]):
             queries = torch.nonzero(query_mask[row], as_tuple=False).flatten()
-            references = torch.nonzero(
-                reference_mask[row], as_tuple=False
-            ).flatten()
+            references = torch.nonzero(reference_mask[row], as_tuple=False).flatten()
             if not len(queries) or not len(references):
                 continue
             for start in range(0, len(queries), chunk_size):
@@ -476,9 +486,7 @@ class TCDPRGModel(nn.Module):
         found = domain.any(-1)
         return distance.argmin(-1), found
 
-    def _forward_region(
-        self, encoded: Any, sensor: dict[str, Tensor]
-    ) -> dict[str, Tensor]:
+    def _forward_region(self, encoded: Any, sensor: dict[str, Tensor]) -> dict[str, Tensor]:
         return self.region_head(
             encoded.point_features,
             encoded.target_token,
@@ -487,15 +495,21 @@ class TCDPRGModel(nn.Module):
             sensor["point_mask"],
         )
 
-    def _push_condition(self, encoded: Any, region: dict[str, Tensor], task: dict[str, Tensor]) -> PushCondition:
+    def _push_condition(
+        self, encoded: Any, region: dict[str, Tensor], task: dict[str, Tensor]
+    ) -> PushCondition:
         target_valid = self._target_identity_gate(encoded)
         object_valid = encoded.object_mask.clone()
         rows = torch.arange(object_valid.shape[0], device=object_valid.device)
         object_valid[rows[target_valid], encoded.target_query_index[target_valid]] = True
         return PushCondition(
-            encoded.instance.mask_probability * object_valid[:, :, None], object_valid,
-            encoded.target_instance_probability, region["region_probability"], target_valid,
-            task["task_category_id"], task["task_region_id"],
+            encoded.instance.mask_probability * object_valid[:, :, None],
+            object_valid,
+            encoded.target_instance_probability,
+            region["region_probability"],
+            target_valid,
+            task["task_category_id"],
+            task["task_region_id"],
         )
 
     def generate_target_grasp_proposals(
@@ -545,22 +559,23 @@ class TCDPRGModel(nn.Module):
             )
         return task_grasp
 
-    def forward_push_from_condition(self, sensor: dict[str, Tensor], condition: PushCondition, training_hints: Mapping[str, Tensor] | None = None) -> dict[str, Tensor]:
+    def forward_push_from_condition(
+        self,
+        sensor: dict[str, Tensor],
+        condition: PushCondition,
+        training_hints: Mapping[str, Tensor] | None = None,
+    ) -> dict[str, Tensor]:
         """Shared Stage-C path for GT standalone training and A+C inference."""
         condition.validate(sensor["xyz"].shape[1])
         hints = training_hints or {}
         return self.push(sensor, condition, hints.get("push_direction_point_mask"))
 
-    def forward_instances(
-        self, batch: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def forward_instances(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         """Task-free sensor-only instance inference for real-scene acquisition."""
         scene, instance, sensor = self._encode_scene_instances(batch)
         return {"scene": scene, "instance": instance, "sensor": sensor}
 
-    def forward_perception(
-        self, batch: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def forward_perception(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         """Stage A: instance/target/region only; no GraspNet or Push execution."""
         encoded, sensor, task = self._encode_scene(batch)
         region = self._forward_region(encoded, sensor)
@@ -571,7 +586,9 @@ class TCDPRGModel(nn.Module):
             task_category_id=task["task_category_id"],
             task_region_id=task["task_region_id"],
         ).validate(sensor["xyz"].shape[1])
-        push_condition = self._push_condition(encoded, region, task).validate(sensor["xyz"].shape[1])
+        push_condition = self._push_condition(encoded, region, task).validate(
+            sensor["xyz"].shape[1]
+        )
         return {
             "stageb_condition": stageb_condition,
             "push_condition": push_condition,
@@ -585,9 +602,7 @@ class TCDPRGModel(nn.Module):
             "push": None,
         }
 
-    def forward_grasp(
-        self, batch: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def forward_grasp(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         """Stage B from the public condition supplied at the module boundary."""
         sensor = self._sensor(batch)
         condition = batch.get("stageb_condition")
@@ -612,9 +627,7 @@ class TCDPRGModel(nn.Module):
             "push": None,
         }
 
-    def forward_push(
-        self, batch: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def forward_push(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         """Stage C consumes only the public PushCondition boundary."""
         sensor = self._sensor(batch)
         condition = batch.get("push_condition")
@@ -622,8 +635,15 @@ class TCDPRGModel(nn.Module):
             raise TypeError("Stage-C forward requires a PushCondition")
         push = self.forward_push_from_condition(sensor, condition, batch.get("training_hints"))
         return {
-            "push_condition": condition, "encoded": None, "sensor": sensor,
-            "task": {"task_category_id": condition.task_category_id, "task_region_id": condition.task_region_id}, "instance": None, "region": None,
+            "push_condition": condition,
+            "encoded": None,
+            "sensor": sensor,
+            "task": {
+                "task_category_id": condition.task_category_id,
+                "task_region_id": condition.task_region_id,
+            },
+            "instance": None,
+            "region": None,
             "task_grasp": None,
             "global_grasp": None,
             "push": push,

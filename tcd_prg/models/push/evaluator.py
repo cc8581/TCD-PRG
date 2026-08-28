@@ -8,6 +8,28 @@ import torch
 from torch import Tensor, nn
 
 
+def nearest_object_contact_point(
+    xyz: Tensor,
+    point_mask: Tensor,
+    object_probability: Tensor,
+    object_index: int,
+    contact_world: Tensor,
+) -> Tensor:
+    """Use the same hard-owner/membership domain as the deployment decoder."""
+    if object_index < 0 or object_index >= object_probability.shape[0]:
+        raise IndexError(f"PUSH evaluator acted_object out of range: {object_index}")
+    membership = object_probability[object_index]
+    owner = object_probability.argmax(0)
+    domain = point_mask.bool() & (owner == object_index) & (membership >= 0.5)
+    if not bool(domain.any()):
+        domain = point_mask.bool() & (owner == object_index)
+    points = torch.nonzero(domain, as_tuple=False).flatten()
+    if not len(points):
+        raise ValueError(f"PUSH evaluator object {object_index} has no visible owned scene point")
+    distance = torch.linalg.vector_norm(xyz[points] - contact_world, dim=-1)
+    return points[distance.argmin()]
+
+
 class PushEffectivenessEvaluator(nn.Module):
     """Score a decoded complete PUSH without updating proposal features."""
 
@@ -72,6 +94,7 @@ class PushEffectivenessEvaluator(nn.Module):
         contact_world: Tensor,
         direction_world: Tensor,
         push_distance: Tensor,
+        point_index: Tensor | None = None,
     ) -> Tensor:
         """Condition on logged actions, preserving their exact scene-state pairing."""
         rows: list[Tensor] = []
@@ -83,13 +106,23 @@ class PushEffectivenessEvaluator(nn.Module):
             object_index = int(acted_object[action])
             if object_index < 0 or object_index >= push["proposal_object_feature"].shape[1]:
                 raise IndexError(f"PUSH evaluator acted_object out of range: {object_index}")
-            valid_points = torch.nonzero(sensor["point_mask"][row], as_tuple=False).flatten()
-            if not len(valid_points):
-                raise ValueError("PUSH evaluator received a scene row with no valid points")
-            distance = torch.linalg.vector_norm(
-                sensor["xyz"][row, valid_points] - contact_world[action], dim=-1
-            )
-            point = valid_points[distance.argmin()]
+            if point_index is None:
+                point = nearest_object_contact_point(
+                    sensor["xyz"][row],
+                    sensor["point_mask"][row],
+                    push["point_object_probability"][row],
+                    object_index,
+                    contact_world[action],
+                )
+            else:
+                point = point_index[action].long()
+                if int(point) < 0 or int(point) >= sensor["xyz"].shape[1]:
+                    raise IndexError(f"PUSH evaluator point_index out of range: {int(point)}")
+                owner = push["point_object_probability"][row, :, point].argmax()
+                if int(owner) != object_index:
+                    raise ValueError(
+                        "PUSH evaluator exact-action anchor does not belong to acted_object"
+                    )
             planar_raw = direction_world[action, :2]
             planar_norm = torch.linalg.vector_norm(planar_raw)
             if not bool(torch.isfinite(planar_norm)) or float(planar_norm) <= 1e-8:

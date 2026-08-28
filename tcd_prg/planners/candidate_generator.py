@@ -1,4 +1,5 @@
 """Decode executable candidates from predicted object-centric scene features."""
+
 from __future__ import annotations
 
 import math
@@ -17,20 +18,23 @@ from .push_decoder import decode_push_candidates, push_nms_mask
 
 
 class DenseCandidateGenerator:
-    def __init__(
-        self, config: ModelConfig, *, use_push_potential: bool = True
-    ) -> None:
+    def __init__(self, config: ModelConfig, *, use_push_potential: bool = True) -> None:
         self.config = config
         self.use_push_potential = bool(use_push_potential)
 
     @staticmethod
     def _empty_row(device: torch.device) -> dict[str, Tensor]:
         return {
-            "type": torch.empty(0, dtype=torch.long, device=device), "object": torch.empty(0, dtype=torch.long, device=device),
-            "contact_world": torch.empty(0, 3, device=device), "direction_world": torch.empty(0, 3, device=device),
-            "pose_world": torch.empty(0, 7, device=device), "destination_world": torch.empty(0, 3, device=device),
-            "width_m": torch.empty(0, device=device), "proposal_score": torch.empty(0, device=device),
-            "point_index": torch.empty(0, dtype=torch.long, device=device), "direction_bin": torch.empty(0, dtype=torch.long, device=device),
+            "type": torch.empty(0, dtype=torch.long, device=device),
+            "object": torch.empty(0, dtype=torch.long, device=device),
+            "contact_world": torch.empty(0, 3, device=device),
+            "direction_world": torch.empty(0, 3, device=device),
+            "pose_world": torch.empty(0, 7, device=device),
+            "destination_world": torch.empty(0, 3, device=device),
+            "width_m": torch.empty(0, device=device),
+            "proposal_score": torch.empty(0, device=device),
+            "point_index": torch.empty(0, dtype=torch.long, device=device),
+            "direction_bin": torch.empty(0, dtype=torch.long, device=device),
             "direction_score": torch.empty(0, device=device),
             "object_score": torch.empty(0, device=device),
             "contact_score": torch.empty(0, device=device),
@@ -43,7 +47,7 @@ class DenseCandidateGenerator:
     @staticmethod
     def _top_per_object(
         score: Tensor,
-        object_probability: Tensor,   # [Q,N]
+        object_probability: Tensor,  # [Q,N]
         object_ids: Tensor,
         point_mask: Tensor,
         total: int,
@@ -74,19 +78,13 @@ class DenseCandidateGenerator:
         candidate_joint = push_contact_joint_score(
             score[candidates][None], candidate_membership
         ).amax(0)
-        return candidates[
-            candidate_joint.topk(min(total, len(candidates))).indices
-        ]
+        return candidates[candidate_joint.topk(min(total, len(candidates))).indices]
 
     @staticmethod
-    def _nearest_scene_point(
-        translation: Tensor, xyz: Tensor, point_mask: Tensor
-    ) -> Tensor:
+    def _nearest_scene_point(translation: Tensor, xyz: Tensor, point_mask: Tensor) -> Tensor:
         points = torch.nonzero(point_mask, as_tuple=False).flatten()
         if not len(points):
-            return torch.zeros(
-                len(translation), dtype=torch.long, device=translation.device
-            )
+            return torch.zeros(len(translation), dtype=torch.long, device=translation.device)
         distance = torch.cdist(translation, xyz[points])
         return points[distance.argmin(-1)]
 
@@ -107,10 +105,10 @@ class DenseCandidateGenerator:
         """
         owner = instance_probability.argmax(0)
         owner_domain = (
-            owner[None] == torch.arange(
-                instance_probability.shape[0], device=xyz.device
-            )[:, None]
-        ) & point_mask[None] & object_mask[:, None]
+            (owner[None] == torch.arange(instance_probability.shape[0], device=xyz.device)[:, None])
+            & point_mask[None]
+            & object_mask[:, None]
+        )
         confident = owner_domain & (instance_probability >= 0.5)
         has_confident = confident.any(-1)
         hard = torch.where(has_confident[:, None], confident, owner_domain)
@@ -156,20 +154,14 @@ class DenseCandidateGenerator:
             width[None],
             score[None],
             objects[None],
-            torch.ones(
-                (1, len(score)), dtype=torch.bool, device=score.device
-            ),
+            torch.ones((1, len(score)), dtype=torch.bool, device=score.device),
             translation_threshold_m=thresholds[0],
             rotation_threshold_deg=thresholds[1],
             width_threshold_m=thresholds[2],
             approach_threshold_deg=thresholds[3],
         )[0]
         selected = torch.nonzero(keep, as_tuple=False).flatten()
-        return selected[
-            score[selected].argsort(
-                descending=True, stable=True
-            )[:amount]
-        ]
+        return selected[score[selected].argsort(descending=True, stable=True)[:amount]]
 
     def select_task_grasp_indices(
         self,
@@ -195,14 +187,11 @@ class DenseCandidateGenerator:
         )
         return eligible[selected_local]
 
-    def apply_push_nms(
-        self, candidates: dict[str, Tensor], candidate_scores: Tensor
-    ) -> Tensor:
+    def apply_push_nms(self, candidates: dict[str, Tensor], candidate_scores: Tensor) -> Tensor:
         keep = candidates["valid"].clone()
         for row in range(keep.shape[0]):
             push = torch.nonzero(
-                keep[row]
-                & (candidates["type"][row] == int(ActionType.PUSH)),
+                keep[row] & (candidates["type"][row] == int(ActionType.PUSH)),
                 as_tuple=False,
             ).flatten()
             decoded = {
@@ -222,9 +211,7 @@ class DenseCandidateGenerator:
         score_kind: str = "scene",
     ) -> list[dict[str, Tensor]]:
         if score_kind not in {"raw", "scene"}:
-            raise ValueError(
-                "score_kind must be scene (raw is a compatibility alias)"
-            )
+            raise ValueError("score_kind must be scene (raw is a compatibility alias)")
         head = output["global_grasp"]
         amount = int(topk or self.config.candidate_topk)
         sensor = output.get("sensor", batch.get("model_inputs", batch))
@@ -232,28 +219,26 @@ class DenseCandidateGenerator:
         for row in range(sensor["xyz"].shape[0]):
             translation = head["translation_world"][row]
             rotation = head["rotation_matrix"][row]
-            pose = torch.cat(
-                (translation, matrix_to_quaternion_xyzw(rotation)), -1
-            )
+            pose = torch.cat((translation, matrix_to_quaternion_xyzw(rotation)), -1)
             width = head["width_m"][row]
             score = torch.sigmoid(head["quality_logit"][row])
             point = head["attention_point_index"][row]
             objects = head["object_logits"][row].argmax(-1)
-            selected = self._nms_indices(
-                pose, width, score, objects, amount, global_grasp=True
-            )
+            selected = self._nms_indices(pose, width, score, objects, amount, global_grasp=True)
             if "valid" in head:
                 selected = selected[head["valid"][row, selected]]
-            rows.append({
-                "object": objects[selected],
-                "contact_world": translation[selected],
-                "pose_world": pose[selected],
-                "width_m": width[selected],
-                "raw_score": score[selected],
-                "scene_score": score[selected],
-                "point_index": point[selected],
-                "mode_index": selected,
-            })
+            rows.append(
+                {
+                    "object": objects[selected],
+                    "contact_world": translation[selected],
+                    "pose_world": pose[selected],
+                    "width_m": width[selected],
+                    "raw_score": score[selected],
+                    "scene_score": score[selected],
+                    "point_index": point[selected],
+                    "mode_index": selected,
+                }
+            )
         return rows
 
     def generate(
@@ -272,12 +257,11 @@ class DenseCandidateGenerator:
             use_push_potential=self.use_push_potential,
         )
         push_evaluator = getattr(model, "push_evaluator", None)
-        if push_evaluator is not None:
+        evaluator_ready = bool(getattr(model, "push_evaluator_ready", False))
+        if push_evaluator is not None and evaluator_ready:
             for batch_row, decoded in enumerate(decoded_push_rows):
                 if len(decoded["point_index"]):
-                    logits = push_evaluator(
-                        output["push"], decoded, batch_index=batch_row
-                    )
+                    logits = push_evaluator(output["push"], decoded, batch_index=batch_row)
                     decoded["effective_logit"] = logits
                     decoded["effective_probability"] = torch.sigmoid(logits)
 
@@ -287,7 +271,11 @@ class DenseCandidateGenerator:
             push_condition = output["push_condition"]
             instance_probability = push_condition.object_probability[batch_row]
             active = push_condition.object_valid[batch_row]
-            target_object = int((instance_probability * push_condition.target_probability[batch_row][None]).sum(-1).argmax())
+            target_object = int(
+                (instance_probability * push_condition.target_probability[batch_row][None])
+                .sum(-1)
+                .argmax()
+            )
             if not bool(push_condition.target_valid[batch_row]):
                 rows.append(self._empty_row(xyz.device))
                 continue
@@ -338,65 +326,47 @@ class DenseCandidateGenerator:
             if not bool(active[target_object]):
                 selected = selected[:0]
             if len(selected):
-                points = task["attention_point_index"][
-                    batch_row, selected
-                ]
-                type_parts.append(
-                    torch.full_like(
-                        selected, int(ActionType.TASK_GRASP)
-                    )
-                )
+                points = task["attention_point_index"][batch_row, selected]
+                type_parts.append(torch.full_like(selected, int(ActionType.TASK_GRASP)))
                 object_parts.append(task_objects[selected])
-                contact_parts.append(torch.full(
-                    (len(selected), 3), float("nan"), device=xyz.device
-                ))
-                direction_parts.append(torch.full(
-                    (len(selected), 3), float("nan"), device=xyz.device
-                ))
-                pose_parts.append(task_pose[selected])
-                destination_parts.append(torch.full(
-                    (len(selected), 3), float("nan"), device=xyz.device
-                ))
-                width_parts.append(
-                    task["width_m"][batch_row, selected]
+                contact_parts.append(
+                    torch.full((len(selected), 3), float("nan"), device=xyz.device)
                 )
+                direction_parts.append(
+                    torch.full((len(selected), 3), float("nan"), device=xyz.device)
+                )
+                pose_parts.append(task_pose[selected])
+                destination_parts.append(
+                    torch.full((len(selected), 3), float("nan"), device=xyz.device)
+                )
+                width_parts.append(task["width_m"][batch_row, selected])
                 score_parts.append(task_score[selected])
                 point_parts.append(points)
-                direction_bin_parts.append(
-                    torch.full_like(selected, -1)
-                )
-                direction_score_parts.append(
-                    torch.full_like(task_score[selected], float("nan"))
-                )
+                direction_bin_parts.append(torch.full_like(selected, -1))
+                direction_score_parts.append(torch.full_like(task_score[selected], float("nan")))
                 object_score_parts.append(torch.full_like(task_score[selected], float("nan")))
                 contact_score_parts.append(torch.full_like(task_score[selected], float("nan")))
                 utility_parts.append(torch.full_like(task_score[selected], float("nan")))
-                direction_residual_parts.append(torch.full(
-                    (len(selected), 2), float("nan"), device=xyz.device
-                ))
+                direction_residual_parts.append(
+                    torch.full((len(selected), 2), float("nan"), device=xyz.device)
+                )
                 effective_logit_parts.append(torch.full_like(task_score[selected], float("nan")))
-                effective_probability_parts.append(torch.full_like(task_score[selected], float("nan")))
+                effective_probability_parts.append(
+                    torch.full_like(task_score[selected], float("nan"))
+                )
 
             # Generic remove grasps are assigned to predicted object queries.
             global_head = output["global_grasp"]
             global_pose = torch.cat(
                 (
                     global_head["translation_world"][batch_row],
-                    matrix_to_quaternion_xyzw(
-                        global_head["rotation_matrix"][batch_row]
-                    ),
+                    matrix_to_quaternion_xyzw(global_head["rotation_matrix"][batch_row]),
                 ),
                 -1,
             )
-            global_score = torch.sigmoid(
-                global_head["quality_logit"][batch_row]
-            )
-            global_point = global_head["attention_point_index"][
-                batch_row
-            ]
-            global_object = global_head["object_logits"][
-                batch_row
-            ].argmax(-1)
+            global_score = torch.sigmoid(global_head["quality_logit"][batch_row])
+            global_point = global_head["attention_point_index"][batch_row]
+            global_object = global_head["object_logits"][batch_row].argmax(-1)
 
             remove_domain = active.clone()
             remove_domain[target_object] = False
@@ -409,15 +379,12 @@ class DenseCandidateGenerator:
                 self.config.pick_remove_target_margin_m,
             )
             remove_eligible = remove_domain & target_local
-            valid_remove = (
-                (global_object >= 0)
-                & remove_eligible[global_object.clamp(0, len(active) - 1)]
-            )
+            valid_remove = (global_object >= 0) & remove_eligible[
+                global_object.clamp(0, len(active) - 1)
+            ]
             if "valid" in global_head:
                 valid_remove &= global_head["valid"][batch_row]
-            valid_remove &= (
-                global_score >= self.config.pick_remove_probability_threshold
-            )
+            valid_remove &= global_score >= self.config.pick_remove_probability_threshold
             candidates = torch.nonzero(valid_remove, as_tuple=False).flatten()
             if len(candidates):
                 candidate_score = global_score[candidates]
@@ -430,54 +397,74 @@ class DenseCandidateGenerator:
                     global_grasp=True,
                 )
                 selected = candidates[local]
-                type_parts.append(torch.full_like(
-                    selected, int(ActionType.PICK_REMOVE)
-                ))
+                type_parts.append(torch.full_like(selected, int(ActionType.PICK_REMOVE)))
                 object_parts.append(global_object[selected])
-                contact_parts.append(torch.full(
-                    (len(selected), 3), float("nan"), device=xyz.device,
-                ))
-                direction_parts.append(torch.full(
-                    (len(selected), 3), float("nan"), device=xyz.device,
-                ))
+                contact_parts.append(
+                    torch.full(
+                        (len(selected), 3),
+                        float("nan"),
+                        device=xyz.device,
+                    )
+                )
+                direction_parts.append(
+                    torch.full(
+                        (len(selected), 3),
+                        float("nan"),
+                        device=xyz.device,
+                    )
+                )
                 pose_parts.append(global_pose[selected])
-                destination_parts.append(torch.full(
-                    (len(selected), 3), float("nan"), device=xyz.device,
-                ))
+                destination_parts.append(
+                    torch.full(
+                        (len(selected), 3),
+                        float("nan"),
+                        device=xyz.device,
+                    )
+                )
                 width_parts.append(global_head["width_m"][batch_row, selected])
                 score_parts.append(candidate_score[local])
                 point_parts.append(global_point[selected])
                 direction_bin_parts.append(torch.full_like(selected, -1))
-                direction_score_parts.append(torch.full_like(
-                    candidate_score[local], float("nan")
-                ))
+                direction_score_parts.append(torch.full_like(candidate_score[local], float("nan")))
                 object_score_parts.append(torch.full_like(candidate_score[local], float("nan")))
                 contact_score_parts.append(torch.full_like(candidate_score[local], float("nan")))
                 utility_parts.append(torch.full_like(candidate_score[local], float("nan")))
-                direction_residual_parts.append(torch.full(
-                    (len(selected), 2), float("nan"), device=xyz.device
-                ))
+                direction_residual_parts.append(
+                    torch.full((len(selected), 2), float("nan"), device=xyz.device)
+                )
                 effective_logit_parts.append(torch.full_like(candidate_score[local], float("nan")))
-                effective_probability_parts.append(torch.full_like(candidate_score[local], float("nan")))
+                effective_probability_parts.append(
+                    torch.full_like(candidate_score[local], float("nan"))
+                )
 
             decoded_push = decoded_push_rows[batch_row]
             if len(decoded_push["point_index"]):
                 expanded_point = decoded_push["point_index"]
-                type_parts.append(torch.full_like(
-                    expanded_point, int(ActionType.PUSH)
-                ))
+                type_parts.append(torch.full_like(expanded_point, int(ActionType.PUSH)))
                 object_parts.append(decoded_push["object"])
                 contact_parts.append(decoded_push["contact_world"])
                 direction_parts.append(decoded_push["direction_world"])
-                pose_parts.append(torch.full(
-                    (len(expanded_point), 7), float("nan"), device=xyz.device,
-                ))
-                destination_parts.append(torch.full(
-                    (len(expanded_point), 3), float("nan"), device=xyz.device,
-                ))
-                width_parts.append(torch.full(
-                    (len(expanded_point),), float("nan"), device=xyz.device,
-                ))
+                pose_parts.append(
+                    torch.full(
+                        (len(expanded_point), 7),
+                        float("nan"),
+                        device=xyz.device,
+                    )
+                )
+                destination_parts.append(
+                    torch.full(
+                        (len(expanded_point), 3),
+                        float("nan"),
+                        device=xyz.device,
+                    )
+                )
+                width_parts.append(
+                    torch.full(
+                        (len(expanded_point),),
+                        float("nan"),
+                        device=xyz.device,
+                    )
+                )
                 score_parts.append(decoded_push["proposal_score"])
                 point_parts.append(expanded_point)
                 direction_bin_parts.append(decoded_push["direction_bin"])
@@ -498,58 +485,32 @@ class DenseCandidateGenerator:
                 return (
                     torch.cat(parts)
                     if parts
-                    else torch.full(
-                        shape, fill, dtype=dtype, device=xyz.device
-                    )
+                    else torch.full(shape, fill, dtype=dtype, device=xyz.device)
                 )
 
-            rows.append({
-                "type": joined(
-                    type_parts, (0,), torch.long, -1
-                ),
-                "object": joined(
-                    object_parts, (0,), torch.long, -1
-                ),
-                "contact_world": joined(
-                    contact_parts, (0, 3), xyz.dtype
-                ),
-                "direction_world": joined(
-                    direction_parts, (0, 3), xyz.dtype
-                ),
-                "pose_world": joined(
-                    pose_parts, (0, 7), xyz.dtype
-                ),
-                "destination_world": joined(
-                    destination_parts, (0, 3), xyz.dtype
-                ),
-                "width_m": joined(
-                    width_parts, (0,), xyz.dtype
-                ),
-                "proposal_score": joined(
-                    score_parts, (0,), xyz.dtype, -1.0
-                ),
-                "point_index": joined(
-                    point_parts, (0,), torch.long, -1
-                ),
-                "direction_bin": joined(
-                    direction_bin_parts, (0,), torch.long, -1
-                ),
-                "direction_score": joined(
-                    direction_score_parts, (0,), xyz.dtype
-                ),
-                "object_score": joined(object_score_parts, (0,), xyz.dtype),
-                "contact_score": joined(contact_score_parts, (0,), xyz.dtype),
-                "utility": joined(utility_parts, (0,), xyz.dtype),
-                "direction_residual": joined(
-                    direction_residual_parts, (0, 2), xyz.dtype
-                ),
-                "effective_logit": joined(effective_logit_parts, (0,), xyz.dtype),
-                "effective_probability": joined(effective_probability_parts, (0,), xyz.dtype),
-            })
+            rows.append(
+                {
+                    "type": joined(type_parts, (0,), torch.long, -1),
+                    "object": joined(object_parts, (0,), torch.long, -1),
+                    "contact_world": joined(contact_parts, (0, 3), xyz.dtype),
+                    "direction_world": joined(direction_parts, (0, 3), xyz.dtype),
+                    "pose_world": joined(pose_parts, (0, 7), xyz.dtype),
+                    "destination_world": joined(destination_parts, (0, 3), xyz.dtype),
+                    "width_m": joined(width_parts, (0,), xyz.dtype),
+                    "proposal_score": joined(score_parts, (0,), xyz.dtype, -1.0),
+                    "point_index": joined(point_parts, (0,), torch.long, -1),
+                    "direction_bin": joined(direction_bin_parts, (0,), torch.long, -1),
+                    "direction_score": joined(direction_score_parts, (0,), xyz.dtype),
+                    "object_score": joined(object_score_parts, (0,), xyz.dtype),
+                    "contact_score": joined(contact_score_parts, (0,), xyz.dtype),
+                    "utility": joined(utility_parts, (0,), xyz.dtype),
+                    "direction_residual": joined(direction_residual_parts, (0, 2), xyz.dtype),
+                    "effective_logit": joined(effective_logit_parts, (0,), xyz.dtype),
+                    "effective_probability": joined(effective_probability_parts, (0,), xyz.dtype),
+                }
+            )
 
-        max_candidates = max(
-            1, max(len(row["type"]) for row in rows)
-        )
+        max_candidates = max(1, max(len(row["type"]) for row in rows))
         fill = {
             "type": -1,
             "object": -1,
@@ -572,8 +533,7 @@ class DenseCandidateGenerator:
         result: dict[str, Tensor] = {}
         for key in rows[0]:
             value = torch.full(
-                (len(rows), max_candidates)
-                + rows[0][key].shape[1:],
+                (len(rows), max_candidates) + rows[0][key].shape[1:],
                 fill[key],
                 dtype=rows[0][key].dtype,
                 device=rows[0][key].device,
@@ -585,11 +545,7 @@ class DenseCandidateGenerator:
         result["valid"] = result["type"] >= 0
         result["push_distance_m"] = torch.where(
             result["type"] == int(ActionType.PUSH),
-            torch.full_like(
-                result["proposal_score"], PUSH_DISTANCE_M
-            ),
-            torch.full_like(
-                result["proposal_score"], float("nan")
-            ),
+            torch.full_like(result["proposal_score"], PUSH_DISTANCE_M),
+            torch.full_like(result["proposal_score"], float("nan")),
         )
         return result

@@ -15,15 +15,16 @@ from tcd_prg.constants import ActionType, CandidateStatus
 from tcd_prg.datasets import ActionStateGroupDataset
 from tcd_prg.evaluators import push_effectiveness_metrics
 from tcd_prg.evaluators.push_effectiveness import (
-    proposal_positive_match_masks,
+    proposal_known_outcome_masks,
     push_candidate_ranking_counts,
 )
 from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
 from tcd_prg.models import StandalonePushModel, push_condition_from_gt
-from tcd_prg.models.staged_checkpoint import push_checkpoint_fingerprint
+from tcd_prg.models.staged_checkpoint import load_push_stage, push_checkpoint_fingerprint
 from tcd_prg.planners.push_decoder import decode_push_candidates
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter
 from tcd_prg.trainers import freeze_push_proposal, push_effectiveness_batch_loss
+from tcd_prg.trainers.reproducibility import seed_everything
 
 
 def _device(value: Any, device: torch.device) -> Any:
@@ -65,7 +66,9 @@ def _evaluate(
     weighted_loss = 0.0
     evaluated = 0
     group_offset = 0
-    candidate_sets = 0
+    positive_sets = 0
+    top1_evaluable = 0
+    top5_evaluable = 0
     candidate_hit1 = 0
     candidate_hit5 = 0
     for cpu_batch in loader:
@@ -108,14 +111,16 @@ def _evaluate(
                 )
                 row["effective_logit"] = candidate_logits
                 row["effective_probability"] = torch.sigmoid(candidate_logits)
-        positive_masks = proposal_positive_match_masks(
+        positive_masks, _, known_masks = proposal_known_outcome_masks(
             final_rows,
             batch,
             contact_threshold_m=config.evaluation.push_match_contact_m,
             direction_threshold_deg=config.evaluation.push_match_direction_deg,
         )
-        ranking = push_candidate_ranking_counts(final_rows, positive_masks)
-        candidate_sets += int(ranking["push_evaluator_candidate_set_count"])
+        ranking = push_candidate_ranking_counts(final_rows, positive_masks, known_masks)
+        positive_sets += int(ranking["push_evaluator_positive_candidate_set_count"])
+        top1_evaluable += int(ranking["push_evaluator_top1_evaluable_count"])
+        top5_evaluable += int(ranking["push_evaluator_top5_evaluable_count"])
         candidate_hit1 += int(ranking["push_evaluator_hit_at_1_count"])
         candidate_hit5 += int(ranking["push_evaluator_recall_at_5_count"])
     if not evaluated:
@@ -135,12 +140,18 @@ def _evaluate(
     }
     result["push_evaluator_loss"] = weighted_loss / evaluated
     result["push_evaluator_evaluated_count"] = float(evaluated)
-    result["push_evaluator_oracle_candidate_set_count"] = float(candidate_sets)
+    result["push_evaluator_oracle_positive_candidate_set_count"] = float(positive_sets)
+    result["push_evaluator_oracle_top1_evaluable_rate"] = (
+        top1_evaluable / positive_sets if positive_sets else float("nan")
+    )
+    result["push_evaluator_oracle_top5_evaluable_rate"] = (
+        top5_evaluable / positive_sets if positive_sets else float("nan")
+    )
     result["push_evaluator_oracle_hit_at_1"] = (
-        candidate_hit1 / candidate_sets if candidate_sets else float("nan")
+        candidate_hit1 / top1_evaluable if top1_evaluable else float("nan")
     )
     result["push_evaluator_oracle_recall_at_5"] = (
-        candidate_hit5 / candidate_sets if candidate_sets else float("nan")
+        candidate_hit5 / top5_evaluable if top5_evaluable else float("nan")
     )
     return result
 
@@ -153,6 +164,7 @@ def main() -> None:
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
+    seed_everything(config.training.seed, config.training.deterministic)
     device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
     adapter = create_adapter(config, allow_render=False)
     dataset = ActionStateGroupDataset(
@@ -177,25 +189,22 @@ def main() -> None:
     if not len(validation_dataset):
         raise RuntimeError("Formal PUSH evaluator training requires a non-empty val split")
     model = StandalonePushModel(config.model).to(device)
-    payload = torch.load(args.proposal_checkpoint, map_location="cpu", weights_only=False)
-    state = payload.get("ema") or payload.get("model", payload)
+    load_push_stage(model, args.proposal_checkpoint, config)
     proposal_fingerprint, proposal_source = push_checkpoint_fingerprint(args.proposal_checkpoint)
-    proposal_state = {key: value for key, value in state.items() if key.startswith("push.")}
-    missing, unexpected = model.load_state_dict(proposal_state, strict=False)
-    if unexpected or any(not key.startswith("push_evaluator.") for key in missing):
-        raise RuntimeError(
-            f"Incompatible Stage-C checkpoint: missing={missing}, extra={unexpected}"
-        )
     freeze_push_proposal(model)
     loss_function = PushEffectivenessLoss(negatives / positives)
     optimizer = torch.optim.AdamW(
-        model.push_evaluator.parameters(), lr=config.optimizer.learning_rate
+        model.push_evaluator.parameters(),
+        lr=config.optimizer.learning_rate,
+        weight_decay=config.optimizer.weight_decay,
     )
     loader = DataLoader(
         dataset,
         batch_size=config.training.batch_size,
         shuffle=True,
         num_workers=config.training.num_workers,
+        pin_memory=config.training.pin_memory,
+        persistent_workers=config.training.num_workers > 0,
         collate_fn=UnifiedBatchCollator(config, training=True, include_graspnet=False),
     )
     validation_loader = DataLoader(
@@ -203,6 +212,8 @@ def main() -> None:
         batch_size=config.training.batch_size,
         shuffle=False,
         num_workers=config.training.validation_num_workers,
+        pin_memory=config.training.pin_memory,
+        persistent_workers=config.training.validation_num_workers > 0,
         collate_fn=UnifiedBatchCollator(config, training=False, include_graspnet=False),
     )
     step = 0
@@ -212,6 +223,7 @@ def main() -> None:
     last_validation_step = -1
     validation_interval = max(0, int(config.training.validation_interval))
     while step < config.training.max_optimizer_steps:
+        made_progress = False
         for cpu_batch in loader:
             batch = _device(cpu_batch, device)
             optimizer.zero_grad(set_to_none=True)
@@ -223,6 +235,7 @@ def main() -> None:
             )
             if not int(details["effective_logit"].numel()):
                 continue
+            made_progress = True
             loss.backward()
             optimizer.step()
             step += 1
@@ -247,6 +260,10 @@ def main() -> None:
                 model.push_evaluator.train()
             if step >= config.training.max_optimizer_steps:
                 break
+        if not made_progress:
+            raise RuntimeError(
+                "A complete PUSH evaluator epoch contained no known evaluated PUSH actions"
+            )
     if last_validation_step != step:
         metrics = _evaluate(
             model,

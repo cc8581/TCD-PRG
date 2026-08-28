@@ -10,7 +10,7 @@ from torch import Tensor, nn
 
 from tcd_prg.config import TCDPRGConfig
 from tcd_prg.evaluators.push_effectiveness import (
-    proposal_positive_match_masks,
+    proposal_known_outcome_masks,
     push_candidate_ranking_counts,
 )
 from tcd_prg.losses.instance import InstanceSetLoss, build_instance_targets
@@ -102,20 +102,32 @@ def integrated_push_proposal_counts(
     )
     if not bool(torch.equal(total, final_total)):
         raise RuntimeError("Integrated PUSH denominator changed across NMS")
-    positive_masks = proposal_positive_match_masks(
+    positive_masks, _, known_masks = proposal_known_outcome_masks(
         associated_final,
         dict(batch),
         contact_threshold_m=config.evaluation.push_match_contact_m,
         direction_threshold_deg=config.evaluation.push_match_direction_deg,
     )
-    ranking = push_candidate_ranking_counts(final, positive_masks)
+    ranking = push_candidate_ranking_counts(final, positive_masks, known_masks)
     return {
         "integrated_push_proposal_positive_total_count": total,
         "integrated_push_proposal_positive_pre_nms_hits_count": pre_hits,
         "integrated_push_proposal_positive_final_hits_count": final_hits,
-        "integrated_push_evaluator_candidate_set_count": ranking[
-            "push_evaluator_candidate_set_count"
+        "integrated_push_evaluator_positive_candidate_set_count": ranking[
+            "push_evaluator_positive_candidate_set_count"
+        ],
+        "integrated_push_evaluator_top1_evaluable_count": ranking[
+            "push_evaluator_top1_evaluable_count"
+        ],
+        "integrated_push_evaluator_top5_evaluable_count": ranking[
+            "push_evaluator_top5_evaluable_count"
         ],
         "integrated_push_evaluator_hit_at_1_count": ranking["push_evaluator_hit_at_1_count"],
         "integrated_push_evaluator_recall_at_5_count": ranking["push_evaluator_recall_at_5_count"],
+        "integrated_push_evaluator_known_candidate_count": ranking[
+            "push_evaluator_known_candidate_count"
+        ],
+        "integrated_push_evaluator_total_candidate_count": ranking[
+            "push_evaluator_total_candidate_count"
+        ],
     }

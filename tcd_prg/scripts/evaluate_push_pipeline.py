@@ -13,12 +13,16 @@ from torch.utils.data import DataLoader
 from tcd_prg.config import load_config
 from tcd_prg.datasets import ActionStateGroupDataset
 from tcd_prg.evaluators.push_effectiveness import (
-    proposal_positive_match_masks,
+    proposal_known_outcome_masks,
     push_candidate_ranking_counts,
 )
 from tcd_prg.evaluators.push_integrated import integrated_push_proposal_counts
 from tcd_prg.models import StandalonePushModel, TCDPRGModel, push_condition_from_gt
-from tcd_prg.models.staged_checkpoint import _load_stage, load_push_evaluator
+from tcd_prg.models.staged_checkpoint import (
+    load_perception_stage,
+    load_push_evaluator,
+    load_push_stage,
+)
 from tcd_prg.planners.push_decoder import decode_push_candidates, proposal_recall_counts
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter
 
@@ -62,20 +66,34 @@ def oracle_push_pipeline_counts(stage_c, batch, config) -> dict[str, torch.Tenso
             logits = stage_c.push_evaluator(proposal["push"], row, batch_index=row_index)
             row["effective_logit"] = logits
             row["effective_probability"] = torch.sigmoid(logits)
-    positive_masks = proposal_positive_match_masks(
+    positive_masks, _, known_masks = proposal_known_outcome_masks(
         final,
         batch,
         contact_threshold_m=config.evaluation.push_match_contact_m,
         direction_threshold_deg=config.evaluation.push_match_direction_deg,
     )
-    ranking = push_candidate_ranking_counts(final, positive_masks)
+    ranking = push_candidate_ranking_counts(final, positive_masks, known_masks)
     return {
         "oracle_push_proposal_positive_total_count": total,
         "oracle_push_proposal_positive_pre_nms_hits_count": pre_hits,
         "oracle_push_proposal_positive_final_hits_count": final_hits,
-        "oracle_push_evaluator_candidate_set_count": ranking["push_evaluator_candidate_set_count"],
+        "oracle_push_evaluator_positive_candidate_set_count": ranking[
+            "push_evaluator_positive_candidate_set_count"
+        ],
+        "oracle_push_evaluator_top1_evaluable_count": ranking[
+            "push_evaluator_top1_evaluable_count"
+        ],
+        "oracle_push_evaluator_top5_evaluable_count": ranking[
+            "push_evaluator_top5_evaluable_count"
+        ],
         "oracle_push_evaluator_hit_at_1_count": ranking["push_evaluator_hit_at_1_count"],
         "oracle_push_evaluator_recall_at_5_count": ranking["push_evaluator_recall_at_5_count"],
+        "oracle_push_evaluator_known_candidate_count": ranking[
+            "push_evaluator_known_candidate_count"
+        ],
+        "oracle_push_evaluator_total_candidate_count": ranking[
+            "push_evaluator_total_candidate_count"
+        ],
     }
 
 
@@ -116,8 +134,8 @@ def main() -> None:
         device
     )
     stage_c = StandalonePushModel(config.model).to(device)
-    _load_stage(stage_a, args.stage_a_checkpoint, "perception")
-    _load_stage(stage_c, args.stage_c_checkpoint, "push")
+    load_perception_stage(stage_a, args.stage_a_checkpoint, config)
+    load_push_stage(stage_c, args.stage_c_checkpoint, config)
     load_push_evaluator(
         stage_c,
         args.push_evaluator_checkpoint,
@@ -149,12 +167,27 @@ def main() -> None:
         metrics[f"{prefix}_push_evaluator_hit_at_1"] = _ratio(
             totals,
             f"{prefix}_push_evaluator_hit_at_1_count",
-            f"{prefix}_push_evaluator_candidate_set_count",
+            f"{prefix}_push_evaluator_top1_evaluable_count",
         )
         metrics[f"{prefix}_push_evaluator_recall_at_5"] = _ratio(
             totals,
             f"{prefix}_push_evaluator_recall_at_5_count",
-            f"{prefix}_push_evaluator_candidate_set_count",
+            f"{prefix}_push_evaluator_top5_evaluable_count",
+        )
+        metrics[f"{prefix}_push_evaluator_top1_evaluable_rate"] = _ratio(
+            totals,
+            f"{prefix}_push_evaluator_top1_evaluable_count",
+            f"{prefix}_push_evaluator_positive_candidate_set_count",
+        )
+        metrics[f"{prefix}_push_evaluator_top5_evaluable_rate"] = _ratio(
+            totals,
+            f"{prefix}_push_evaluator_top5_evaluable_count",
+            f"{prefix}_push_evaluator_positive_candidate_set_count",
+        )
+        metrics[f"{prefix}_push_evaluator_known_candidate_coverage"] = _ratio(
+            totals,
+            f"{prefix}_push_evaluator_known_candidate_count",
+            f"{prefix}_push_evaluator_total_candidate_count",
         )
     payload = {
         "split": args.split,
@@ -162,10 +195,10 @@ def main() -> None:
         "metrics": metrics,
         "protocol": {
             "push_distance_m": 0.15,
-            "evaluator_ranking_denominator": (
-                "rows where final Stage-C proposals contain a matched known positive"
-            ),
             "unknown_is_negative": False,
+            "partial_label_warning": (
+                "Report evaluable rates and known-candidate coverage with Hit@1/Recall@5"
+            ),
         },
     }
     output = Path(args.output)

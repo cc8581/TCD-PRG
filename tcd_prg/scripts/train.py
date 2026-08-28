@@ -164,7 +164,10 @@ def build_optimizer_parameter_groups(model, config, pretrained_parameter_names=(
     named = dict(model.named_parameters())
     missing = [name for name in pretrained_parameter_names if name not in named]
     if missing:
-        raise RuntimeError("Checkpoint pre-trained parameter names do not match this model: " + ", ".join(missing[:8]))
+        raise RuntimeError(
+            "Checkpoint pre-trained parameter names do not match this model: "
+            + ", ".join(missing[:8])
+        )
     if pretrained_parameter_names:
         low = [named[name] for name in pretrained_parameter_names if named[name].requires_grad]
         low_lr = config.optimizer.backbone_learning_rate
@@ -174,12 +177,18 @@ def build_optimizer_parameter_groups(model, config, pretrained_parameter_names=(
         low = [parameter for parameter in model.encoder.parameters() if parameter.requires_grad]
         low_lr = config.optimizer.learning_rate
     low_ids = {id(parameter) for parameter in low}
-    other = [parameter for parameter in model.parameters() if parameter.requires_grad and id(parameter) not in low_ids]
+    other = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in low_ids
+    ]
     groups = []
     if low:
         groups.append({"params": low, "lr": low_lr, "name": "pretrained_trunk"})
     if other:
-        groups.append({"params": other, "lr": config.optimizer.learning_rate, "name": "new_modules"})
+        groups.append(
+            {"params": other, "lr": config.optimizer.learning_rate, "name": "new_modules"}
+        )
     if not groups:
         raise RuntimeError("Selected training stage has no trainable parameters")
     return groups
@@ -195,7 +204,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-rank", "--local_rank", type=int)
     parser.add_argument("--ddp-init-method")
     parser.add_argument(
-        "--validate-only", action="store_true",
+        "--validate-only",
+        action="store_true",
         help="Run one validation pass from --resume and skip optimizer updates.",
     )
     parser.add_argument("overrides", nargs="*")
@@ -208,7 +218,9 @@ def main() -> None:
         raise ValueError("--validate-only requires --resume")
     config = load_config(args.config, args.overrides)
     if config.training.stage == "joint":
-        raise RuntimeError("Legacy joint training is incompatible with standalone Stage-B/Stage-C condition protocols; train perception, grasp and push independently.")
+        raise RuntimeError(
+            "Legacy joint training is incompatible with standalone Stage-B/Stage-C condition protocols; train perception, grasp and push independently."
+        )
     if config.observation.provider != "cached":
         raise ValueError(
             "Formal training requires observation.provider=cached for bounded read-through caching"
@@ -434,8 +446,13 @@ def main() -> None:
         if validation_dataset is not None and len(validation_dataset)
         else None
     )
-    model = (StandalonePushModel(config.model) if config.training.stage == "push" else TCDPRGModel(
-        config.model, config.ablation, config.backbone, config.graspnet))
+    model = (
+        StandalonePushModel(config.model)
+        if config.training.stage == "push"
+        else TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet)
+    )
+    if config.training.stage == "push":
+        model.push_evaluator.requires_grad_(False)
     pretrained_report = None
     resume_pretrained_names: list[str] = []
     resume_validation_protocol_changed = False
@@ -459,8 +476,12 @@ def main() -> None:
             resume_config.get("training", {}) if isinstance(resume_config, dict) else {}
         )
         resume_model = resume_config.get("model", {}) if isinstance(resume_config, dict) else {}
-        resume_evaluation = resume_config.get("evaluation", {}) if isinstance(resume_config, dict) else {}
-        resume_ablation = resume_config.get("ablation", {}) if isinstance(resume_config, dict) else {}
+        resume_evaluation = (
+            resume_config.get("evaluation", {}) if isinstance(resume_config, dict) else {}
+        )
+        resume_ablation = (
+            resume_config.get("ablation", {}) if isinstance(resume_config, dict) else {}
+        )
         if isinstance(resume_training, dict):
             old_validation_signature = (
                 resume_training.get("validation_scene_count"),
@@ -703,11 +724,13 @@ def main() -> None:
                     )
                     if not bool(torch.equal(proposal_total, final_total)):
                         raise RuntimeError("PUSH proposal recall denominator changed across NMS")
-                    terms.update({
-                        "push_proposal_positive_total_count": proposal_total,
-                        "push_proposal_positive_pre_nms_hits_count": pre_hits,
-                        "push_proposal_positive_final_hits_count": final_hits,
-                    })
+                    terms.update(
+                        {
+                            "push_proposal_positive_total_count": proposal_total,
+                            "push_proposal_positive_pre_nms_hits_count": pre_hits,
+                            "push_proposal_positive_final_hits_count": final_hits,
+                        }
+                    )
                 if stageb:
                     valid = (
                         batch["stageb_candidate_valid"].bool()
@@ -784,15 +807,19 @@ def main() -> None:
 
     if args.validate_only:
         validation = validate(trainer.ema.model if trainer.ema else trainer.model)
+        validation_summaries = [validation]
+        if torch.distributed.is_initialized():
+            gathered = [None for _ in range(torch.distributed.get_world_size())]
+            torch.distributed.all_gather_object(gathered, validation)
+            validation_summaries = [item for item in gathered if item is not None]
         if rank == 0:
-            metric_sums = {
-                str(key): float(value)
-                for key, value in validation.get("metric_sums", {}).items()
-            }
-            metric_counts = {
-                str(key): int(value)
-                for key, value in validation.get("metric_counts", {}).items()
-            }
+            metric_sums: dict[str, float] = {}
+            metric_counts: dict[str, int] = {}
+            for summary in validation_summaries:
+                for key, value in summary.get("metric_sums", {}).items():
+                    metric_sums[str(key)] = metric_sums.get(str(key), 0.0) + float(value)
+                for key, value in summary.get("metric_counts", {}).items():
+                    metric_counts[str(key)] = metric_counts.get(str(key), 0) + int(value)
             metric_details = {
                 key: value
                 if key in Trainer.COUNT_TERMS
@@ -800,18 +827,23 @@ def main() -> None:
                 for key, value in metric_sums.items()
             }
             serializable = {
-                "score_sum": float(validation["score_sum"]),
-                "score_count": int(validation["score_count"]),
+                "score_sum": float(sum(float(item["score_sum"]) for item in validation_summaries)),
+                "score_count": int(sum(int(item["score_count"]) for item in validation_summaries)),
                 "metric_sums": metric_sums,
                 "metric_counts": metric_counts,
                 "metrics": finalize_push_validation_metrics(metric_details),
             }
-            if "stageb_scores" in validation:
+            if any("stageb_scores" in item for item in validation_summaries):
                 serializable.update(
                     {
-                        "stageb_candidates": int(len(validation["stageb_scores"])),
+                        "stageb_candidates": int(
+                            sum(len(item.get("stageb_scores", ())) for item in validation_summaries)
+                        ),
                         "stageb_deployment_candidates": int(
-                            len(validation["stageb_deployment_scores"])
+                            sum(
+                                len(item.get("stageb_deployment_scores", ()))
+                                for item in validation_summaries
+                            )
                         ),
                     }
                 )

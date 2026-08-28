@@ -16,6 +16,46 @@ STAGE_PREFIXES = {
     "push": ("push.",),
 }
 
+PERCEPTION_RUNTIME_MODEL_FIELDS = (
+    "instance_queries",
+    "instance_decoder_layers",
+    "instance_decoder_heads",
+    "instance_objectness_threshold",
+    "target_query_temperature",
+    "target_prompt_radius_m",
+    "target_prompt_sigma_m",
+    "target_prompt_weight",
+    "target_category_weight",
+    "target_objectness_weight",
+    "target_center_weight",
+    "target_learned_weight",
+    "target_reid_weight",
+    "target_reid_center_weight",
+    "target_reid_max_center_distance_m",
+    "target_prompt_min_support",
+    "target_prompt_min_margin",
+)
+
+PUSH_RUNTIME_MODEL_FIELDS = (
+    "instance_queries",
+    "num_categories",
+    "num_task_regions",
+    "num_direction_bins",
+    "push_direction_feature_dim",
+    "push_direction_transformer_layers",
+    "push_direction_transformer_heads",
+    "push_direction_contact_topk",
+    "push_object_topk",
+    "push_candidates",
+    "push_directions_per_contact",
+    "max_push_candidates",
+    "push_utility_threshold",
+    "push_candidate_probability_threshold",
+    "push_utility_temperature",
+    "push_nms_contact_m",
+    "push_nms_direction_deg",
+)
+
 
 def _load_stage(model: nn.Module, path: str | Path, stage: str) -> dict:
     payload = torch.load(path, map_location="cpu", weights_only=False)
@@ -50,6 +90,47 @@ def _require_fields(
                 raise RuntimeError(f"{stage} runtime mismatch: {section}.{field}")
 
 
+def validate_perception_stage_runtime(payload: dict, runtime_config) -> None:
+    _require_fields(
+        payload,
+        runtime_config,
+        {
+            "model": PERCEPTION_RUNTIME_MODEL_FIELDS,
+            "ablation": ("use_task_region_condition",),
+            "backbone": ("backend", "grid_size_m", "patch_size", "attention_points"),
+        },
+        "perception",
+    )
+
+
+def validate_push_stage_runtime(payload: dict, runtime_config) -> None:
+    """Reject shape-invariant decoder/proposal protocol drift."""
+    _require_fields(payload, runtime_config, {"model": PUSH_RUNTIME_MODEL_FIELDS}, "push")
+    saved_ablation = payload.get("config", {}).get("ablation", {})
+    saved_use_potential = bool(saved_ablation.get("use_push_potential", False))
+    runtime_use_potential = bool(runtime_config.ablation.use_push_potential)
+    if saved_use_potential != runtime_use_potential:
+        raise RuntimeError("push runtime mismatch: ablation.use_push_potential")
+    if runtime_use_potential:
+        saved_losses = payload.get("config", {}).get("losses", {})
+        if float(saved_losses.get("push_potential", 0.0)) <= 0.0:
+            raise RuntimeError(
+                "push runtime requires a Stage-C checkpoint trained with push potential"
+            )
+
+
+def load_perception_stage(model: nn.Module, checkpoint: str | Path, runtime_config) -> dict:
+    payload = _load_stage(model, checkpoint, "perception")
+    validate_perception_stage_runtime(payload, runtime_config)
+    return payload
+
+
+def load_push_stage(model: nn.Module, checkpoint: str | Path, runtime_config) -> dict:
+    payload = _load_stage(model, checkpoint, "push")
+    validate_push_stage_runtime(payload, runtime_config)
+    return payload
+
+
 def load_staged_tcd_prg(
     model: nn.Module,
     stage_a_checkpoint: str | Path,
@@ -57,65 +138,16 @@ def load_staged_tcd_prg(
     stage_c_checkpoint: str | Path,
     runtime_config,
 ) -> float:
-    stage_a = _load_stage(model, stage_a_checkpoint, "perception")
+    stage_a = load_perception_stage(model, stage_a_checkpoint, runtime_config)
     stage_b = _load_stage(model, stage_b_checkpoint, "grasp")
-    stage_c = _load_stage(model, stage_c_checkpoint, "push")
-    perception_fields = (
-        "instance_queries",
-        "instance_objectness_threshold",
-        "target_query_temperature",
-        "target_prompt_radius_m",
-        "target_prompt_sigma_m",
-        "target_prompt_weight",
-        "target_category_weight",
-        "target_objectness_weight",
-        "target_center_weight",
-        "target_learned_weight",
-        "target_reid_weight",
-        "target_reid_center_weight",
-        "target_reid_max_center_distance_m",
-        "target_prompt_min_support",
-        "target_prompt_min_margin",
-    )
-    _require_fields(
-        stage_a,
-        runtime_config,
-        {
-            "model": perception_fields,
-            "ablation": ("use_task_region_condition",),
-            "backbone": ("grid_size_m",),
-        },
-        "perception",
-    )
-    _require_fields(
-        stage_c,
-        runtime_config,
-        {
-            "model": (
-                "instance_queries",
-                "num_categories",
-                "num_task_regions",
-                "num_direction_bins",
-                "push_direction_contact_topk",
-                "push_object_topk",
-                "push_utility_temperature",
-            )
-        },
-        "push",
-    )
+    stage_c = load_push_stage(model, stage_c_checkpoint, runtime_config)
     _require_fields(
         stage_b,
         runtime_config,
         {"model": ("task_grasp_scene_points", "task_grasp_gripper_points")},
         "grasp",
     )
-    saved_ablation = stage_c.get("config", {}).get("ablation", {})
-    saved_losses = stage_c.get("config", {}).get("losses", {})
-    if runtime_config.ablation.use_push_potential and (
-        not saved_ablation.get("use_push_potential", False)
-        or float(saved_losses.get("push_potential", 0.0)) <= 0.0
-    ):
-        raise RuntimeError("push runtime requires a Stage-C checkpoint trained with push potential")
+    del stage_a, stage_c
     saved_stageb = compatibility_provenance(stage_b.get("stageb_provenance", {}))
     runtime_stageb = stageb_compatibility(runtime_config)
     for key in ("scene_preprocess", "target_graspnet", "proposal_label_protocol"):
@@ -169,3 +201,4 @@ def load_push_evaluator(
                 "different proposal states"
             )
     model.push_evaluator.load_state_dict(payload["model"], strict=True)
+    model.push_evaluator_ready = True
