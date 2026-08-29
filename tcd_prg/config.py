@@ -204,45 +204,77 @@ class AblationConfig:
 
 
 @dataclass(slots=True)
-class RGBAugmentationConfig:
-    """Online RGB-only augmentation; geometry and supervision stay unchanged."""
-
+class AugmentationMethodConfig:
     enabled: bool = True
-    zero_enabled: bool = True
-    zero_probability: float = 0.10
-    grayscale_enabled: bool = True
-    grayscale_probability: float = 0.10
-    color_jitter_enabled: bool = True
-    color_jitter_probability: float = 0.80
+    probability: float = 0.0
+
+
+@dataclass(slots=True)
+class ColorJitterConfig(AugmentationMethodConfig):
+    probability: float = 0.80
     brightness: float = 0.35
     contrast: float = 0.35
     saturation: float = 0.35
     hue: float = 0.08
     gamma: tuple[float, float] = (0.75, 1.35)
-    object_recolor_enabled: bool = True
-    object_recolor_probability: float = 0.35
-    object_recolor_strength: tuple[float, float] = (0.35, 0.90)
-    material_jitter_enabled: bool = True
-    material_jitter_probability: float = 0.30
-    material_noise_std: tuple[float, float] = (0.01, 0.08)
-    lighting_jitter_enabled: bool = True
-    lighting_jitter_probability: float = 0.50
-    lighting_gain: tuple[float, float] = (0.65, 1.35)
-    lighting_bias: tuple[float, float] = (-0.12, 0.12)
-    noise_enabled: bool = True
-    noise_probability: float = 0.30
-    noise_std: tuple[float, float] = (0.005, 0.04)
-    channel_dropout_enabled: bool = True
-    channel_dropout_probability: float = 0.05
-    point_dropout_enabled: bool = True
-    point_dropout_probability: float = 0.05
-    point_dropout_fraction: tuple[float, float] = (0.01, 0.15)
+
+
+@dataclass(slots=True)
+class ObjectRecolorConfig(AugmentationMethodConfig):
+    probability: float = 0.35
+    strength: tuple[float, float] = (0.35, 0.90)
+
+
+@dataclass(slots=True)
+class MaterialJitterConfig(AugmentationMethodConfig):
+    probability: float = 0.30
+    noise_std: tuple[float, float] = (0.01, 0.08)
+
+
+@dataclass(slots=True)
+class LightingJitterConfig(AugmentationMethodConfig):
+    probability: float = 0.50
+    gain: tuple[float, float] = (0.65, 1.35)
+    bias: tuple[float, float] = (-0.12, 0.12)
+
+
+@dataclass(slots=True)
+class SensorNoiseConfig(AugmentationMethodConfig):
+    probability: float = 0.30
+    std: tuple[float, float] = (0.005, 0.04)
+
+
+@dataclass(slots=True)
+class PointDropoutConfig(AugmentationMethodConfig):
+    probability: float = 0.05
+    fraction: tuple[float, float] = (0.01, 0.15)
+
+
+@dataclass(slots=True)
+class AugmentationConfig:
+    """Training-only point-cloud augmentation grouped by independent method."""
+
+    enabled: bool = True
+    zero_rgb: AugmentationMethodConfig = field(
+        default_factory=lambda: AugmentationMethodConfig(probability=0.10)
+    )
+    grayscale: AugmentationMethodConfig = field(
+        default_factory=lambda: AugmentationMethodConfig(probability=0.10)
+    )
+    color_jitter: ColorJitterConfig = field(default_factory=ColorJitterConfig)
+    object_recolor: ObjectRecolorConfig = field(default_factory=ObjectRecolorConfig)
+    material_jitter: MaterialJitterConfig = field(default_factory=MaterialJitterConfig)
+    lighting_jitter: LightingJitterConfig = field(default_factory=LightingJitterConfig)
+    sensor_noise: SensorNoiseConfig = field(default_factory=SensorNoiseConfig)
+    channel_dropout: AugmentationMethodConfig = field(
+        default_factory=lambda: AugmentationMethodConfig(probability=0.05)
+    )
+    point_dropout: PointDropoutConfig = field(default_factory=PointDropoutConfig)
 
 
 @dataclass(slots=True)
 class TrainingConfig:
     stage: str = "joint"
-    # Initialize a complete same-stage model while starting a fresh training state.
     pretrain_checkpoint: str | None = None
     # max_optimizer_steps 统计真实参数更新次数，不包含 AMP 溢出后被跳过的 step。
     seed: int = 2026
@@ -423,7 +455,7 @@ class TCDPRGConfig:
     region_head: RegionHeadConfig = field(default_factory=RegionHeadConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     ablation: AblationConfig = field(default_factory=AblationConfig)
-    rgb_augmentation: RGBAugmentationConfig = field(default_factory=RGBAugmentationConfig)
+    augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     losses: LossConfig = field(default_factory=LossConfig)
@@ -437,43 +469,47 @@ class TCDPRGConfig:
     name: str = "tcd-prg"
 
     def validate(self) -> None:
-        augmentation = self.rgb_augmentation
-        probability_fields = (
-            "zero_probability", "grayscale_probability", "color_jitter_probability",
-            "object_recolor_probability", "material_jitter_probability",
-            "lighting_jitter_probability", "noise_probability",
-            "channel_dropout_probability", "point_dropout_probability",
+        augmentation = self.augmentation
+        methods = (
+            "zero_rgb", "grayscale", "color_jitter", "object_recolor",
+            "material_jitter", "lighting_jitter", "sensor_noise",
+            "channel_dropout", "point_dropout",
         )
-        for name in probability_fields:
-            if not 0.0 <= float(getattr(augmentation, name)) <= 1.0:
-                raise ValueError(f"rgb_augmentation.{name} must be in [0,1]")
+        for name in methods:
+            if not 0.0 <= float(getattr(augmentation, name).probability) <= 1.0:
+                raise ValueError(f"augmentation.{name}.probability must be in [0,1]")
         base_probability = (
-            augmentation.zero_probability if augmentation.zero_enabled else 0.0
+            augmentation.zero_rgb.probability if augmentation.zero_rgb.enabled else 0.0
         ) + (
-            augmentation.grayscale_probability if augmentation.grayscale_enabled else 0.0
+            augmentation.grayscale.probability if augmentation.grayscale.enabled else 0.0
         )
         if base_probability > 1.0:
             raise ValueError(
-                "rgb_augmentation zero_probability + grayscale_probability must be <= 1"
+                "augmentation zero_rgb + grayscale probabilities must be <= 1"
             )
-        for name in (
-            "gamma", "object_recolor_strength", "material_noise_std", "lighting_gain",
-            "lighting_bias", "noise_std", "point_dropout_fraction",
-        ):
-            low, high = getattr(augmentation, name)
+        ranges = {
+            "color_jitter.gamma": augmentation.color_jitter.gamma,
+            "object_recolor.strength": augmentation.object_recolor.strength,
+            "material_jitter.noise_std": augmentation.material_jitter.noise_std,
+            "lighting_jitter.gain": augmentation.lighting_jitter.gain,
+            "lighting_jitter.bias": augmentation.lighting_jitter.bias,
+            "sensor_noise.std": augmentation.sensor_noise.std,
+            "point_dropout.fraction": augmentation.point_dropout.fraction,
+        }
+        for name, (low, high) in ranges.items():
             if low > high:
-                raise ValueError(f"rgb_augmentation.{name} must be ordered [low, high]")
-        if augmentation.gamma[0] <= 0 or augmentation.lighting_gain[0] < 0:
+                raise ValueError(f"augmentation.{name} must be ordered [low, high]")
+        if augmentation.color_jitter.gamma[0] <= 0 or augmentation.lighting_jitter.gain[0] < 0:
             raise ValueError("RGB gamma and lighting gain lower bounds must be valid")
-        if augmentation.material_noise_std[0] < 0 or augmentation.noise_std[0] < 0:
+        if augmentation.material_jitter.noise_std[0] < 0 or augmentation.sensor_noise.std[0] < 0:
             raise ValueError("RGB noise standard deviations cannot be negative")
         if not (
             0.0
-            <= augmentation.point_dropout_fraction[0]
-            <= augmentation.point_dropout_fraction[1]
+            <= augmentation.point_dropout.fraction[0]
+            <= augmentation.point_dropout.fraction[1]
             <= 1.0
         ):
-            raise ValueError("rgb_augmentation.point_dropout_fraction must lie in [0,1]")
+            raise ValueError("augmentation.point_dropout.fraction must lie in [0,1]")
         if self.dataset.stageb_source not in {"acronym_dynamic", "binary_records"}:
             raise ValueError("dataset.stageb_source must be acronym_dynamic or binary_records")
         if self.dataset.stageb_positive_per_state <= 0:

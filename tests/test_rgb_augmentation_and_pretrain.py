@@ -5,7 +5,12 @@ import copy
 import pytest
 import torch
 
-from tcd_prg.config import RGBAugmentationConfig
+from tcd_prg.config import (
+    AugmentationConfig,
+    AugmentationMethodConfig,
+    ColorJitterConfig,
+    ObjectRecolorConfig,
+)
 from tcd_prg.datasets.rgb_augmentation import PointCloudRGBAugmentation
 from tcd_prg.scripts.train import load_pretrain_checkpoint, validate_checkpoint_gate
 
@@ -21,19 +26,17 @@ def _batch() -> dict[str, torch.Tensor]:
 
 
 def test_rgb_augmentation_changes_only_rgb_and_preserves_padding() -> None:
-    config = RGBAugmentationConfig(
+    config = AugmentationConfig(
         enabled=True,
-        zero_enabled=False,
-        grayscale_enabled=False,
-        color_jitter_enabled=True,
-        color_jitter_probability=1.0,
-        object_recolor_enabled=True,
-        object_recolor_probability=1.0,
-        material_jitter_enabled=False,
-        lighting_jitter_enabled=False,
-        noise_enabled=False,
-        channel_dropout_enabled=False,
-        point_dropout_enabled=False,
+        zero_rgb=AugmentationMethodConfig(enabled=False),
+        grayscale=AugmentationMethodConfig(enabled=False),
+        color_jitter=ColorJitterConfig(enabled=True, probability=1.0),
+        object_recolor=ObjectRecolorConfig(enabled=True, probability=1.0),
+        material_jitter=AugmentationMethodConfig(enabled=False),
+        lighting_jitter=AugmentationMethodConfig(enabled=False),
+        sensor_noise=AugmentationMethodConfig(enabled=False),
+        channel_dropout=AugmentationMethodConfig(enabled=False),
+        point_dropout=AugmentationMethodConfig(enabled=False),
     )
     batch = _batch()
     original = {name: value.clone() for name, value in batch.items()}
@@ -46,18 +49,17 @@ def test_rgb_augmentation_changes_only_rgb_and_preserves_padding() -> None:
 
 
 def test_rgb_zero_mode_keeps_three_channels() -> None:
-    config = RGBAugmentationConfig(
+    config = AugmentationConfig(
         enabled=True,
-        zero_enabled=True,
-        zero_probability=1.0,
-        grayscale_enabled=False,
-        color_jitter_enabled=False,
-        object_recolor_enabled=False,
-        material_jitter_enabled=False,
-        lighting_jitter_enabled=False,
-        noise_enabled=False,
-        channel_dropout_enabled=False,
-        point_dropout_enabled=False,
+        zero_rgb=AugmentationMethodConfig(enabled=True, probability=1.0),
+        grayscale=AugmentationMethodConfig(enabled=False),
+        color_jitter=ColorJitterConfig(enabled=False),
+        object_recolor=ObjectRecolorConfig(enabled=False),
+        material_jitter=AugmentationMethodConfig(enabled=False),
+        lighting_jitter=AugmentationMethodConfig(enabled=False),
+        sensor_noise=AugmentationMethodConfig(enabled=False),
+        channel_dropout=AugmentationMethodConfig(enabled=False),
+        point_dropout=AugmentationMethodConfig(enabled=False),
     )
     batch = _batch()
     PointCloudRGBAugmentation(config)(batch)

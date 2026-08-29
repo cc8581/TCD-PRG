@@ -134,10 +134,10 @@ class UnifiedBatchCollator:
                 else self.include_graspnet
             ),
         )
-        if self.training and self.config.rgb_augmentation.enabled:
+        if self.training and self.config.augmentation.enabled:
             from tcd_prg.datasets.rgb_augmentation import PointCloudRGBAugmentation
 
-            PointCloudRGBAugmentation(self.config.rgb_augmentation)(batch)
+            PointCloudRGBAugmentation(self.config.augmentation)(batch)
         return batch
 
 
@@ -157,10 +157,10 @@ class StageBBinaryBatchCollator:
             samples, grid_size_m=grid_size, training=self.training,
             point_count=self.config.dataset.scene_points,
         )
-        if self.training and self.config.rgb_augmentation.enabled:
+        if self.training and self.config.augmentation.enabled:
             from tcd_prg.datasets.rgb_augmentation import PointCloudRGBAugmentation
 
-            PointCloudRGBAugmentation(self.config.rgb_augmentation)(batch)
+            PointCloudRGBAugmentation(self.config.augmentation)(batch)
         return batch
 
 

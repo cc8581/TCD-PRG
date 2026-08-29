@@ -18,6 +18,7 @@ scheduler:
   warmup_steps: 2000
 
 training:
+  pretrain_checkpoint: null
   stage: grasp
   max_optimizer_steps: 15000
   frozen_modules: [encoder, region_head, graspnet, push]

@@ -7,7 +7,7 @@ import math
 import torch
 from torch import Tensor
 
-from tcd_prg.config import RGBAugmentationConfig
+from tcd_prg.config import AugmentationConfig
 
 
 def _uniform(low: float, high: float, *, device: torch.device) -> Tensor:
@@ -44,7 +44,7 @@ def _hue_rotate(rgb: Tensor, delta: float) -> Tensor:
 class PointCloudRGBAugmentation:
     """Apply stochastic RGB transforms while preserving every non-RGB field."""
 
-    def __init__(self, config: RGBAugmentationConfig) -> None:
+    def __init__(self, config: AugmentationConfig) -> None:
         self.config = config
 
     def __call__(self, batch: dict[str, object]) -> dict[str, object]:
@@ -76,9 +76,9 @@ class PointCloudRGBAugmentation:
         config, device = self.config, rgb.device
         value = rgb.float().clone().clamp(0, 1)
         base_draw = float(torch.rand((), device=device))
-        zero_probability = config.zero_probability if config.zero_enabled else 0.0
+        zero_probability = config.zero_rgb.probability if config.zero_rgb.enabled else 0.0
         grayscale_probability = (
-            config.grayscale_probability if config.grayscale_enabled else 0.0
+            config.grayscale.probability if config.grayscale.enabled else 0.0
         )
         if base_draw < zero_probability:
             return torch.zeros_like(value)
@@ -86,51 +86,50 @@ class PointCloudRGBAugmentation:
             gray = (value * value.new_tensor((0.299, 0.587, 0.114))).sum(-1, keepdim=True)
             value = gray.expand_as(value).clone()
 
-        if config.color_jitter_enabled and _chance(config.color_jitter_probability, device=device):
-            brightness = _uniform(1 - config.brightness, 1 + config.brightness, device=device)
-            contrast = _uniform(1 - config.contrast, 1 + config.contrast, device=device)
-            saturation = _uniform(1 - config.saturation, 1 + config.saturation, device=device)
+        jitter = config.color_jitter
+        if jitter.enabled and _chance(jitter.probability, device=device):
+            brightness = _uniform(1 - jitter.brightness, 1 + jitter.brightness, device=device)
+            contrast = _uniform(1 - jitter.contrast, 1 + jitter.contrast, device=device)
+            saturation = _uniform(1 - jitter.saturation, 1 + jitter.saturation, device=device)
             value = value * brightness
             mean = value.mean(dim=0, keepdim=True)
             value = (value - mean) * contrast + mean
             gray = (value * value.new_tensor((0.299, 0.587, 0.114))).sum(-1, keepdim=True)
             value = gray + (value - gray) * saturation
-            value = _hue_rotate(value, float(_uniform(-config.hue, config.hue, device=device)))
-            value = value.clamp(0, 1).pow(_uniform(*config.gamma, device=device))
+            value = _hue_rotate(value, float(_uniform(-jitter.hue, jitter.hue, device=device)))
+            value = value.clamp(0, 1).pow(_uniform(*jitter.gamma, device=device))
 
+        recolor = config.object_recolor
         if (
-            config.object_recolor_enabled
+            recolor.enabled
             and instance_id is not None
-            and _chance(config.object_recolor_probability, device=device)
+            and _chance(recolor.probability, device=device)
         ):
             for object_id in torch.unique(instance_id):
                 if int(object_id) < 0:
                     continue
                 selected = instance_id == object_id
                 color = torch.rand(3, device=device)
-                strength = _uniform(*config.object_recolor_strength, device=device)
+                strength = _uniform(*recolor.strength, device=device)
                 value[selected] = value[selected] * (1 - strength) + color * strength
 
-        if config.material_jitter_enabled and _chance(
-            config.material_jitter_probability, device=device
-        ):
-            std = _uniform(*config.material_noise_std, device=device)
+        material = config.material_jitter
+        if material.enabled and _chance(material.probability, device=device):
+            std = _uniform(*material.noise_std, device=device)
             channel_scale = torch.empty(3, device=device).normal_(1.0, float(std))
             value = value * channel_scale + torch.randn_like(value) * std
-        if config.lighting_jitter_enabled and _chance(
-            config.lighting_jitter_probability, device=device
-        ):
-            value = value * _uniform(*config.lighting_gain, device=device)
-            value = value + _uniform(*config.lighting_bias, device=device)
-        if config.noise_enabled and _chance(config.noise_probability, device=device):
-            value = value + torch.randn_like(value) * _uniform(*config.noise_std, device=device)
-        if config.channel_dropout_enabled and _chance(
-            config.channel_dropout_probability, device=device
-        ):
+        lighting = config.lighting_jitter
+        if lighting.enabled and _chance(lighting.probability, device=device):
+            value = value * _uniform(*lighting.gain, device=device)
+            value = value + _uniform(*lighting.bias, device=device)
+        noise = config.sensor_noise
+        if noise.enabled and _chance(noise.probability, device=device):
+            value = value + torch.randn_like(value) * _uniform(*noise.std, device=device)
+        channel_dropout = config.channel_dropout
+        if channel_dropout.enabled and _chance(channel_dropout.probability, device=device):
             value[:, int(torch.randint(0, 3, (), device=device))] = 0
-        if config.point_dropout_enabled and _chance(
-            config.point_dropout_probability, device=device
-        ):
-            fraction = _uniform(*config.point_dropout_fraction, device=device)
+        point_dropout = config.point_dropout
+        if point_dropout.enabled and _chance(point_dropout.probability, device=device):
+            fraction = _uniform(*point_dropout.fraction, device=device)
             value[torch.rand(len(value), device=device) < fraction] = 0
         return value.clamp_(0, 1).to(rgb.dtype)

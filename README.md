@@ -193,8 +193,8 @@ supported by Stage A, Stage B and Stage C. The standalone
 PUSH evaluator accepts the same option through `train_push_evaluator.py`.
 Checkpoint stage, schema, parameter names and tensor shapes are checked strictly.
 
-Formal stage configurations inherit the training-only `rgb_augmentation`
-pipeline from `configs/config.yaml`. Each RGB transform has an independent
+Formal stage configurations inherit the training-only `augmentation`
+pipeline from `configs/config.yaml`. Each RGB transform has its own nested
 enable flag, probability and intensity range. The pipeline can keep RGB,
 zero it, convert it to three-channel grayscale, jitter color, randomly recolor
 instances, perturb material/lighting, add sensor noise, or drop channels/points.

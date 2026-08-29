@@ -11,6 +11,7 @@ scheduler:
   warmup_steps: 2000
 
 training:
+  pretrain_checkpoint: null
   stage: push
   max_optimizer_steps: 15000
   validation_interval: 1000

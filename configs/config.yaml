@@ -34,37 +34,46 @@ observation:
   certification_temporary_root: runtime/tmp/certification
 
 # Online training-only RGB augmentation. Validation and inference never use it.
-rgb_augmentation:
+augmentation:
   enabled: true
-  zero_enabled: true
-  zero_probability: 0.10
-  grayscale_enabled: true
-  grayscale_probability: 0.10
-  color_jitter_enabled: true
-  color_jitter_probability: 0.80
-  brightness: 0.35
-  contrast: 0.35
-  saturation: 0.35
-  hue: 0.08
-  gamma: [0.75, 1.35]
-  object_recolor_enabled: true
-  object_recolor_probability: 0.35
-  object_recolor_strength: [0.35, 0.90]
-  material_jitter_enabled: true
-  material_jitter_probability: 0.30
-  material_noise_std: [0.01, 0.08]
-  lighting_jitter_enabled: true
-  lighting_jitter_probability: 0.50
-  lighting_gain: [0.65, 1.35]
-  lighting_bias: [-0.12, 0.12]
-  noise_enabled: true
-  noise_probability: 0.30
-  noise_std: [0.005, 0.04]
-  channel_dropout_enabled: true
-  channel_dropout_probability: 0.05
-  point_dropout_enabled: true
-  point_dropout_probability: 0.05
-  point_dropout_fraction: [0.01, 0.15]
+  zero_rgb:
+    enabled: true
+    probability: 0.10
+  grayscale:
+    enabled: true
+    probability: 0.10
+  color_jitter:
+    enabled: true
+    probability: 0.80
+    brightness: 0.35
+    contrast: 0.35
+    saturation: 0.35
+    hue: 0.08
+    gamma: [0.75, 1.35]
+  object_recolor:
+    enabled: true
+    probability: 0.35
+    strength: [0.35, 0.90]
+  material_jitter:
+    enabled: true
+    probability: 0.30
+    noise_std: [0.01, 0.08]
+  lighting_jitter:
+    enabled: true
+    probability: 0.50
+    gain: [0.65, 1.35]
+    bias: [-0.12, 0.12]
+  sensor_noise:
+    enabled: true
+    probability: 0.30
+    std: [0.005, 0.04]
+  channel_dropout:
+    enabled: true
+    probability: 0.05
+  point_dropout:
+    enabled: true
+    probability: 0.05
+    fraction: [0.01, 0.15]
 
 cache:
   # 命中会刷新访问时间；达到容量或磁盘余量阈值时，LRU 自动淘汰最久未访问条目。
@@ -191,8 +200,6 @@ sampling:
   global_negative_grasps_per_object: 32
 
 training:
-  # Same-stage full-model initialization; optimizer/scheduler/step always start fresh.
-  pretrain_checkpoint: null
   seed: 2026
   device: cuda
   deterministic: False
