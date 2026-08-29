@@ -50,11 +50,7 @@ class PointCloudRGBAugmentation:
     def __call__(self, batch: dict[str, object]) -> dict[str, object]:
         rgb = batch.get("rgb")
         point_mask = batch.get("point_mask")
-        if (
-            not self.config.enabled
-            or not isinstance(rgb, Tensor)
-            or not isinstance(point_mask, Tensor)
-        ):
+        if not isinstance(rgb, Tensor) or not isinstance(point_mask, Tensor):
             return batch
         instance_id = batch.get("instance_id")
         instance_id = instance_id if isinstance(instance_id, Tensor) else None
@@ -76,10 +72,8 @@ class PointCloudRGBAugmentation:
         config, device = self.config, rgb.device
         value = rgb.float().clone().clamp(0, 1)
         base_draw = float(torch.rand((), device=device))
-        zero_probability = config.zero_rgb.probability if config.zero_rgb.enabled else 0.0
-        grayscale_probability = (
-            config.grayscale.probability if config.grayscale.enabled else 0.0
-        )
+        zero_probability = config.zero_rgb.probability
+        grayscale_probability = config.grayscale.probability
         if base_draw < zero_probability:
             return torch.zeros_like(value)
         if base_draw < zero_probability + grayscale_probability:
@@ -87,7 +81,7 @@ class PointCloudRGBAugmentation:
             value = gray.expand_as(value).clone()
 
         jitter = config.color_jitter
-        if jitter.enabled and _chance(jitter.probability, device=device):
+        if _chance(jitter.probability, device=device):
             brightness = _uniform(1 - jitter.brightness, 1 + jitter.brightness, device=device)
             contrast = _uniform(1 - jitter.contrast, 1 + jitter.contrast, device=device)
             saturation = _uniform(1 - jitter.saturation, 1 + jitter.saturation, device=device)
@@ -100,11 +94,7 @@ class PointCloudRGBAugmentation:
             value = value.clamp(0, 1).pow(_uniform(*jitter.gamma, device=device))
 
         recolor = config.object_recolor
-        if (
-            recolor.enabled
-            and instance_id is not None
-            and _chance(recolor.probability, device=device)
-        ):
+        if instance_id is not None and _chance(recolor.probability, device=device):
             for object_id in torch.unique(instance_id):
                 if int(object_id) < 0:
                     continue
@@ -114,22 +104,22 @@ class PointCloudRGBAugmentation:
                 value[selected] = value[selected] * (1 - strength) + color * strength
 
         material = config.material_jitter
-        if material.enabled and _chance(material.probability, device=device):
+        if _chance(material.probability, device=device):
             std = _uniform(*material.noise_std, device=device)
             channel_scale = torch.empty(3, device=device).normal_(1.0, float(std))
             value = value * channel_scale + torch.randn_like(value) * std
         lighting = config.lighting_jitter
-        if lighting.enabled and _chance(lighting.probability, device=device):
+        if _chance(lighting.probability, device=device):
             value = value * _uniform(*lighting.gain, device=device)
             value = value + _uniform(*lighting.bias, device=device)
         noise = config.sensor_noise
-        if noise.enabled and _chance(noise.probability, device=device):
+        if _chance(noise.probability, device=device):
             value = value + torch.randn_like(value) * _uniform(*noise.std, device=device)
         channel_dropout = config.channel_dropout
-        if channel_dropout.enabled and _chance(channel_dropout.probability, device=device):
+        if _chance(channel_dropout.probability, device=device):
             value[:, int(torch.randint(0, 3, (), device=device))] = 0
         point_dropout = config.point_dropout
-        if point_dropout.enabled and _chance(point_dropout.probability, device=device):
+        if _chance(point_dropout.probability, device=device):
             fraction = _uniform(*point_dropout.fraction, device=device)
             value[torch.rand(len(value), device=device) < fraction] = 0
         return value.clamp_(0, 1).to(rgb.dtype)

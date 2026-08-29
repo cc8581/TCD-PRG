@@ -205,7 +205,6 @@ class AblationConfig:
 
 @dataclass(slots=True)
 class AugmentationMethodConfig:
-    enabled: bool = True
     probability: float = 0.0
 
 
@@ -254,7 +253,6 @@ class PointDropoutConfig(AugmentationMethodConfig):
 class AugmentationConfig:
     """Training-only point-cloud augmentation grouped by independent method."""
 
-    enabled: bool = True
     zero_rgb: AugmentationMethodConfig = field(
         default_factory=lambda: AugmentationMethodConfig(probability=0.10)
     )
@@ -479,9 +477,7 @@ class TCDPRGConfig:
             if not 0.0 <= float(getattr(augmentation, name).probability) <= 1.0:
                 raise ValueError(f"augmentation.{name}.probability must be in [0,1]")
         base_probability = (
-            augmentation.zero_rgb.probability if augmentation.zero_rgb.enabled else 0.0
-        ) + (
-            augmentation.grayscale.probability if augmentation.grayscale.enabled else 0.0
+            augmentation.zero_rgb.probability + augmentation.grayscale.probability
         )
         if base_probability > 1.0:
             raise ValueError(

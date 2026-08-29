@@ -27,16 +27,15 @@ def _batch() -> dict[str, torch.Tensor]:
 
 def test_rgb_augmentation_changes_only_rgb_and_preserves_padding() -> None:
     config = AugmentationConfig(
-        enabled=True,
-        zero_rgb=AugmentationMethodConfig(enabled=False),
-        grayscale=AugmentationMethodConfig(enabled=False),
-        color_jitter=ColorJitterConfig(enabled=True, probability=1.0),
-        object_recolor=ObjectRecolorConfig(enabled=True, probability=1.0),
-        material_jitter=AugmentationMethodConfig(enabled=False),
-        lighting_jitter=AugmentationMethodConfig(enabled=False),
-        sensor_noise=AugmentationMethodConfig(enabled=False),
-        channel_dropout=AugmentationMethodConfig(enabled=False),
-        point_dropout=AugmentationMethodConfig(enabled=False),
+        zero_rgb=AugmentationMethodConfig(probability=0.0),
+        grayscale=AugmentationMethodConfig(probability=0.0),
+        color_jitter=ColorJitterConfig(probability=1.0),
+        object_recolor=ObjectRecolorConfig(probability=1.0),
+        material_jitter=AugmentationMethodConfig(probability=0.0),
+        lighting_jitter=AugmentationMethodConfig(probability=0.0),
+        sensor_noise=AugmentationMethodConfig(probability=0.0),
+        channel_dropout=AugmentationMethodConfig(probability=0.0),
+        point_dropout=AugmentationMethodConfig(probability=0.0),
     )
     batch = _batch()
     original = {name: value.clone() for name, value in batch.items()}
@@ -50,21 +49,39 @@ def test_rgb_augmentation_changes_only_rgb_and_preserves_padding() -> None:
 
 def test_rgb_zero_mode_keeps_three_channels() -> None:
     config = AugmentationConfig(
-        enabled=True,
-        zero_rgb=AugmentationMethodConfig(enabled=True, probability=1.0),
-        grayscale=AugmentationMethodConfig(enabled=False),
-        color_jitter=ColorJitterConfig(enabled=False),
-        object_recolor=ObjectRecolorConfig(enabled=False),
-        material_jitter=AugmentationMethodConfig(enabled=False),
-        lighting_jitter=AugmentationMethodConfig(enabled=False),
-        sensor_noise=AugmentationMethodConfig(enabled=False),
-        channel_dropout=AugmentationMethodConfig(enabled=False),
-        point_dropout=AugmentationMethodConfig(enabled=False),
+        zero_rgb=AugmentationMethodConfig(probability=1.0),
+        grayscale=AugmentationMethodConfig(probability=0.0),
+        color_jitter=ColorJitterConfig(probability=0.0),
+        object_recolor=ObjectRecolorConfig(probability=0.0),
+        material_jitter=AugmentationMethodConfig(probability=0.0),
+        lighting_jitter=AugmentationMethodConfig(probability=0.0),
+        sensor_noise=AugmentationMethodConfig(probability=0.0),
+        channel_dropout=AugmentationMethodConfig(probability=0.0),
+        point_dropout=AugmentationMethodConfig(probability=0.0),
     )
     batch = _batch()
     PointCloudRGBAugmentation(config)(batch)
     assert batch["rgb"].shape == (1, 8, 3)
     assert torch.count_nonzero(batch["rgb"]) == 0
+
+
+def test_zero_probabilities_leave_rgb_unchanged() -> None:
+    config = AugmentationConfig(
+        zero_rgb=AugmentationMethodConfig(probability=0.0),
+        grayscale=AugmentationMethodConfig(probability=0.0),
+        color_jitter=ColorJitterConfig(probability=0.0),
+        object_recolor=ObjectRecolorConfig(probability=0.0),
+        material_jitter=AugmentationMethodConfig(probability=0.0),
+        lighting_jitter=AugmentationMethodConfig(probability=0.0),
+        sensor_noise=AugmentationMethodConfig(probability=0.0),
+        channel_dropout=AugmentationMethodConfig(probability=0.0),
+        point_dropout=AugmentationMethodConfig(probability=0.0),
+    )
+    batch = _batch()
+    original = batch["rgb"].clone()
+    PointCloudRGBAugmentation(config)(batch)
+    assert torch.equal(batch["rgb"][:, :6], original[:, :6])
+    assert torch.count_nonzero(batch["rgb"][:, 6:]) == 0
 
 
 def test_pretrain_load_is_strict_and_does_not_create_trainer_state() -> None:

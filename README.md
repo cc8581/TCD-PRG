@@ -195,7 +195,7 @@ Checkpoint stage, schema, parameter names and tensor shapes are checked strictly
 
 Formal stage configurations inherit the training-only `augmentation`
 pipeline from `configs/config.yaml`. Each RGB transform has its own nested
-enable flag, probability and intensity range. The pipeline can keep RGB,
+probability and intensity range; probability zero disables that method. The pipeline can keep RGB,
 zero it, convert it to three-channel grayscale, jitter color, randomly recolor
 instances, perturb material/lighting, add sensor noise, or drop channels/points.
 It never changes XYZ, point count, labels or point correspondence, and validation
