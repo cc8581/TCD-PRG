@@ -73,6 +73,7 @@ def test_nonstandard_metric_names_are_rejected() -> None:
     with pytest.raises(ValueError):
         metric_protocol("selected_candidate_success")
     assert metric_protocol("standard_region_miou").task == "task_region"
+    assert metric_protocol("standard_target_iou").task == "target_instance"
 
 
 def test_evaluator_exports_only_standard_metrics() -> None:

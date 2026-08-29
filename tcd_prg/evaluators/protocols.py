@@ -189,6 +189,12 @@ def metric_protocol(name: str) -> MetricProtocol:
             "SGG no-graph-constraint R@K/mR@K",
             "Multiple predicates per relation pair remain eligible.",
         )
+    if "target" in name:
+        return MetricProtocol(
+            "target_instance",
+            "binary point segmentation IoU/Precision/Recall",
+            "Dataset-level confusion aggregation at probability threshold 0.5.",
+        )
     if "region" in name:
         return MetricProtocol(
             "task_region",
@@ -220,6 +226,10 @@ def protocol_audit_manifest() -> dict[str, Any]:
     """State exactly which protocols are available from each evaluation path."""
 
     return {
+        "target_instance": {
+            "protocol": "binary point segmentation IoU/Precision/Recall",
+            "offline_supported": True,
+        },
         "task_region": {
             "protocol": "binary segmentation IoU/mIoU",
             "offline_supported": True,

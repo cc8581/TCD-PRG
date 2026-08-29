@@ -1,8 +1,8 @@
 """Standard-only metrics for the minimal TCD-PRG training/evaluation path.
 
 Task/global grasp and closed-loop manipulation remain evaluated by their dedicated
-physical protocols. The offline evaluator only reports task-region segmentation,
-which is directly comparable from native labels without a learned Graph/Verifier.
+physical protocols. The offline evaluator reports target-instance and task-region
+segmentation, which are directly comparable from native point labels.
 """
 from __future__ import annotations
 
@@ -60,8 +60,18 @@ class OfflineModelEvaluator:
                     min(4, (1.0 - sample.state_labels.target_visible_ratio) * 5)
                 ),
             }
+            encoded = output.get("encoded")
+            if "target_mask" in batch and encoded is not None:
+                valid = self._numpy(batch["point_mask"][row]).astype(bool)
+                target = self._numpy(batch["target_mask"][row]).astype(bool)
+                probability = self._numpy(encoded.target_instance_probability[row])
+                prediction = probability >= 0.5
+                record["_confusion_standard_target"] = binary_confusion(
+                    prediction, target, valid
+                )
             if "region_target" in batch and output.get("region") is not None:
                 valid = self._numpy(batch["region_valid"][row]).astype(bool)
+                valid &= self._numpy(batch["point_mask"][row]).astype(bool)
                 target = self._numpy(batch["region_target"][row]).astype(bool)
                 probability = self._numpy(output["region"]["region_probability"][row])
                 prediction = (

@@ -401,8 +401,21 @@ class Trainer:
             f"{label}: {value:.4f}" for label, value in self._grouped_losses(record["metrics"])
         )
         metrics = record["metrics"]
-        if "standard_region_miou" in metrics:
-            fields.append(f"mIoU: {float(metrics['standard_region_miou']):.1%}")
+        displayed_metrics = (
+            ("target IoU", "standard_target_iou"),
+            ("target P", "standard_target_precision"),
+            ("target R", "standard_target_recall"),
+            ("region fg IoU", "standard_region_foreground_iou"),
+            ("region bg IoU", "standard_region_background_iou"),
+            ("region mIoU", "standard_region_miou"),
+            ("region P", "standard_region_foreground_precision"),
+            ("region R", "standard_region_foreground_recall"),
+        )
+        fields.extend(
+            f"{label}: {float(metrics[key]):.1%}"
+            for label, key in displayed_metrics
+            if key in metrics
+        )
         print("  ".join(fields), flush=True)
 
     # validation-resume-transaction-v1
@@ -636,7 +649,7 @@ class Trainer:
                 )
                 temporary.replace(threshold_path)
             validation_record = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "timestamp_utc": self._timestamp(),
                 "optimizer_step": step,
                 "validation_score": score,
@@ -725,7 +738,7 @@ class Trainer:
                     "git_commit": commit,
                     "torch": torch.__version__,
                     "train_metrics_schema_version": 6,
-                    "validation_metrics_schema_version": 3,
+                    "validation_metrics_schema_version": 4,
                     "training_events_schema_version": 1,
                 },
                 indent=2,
