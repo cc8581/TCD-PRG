@@ -135,9 +135,20 @@ class UnifiedBatchCollator:
             ),
         )
         if self.training:
+            from tcd_prg.datasets.augmentation_debug import (
+                claim_debug_batch,
+                save_debug_batch,
+            )
             from tcd_prg.datasets.rgb_augmentation import PointCloudRGBAugmentation
 
+            debug_directory = claim_debug_batch(
+                self.config.output_dir,
+                self.config.augmentation.debug.save_first_batches,
+            )
+            rgb_before = batch["rgb"].clone() if debug_directory is not None else None
             PointCloudRGBAugmentation(self.config.augmentation)(batch)
+            if debug_directory is not None and rgb_before is not None:
+                save_debug_batch(debug_directory, batch, rgb_before)
         return batch
 
 
@@ -158,9 +169,20 @@ class StageBBinaryBatchCollator:
             point_count=self.config.dataset.scene_points,
         )
         if self.training:
+            from tcd_prg.datasets.augmentation_debug import (
+                claim_debug_batch,
+                save_debug_batch,
+            )
             from tcd_prg.datasets.rgb_augmentation import PointCloudRGBAugmentation
 
+            debug_directory = claim_debug_batch(
+                self.config.output_dir,
+                self.config.augmentation.debug.save_first_batches,
+            )
+            rgb_before = batch["rgb"].clone() if debug_directory is not None else None
             PointCloudRGBAugmentation(self.config.augmentation)(batch)
+            if debug_directory is not None and rgb_before is not None:
+                save_debug_batch(debug_directory, batch, rgb_before)
         return batch
 
 

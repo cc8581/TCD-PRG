@@ -35,34 +35,38 @@ observation:
 
 # Online training-only RGB augmentation. Validation and inference never use it.
 augmentation:
+  debug:
+    # 0 disables previews. Positive N saves exactly N training batches under
+    # output_dir/augmentation_debug, shared across all DataLoader workers.
+    save_first_batches: 0
   zero_rgb:
-    probability: 0.10
+    probability: 0.50
   grayscale:
-    probability: 0.10
+    probability: 0.50
   color_jitter:
-    probability: 0.80
+    probability: 0.50
     brightness: 0.35
     contrast: 0.35
     saturation: 0.35
     hue: 0.08
     gamma: [0.75, 1.35]
   object_recolor:
-    probability: 0.35
+    probability: 0.5
     strength: [0.35, 0.90]
   material_jitter:
-    probability: 0.30
+    probability: 0.5
     noise_std: [0.01, 0.08]
   lighting_jitter:
     probability: 0.50
     gain: [0.65, 1.35]
     bias: [-0.12, 0.12]
   sensor_noise:
-    probability: 0.30
+    probability: 0.5
     std: [0.005, 0.04]
   channel_dropout:
-    probability: 0.05
+    probability: 0.2
   point_dropout:
-    probability: 0.05
+    probability: 0.2
     fraction: [0.01, 0.15]
 
 cache:

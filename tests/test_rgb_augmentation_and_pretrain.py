@@ -11,6 +11,7 @@ from tcd_prg.config import (
     ColorJitterConfig,
     ObjectRecolorConfig,
 )
+from tcd_prg.datasets.augmentation_debug import claim_debug_batch, save_debug_batch
 from tcd_prg.datasets.rgb_augmentation import PointCloudRGBAugmentation
 from tcd_prg.scripts.train import load_pretrain_checkpoint, validate_checkpoint_gate
 
@@ -82,6 +83,21 @@ def test_zero_probabilities_leave_rgb_unchanged() -> None:
     PointCloudRGBAugmentation(config)(batch)
     assert torch.equal(batch["rgb"][:, :6], original[:, :6])
     assert torch.count_nonzero(batch["rgb"][:, 6:]) == 0
+
+
+def test_augmentation_debug_is_globally_bounded_and_uses_output_dir(tmp_path) -> None:
+    first = claim_debug_batch(tmp_path, 2)
+    second = claim_debug_batch(tmp_path, 2)
+    assert first == tmp_path / "augmentation_debug" / "batch_0000"
+    assert second == tmp_path / "augmentation_debug" / "batch_0001"
+    assert claim_debug_batch(tmp_path, 2) is None
+    batch = _batch()
+    before = batch["rgb"].clone()
+    batch["rgb"][:, :6] = 0
+    save_debug_batch(first, batch, before)
+    assert (first / "batch_before_after.npz").is_file()
+    assert (first / "report.json").is_file()
+    assert (first / "preview.svg").is_file()
 
 
 def test_pretrain_load_is_strict_and_does_not_create_trainer_state() -> None:

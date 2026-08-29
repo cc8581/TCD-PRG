@@ -201,6 +201,13 @@ instances, perturb material/lighting, add sensor noise, or drop channels/points.
 It never changes XYZ, point count, labels or point correspondence, and validation
 and inference bypass it entirely.
 
+Set `augmentation.debug.save_first_batches` to a positive integer to inspect
+the actual post-collation training inputs. Exactly that many batches are saved
+across all DataLoader workers under `output_dir/augmentation_debug/`; each slot
+contains `preview.svg`, `report.json`, and the complete
+`batch_before_after.npz`. The default value is zero, so normal training performs
+no debug I/O.
+
 Stage B trains only on concrete GraspNet proposals stored with strict 0/1
 `task_valid` labels. Invalid data-generation attempts are dropped and never become
 a third class. Each record freezes the sampled scene context, GT condition, pose

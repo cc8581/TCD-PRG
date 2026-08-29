@@ -250,6 +250,11 @@ class PointDropoutConfig(AugmentationMethodConfig):
 
 
 @dataclass(slots=True)
+class AugmentationDebugConfig:
+    save_first_batches: int = 0
+
+
+@dataclass(slots=True)
 class AugmentationConfig:
     """Training-only point-cloud augmentation grouped by independent method."""
 
@@ -268,6 +273,7 @@ class AugmentationConfig:
         default_factory=lambda: AugmentationMethodConfig(probability=0.05)
     )
     point_dropout: PointDropoutConfig = field(default_factory=PointDropoutConfig)
+    debug: AugmentationDebugConfig = field(default_factory=AugmentationDebugConfig)
 
 
 @dataclass(slots=True)
@@ -468,6 +474,8 @@ class TCDPRGConfig:
 
     def validate(self) -> None:
         augmentation = self.augmentation
+        if augmentation.debug.save_first_batches < 0:
+            raise ValueError("augmentation.debug.save_first_batches cannot be negative")
         methods = (
             "zero_rgb", "grayscale", "color_jitter", "object_recolor",
             "material_jitter", "lighting_jitter", "sensor_noise",
