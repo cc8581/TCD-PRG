@@ -180,15 +180,16 @@ and Stage C checkpoints and checks their runtime semantics before composition.
 
 To start a new run from every parameter in a same-stage checkpoint without
 restoring its optimizer, scheduler, AMP scaler, RNG state, best metric or step,
-use the weights-only mode:
+use the pretrain-checkpoint mode:
 
 ```powershell
 python train.py --stage perception `
-  --weights-only-checkpoint outputs\old_perception\best.pt `
+  --pretrain-checkpoint outputs\old_perception\best.pt `
   --output-dir outputs\perception_rgb_augmented
 ```
 
-The same option is supported by Stage A, Stage B and Stage C. The standalone
+The same option and `training.pretrain_checkpoint` configuration field are
+supported by Stage A, Stage B and Stage C. The standalone
 PUSH evaluator accepts the same option through `train_push_evaluator.py`.
 Checkpoint stage, schema, parameter names and tensor shapes are checked strictly.
 

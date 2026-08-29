@@ -227,7 +227,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--resume", "--checkpoint", dest="resume", type=Path, default=defaults["resume"], help="Checkpoint used to resume or validate.")
     parser.add_argument(
-        "--weights-only-checkpoint",
+        "--pretrain-checkpoint",
         type=Path,
         default=None,
         help="Initialize the complete same-stage model and start a fresh training run at step 0.",
@@ -238,8 +238,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("overrides", nargs="*", help="Additional dotted YAML overrides.")
     args = parser.parse_args(argv)
-    if args.resume is not None and args.weights_only_checkpoint is not None:
-        parser.error("--resume and --weights-only-checkpoint are mutually exclusive")
+    if args.resume is not None and args.pretrain_checkpoint is not None:
+        parser.error("--resume and --pretrain-checkpoint are mutually exclusive")
     # resume checkpoint parent becomes the default output directory
     if args.output_dir is None:
         args.output_dir = (
@@ -274,9 +274,9 @@ def _training_arguments(
         arguments.append("--validate-only")
     if args.resume:
         arguments.extend(("--resume", str(args.resume.resolve())))
-    if getattr(args, "weights_only_checkpoint", None):
+    if getattr(args, "pretrain_checkpoint", None):
         arguments.extend(
-            ("--weights-only-checkpoint", str(args.weights_only_checkpoint.resolve()))
+            ("--pretrain-checkpoint", str(args.pretrain_checkpoint.resolve()))
         )
     arguments.append(_quoted_override("output_dir", output))
     named_training_overrides = {
@@ -372,9 +372,9 @@ def _push_evaluator_command(
 
 
 def _run_all_stages(args: argparse.Namespace) -> None:
-    if args.resume is not None or args.weights_only_checkpoint is not None:
+    if args.resume is not None or args.pretrain_checkpoint is not None:
         raise ValueError(
-            "The all-stage pipeline starts fresh; select one stage for resume or weights-only start"
+            "The all-stage pipeline starts fresh; select one stage for resume or pretraining"
         )
     dataset, _, _, _, _ = _resolve_paths(args)
     stageb_manifest = dataset / "task_training_labels" / "acronym_binary_grasps" / "manifest.json"

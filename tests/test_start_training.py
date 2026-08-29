@@ -30,6 +30,7 @@ def test_launcher_path_arguments_have_local_config_defaults(tmp_path) -> None:
     assert args.output_dir.parent == PROJECT / "outputs"
     assert args.output_dir.name.startswith("formal_")
     assert args.resume is None
+    assert args.pretrain_checkpoint is None
     assert args.batch_size is None
     assert args.num_workers is None
     assert args.validation_num_workers is None
@@ -63,6 +64,17 @@ def test_launcher_data_fraction_flag_is_forwarded(tmp_path) -> None:
     ])
     arguments = _training_arguments(args)
     assert "training.data_fraction=0.25" in arguments
+
+
+def test_launcher_forwards_pretrain_checkpoint(tmp_path) -> None:
+    checkpoint = tmp_path / "best.pt"
+    args = _parse_args([
+        "--stage", "perception", "--pretrain-checkpoint", str(checkpoint),
+    ])
+    arguments = _training_arguments(args)
+    assert arguments[arguments.index("--pretrain-checkpoint") + 1] == str(
+        checkpoint.resolve()
+    )
 
 
 def test_launcher_only_forwards_explicit_named_training_overrides(tmp_path) -> None:

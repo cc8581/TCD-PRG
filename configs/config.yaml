@@ -191,6 +191,8 @@ sampling:
   global_negative_grasps_per_object: 32
 
 training:
+  # Same-stage full-model initialization; optimizer/scheduler/step always start fresh.
+  pretrain_checkpoint: null
   seed: 2026
   device: cuda
   deterministic: False

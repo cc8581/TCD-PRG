@@ -159,6 +159,7 @@ def test_zero_scene_point_limit_preserves_variable_length_observation() -> None:
 def test_formal_config_uses_bounded_variable_length_scenes() -> None:
     config = load_config(PROJECT_ROOT / "configs" / "config.yaml")
     assert config.dataset.scene_points == 16_384
+    assert config.training.pretrain_checkpoint is None
 
 
 def test_formal_config_uses_strict_offline_cache_and_scene_splits() -> None:

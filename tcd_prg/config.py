@@ -242,6 +242,8 @@ class RGBAugmentationConfig:
 @dataclass(slots=True)
 class TrainingConfig:
     stage: str = "joint"
+    # Initialize a complete same-stage model while starting a fresh training state.
+    pretrain_checkpoint: str | None = None
     # max_optimizer_steps 统计真实参数更新次数，不包含 AMP 溢出后被跳过的 step。
     seed: int = 2026
     device: str = "cuda"
@@ -857,6 +859,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> TCDPRGC
         (config.baseline, "graspnet_checkpoint"),
         (config.model, "task_grasp_gripper_geometry"),
         (config.model, "stageb_label_gripper_geometry"),
+        (config.training, "pretrain_checkpoint"),
         (config, "output_dir"),
     )
     for owner, name in path_fields:

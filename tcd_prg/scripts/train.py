@@ -149,7 +149,7 @@ def validate_checkpoint_gate(
     stage: str,
     *,
     resume_payload: dict | None,
-    weights_payload: dict | None = None,
+    pretrain_payload: dict | None = None,
 ) -> None:
     """Enforce independent A/B starts and the remaining B -> C transition."""
 
@@ -158,34 +158,34 @@ def validate_checkpoint_gate(
         if source != stage:
             raise RuntimeError(f"Resume requires a {stage!r} checkpoint, got {source!r}")
         return
-    if weights_payload is not None:
-        source = weights_payload.get("training_stage")
+    if pretrain_payload is not None:
+        source = pretrain_payload.get("training_stage")
         if source != stage:
             raise RuntimeError(
-                f"Weights-only start requires a {stage!r} checkpoint, got {source!r}"
+                f"Pretrain start requires a {stage!r} checkpoint, got {source!r}"
             )
-        if int(weights_payload.get("schema_version", -1)) != 12:
-            raise RuntimeError("Weights-only start requires a schema-12 TCD-PRG checkpoint")
+        if int(pretrain_payload.get("schema_version", -1)) != 12:
+            raise RuntimeError("Pretrain start requires a schema-12 TCD-PRG checkpoint")
     return
 
 
-def load_model_weights_only(model: torch.nn.Module, payload: dict, stage: str) -> None:
+def load_pretrain_checkpoint(model: torch.nn.Module, payload: dict, stage: str) -> None:
     """Strictly initialize one stage without restoring any trainer state."""
 
     source = model.module if hasattr(model, "module") else model
     current = source.state_dict()
     supplied = payload.get("model")
     if not isinstance(supplied, dict):
-        raise RuntimeError("Weights-only checkpoint does not contain a model state_dict")
+        raise RuntimeError("Pretrain checkpoint does not contain a model state_dict")
     if set(current) != set(supplied):
         missing = sorted(set(current) - set(supplied))
         extra = sorted(set(supplied) - set(current))
         raise RuntimeError(
-            f"{stage} weights-only parameter mismatch: missing={missing[:5]} extra={extra[:5]}"
+            f"{stage} pretrain parameter mismatch: missing={missing[:5]} extra={extra[:5]}"
         )
     mismatched = [name for name in current if current[name].shape != supplied[name].shape]
     if mismatched:
-        raise RuntimeError(f"{stage} weights-only tensor shape mismatch: {mismatched[:5]}")
+        raise RuntimeError(f"{stage} pretrain tensor shape mismatch: {mismatched[:5]}")
     source.load_state_dict(supplied, strict=True)
 
 
@@ -229,7 +229,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--resume")
     parser.add_argument(
-        "--weights-only-checkpoint",
+        "--pretrain-checkpoint",
         help="Initialize the complete same-stage model, but start optimizer/scheduler/steps fresh.",
     )
     # Windows 原生启动器显式传递进程拓扑；torchrun 的环境变量仅作为 Linux 兼容路径。
@@ -248,11 +248,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.resume and args.weights_only_checkpoint:
-        raise ValueError("--resume and --weights-only-checkpoint are mutually exclusive")
+    config = load_config(args.config, args.overrides)
+    pretrain_checkpoint = args.pretrain_checkpoint or config.training.pretrain_checkpoint
+    if args.resume and pretrain_checkpoint:
+        raise ValueError("--resume and --pretrain-checkpoint are mutually exclusive")
     if args.validate_only and not args.resume:
         raise ValueError("--validate-only requires --resume")
-    config = load_config(args.config, args.overrides)
     if config.training.stage == "joint":
         raise RuntimeError(
             "Legacy joint training is incompatible with standalone Stage-B/Stage-C condition protocols; train perception, grasp and push independently."
@@ -264,14 +265,14 @@ def main() -> None:
     resume_payload = (
         torch.load(args.resume, map_location="cpu", weights_only=False) if args.resume else None
     )
-    weights_payload = (
-        torch.load(args.weights_only_checkpoint, map_location="cpu", weights_only=False)
-        if args.weights_only_checkpoint else None
+    pretrain_payload = (
+        torch.load(pretrain_checkpoint, map_location="cpu", weights_only=False)
+        if pretrain_checkpoint else None
     )
     validate_checkpoint_gate(
         config.training.stage,
         resume_payload=resume_payload,
-        weights_payload=weights_payload,
+        pretrain_payload=pretrain_payload,
     )
     world_size = (
         args.world_size if args.world_size is not None else int(os.environ.get("WORLD_SIZE", "1"))
@@ -521,12 +522,12 @@ def main() -> None:
         if config.training.stage == "push"
         else TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet)
     )
-    if weights_payload is not None:
-        load_model_weights_only(model, weights_payload, config.training.stage)
+    if pretrain_payload is not None:
+        load_pretrain_checkpoint(model, pretrain_payload, config.training.stage)
         if rank == 0:
             print(
-                f"[weights-only] initialized complete {config.training.stage} model from "
-                f"{Path(args.weights_only_checkpoint).resolve()}; trainer state starts at step 0",
+                f"[pretrain] initialized complete {config.training.stage} model from "
+                f"{Path(pretrain_checkpoint).resolve()}; trainer state starts at step 0",
                 flush=True,
             )
     if config.training.stage == "push":
@@ -613,7 +614,7 @@ def main() -> None:
             )
     if (
         not args.resume
-        and weights_payload is None
+        and pretrain_payload is None
         and config.training.stage not in {"grasp", "push"}
     ):
         distributed = torch.distributed.is_initialized()
