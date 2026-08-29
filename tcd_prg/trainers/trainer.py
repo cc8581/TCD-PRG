@@ -121,6 +121,7 @@ class TrainerState:
 
 
 class Trainer:
+    VALIDATION_SELECTION_PROTOCOL = "target_iou_plus_region_miou_v1"
     COUNT_TERMS = {
         "task_grasp_supervised_candidates",
         "push_object_effective_rows",
@@ -238,6 +239,21 @@ class Trainer:
     @staticmethod
     def _timestamp() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _validation_selection_score(
+        validation_loss_score: float,
+        validation_details: dict[str, float],
+    ) -> float:
+        target_iou = validation_details.get("standard_target_iou")
+        region_miou = validation_details.get("standard_region_miou")
+        if target_iou is None or region_miou is None:
+            return float(validation_loss_score)
+        combined_score = float(target_iou) + float(region_miou)
+        validation_details["target_region_combined_score"] = combined_score
+        # Trainer state remains lower-is-better for checkpoint/resume compatibility.
+        # This monotonic error selects exactly the maximum Target IoU + Region mIoU.
+        return 2.0 - combined_score
 
     @staticmethod
     def _append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
@@ -391,16 +407,26 @@ class Trainer:
         print("  ".join(fields), flush=True)
 
     def _print_validation_summary(self, record: Mapping[str, Any]) -> None:
+        combined = "target_region_combined_score" in record["metrics"]
         fields = [
             f"Val [{self._training_stage(record['metrics'])}] "
             f"[{int(record['optimizer_step']):07d}]",
-            f"score: {float(record['validation_score']):.6f}",
-            f"best: {float(record['best_validation']):.6f}",
+            f"{'selection error' if combined else 'score'}: "
+            f"{float(record['validation_score']):.6f}",
+            f"{'best error' if combined else 'best'}: "
+            f"{float(record['best_validation']):.6f}",
         ]
         fields.extend(
             f"{label}: {value:.4f}" for label, value in self._grouped_losses(record["metrics"])
         )
         metrics = record["metrics"]
+        if "target_region_combined_score" in metrics:
+            fields.extend(
+                (
+                    f"target+region: {float(metrics['target_region_combined_score']):.4f}/2",
+                    f"best combined: {2.0 - float(record['best_validation']):.4f}/2",
+                )
+            )
         displayed_metrics = (
             ("target IoU", "standard_target_iou"),
             ("target P", "standard_target_precision"),
@@ -437,7 +463,8 @@ class Trainer:
                         f"{self.validation_metrics_path}"
                     ) from error
                 if int(record.get("optimizer_step", -1)) == int(step):
-                    found = record
+                    if record.get("selection_protocol") == self.VALIDATION_SELECTION_PROTOCOL:
+                        found = record
         return found
 
     def _recover_completed_validation(self, step: int) -> bool:
@@ -599,6 +626,10 @@ class Trainer:
         else:
             score = float(validation)
 
+        validation_loss_score = float(score)
+        score = self._validation_selection_score(validation_loss_score, validation_details)
+        validation_details["validation_loss_score"] = validation_loss_score
+
         previous_best = self.state.best_validation
         improved = score < previous_best
         if improved:
@@ -649,7 +680,8 @@ class Trainer:
                 )
                 temporary.replace(threshold_path)
             validation_record = {
-                "schema_version": 4,
+                "schema_version": 5,
+                "selection_protocol": self.VALIDATION_SELECTION_PROTOCOL,
                 "timestamp_utc": self._timestamp(),
                 "optimizer_step": step,
                 "validation_score": score,
@@ -738,7 +770,7 @@ class Trainer:
                     "git_commit": commit,
                     "torch": torch.__version__,
                     "train_metrics_schema_version": 6,
-                    "validation_metrics_schema_version": 4,
+                    "validation_metrics_schema_version": 5,
                     "training_events_schema_version": 1,
                 },
                 indent=2,
@@ -1204,6 +1236,7 @@ class Trainer:
             "rng_by_rank": rng_by_rank,
             "task_grasp_probability_threshold": self.task_grasp_probability_threshold,
             "stageb_provenance": self.stageb_provenance,
+            "validation_selection_protocol": self.VALIDATION_SELECTION_PROTOCOL,
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
         torch.save(payload, temporary)
@@ -1254,6 +1287,15 @@ class Trainer:
         if self.ema and payload["ema"] is not None:
             self.ema.model.load_state_dict(payload["ema"], strict=True)
         self.state = TrainerState(**payload["trainer_state"])
+        if payload.get("validation_selection_protocol") != self.VALIDATION_SELECTION_PROTOCOL:
+            self.state.best_validation = float("inf")
+            self.state.validation_without_improvement = 0
+            self.state.last_completed_validation_step = 0
+            self.state.pending_validation_step = 0
+            self._write_event(
+                "validation_selection_protocol_reset",
+                selection_protocol=self.VALIDATION_SELECTION_PROTOCOL,
+            )
         # ``map_location=self.device`` also moves serialized RNG byte tensors
         # to CUDA.  PyTorch's RNG restoration APIs require CPU ByteTensors even
         # when restoring the per-device CUDA generators.

@@ -250,6 +250,51 @@ class PointDropoutConfig(AugmentationMethodConfig):
 
 
 @dataclass(slots=True)
+class DepthNoiseConfig(AugmentationMethodConfig):
+    probability: float = 0.30
+    std_m: tuple[float, float] = (0.0005, 0.0030)
+
+
+@dataclass(slots=True)
+class HoleDropoutConfig(AugmentationMethodConfig):
+    probability: float = 0.20
+    count: tuple[int, int] = (1, 3)
+    radius_m: tuple[float, float] = (0.008, 0.030)
+
+
+@dataclass(slots=True)
+class OutlierInjectionConfig(AugmentationMethodConfig):
+    probability: float = 0.15
+    fraction: tuple[float, float] = (0.001, 0.010)
+    displacement_m: tuple[float, float] = (0.005, 0.050)
+
+
+@dataclass(slots=True)
+class ViewDropoutConfig(AugmentationMethodConfig):
+    probability: float = 0.15
+    max_views: int = 1
+
+
+@dataclass(slots=True)
+class DensityVariationConfig(AugmentationMethodConfig):
+    probability: float = 0.20
+    keep_ratio: tuple[float, float] = (0.60, 0.95)
+
+
+@dataclass(slots=True)
+class ExtrinsicJitterConfig(AugmentationMethodConfig):
+    probability: float = 0.20
+    translation_std_m: tuple[float, float] = (0.0005, 0.0030)
+    rotation_degrees: tuple[float, float] = (0.10, 1.00)
+
+
+@dataclass(slots=True)
+class OcclusionConfig(AugmentationMethodConfig):
+    probability: float = 0.20
+    fraction: tuple[float, float] = (0.05, 0.20)
+
+
+@dataclass(slots=True)
 class AugmentationDebugConfig:
     save_first_batches: int = 0
 
@@ -273,6 +318,13 @@ class AugmentationConfig:
         default_factory=lambda: AugmentationMethodConfig(probability=0.05)
     )
     point_dropout: PointDropoutConfig = field(default_factory=PointDropoutConfig)
+    depth_noise: DepthNoiseConfig = field(default_factory=DepthNoiseConfig)
+    hole_dropout: HoleDropoutConfig = field(default_factory=HoleDropoutConfig)
+    outlier_injection: OutlierInjectionConfig = field(default_factory=OutlierInjectionConfig)
+    view_dropout: ViewDropoutConfig = field(default_factory=ViewDropoutConfig)
+    density_variation: DensityVariationConfig = field(default_factory=DensityVariationConfig)
+    extrinsic_jitter: ExtrinsicJitterConfig = field(default_factory=ExtrinsicJitterConfig)
+    occlusion: OcclusionConfig = field(default_factory=OcclusionConfig)
     debug: AugmentationDebugConfig = field(default_factory=AugmentationDebugConfig)
 
 
@@ -479,7 +531,9 @@ class TCDPRGConfig:
         methods = (
             "zero_rgb", "grayscale", "color_jitter", "object_recolor",
             "material_jitter", "lighting_jitter", "sensor_noise",
-            "channel_dropout", "point_dropout",
+            "channel_dropout", "point_dropout", "depth_noise", "hole_dropout",
+            "outlier_injection", "view_dropout", "density_variation",
+            "extrinsic_jitter", "occlusion",
         )
         for name in methods:
             if not 0.0 <= float(getattr(augmentation, name).probability) <= 1.0:
@@ -499,6 +553,14 @@ class TCDPRGConfig:
             "lighting_jitter.bias": augmentation.lighting_jitter.bias,
             "sensor_noise.std": augmentation.sensor_noise.std,
             "point_dropout.fraction": augmentation.point_dropout.fraction,
+            "depth_noise.std_m": augmentation.depth_noise.std_m,
+            "hole_dropout.radius_m": augmentation.hole_dropout.radius_m,
+            "outlier_injection.fraction": augmentation.outlier_injection.fraction,
+            "outlier_injection.displacement_m": augmentation.outlier_injection.displacement_m,
+            "density_variation.keep_ratio": augmentation.density_variation.keep_ratio,
+            "extrinsic_jitter.translation_std_m": augmentation.extrinsic_jitter.translation_std_m,
+            "extrinsic_jitter.rotation_degrees": augmentation.extrinsic_jitter.rotation_degrees,
+            "occlusion.fraction": augmentation.occlusion.fraction,
         }
         for name, (low, high) in ranges.items():
             if low > high:
@@ -514,6 +576,29 @@ class TCDPRGConfig:
             <= 1.0
         ):
             raise ValueError("augmentation.point_dropout.fraction must lie in [0,1]")
+        unit_ranges = {
+            "outlier_injection.fraction": augmentation.outlier_injection.fraction,
+            "density_variation.keep_ratio": augmentation.density_variation.keep_ratio,
+            "occlusion.fraction": augmentation.occlusion.fraction,
+        }
+        for name, (low, high) in unit_ranges.items():
+            if not 0.0 <= low <= high <= 1.0:
+                raise ValueError(f"augmentation.{name} must lie in [0,1]")
+        nonnegative_ranges = {
+            "depth_noise.std_m": augmentation.depth_noise.std_m,
+            "hole_dropout.radius_m": augmentation.hole_dropout.radius_m,
+            "outlier_injection.displacement_m": augmentation.outlier_injection.displacement_m,
+            "extrinsic_jitter.translation_std_m": augmentation.extrinsic_jitter.translation_std_m,
+            "extrinsic_jitter.rotation_degrees": augmentation.extrinsic_jitter.rotation_degrees,
+        }
+        for name, (low, _high) in nonnegative_ranges.items():
+            if low < 0:
+                raise ValueError(f"augmentation.{name} cannot be negative")
+        hole_count = augmentation.hole_dropout.count
+        if hole_count[0] < 1 or hole_count[0] > hole_count[1]:
+            raise ValueError("augmentation.hole_dropout.count must be ordered positive integers")
+        if augmentation.view_dropout.max_views < 1:
+            raise ValueError("augmentation.view_dropout.max_views must be positive")
         if self.dataset.stageb_source not in {"acronym_dynamic", "binary_records"}:
             raise ValueError("dataset.stageb_source must be acronym_dynamic or binary_records")
         if self.dataset.stageb_positive_per_state <= 0:

@@ -104,6 +104,29 @@ def create_action_certifier(config: TCDPRGConfig) -> ExternalFR5AG16095Certifier
     )
 
 
+def _apply_training_augmentation(
+    config: TCDPRGConfig, batch: dict[str, Any]
+) -> dict[str, Any]:
+    from tcd_prg.datasets.augmentation_debug import claim_debug_batch, save_debug_batch
+    from tcd_prg.datasets.pointcloud_augmentation import PointCloudAugmentation
+
+    debug_directory = claim_debug_batch(
+        config.output_dir,
+        config.augmentation.debug.save_first_batches,
+    )
+    rgb_before = batch["rgb"].clone() if debug_directory is not None else None
+    xyz_before = batch["xyz"].clone() if debug_directory is not None else None
+    point_mask_before = (
+        batch["point_mask"].clone() if debug_directory is not None else None
+    )
+    PointCloudAugmentation(config.augmentation)(batch)
+    if debug_directory is not None and rgb_before is not None:
+        save_debug_batch(
+            debug_directory, batch, rgb_before, xyz_before, point_mask_before
+        )
+    return batch
+
+
 @dataclass(slots=True)
 class UnifiedBatchCollator:
     """Pickle-safe Windows DataLoader collator with provider-backed exact geometry."""
@@ -134,22 +157,7 @@ class UnifiedBatchCollator:
                 else self.include_graspnet
             ),
         )
-        if self.training:
-            from tcd_prg.datasets.augmentation_debug import (
-                claim_debug_batch,
-                save_debug_batch,
-            )
-            from tcd_prg.datasets.rgb_augmentation import PointCloudRGBAugmentation
-
-            debug_directory = claim_debug_batch(
-                self.config.output_dir,
-                self.config.augmentation.debug.save_first_batches,
-            )
-            rgb_before = batch["rgb"].clone() if debug_directory is not None else None
-            PointCloudRGBAugmentation(self.config.augmentation)(batch)
-            if debug_directory is not None and rgb_before is not None:
-                save_debug_batch(debug_directory, batch, rgb_before)
-        return batch
+        return _apply_training_augmentation(self.config, batch) if self.training else batch
 
 
 @dataclass(slots=True)
@@ -168,22 +176,7 @@ class StageBBinaryBatchCollator:
             samples, grid_size_m=grid_size, training=self.training,
             point_count=self.config.dataset.scene_points,
         )
-        if self.training:
-            from tcd_prg.datasets.augmentation_debug import (
-                claim_debug_batch,
-                save_debug_batch,
-            )
-            from tcd_prg.datasets.rgb_augmentation import PointCloudRGBAugmentation
-
-            debug_directory = claim_debug_batch(
-                self.config.output_dir,
-                self.config.augmentation.debug.save_first_batches,
-            )
-            rgb_before = batch["rgb"].clone() if debug_directory is not None else None
-            PointCloudRGBAugmentation(self.config.augmentation)(batch)
-            if debug_directory is not None and rgb_before is not None:
-                save_debug_batch(debug_directory, batch, rgb_before)
-        return batch
+        return _apply_training_augmentation(self.config, batch) if self.training else batch
 
 
 @dataclass(slots=True)
@@ -199,7 +192,7 @@ class GlobalGraspBatchCollator:
             if self.config.backbone.backend == "point_transformer_v3"
             else None
         )
-        return collate_global_grasp(
+        batch = collate_global_grasp(
             samples,
             grid_size_m=grid_size,
             training=self.training,
@@ -210,3 +203,4 @@ class GlobalGraspBatchCollator:
             ),
             graspnet_view_index=self.config.graspnet.camera_view_index,
         )
+        return _apply_training_augmentation(self.config, batch) if self.training else batch

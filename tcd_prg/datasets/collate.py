@@ -500,6 +500,17 @@ def collate_global_grasp(
         [obs.target_mask[index] for obs, index in zip(observations, point_indices, strict=True)],
         False,
     )
+    source_view, _ = _pad(
+        [
+            (
+                obs.source_view[index]
+                if obs.source_view is not None
+                else np.full(len(index), -1, np.int16)
+            )
+            for obs, index in zip(observations, point_indices, strict=True)
+        ],
+        -1,
+    )
     object_present, object_mask = _pad([obs.object_present for obs in observations], False)
     object_active, _ = _pad([obs.object_active for obs in observations], False)
     object_category_id, _ = _pad([obs.object_category_id for obs in observations], -1)
@@ -513,6 +524,7 @@ def collate_global_grasp(
         "xyz": xyz.float(),
         "rgb": rgb.float(),
         "point_mask": point_mask.bool(),
+        "source_view": source_view.long(),
         "instance_id": instance_id.long(),
         "target_mask": target_mask.bool(),
         "target_object": torch.tensor(

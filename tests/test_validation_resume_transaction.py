@@ -74,6 +74,17 @@ def test_resume_boundary_retries_unfinished_validation_before_training(tmp_path)
     assert state.pending_validation_step == 0
 
 
+def test_best_checkpoint_selection_uses_target_iou_plus_region_miou() -> None:
+    details = {"standard_target_iou": 0.75, "standard_region_miou": 0.60}
+    score = Trainer._validation_selection_score(0.01, details)
+    assert score == pytest.approx(0.65)
+    assert details["target_region_combined_score"] == pytest.approx(1.35)
+
+    better_details = {"standard_target_iou": 0.80, "standard_region_miou": 0.70}
+    better_score = Trainer._validation_selection_score(99.0, better_details)
+    assert better_score < score
+
+
 def test_resume_boundary_uses_completed_validation_log_without_duplicate(tmp_path):
     source, _ = _make_trainer(tmp_path, max_steps=3, interval=2)
     source.state.optimizer_steps = 2
@@ -82,6 +93,7 @@ def test_resume_boundary_uses_completed_validation_log_without_duplicate(tmp_pat
         json.dumps(
             {
                 "schema_version": 3,
+                "selection_protocol": Trainer.VALIDATION_SELECTION_PROTOCOL,
                 "optimizer_step": 2,
                 "validation_score": 0.5,
                 "best_validation": 0.5,
