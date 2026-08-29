@@ -1,4 +1,5 @@
 defaults:
+  - ../stage/push.yaml
   - config.yaml
   - _self_
 

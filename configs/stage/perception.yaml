@@ -3,9 +3,54 @@ defaults:
   - ../config.yaml
   - _self_
 
+backbone:
+  pretrained_checkpoint: null
+  pretrained_format: sonata
+  pretrained_auto_download: true
+  pretrained_url: "https://huggingface.co/Pointcept/Sonata/resolve/main/sonata_20251024.pth?download=true"
+  pretrained_sha256: "8aab33915ddfec2628da10ee1236ace7ed720b7ebba0dd9bc86f9ca7f9de102f"
+  pretrained_cache_dir: runtime/cache/pretrained
+  pretrained_required: true
+  pretrained_min_parameter_fraction: 0.35
+  pretrained_freeze_steps: 2000
+  freeze: false
+
+region_head:
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  dice_weight: 1.0
+
+optimizer:
+  learning_rate: 0.0001
+  backbone_learning_rate: 0.0001
+  weight_decay: 0.01
+
+scheduler:
+  warmup_steps: 2000
+
 training:
   stage: perception
   max_optimizer_steps: 15000
+  validation_interval: 1000
+  batch_size: 8
+  gradient_accumulation_steps: 3
+  max_train_groups: null
+  max_validation_groups: null
+  validation_scene_count: 20
+  unfreeze_at_optimizer_step: null
+  amp: true
+  amp_dtype: float16
+  amp_initial_scale: 4096
+  gradient_clip_norm: 20.0
+  ema_decay: 0.999
+  early_stopping_patience: 15
+  num_workers: 8
+  validation_num_workers: 0
+  pin_memory: true
+  validation_scene_seed: 2026
+  ddp_backend: auto
+  ddp_find_unused_parameters: false
+  validation_family_weights: {instance: 0.1, region: 0.1}
   frozen_modules: [task_grasp, graspnet, push]
   allowed_action_strata: []
   action_batch_coverage_strata: []
@@ -18,3 +63,19 @@ losses:
   push_contact: 0.0
   push_direction: 0.0
   push_potential: 0.0
+  internal:
+    instance_objectness: 1.0
+    instance_mask: 2.0
+    instance_dice: 2.0
+    instance_category: 1.0
+    target_query: 1.0
+    instance_auxiliary: 0.5
+    region_focal: 1.0
+    region_dice: 1.0
+    region_visibility: 0.2
+
+logging:
+  backend: tensorboard
+  log_interval: 20
+  validation_log_interval: 20
+  gradient_diagnostics_interval: 200

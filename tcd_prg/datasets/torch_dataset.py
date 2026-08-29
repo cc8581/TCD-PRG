@@ -22,7 +22,9 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 from tcd_prg.constants import ActionType, CandidateStatus
+from tcd_prg.geometry.numpy_se3 import quaternion_xyzw_to_matrix_numpy
 
+from .acronym_grasp_database import load_object_grasps
 from .base import DatasetAdapter
 from .stageb_manifest import SCHEMA_VERSION, compatibility_provenance
 from .types import GlobalGraspSample, PushObjectStateGroup, UnifiedSample
@@ -35,7 +37,7 @@ class StageBBinarySample:
     rotation_matrix: np.ndarray
     width_m: np.ndarray
     label: np.ndarray
-    context: dict[str, np.ndarray]
+    context: dict[str, np.ndarray] | None
 
 
 class StageBBinaryDataset(Dataset[StageBBinarySample]):
@@ -144,8 +146,7 @@ class StageBBinaryDataset(Dataset[StageBBinarySample]):
             record["object_category_id"]
         ):
             raise RuntimeError(
-                "Stage-B immutable record task semantics disagree with the live dataset: "
-                f"{path}"
+                f"Stage-B immutable record task semantics disagree with the live dataset: {path}"
             )
         context_keys = (
             "context_xyz",
@@ -161,6 +162,116 @@ class StageBBinaryDataset(Dataset[StageBBinarySample]):
             raise ValueError(f"Stage-B record is missing fixed evaluator context: {path}")
         context = {key: payload[key] for key in context_keys}
         return StageBBinarySample(sample, translation, rotation, width, label, context)
+
+
+class StageBAcronymDataset(Dataset[StageBBinarySample]):
+    """Build task-aware Stage-B candidates dynamically from object-local ACRONYM labels."""
+
+    def __init__(
+        self,
+        adapter: DatasetAdapter,
+        root: str | Path,
+        split: str,
+        max_groups: int | None = None,
+        positive_count: int = 8,
+        negative_count: int = 16,
+        seed: int = 2026,
+    ) -> None:
+        if positive_count <= 0 or negative_count <= 0:
+            raise ValueError("Dynamic Stage-B requires positive and negative candidates")
+        self.adapter, self.root = adapter, Path(root)
+        manifest = self.root / "manifest.json"
+        if not manifest.is_file():
+            raise FileNotFoundError(f"ACRONYM grasp database manifest does not exist: {manifest}")
+        self.manifest = json.loads(manifest.read_text(encoding="utf-8"))
+        self.base = ActionStateGroupDataset(
+            adapter,
+            split=split,
+            max_groups=max_groups,
+            deduplicate_state_task=True,
+            global_grasp_mode="never",
+        )
+        self.units = self.base.units
+        self.source_group_count = self.base.source_group_count
+        self.selected_group_count = len(self.base)
+        self.positive_count, self.negative_count, self.seed = positive_count, negative_count, seed
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    @property
+    def stratum_counts(self) -> dict[str, int]:
+        return {"acronym_dynamic": len(self)}
+
+    def __getitem__(self, index: int) -> StageBBinarySample:
+        sample = self.base[index]
+        observation = sample.observation
+        target = int(observation.target_object)
+        match_files = self.adapter.object_match_files(observation.scene_id)
+        relative = match_files[target]
+        database = load_object_grasps(self.root / relative)
+        library = self.adapter.grasp_registry.load(relative)
+        source_to_row = {int(value): row for row, value in enumerate(library.source_index)}
+        status = database["status"]
+        intrinsic_negative = np.flatnonzero(status == int(CandidateStatus.NEGATIVE))
+        task_region = int(observation.task_region_id)
+        positive_rows = np.asarray(
+            [
+                row
+                for row, source in enumerate(database["source_index"])
+                if int(source) in source_to_row
+                and int(library.task_label[source_to_row[int(source)]]) == task_region
+            ],
+            dtype=np.int64,
+        )
+        other_task_rows = np.asarray(
+            [
+                row
+                for row, source in enumerate(database["source_index"])
+                if int(source) in source_to_row
+                and int(library.task_label[source_to_row[int(source)]]) != task_region
+            ],
+            dtype=np.int64,
+        )
+        negative_rows = np.concatenate((intrinsic_negative, other_task_rows))
+        if not len(positive_rows) or not len(negative_rows):
+            raise RuntimeError(f"No balanced task labels for {relative}, region {task_region}")
+        unit = self.units[index]
+        rng = np.random.default_rng(
+            np.random.SeedSequence([self.seed, unit.scene_id, unit.state_id, unit.task_index])
+        )
+        pos = rng.choice(
+            positive_rows, self.positive_count, replace=len(positive_rows) < self.positive_count
+        )
+        neg = rng.choice(
+            negative_rows, self.negative_count, replace=len(negative_rows) < self.negative_count
+        )
+        rows = np.concatenate((pos, neg)).astype(np.int64)
+        labels = np.concatenate((np.ones(len(pos), bool), np.zeros(len(neg), bool)))
+        order = rng.permutation(len(rows))
+        rows, labels = rows[order], labels[order]
+        translation_object = database["translation_object"][rows].astype(np.float32, copy=True)
+        rotation_object = database["rotation_object"][rows].astype(np.float32, copy=True)
+        widths = database["source_total_opening_m"][rows].astype(np.float32, copy=True)
+        for output_row, source in enumerate(database["source_index"][rows]):
+            library_row = source_to_row.get(int(source))
+            if library_row is not None:
+                transform = library.transform_object[library_row]
+                translation_object[output_row] = transform[:3, 3]
+                rotation_object[output_row] = transform[:3, :3]
+                widths[output_row] = library.contact_span_m[library_row]
+        pose = observation.object_pose[target]
+        world_object = quaternion_xyzw_to_matrix_numpy(pose[3:]).astype(np.float32)
+        translation_world = translation_object @ world_object.T + pose[:3]
+        rotation_world = world_object[None] @ rotation_object
+        return StageBBinarySample(
+            sample,
+            translation_world.astype(np.float32),
+            rotation_world.astype(np.float32),
+            widths,
+            labels,
+            None,
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -22,45 +22,21 @@ PROJECT = Path(__file__).resolve().parent
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 # 公共配置只保存可移植参数；每台机器的数据盘路径写在被 Git 忽略的 local_paths.yaml 中。
-DEFAULT_CONFIG = PROJECT / "configs" / "config.yaml"
 DEFAULT_PATHS_CONFIG = PROJECT / "configs" / "local_paths.yaml"
-
-STAGE_OVERRIDES: dict[str, tuple[str, ...]] = {
-    "perception": (
-        "training.frozen_modules=[task_grasp,graspnet,push]",
-        "training.allowed_action_strata=[]",
-        "training.action_batch_coverage_strata=[]",
-        "losses.instance=1.0",
-        "losses.region=1.0",
-        "losses.task_grasp=0.0",
-        "losses.push_object=0.0",
-        "losses.push_contact=0.0",
-        "losses.push_direction=0.0",
-        "losses.push_potential=0.0",
-    ),
-    "grasp": (
-        "training.frozen_modules=[encoder,region_head,graspnet,push]",
-        "losses.instance=0.0",
-        "losses.region=0.0",
-        "losses.task_grasp=1.0",
-        "losses.push_object=0.0",
-        "losses.push_contact=0.0",
-        "losses.push_direction=0.0",
-        "losses.push_potential=0.0",
-    ),
-    "push": (
-        "training.frozen_modules=[encoder,region_head,task_grasp,graspnet]",
-        "training.allowed_action_strata=[push,push_failure]",
-        "training.action_batch_coverage_strata=[push,push_failure]",
-        "losses.instance=0.0",
-        "losses.region=0.0",
-        "losses.task_grasp=0.0",
-        "losses.push_object=0.25",
-        "losses.push_contact=0.25",
-        "losses.push_direction=0.25",
-        "losses.push_potential=0.25",
-    ),
+STAGE_CONFIGS = {
+    "perception": PROJECT / "configs" / "stage" / "perception.yaml",
+    "grasp": PROJECT / "configs" / "stage" / "grasp.yaml",
+    "push": PROJECT / "configs" / "stage" / "push.yaml",
+    "push_evaluator": PROJECT / "configs" / "stage" / "push_evaluator.yaml",
 }
+
+
+def _config_for_stage(args: argparse.Namespace, stage: str) -> Path:
+    if args.config is not None and getattr(args, "stage", stage) != "all":
+        return args.config.resolve()
+    if stage == "all" and args.config is not None:
+        return args.config.resolve()
+    return STAGE_CONFIGS[stage].resolve()
 
 def _load_local_paths(path: Path) -> dict[str, str]:
     if not path.is_file():
@@ -188,7 +164,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Start TCD-PRG training using YAML configuration defaults.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument(
+        "--config", type=Path, default=None,
+        help="Custom complete stage config; valid only when a single --stage is selected.",
+    )
     parser.add_argument("--paths-config", type=Path, default=DEFAULT_PATHS_CONFIG)
     parser.add_argument(
         "--stage", choices=("all", "perception", "grasp", "push"), default="all",
@@ -248,11 +227,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--resume", "--checkpoint", dest="resume", type=Path, default=defaults["resume"], help="Checkpoint used to resume or validate.")
     parser.add_argument(
+        "--weights-only-checkpoint",
+        type=Path,
+        default=None,
+        help="Initialize the complete same-stage model and start a fresh training run at step 0.",
+    )
+    parser.add_argument(
         "--data-fraction", type=float, default=None,
         help="Override training.data_fraction with a deterministic fraction in (0, 1].",
     )
     parser.add_argument("overrides", nargs="*", help="Additional dotted YAML overrides.")
     args = parser.parse_args(argv)
+    if args.resume is not None and args.weights_only_checkpoint is not None:
+        parser.error("--resume and --weights-only-checkpoint are mutually exclusive")
     # resume checkpoint parent becomes the default output directory
     if args.output_dir is None:
         args.output_dir = (
@@ -266,6 +253,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--validate-only requires an explicit --stage")
     if args.validate_only and args.resume is None:
         parser.error("--validate-only requires --checkpoint/--resume")
+    if args.stage == "all" and args.config is not None:
+        parser.error("--stage all selects each configs/stage/*.yaml automatically; omit --config")
     return args
 
 
@@ -277,18 +266,18 @@ def _training_arguments(
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output = PROJECT / "outputs" / f"ptv3_full_{stamp}"
     output = output.resolve()
-    arguments = ["--config", str(args.config.resolve())]
-    overrides: list[str] = []
     stage = getattr(args, "stage", "all")
-    if stage != "all":
-        overrides.extend(STAGE_OVERRIDES[stage])
+    arguments = ["--config", str(_config_for_stage(args, stage))]
+    overrides: list[str] = []
     overrides.extend(getattr(args, "overrides", ()))
-    if stage != "all":
-        overrides.append(f"training.stage={stage}")
     if getattr(args, "validate_only", False):
         arguments.append("--validate-only")
     if args.resume:
         arguments.extend(("--resume", str(args.resume.resolve())))
+    if getattr(args, "weights_only_checkpoint", None):
+        arguments.extend(
+            ("--weights-only-checkpoint", str(args.weights_only_checkpoint.resolve()))
+        )
     arguments.append(_quoted_override("output_dir", output))
     named_training_overrides = {
         "batch_size": "batch_size",
@@ -317,7 +306,7 @@ def _pipeline_command(
         sys.executable,
         str(PROJECT / "train.py"),
         "--stage", stage,
-        "--config", str(args.config.resolve()),
+        "--config", str(STAGE_CONFIGS[stage].resolve()),
         "--output-dir", str(output_dir.resolve()),
         "--paths-config", str(args.paths_config.resolve()),
         "--dataset-root", str(args.dataset_root),
@@ -341,21 +330,66 @@ def _pipeline_command(
     return command
 
 
+def _push_evaluator_command(
+    args: argparse.Namespace,
+    proposal_checkpoint: Path,
+    output_checkpoint: Path,
+) -> list[str]:
+    dataset, acronym, functional_region, pybullet_python, observation_cache = _resolve_paths(args)
+    cache_index_directory = _resolve_cache_index_path(args)
+    overrides = [
+        _quoted_override("dataset.root", dataset),
+        _quoted_override("dataset.acronym_root", acronym),
+        _quoted_override("dataset.functional_region_root", functional_region),
+        _quoted_override("observation.pybullet_python", pybullet_python),
+        _quoted_override("cache.directory", observation_cache),
+        _quoted_override("cache.index_directory", cache_index_directory),
+    ]
+    named_training_overrides = {
+        "batch_size": "batch_size",
+        "num_workers": "num_workers",
+        "validation_num_workers": "validation_num_workers",
+        "max_optimizer_steps": "max_optimizer_steps",
+        "validation_interval": "validation_interval",
+        "data_fraction": "data_fraction",
+    }
+    for argument_name, config_name in named_training_overrides.items():
+        value = getattr(args, argument_name, None)
+        if value is not None:
+            overrides.append(f"training.{config_name}={value:g}")
+    overrides.extend(args.overrides)
+    return [
+        sys.executable,
+        str(PROJECT / "train_push_evaluator.py"),
+        "--config",
+        str(STAGE_CONFIGS["push_evaluator"].resolve()),
+        "--proposal-checkpoint",
+        str(proposal_checkpoint.resolve()),
+        "--output",
+        str(output_checkpoint.resolve()),
+        *overrides,
+    ]
+
+
 def _run_all_stages(args: argparse.Namespace) -> None:
-    if args.resume is not None:
-        raise ValueError("The all-stage pipeline starts fresh; use --stage for resume")
-    stageb_manifest = args.stageb_binary_root.expanduser().resolve() / "manifest.json"
+    if args.resume is not None or args.weights_only_checkpoint is not None:
+        raise ValueError(
+            "The all-stage pipeline starts fresh; select one stage for resume or weights-only start"
+        )
+    dataset, _, _, _, _ = _resolve_paths(args)
+    stageb_manifest = dataset / "task_training_labels" / "acronym_binary_grasps" / "manifest.json"
     if not stageb_manifest.is_file():
         raise FileNotFoundError(
-            "The all-stage pipeline requires the prebuilt Stage-B binary dataset before "
+            "The all-stage pipeline requires the ACRONYM object grasp database before "
             f"Stage A starts: {stageb_manifest}. Build both train and val splits with "
-            "tcd_prg.scripts.build_stageb_binary first."
+            "tcd_prg.scripts.build_acronym_grasp_database first."
         )
     root = args.output_dir.resolve()
     stage_outputs = {
         "perception": root / "perception",
         "grasp": root / "grasp",
         "push": root / "push",
+        "push_evaluator": root / "push_evaluator",
     }
     subprocess.run(
         _pipeline_command(args, "perception", stage_outputs["perception"]),
@@ -368,6 +402,24 @@ def _run_all_stages(args: argparse.Namespace) -> None:
     subprocess.run(
         _pipeline_command(args, "push", stage_outputs["push"]),
         check=True, cwd=PROJECT,
+    )
+    proposal_checkpoint = stage_outputs["push"] / "best.pt"
+    if not proposal_checkpoint.is_file():
+        proposal_checkpoint = stage_outputs["push"] / "last.pt"
+    if not proposal_checkpoint.is_file():
+        raise FileNotFoundError(
+            "Stage-C completed without a usable proposal checkpoint: "
+            f"{stage_outputs['push']}"
+        )
+    stage_outputs["push_evaluator"].mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        _push_evaluator_command(
+            args,
+            proposal_checkpoint,
+            stage_outputs["push_evaluator"] / "best.pt",
+        ),
+        check=True,
+        cwd=PROJECT,
     )
 
 
@@ -398,23 +450,28 @@ def main() -> None:
         _quoted_override("dataset.root", dataset),
         _quoted_override("dataset.acronym_root", acronym),
         _quoted_override("dataset.functional_region_root", functional_region),
-        _quoted_override("dataset.stageb_binary_root", args.stageb_binary_root.resolve()),
         _quoted_override("observation.pybullet_python", pybullet_python),
         _quoted_override("cache.directory", observation_cache),
         _quoted_override("cache.index_directory", cache_index_directory),
     )
+    if args.stage == "grasp":
+        path_overrides += (
+            _quoted_override("dataset.stageb_binary_root", args.stageb_binary_root.resolve()),
+        )
     training_args = _training_arguments(args, path_overrides)
     print("TCD-PRG formal training", flush=True)
     print(f"  platform={sys.platform} gpus={args.gpus}", flush=True)
     print(f"  dataset={dataset}", flush=True)
     print(f"  acronym={acronym}", flush=True)
-    print(f"  stageb_binary_root={args.stageb_binary_root.resolve()}", flush=True)
+    stageb_dynamic_root = dataset / "task_training_labels" / "acronym_binary_grasps"
+    print(f"  stageb_dynamic_root={stageb_dynamic_root}", flush=True)
+    print(f"  stageb_legacy_binary_root={args.stageb_binary_root.resolve()}", flush=True)
     print(f"  functional_regions={functional_region}", flush=True)
     print(f"  observation_cache={observation_cache}", flush=True)
     print(f"  cache_index_directory={cache_index_directory}", flush=True)
     print(f"  output_dir={args.output_dir.resolve()}", flush=True)
     print(f"  pybullet_python={pybullet_python}", flush=True)
-    print(f"  config={args.config.resolve()}", flush=True)
+    print(f"  config={_config_for_stage(args, args.stage)}", flush=True)
     os.chdir(PROJECT)
     # 单卡直接进入训练器；Windows 多卡使用 spawn，Linux 使用 torchrun。
     if args.gpus == 1:

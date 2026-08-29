@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tcd_prg.config import ModelConfig, TCDPRGConfig, TrainingConfig, load_config
+from tcd_prg.config import TCDPRGConfig, TrainingConfig, load_config
 from tcd_prg.observation.base import ObservationRequest, PointObservation
 from tcd_prg.observation.cached import CachedObservationProvider, request_hash
 from tcd_prg.observation.saved import _resize_view_nearest, deterministic_stratified_sample
@@ -164,16 +164,19 @@ def test_formal_config_uses_bounded_variable_length_scenes() -> None:
 def test_formal_config_uses_strict_offline_cache_and_scene_splits() -> None:
     config = load_config(PROJECT_ROOT / "configs" / "config.yaml")
     assert config.cache.max_gb == 10.0
-    assert config.cache.eviction == "lru"
     assert config.observation.allow_render_on_miss is False
     assert config.training.scene_start == 0
     assert config.training.scene_count == 2500
     assert tuple(config.training.split_ratios) == (9.0, 1.0)
     assert config.training.max_validation_groups is None
-    assert config.training.validation_scene_count == 20
+    assert config.training.validation_scene_count is None
     assert config.training.validation_scene_seed == 2026
     assert config.training.validation_num_workers == 0
     assert config.logging.validation_log_interval == 20
+    perception = load_config(PROJECT_ROOT / "configs" / "stage" / "perception.yaml")
+    assert perception.training.validation_scene_count == 20
+    assert perception.training.max_optimizer_steps == 15000
+    assert perception.training.validation_interval == 1000
 
 
 def test_validation_worker_count_must_be_non_negative() -> None:

@@ -3,12 +3,41 @@ defaults:
   - ../config.yaml
   - _self_
 
+optimizer:
+  learning_rate: 0.0001
+  weight_decay: 0.01
+
+scheduler:
+  warmup_steps: 2000
+
 training:
   stage: push
   max_optimizer_steps: 15000
+  validation_interval: 1000
+  batch_size: 8
+  gradient_accumulation_steps: 3
+  max_train_groups: null
+  max_validation_groups: null
+  validation_scene_count: 20
+  unfreeze_at_optimizer_step: null
   frozen_modules: [encoder, region_head, task_grasp, graspnet]
   allowed_action_strata: [push, push_failure]
   action_batch_coverage_strata: [push, push_failure]
+  amp: true
+  amp_dtype: float16
+  amp_initial_scale: 4096
+  gradient_clip_norm: 20.0
+  ema_decay: 0.999
+  early_stopping_patience: 15
+  push_coverage_penalty_weight: 1.0
+  num_workers: 8
+  validation_num_workers: 0
+  pin_memory: true
+  validation_scene_seed: 2026
+  ddp_backend: auto
+  ddp_find_unused_parameters: false
+  validation_family_weights:
+    {push_object: 0.1, push_contact: 0.05, push_direction: 0.05, push_potential: 0.1}
 
 losses:
   instance: 0.0
@@ -18,3 +47,14 @@ losses:
   push_contact: 0.25
   push_direction: 0.25
   push_potential: 0.25
+
+evaluation:
+  push_match_contact_m: 0.024
+  push_match_direction_deg: 15.0
+  instance_match_iou_threshold: 0.5
+
+logging:
+  backend: tensorboard
+  log_interval: 20
+  validation_log_interval: 20
+  gradient_diagnostics_interval: 200

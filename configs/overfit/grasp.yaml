@@ -1,4 +1,5 @@
 defaults:
+  - ../stage/grasp.yaml
   - config.yaml
   - _self_
 

@@ -1243,6 +1243,11 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         with np.load(path, allow_pickle=False) as labels:
             return tuple(str(value) for value in labels["object_match_file"])
 
+    def object_match_files(self, scene_id: int) -> tuple[str, ...]:
+        """Return stable object-to-grasp-sidecar links for dynamic datasets."""
+
+        return self._object_match_files(scene_id)
+
     @lru_cache(maxsize=128)
     def _pick_remove_grasp_records(
         self, scene_id: int, state_id: int

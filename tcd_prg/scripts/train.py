@@ -21,9 +21,10 @@ from tcd_prg.datasets import (
     ActionStateGroupDataset,
     DistributedEvaluationSampler,
     DistributedTaskStateBatchSampler,
+    StageBAcronymDataset,
     StageBBinaryDataset,
 )
-from tcd_prg.datasets.stageb_manifest import build_provenance
+from tcd_prg.datasets.stageb_manifest import build_dynamic_acronym_provenance, build_provenance
 from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import StandalonePushModel, TCDPRGModel
@@ -148,6 +149,7 @@ def validate_checkpoint_gate(
     stage: str,
     *,
     resume_payload: dict | None,
+    weights_payload: dict | None = None,
 ) -> None:
     """Enforce independent A/B starts and the remaining B -> C transition."""
 
@@ -156,7 +158,35 @@ def validate_checkpoint_gate(
         if source != stage:
             raise RuntimeError(f"Resume requires a {stage!r} checkpoint, got {source!r}")
         return
+    if weights_payload is not None:
+        source = weights_payload.get("training_stage")
+        if source != stage:
+            raise RuntimeError(
+                f"Weights-only start requires a {stage!r} checkpoint, got {source!r}"
+            )
+        if int(weights_payload.get("schema_version", -1)) != 12:
+            raise RuntimeError("Weights-only start requires a schema-12 TCD-PRG checkpoint")
     return
+
+
+def load_model_weights_only(model: torch.nn.Module, payload: dict, stage: str) -> None:
+    """Strictly initialize one stage without restoring any trainer state."""
+
+    source = model.module if hasattr(model, "module") else model
+    current = source.state_dict()
+    supplied = payload.get("model")
+    if not isinstance(supplied, dict):
+        raise RuntimeError("Weights-only checkpoint does not contain a model state_dict")
+    if set(current) != set(supplied):
+        missing = sorted(set(current) - set(supplied))
+        extra = sorted(set(supplied) - set(current))
+        raise RuntimeError(
+            f"{stage} weights-only parameter mismatch: missing={missing[:5]} extra={extra[:5]}"
+        )
+    mismatched = [name for name in current if current[name].shape != supplied[name].shape]
+    if mismatched:
+        raise RuntimeError(f"{stage} weights-only tensor shape mismatch: {mismatched[:5]}")
+    source.load_state_dict(supplied, strict=True)
 
 
 def build_optimizer_parameter_groups(model, config, pretrained_parameter_names=()):
@@ -198,6 +228,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--resume")
+    parser.add_argument(
+        "--weights-only-checkpoint",
+        help="Initialize the complete same-stage model, but start optimizer/scheduler/steps fresh.",
+    )
     # Windows 原生启动器显式传递进程拓扑；torchrun 的环境变量仅作为 Linux 兼容路径。
     parser.add_argument("--world-size", type=int)
     parser.add_argument("--rank", type=int)
@@ -214,6 +248,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.resume and args.weights_only_checkpoint:
+        raise ValueError("--resume and --weights-only-checkpoint are mutually exclusive")
     if args.validate_only and not args.resume:
         raise ValueError("--validate-only requires --resume")
     config = load_config(args.config, args.overrides)
@@ -228,9 +264,14 @@ def main() -> None:
     resume_payload = (
         torch.load(args.resume, map_location="cpu", weights_only=False) if args.resume else None
     )
+    weights_payload = (
+        torch.load(args.weights_only_checkpoint, map_location="cpu", weights_only=False)
+        if args.weights_only_checkpoint else None
+    )
     validate_checkpoint_gate(
         config.training.stage,
         resume_payload=resume_payload,
+        weights_payload=weights_payload,
     )
     world_size = (
         args.world_size if args.world_size is not None else int(os.environ.get("WORLD_SIZE", "1"))
@@ -284,7 +325,11 @@ def main() -> None:
             if not stageb_provenance:
                 raise RuntimeError("Stage-B resume checkpoint is missing dataset provenance")
         else:
-            stageb_provenance = build_provenance(config)
+            stageb_provenance = (
+                build_dynamic_acronym_provenance(config)
+                if config.dataset.stageb_source == "acronym_dynamic"
+                else build_provenance(config)
+            )
     perception_only_stage = (
         config.losses.task_grasp == 0
         and config.losses.push_object == 0
@@ -292,8 +337,21 @@ def main() -> None:
         and config.losses.push_direction == 0
         and config.losses.push_potential == 0
     )
+    stageb_root = config.dataset.stageb_acronym_root or str(
+        Path(config.dataset.root) / config.dataset.step_labels_subdir / "acronym_binary_grasps"
+    )
     train_dataset = (
-        StageBBinaryDataset(
+        StageBAcronymDataset(
+            adapter,
+            stageb_root,
+            "train",
+            config.training.max_train_groups,
+            config.dataset.stageb_positive_per_state,
+            config.dataset.stageb_negative_per_state,
+            config.training.seed,
+        )
+        if stageb and config.dataset.stageb_source == "acronym_dynamic"
+        else StageBBinaryDataset(
             adapter,
             config.dataset.stageb_binary_root,
             "train",
@@ -323,12 +381,24 @@ def main() -> None:
     if config.training.validation_interval <= 0:
         validation_dataset = None
     elif stageb:
-        validation_dataset = StageBBinaryDataset(
-            adapter,
-            config.dataset.stageb_binary_root,
-            "val",
-            config.training.max_validation_groups,
-            stageb_provenance,
+        validation_dataset = (
+            StageBAcronymDataset(
+                adapter,
+                stageb_root,
+                "val",
+                config.training.max_validation_groups,
+                config.dataset.stageb_positive_per_state,
+                config.dataset.stageb_negative_per_state,
+                config.training.seed + 1,
+            )
+            if config.dataset.stageb_source == "acronym_dynamic"
+            else StageBBinaryDataset(
+                adapter,
+                config.dataset.stageb_binary_root,
+                "val",
+                config.training.max_validation_groups,
+                stageb_provenance,
+            )
         )
     else:
         validation_dataset = ActionStateGroupDataset(
@@ -451,6 +521,14 @@ def main() -> None:
         if config.training.stage == "push"
         else TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet)
     )
+    if weights_payload is not None:
+        load_model_weights_only(model, weights_payload, config.training.stage)
+        if rank == 0:
+            print(
+                f"[weights-only] initialized complete {config.training.stage} model from "
+                f"{Path(args.weights_only_checkpoint).resolve()}; trainer state starts at step 0",
+                flush=True,
+            )
     if config.training.stage == "push":
         model.push_evaluator.requires_grad_(False)
     pretrained_report = None
@@ -533,7 +611,11 @@ def main() -> None:
                 "unfreeze_at_optimizer_step",
                 config.training.unfreeze_at_optimizer_step,
             )
-    if not args.resume and config.training.stage not in {"grasp", "push"}:
+    if (
+        not args.resume
+        and weights_payload is None
+        and config.training.stage not in {"grasp", "push"}
+    ):
         distributed = torch.distributed.is_initialized()
         checkpoint_path = None
         # Only rank zero may resolve a missing managed checkpoint. Other ranks

@@ -102,7 +102,7 @@ cache; DataLoader workers render cache misses through the external PyBullet
 runtime while the GPU consumes already prepared batches:
 
 ```powershell
-python train.py --config configs/stage/perception.yaml
+python train.py --stage perception
 ```
 
 The launcher supplies the Windows RTX 3090 defaults, creates a timestamped
@@ -177,6 +177,28 @@ tcd-prg-train --config configs/stage/push.yaml `
 The Stage-C checkpoint contains only the standalone PUSH module. `--resume` is
 for continuing the same stage. Deployment requires compatible Stage A, Stage B
 and Stage C checkpoints and checks their runtime semantics before composition.
+
+To start a new run from every parameter in a same-stage checkpoint without
+restoring its optimizer, scheduler, AMP scaler, RNG state, best metric or step,
+use the weights-only mode:
+
+```powershell
+python train.py --stage perception `
+  --weights-only-checkpoint outputs\old_perception\best.pt `
+  --output-dir outputs\perception_rgb_augmented
+```
+
+The same option is supported by Stage A, Stage B and Stage C. The standalone
+PUSH evaluator accepts the same option through `train_push_evaluator.py`.
+Checkpoint stage, schema, parameter names and tensor shapes are checked strictly.
+
+Formal stage configurations inherit the training-only `rgb_augmentation`
+pipeline from `configs/config.yaml`. Each RGB transform has an independent
+enable flag, probability and intensity range. The pipeline can keep RGB,
+zero it, convert it to three-channel grayscale, jitter color, randomly recolor
+instances, perturb material/lighting, add sensor noise, or drop channels/points.
+It never changes XYZ, point count, labels or point correspondence, and validation
+and inference bypass it entirely.
 
 Stage B trains only on concrete GraspNet proposals stored with strict 0/1
 `task_valid` labels. Invalid data-generation attempts are dropped and never become

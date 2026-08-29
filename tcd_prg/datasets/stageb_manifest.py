@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from tcd_prg.config import TCDPRGConfig
 
@@ -71,9 +72,7 @@ def stageb_compatibility(config: TCDPRGConfig) -> dict[str, Any]:
             "proposal_sampling_version": PROPOSAL_SAMPLING_VERSION,
             "camera_transfer_protocol_version": CAMERA_TRANSFER_PROTOCOL_VERSION,
             "geometry_protocol_version": GEOMETRY_PROTOCOL_VERSION,
-            "gripper_geometry_sha256": sha256_file(
-                config.model.stageb_label_gripper_geometry
-            ),
+            "gripper_geometry_sha256": sha256_file(config.model.stageb_label_gripper_geometry),
         },
     }
 
@@ -90,6 +89,27 @@ def build_provenance(config: TCDPRGConfig) -> dict[str, Any]:
             **stageb_compatibility(config),
         },
         "audit": {"producer_git_commits": [commit]},
+    }
+
+
+def build_dynamic_acronym_provenance(config: TCDPRGConfig) -> dict[str, Any]:
+    root = (
+        Path(config.dataset.stageb_acronym_root)
+        if config.dataset.stageb_acronym_root
+        else (
+            Path(config.dataset.root) / config.dataset.step_labels_subdir / "acronym_binary_grasps"
+        )
+    )
+    return {
+        "compatibility": {
+            "dataset_protocol_version": "task_oriented_clutter_acronym_dynamic_v1",
+            "database_manifest_sha256": sha256_file(root / "manifest.json"),
+            "label_policy": "intrinsic_negative_or_known_other_region_vs_adapted_matching_region_v1",
+            "positive_per_state": config.dataset.stageb_positive_per_state,
+            "negative_per_state": config.dataset.stageb_negative_per_state,
+            "split_seed": config.training.seed,
+        },
+        "audit": {"producer_git_commits": []},
     }
 
 

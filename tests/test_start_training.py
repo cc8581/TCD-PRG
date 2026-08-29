@@ -59,7 +59,7 @@ def test_launcher_data_fraction_flag_is_forwarded(tmp_path) -> None:
     config = tmp_path / "config.yaml"
     config.write_text("name: test\n", encoding="utf-8")
     args = _parse_args([
-        "--config", str(config), "--data-fraction", "0.25",
+        "--stage", "perception", "--config", str(config), "--data-fraction", "0.25",
     ])
     arguments = _training_arguments(args)
     assert "training.data_fraction=0.25" in arguments
@@ -69,7 +69,8 @@ def test_launcher_only_forwards_explicit_named_training_overrides(tmp_path) -> N
     config = tmp_path / "config.yaml"
     config.write_text("name: test\n", encoding="utf-8")
     args = _parse_args([
-        "--config", str(config), "--batch-size", "3", "--max-optimizer-steps", "17",
+        "--stage", "perception", "--config", str(config),
+        "--batch-size", "3", "--max-optimizer-steps", "17",
     ])
     arguments = _training_arguments(args)
     assert "training.batch_size=3" in arguments
@@ -81,22 +82,32 @@ def test_launcher_forwards_validation_worker_override(tmp_path) -> None:
     config = tmp_path / "config.yaml"
     config.write_text("name: test\n", encoding="utf-8")
     args = _parse_args([
-        "--config", str(config), "--validation-num-workers", "1",
+        "--stage", "perception", "--config", str(config),
+        "--validation-num-workers", "1",
     ])
     arguments = _training_arguments(args)
     assert "training.validation_num_workers=1" in arguments
 
 
 def test_all_stage_pipeline_rejects_missing_stageb_data_before_launch(tmp_path) -> None:
+    dataset = tmp_path / "empty-dataset"
+    acronym = tmp_path / "empty-acronym"
+    regions = tmp_path / "empty-regions"
+    dataset.mkdir()
+    acronym.mkdir()
+    regions.mkdir()
     args = _parse_args([
         "--stage", "all",
+        "--dataset-root", str(dataset),
+        "--acronym-root", str(acronym),
+        "--functional-region-root", str(regions),
         "--stageb-binary-root", str(tmp_path / "missing-stageb"),
         "--output-dir", str(tmp_path / "output"),
     ])
     try:
         train._run_all_stages(args)
     except FileNotFoundError as error:
-        assert "requires the prebuilt Stage-B binary dataset" in str(error)
+        assert "requires the ACRONYM object grasp database" in str(error)
     else:
         raise AssertionError("all-stage launch must fail before Stage A when Stage B is absent")
 

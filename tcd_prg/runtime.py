@@ -134,6 +134,10 @@ class UnifiedBatchCollator:
                 else self.include_graspnet
             ),
         )
+        if self.training and self.config.rgb_augmentation.enabled:
+            from tcd_prg.datasets.rgb_augmentation import PointCloudRGBAugmentation
+
+            PointCloudRGBAugmentation(self.config.rgb_augmentation)(batch)
         return batch
 
 
@@ -149,10 +153,15 @@ class StageBBinaryBatchCollator:
             self.config.backbone.grid_size_m
             if self.config.backbone.backend == "point_transformer_v3" else None
         )
-        return collate_stageb_binary(
+        batch = collate_stageb_binary(
             samples, grid_size_m=grid_size, training=self.training,
             point_count=self.config.dataset.scene_points,
         )
+        if self.training and self.config.rgb_augmentation.enabled:
+            from tcd_prg.datasets.rgb_augmentation import PointCloudRGBAugmentation
+
+            PointCloudRGBAugmentation(self.config.rgb_augmentation)(batch)
+        return batch
 
 
 @dataclass(slots=True)

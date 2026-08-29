@@ -6,9 +6,9 @@ from .acronym_grasp_database import load_object_grasps, match_object_grasp_prior
 from .base import DatasetAdapter
 from .capabilities import DatasetCapabilities
 from .gapg_observation import GAPGObservationAdapter
+from .push_effectiveness_dataset import PushEffectivenessDataset, PushEvaluatorSample
 from .task_oriented_clutter import TaskOrientedClutterAdapter
 from .template import DatasetAdapterTemplate
-from .push_effectiveness_dataset import PushEffectivenessDataset, PushEvaluatorSample
 from .types import (
     ActionCandidateGroup,
     GlobalGraspLabels,
@@ -37,6 +37,7 @@ __all__ = [
     "StateLabels",
     "StateGroupUnit",
     "StageBBinaryDataset",
+    "StageBAcronymDataset",
     "TaskOrientedClutterAdapter",
     "load_object_grasps",
     "match_object_grasp_priors",
@@ -56,6 +57,7 @@ def __getattr__(name: str) -> Any:
         "GlobalStateDataset",
         "StateGroupUnit",
         "StageBBinaryDataset",
+        "StageBAcronymDataset",
     }:
         from .torch_dataset import (
             ActionStateGroupDataset,
@@ -63,8 +65,9 @@ def __getattr__(name: str) -> Any:
             DistributedTaskStateBatchSampler,
             DistributedWeightedStateSampler,
             GlobalStateDataset,
-            StateGroupUnit,
+            StageBAcronymDataset,
             StageBBinaryDataset,
+            StateGroupUnit,
         )
 
         return {
@@ -75,5 +78,6 @@ def __getattr__(name: str) -> Any:
             "GlobalStateDataset": GlobalStateDataset,
             "StateGroupUnit": StateGroupUnit,
             "StageBBinaryDataset": StageBBinaryDataset,
+            "StageBAcronymDataset": StageBAcronymDataset,
         }[name]
     raise AttributeError(name)

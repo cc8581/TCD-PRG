@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
+import yaml
 
 import train
 from tcd_prg.config import TCDPRGConfig
@@ -12,19 +13,89 @@ from tcd_prg.scripts.infer_state import requires_robot_certification
 from tcd_prg.scripts.train import build_optimizer_parameter_groups
 
 
+def _yaml_leaf_paths(value, prefix="") -> set[str]:
+    if not isinstance(value, dict):
+        return {prefix}
+    result: set[str] = set()
+    for key, child in value.items():
+        child_prefix = f"{prefix}.{key}" if prefix else str(key)
+        result.update(_yaml_leaf_paths(child, child_prefix))
+    return result
+
+
+def test_common_and_formal_stage_configs_have_no_duplicate_leaf_parameters() -> None:
+    common = _yaml_leaf_paths(
+        yaml.safe_load((train.PROJECT / "configs/config.yaml").read_text(encoding="utf-8"))
+    )
+    for path in train.STAGE_CONFIGS.values():
+        stage = _yaml_leaf_paths(yaml.safe_load(path.read_text(encoding="utf-8"))) - {"defaults"}
+        assert not common.intersection(stage), path
+
+
 def test_stage_entrypoints_share_base_config_and_select_stage() -> None:
     for stage in ("perception", "grasp", "push"):
-        args = train._parse_args(["--stage", stage, "--config", "configs/config.yaml"])
+        args = train._parse_args(["--stage", stage])
         command = train._pipeline_command(args, stage, Path("outputs/test-stage"))
-        assert command[command.index("--config") + 1].endswith("configs\\config.yaml")
+        assert command[command.index("--config") + 1].endswith(
+            f"configs\\stage\\{stage}.yaml"
+        )
         assert command[command.index("--stage") + 1] == stage
         assert f"training.stage={stage}" not in command
         assert args.stage == stage
 
 
+def test_single_stage_explicit_config_is_respected() -> None:
+    args = train._parse_args(["--stage", "grasp", "--config", "configs/overfit/grasp.yaml"])
+    assert train._config_for_stage(args, "grasp").as_posix().endswith(
+        "configs/overfit/grasp.yaml"
+    )
+
+
+def test_push_evaluator_command_uses_proposal_checkpoint_and_push_semantics(tmp_path) -> None:
+    args = train._parse_args(["--stage", "all"])
+    proposal = tmp_path / "push" / "last.pt"
+    output = tmp_path / "push_evaluator" / "best.pt"
+    command = train._push_evaluator_command(args, proposal, output)
+    assert command[1].endswith("train_push_evaluator.py")
+    assert command[command.index("--proposal-checkpoint") + 1] == str(proposal.resolve())
+    assert command[command.index("--output") + 1] == str(output.resolve())
+    assert command[command.index("--config") + 1].endswith(
+        "configs\\stage\\push_evaluator.yaml"
+    )
+
+
+def test_all_stage_launcher_runs_push_evaluator_after_stage_c(tmp_path, monkeypatch) -> None:
+    dataset = tmp_path / "dataset"
+    manifest = dataset / "task_training_labels" / "acronym_binary_grasps" / "manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}", encoding="utf-8")
+    args = train._parse_args(
+        ["--stage", "all", "--output-dir", str(tmp_path / "out")]
+    )
+    monkeypatch.setattr(
+        train,
+        "_resolve_paths",
+        lambda unused: (dataset, tmp_path / "acronym", tmp_path / "regions", "python", tmp_path / "cache"),
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command, **unused):
+        calls.append(command)
+        if "--stage" in command and command[command.index("--stage") + 1] == "push":
+            checkpoint = args.output_dir.resolve() / "push" / "last.pt"
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_bytes(b"checkpoint")
+
+    monkeypatch.setattr(train.subprocess, "run", fake_run)
+    train._run_all_stages(args)
+    assert len(calls) == 4
+    assert calls[-1][1].endswith("train_push_evaluator.py")
+    assert calls[-1][calls[-1].index("--proposal-checkpoint") + 1].endswith("push\\last.pt")
+
+
 def test_all_stage_launcher_rejects_single_stage_resume() -> None:
     args = train._parse_args(
-        ["--stage", "all", "--resume", "outputs/old/last.pt", "--config", "configs/config.yaml"]
+        ["--stage", "all", "--resume", "outputs/old/last.pt"]
     )
     try:
         train._run_all_stages(args)

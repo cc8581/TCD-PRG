@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+import copy
+
+import pytest
+import torch
+
+from tcd_prg.config import RGBAugmentationConfig
+from tcd_prg.datasets.rgb_augmentation import PointCloudRGBAugmentation
+from tcd_prg.scripts.train import load_model_weights_only, validate_checkpoint_gate
+
+
+def _batch() -> dict[str, torch.Tensor]:
+    return {
+        "xyz": torch.arange(24, dtype=torch.float32).reshape(1, 8, 3),
+        "rgb": torch.linspace(0.05, 0.95, 24).reshape(1, 8, 3),
+        "point_mask": torch.tensor([[True, True, True, True, True, True, False, False]]),
+        "instance_id": torch.tensor([[0, 0, 1, 1, 2, 2, -1, -1]]),
+        "target_mask": torch.tensor([[True, True, False, False, False, False, False, False]]),
+    }
+
+
+def test_rgb_augmentation_changes_only_rgb_and_preserves_padding() -> None:
+    config = RGBAugmentationConfig(
+        enabled=True,
+        zero_enabled=False,
+        grayscale_enabled=False,
+        color_jitter_enabled=True,
+        color_jitter_probability=1.0,
+        object_recolor_enabled=True,
+        object_recolor_probability=1.0,
+        material_jitter_enabled=False,
+        lighting_jitter_enabled=False,
+        noise_enabled=False,
+        channel_dropout_enabled=False,
+        point_dropout_enabled=False,
+    )
+    batch = _batch()
+    original = {name: value.clone() for name, value in batch.items()}
+    torch.manual_seed(7)
+    PointCloudRGBAugmentation(config)(batch)
+    assert not torch.equal(batch["rgb"][:, :6], original["rgb"][:, :6])
+    assert torch.equal(batch["rgb"][:, 6:], torch.zeros_like(batch["rgb"][:, 6:]))
+    for name in ("xyz", "point_mask", "instance_id", "target_mask"):
+        assert torch.equal(batch[name], original[name])
+
+
+def test_rgb_zero_mode_keeps_three_channels() -> None:
+    config = RGBAugmentationConfig(
+        enabled=True,
+        zero_enabled=True,
+        zero_probability=1.0,
+        grayscale_enabled=False,
+        color_jitter_enabled=False,
+        object_recolor_enabled=False,
+        material_jitter_enabled=False,
+        lighting_jitter_enabled=False,
+        noise_enabled=False,
+        channel_dropout_enabled=False,
+        point_dropout_enabled=False,
+    )
+    batch = _batch()
+    PointCloudRGBAugmentation(config)(batch)
+    assert batch["rgb"].shape == (1, 8, 3)
+    assert torch.count_nonzero(batch["rgb"]) == 0
+
+
+def test_weights_only_load_is_strict_and_does_not_create_trainer_state() -> None:
+    source = torch.nn.Sequential(torch.nn.Linear(3, 4), torch.nn.Linear(4, 2))
+    target = copy.deepcopy(source)
+    with torch.no_grad():
+        for parameter in source.parameters():
+            parameter.add_(2.0)
+    payload = {
+        "schema_version": 12,
+        "training_stage": "perception",
+        "model": source.state_dict(),
+        "optimizer": {"sentinel": "must not be consumed"},
+        "trainer_state": {"optimizer_steps": 1234},
+    }
+    validate_checkpoint_gate("perception", resume_payload=None, weights_payload=payload)
+    load_model_weights_only(target, payload, "perception")
+    pairs = zip(source.state_dict().values(), target.state_dict().values(), strict=True)
+    for source_value, target_value in pairs:
+        assert torch.equal(source_value, target_value)
+
+
+def test_weights_only_rejects_stage_and_structure_mismatch() -> None:
+    payload = {"schema_version": 12, "training_stage": "grasp", "model": {}}
+    with pytest.raises(RuntimeError, match="requires a 'perception' checkpoint"):
+        validate_checkpoint_gate("perception", resume_payload=None, weights_payload=payload)
+    with pytest.raises(RuntimeError, match="parameter mismatch"):
+        load_model_weights_only(torch.nn.Linear(2, 2), payload, "grasp")

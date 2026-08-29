@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .constants import MAX_PREPARATION_ACTIONS, PUSH_DISTANCE_M
 from .paths import project_path
 
 
@@ -22,9 +21,11 @@ class DatasetConfig:
     step_labels_subdir: str = "task_training_labels"
     action_labels_subdir: str = "task_positive_multistep_sequences"
     scene_points: int = 0
-    # target_points 仅供独立资源分析器使用，不限制正式 PTv3 输入。
-    target_points: int = 4096
     stageb_binary_root: str = "runtime/stageb_binary"
+    stageb_source: str = "acronym_dynamic"
+    stageb_acronym_root: str = ""
+    stageb_positive_per_state: int = 8
+    stageb_negative_per_state: int = 16
 
 
 @dataclass(slots=True)
@@ -52,7 +53,6 @@ class CacheConfig:
     index_directory: str = "runtime/cache/dataset_indexes"
     max_gb: float = 5.0
     min_free_gb: float = 20.0
-    eviction: str = "lru"
     prefetch_workers: int = 4
 
 
@@ -107,16 +107,9 @@ class GraspNetConfig:
 
 @dataclass(slots=True)
 class RegionHeadConfig:
-    enabled: bool = True
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
     dice_weight: float = 1.0
-    visibility_threshold: float = 0.5
-
-
-@dataclass(slots=True)
-class PlannerConfig:
-    max_preparation_actions: int = MAX_PREPARATION_ACTIONS
 
 
 @dataclass(slots=True)
@@ -169,7 +162,6 @@ class ModelConfig:
     task_grasp_candidates: int = 64
     task_grasp_probability_threshold: float = 0.5
     pick_remove_probability_threshold: float = 0.5
-    global_grasp_candidates: int = 64
     task_grasp_scene_points: int = 256
     task_grasp_gripper_points: int = 128
     task_grasp_gripper_geometry: str = "assets/robots/FR5_AG-160-95/ag16095_open_tcp_128.npz"
@@ -195,7 +187,6 @@ class ModelConfig:
     grasp_nms_rotation_deg: float = 12.0
     grasp_nms_width_m: float = 0.005
     grasp_nms_approach_deg: float = 12.0
-    global_grasp_input_mode: str = "scene_only"
     global_grasp_nms_translation_m: float = 0.01
     global_grasp_nms_rotation_deg: float = 15.0
     global_grasp_nms_width_m: float = 0.005
@@ -210,6 +201,42 @@ class ModelConfig:
 class AblationConfig:
     use_task_region_condition: bool = True
     use_push_potential: bool = True
+
+
+@dataclass(slots=True)
+class RGBAugmentationConfig:
+    """Online RGB-only augmentation; geometry and supervision stay unchanged."""
+
+    enabled: bool = True
+    zero_enabled: bool = True
+    zero_probability: float = 0.10
+    grayscale_enabled: bool = True
+    grayscale_probability: float = 0.10
+    color_jitter_enabled: bool = True
+    color_jitter_probability: float = 0.80
+    brightness: float = 0.35
+    contrast: float = 0.35
+    saturation: float = 0.35
+    hue: float = 0.08
+    gamma: tuple[float, float] = (0.75, 1.35)
+    object_recolor_enabled: bool = True
+    object_recolor_probability: float = 0.35
+    object_recolor_strength: tuple[float, float] = (0.35, 0.90)
+    material_jitter_enabled: bool = True
+    material_jitter_probability: float = 0.30
+    material_noise_std: tuple[float, float] = (0.01, 0.08)
+    lighting_jitter_enabled: bool = True
+    lighting_jitter_probability: float = 0.50
+    lighting_gain: tuple[float, float] = (0.65, 1.35)
+    lighting_bias: tuple[float, float] = (-0.12, 0.12)
+    noise_enabled: bool = True
+    noise_probability: float = 0.30
+    noise_std: tuple[float, float] = (0.005, 0.04)
+    channel_dropout_enabled: bool = True
+    channel_dropout_probability: float = 0.05
+    point_dropout_enabled: bool = True
+    point_dropout_probability: float = 0.05
+    point_dropout_fraction: tuple[float, float] = (0.01, 0.15)
 
 
 @dataclass(slots=True)
@@ -293,45 +320,22 @@ class TrainingConfig:
 
 @dataclass(slots=True)
 class EvaluationConfig:
-    max_preparation_actions: int = MAX_PREPARATION_ACTIONS
-    horizons: tuple[int, ...] = (0, 1, 3, 5)
     bootstrap_samples: int = 1_000
     confidence: float = 0.95
     max_groups: int | None = None
     # 这些阈值属于评测协议；修改后产生的结果不得与旧实验直接混合。
     region_probability_threshold: float = 0.5
-    ranking_topk: tuple[int, ...] = (1, 5, 10)
     calibration_bins: int = 15
-    global_grasp_tracks: tuple[str, ...] = ("scene_only", "instance_assisted")
     # Internal convergence diagnostics only. Public Global Grasp comparison
     # continues to use the official graspnetAPI evaluator.
-    task_translation_threshold_m: float = 0.01
-    task_rotation_threshold_deg: float = 12.0
-    task_width_threshold_m: float = 0.005
-    global_translation_threshold_m: float = 0.01
-    global_rotation_threshold_deg: float = 15.0
-    global_width_threshold_m: float = 0.005
     # NMS thresholds are intentionally independent from GT matching thresholds.
-    task_nms_translation_m: float = 0.01
-    task_nms_rotation_deg: float = 12.0
-    task_nms_width_m: float = 0.005
-    global_nms_translation_m: float = 0.01
-    global_nms_rotation_deg: float = 15.0
-    global_nms_width_m: float = 0.005
     # Deprecated compatibility field; internal diagnostics always apply the
     # explicit NMS configuration above and standard GraspNet uses graspnetAPI.
-    global_metrics_after_nms: bool = True
     # PUSH GT matching is an evaluation protocol and intentionally independent
     # from decoder NMS thresholds.
     push_match_contact_m: float = 0.024
     push_match_direction_deg: float = 15.0
     instance_match_iou_threshold: float = 0.5
-
-
-@dataclass(slots=True)
-class PushConfig:
-    distance_m: float = PUSH_DISTANCE_M
-    direction_bins: int = 16
 
 
 @dataclass(slots=True)
@@ -377,13 +381,10 @@ class LossConfig:
 @dataclass(slots=True)
 class SamplingConfig:
     # 配额只描述每组抽样数量，不能据此推断抓取标签集合已经完备。
-    positive_grasps: int = 8
     wrong_region_grasps: int = 8
     collision_or_approach_negative_grasps: int = 8
-    perturbed_negative_grasps: int = 4
     global_positive_grasps_per_object: int = 64
     global_negative_grasps_per_object: int = 32
-    unit: str = "action_state_group"
 
 
 @dataclass(slots=True)
@@ -420,24 +421,69 @@ class TCDPRGConfig:
     region_head: RegionHeadConfig = field(default_factory=RegionHeadConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     ablation: AblationConfig = field(default_factory=AblationConfig)
+    rgb_augmentation: RGBAugmentationConfig = field(default_factory=RGBAugmentationConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
-    push: PushConfig = field(default_factory=PushConfig)
     losses: LossConfig = field(default_factory=LossConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
-    planner: PlannerConfig = field(default_factory=PlannerConfig)
     baseline: BaselineConfig = field(default_factory=BaselineConfig)
-    push_distance_m: float = PUSH_DISTANCE_M
     output_dir: str = "outputs/default"
     extra: dict[str, Any] = field(default_factory=dict)
     name: str = "tcd-prg"
 
     def validate(self) -> None:
-        if self.training.stage not in {"perception", "grasp", "push", "joint"}:
-            raise ValueError("training.stage must be one of perception, grasp, push, or joint")
+        augmentation = self.rgb_augmentation
+        probability_fields = (
+            "zero_probability", "grayscale_probability", "color_jitter_probability",
+            "object_recolor_probability", "material_jitter_probability",
+            "lighting_jitter_probability", "noise_probability",
+            "channel_dropout_probability", "point_dropout_probability",
+        )
+        for name in probability_fields:
+            if not 0.0 <= float(getattr(augmentation, name)) <= 1.0:
+                raise ValueError(f"rgb_augmentation.{name} must be in [0,1]")
+        base_probability = (
+            augmentation.zero_probability if augmentation.zero_enabled else 0.0
+        ) + (
+            augmentation.grayscale_probability if augmentation.grayscale_enabled else 0.0
+        )
+        if base_probability > 1.0:
+            raise ValueError(
+                "rgb_augmentation zero_probability + grayscale_probability must be <= 1"
+            )
+        for name in (
+            "gamma", "object_recolor_strength", "material_noise_std", "lighting_gain",
+            "lighting_bias", "noise_std", "point_dropout_fraction",
+        ):
+            low, high = getattr(augmentation, name)
+            if low > high:
+                raise ValueError(f"rgb_augmentation.{name} must be ordered [low, high]")
+        if augmentation.gamma[0] <= 0 or augmentation.lighting_gain[0] < 0:
+            raise ValueError("RGB gamma and lighting gain lower bounds must be valid")
+        if augmentation.material_noise_std[0] < 0 or augmentation.noise_std[0] < 0:
+            raise ValueError("RGB noise standard deviations cannot be negative")
+        if not (
+            0.0
+            <= augmentation.point_dropout_fraction[0]
+            <= augmentation.point_dropout_fraction[1]
+            <= 1.0
+        ):
+            raise ValueError("rgb_augmentation.point_dropout_fraction must lie in [0,1]")
+        if self.dataset.stageb_source not in {"acronym_dynamic", "binary_records"}:
+            raise ValueError("dataset.stageb_source must be acronym_dynamic or binary_records")
+        if self.dataset.stageb_positive_per_state <= 0:
+            raise ValueError("dataset.stageb_positive_per_state must be positive")
+        if self.dataset.stageb_negative_per_state <= 0:
+            raise ValueError("dataset.stageb_negative_per_state must be positive")
+        if self.training.stage not in {
+            "perception", "grasp", "push", "push_evaluator", "joint"
+        }:
+            raise ValueError(
+                "training.stage must be perception, grasp, push, push_evaluator, or joint"
+            )
         stage_families = {
             "perception": {"instance", "region"},
             "grasp": {"task_grasp"},
@@ -519,7 +565,10 @@ class TCDPRGConfig:
             and self.training.max_validation_groups <= 0
         ):
             raise ValueError("training.max_validation_groups must be positive")
-        if self.training.max_validation_groups is not None:
+        if (
+            self.training.max_validation_groups is not None
+            and self.training.stage != "push_evaluator"
+        ):
             if set(self.training.validation_stratum_quota) != expected_strata:
                 raise ValueError(
                     "training.validation_stratum_quota must define exactly the five action strata"
@@ -544,26 +593,6 @@ class TCDPRGConfig:
             raise ValueError("training.amp_initial_scale must be positive")
         if not 0 < self.evaluation.region_probability_threshold < 1:
             raise ValueError("evaluation.region_probability_threshold must be in (0,1)")
-        if not self.evaluation.ranking_topk or any(
-            value <= 0 for value in self.evaluation.ranking_topk
-        ):
-            raise ValueError("evaluation.ranking_topk must contain positive integers")
-        diagnostic_thresholds = (
-            self.evaluation.task_translation_threshold_m,
-            self.evaluation.task_rotation_threshold_deg,
-            self.evaluation.task_width_threshold_m,
-            self.evaluation.global_translation_threshold_m,
-            self.evaluation.global_rotation_threshold_deg,
-            self.evaluation.global_width_threshold_m,
-            self.evaluation.task_nms_translation_m,
-            self.evaluation.task_nms_rotation_deg,
-            self.evaluation.task_nms_width_m,
-            self.evaluation.global_nms_translation_m,
-            self.evaluation.global_nms_rotation_deg,
-            self.evaluation.global_nms_width_m,
-        )
-        if any(float(value) <= 0 for value in diagnostic_thresholds):
-            raise ValueError("All grasp diagnostic matching/NMS thresholds must be positive")
         if self.evaluation.calibration_bins <= 1:
             raise ValueError("evaluation.calibration_bins must be greater than one")
         if self.logging.log_interval <= 0:
@@ -605,14 +634,6 @@ class TCDPRGConfig:
             raise ValueError("dataset.scene_points must be zero (unlimited) or positive")
         if self.backbone.patch_size <= 0:
             raise ValueError("backbone.patch_size must be positive")
-        if abs(self.push_distance_m - PUSH_DISTANCE_M) > 1e-7:
-            raise ValueError("The main TCD-PRG primitive requires push_distance_m == 0.15")
-        if abs(self.push.distance_m - PUSH_DISTANCE_M) > 1e-7:
-            raise ValueError("push.distance_m must be 0.15 for the main experiment")
-        if self.evaluation.max_preparation_actions != MAX_PREPARATION_ACTIONS:
-            raise ValueError("The main experiment requires H=5")
-        if self.planner.max_preparation_actions != MAX_PREPARATION_ACTIONS:
-            raise ValueError("planner.max_preparation_actions must be H=5")
         if not 0 <= self.model.min_grasp_width_m < self.model.max_grasp_width_m:
             raise ValueError("Invalid AG gripper opening range")
         if self.model.contact_heatmap_sigma_m <= 0:
@@ -663,8 +684,6 @@ class TCDPRGConfig:
             raise ValueError("push_coverage_penalty_weight must be non-negative")
         if not 0.0 <= self.model.push_candidate_probability_threshold < 1.0:
             raise ValueError("push_candidate_probability_threshold must be in [0,1)")
-        if self.model.global_grasp_input_mode not in {"scene_only", "instance_assisted"}:
-            raise ValueError("global_grasp_input_mode must be scene_only or instance_assisted")
         if (
             min(
                 self.sampling.global_positive_grasps_per_object,
@@ -675,8 +694,6 @@ class TCDPRGConfig:
             raise ValueError("Global grasp stratum sizes cannot be negative")
         if self.sampling.global_positive_grasps_per_object == 0:
             raise ValueError("Global grasp training requires positive samples")
-        if self.model.global_grasp_candidates <= 0:
-            raise ValueError("global_grasp_candidates must be positive")
         if self.model.instance_queries <= 0:
             raise ValueError("instance_queries must be positive")
         if self.model.instance_decoder_layers <= 0 or self.model.instance_decoder_heads <= 0:
@@ -781,8 +798,6 @@ class TCDPRGConfig:
             raise ValueError("push_failure_penalties must cover unstable/workspace/other failures")
         if self.training.amp_dtype not in {"float16", "bfloat16"}:
             raise ValueError("training.amp_dtype must be float16 or bfloat16")
-        if self.cache.eviction != "lru":
-            raise ValueError("Only deterministic LRU cache eviction is supported")
         if self.cache.max_gb <= 0 or self.cache.min_free_gb <= 0:
             raise ValueError("cache max_gb and min_free_gb must be positive")
 
@@ -824,6 +839,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> TCDPRGC
         (config.dataset, "acronym_root"),
         (config.dataset, "functional_region_root"),
         (config.dataset, "stageb_binary_root"),
+        (config.dataset, "stageb_acronym_root"),
         (config.dataset, "fr5_ag_urdf"),
         (config.observation, "worker_script"),
         (config.observation, "runtime_mesh_root"),

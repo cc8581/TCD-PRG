@@ -170,6 +170,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--proposal-checkpoint", required=True)
+    parser.add_argument(
+        "--weights-only-checkpoint",
+        help="Initialize the PUSH evaluator weights while starting a fresh optimizer at step 0.",
+    )
     parser.add_argument("--output", default="outputs/push_evaluator.pt")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
@@ -209,6 +213,19 @@ def main() -> None:
     load_push_stage(model, args.proposal_checkpoint, config)
     proposal_fingerprint, proposal_source = push_checkpoint_fingerprint(args.proposal_checkpoint)
     freeze_push_proposal(model)
+    if args.weights_only_checkpoint:
+        weights_payload = torch.load(
+            args.weights_only_checkpoint, map_location="cpu", weights_only=False
+        )
+        if weights_payload.get("training_stage") != "push_evaluator":
+            raise RuntimeError("Weights-only checkpoint is not a push_evaluator checkpoint")
+        model.push_evaluator.load_state_dict(weights_payload["model"], strict=True)
+        print(
+            "[weights-only] initialized PUSH evaluator from "
+            f"{Path(args.weights_only_checkpoint).resolve()}; "
+            "optimizer and step start fresh",
+            flush=True,
+        )
     loss_function = PushEffectivenessLoss(negatives / positives)
     optimizer = torch.optim.AdamW(
         model.push_evaluator.parameters(),

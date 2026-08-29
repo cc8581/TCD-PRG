@@ -37,9 +37,10 @@ def collate_stageb_binary(
         "region_valid": ("context_region_valid", False),
         "grid_coord": ("context_grid_coord", 0),
     }
-    for output_key, (context_key, fill) in fixed.items():
-        value, _ = _pad([item.context[context_key] for item in samples], fill)
-        batch[output_key] = value
+    if samples[0].context is not None:
+        for output_key, (context_key, fill) in fixed.items():
+            value, _ = _pad([item.context[context_key] for item in samples], fill)
+            batch[output_key] = value
     batch["xyz"] = batch["xyz"].float()
     batch["rgb"] = batch["rgb"].float()
     batch["point_mask"] = batch["point_mask"].bool()
