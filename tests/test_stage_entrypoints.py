@@ -8,7 +8,7 @@ import yaml
 import train
 from tcd_prg.config import TCDPRGConfig
 from tcd_prg.constants import ActionType
-from tcd_prg.models import StandalonePushModel
+from tcd_prg.models import StandalonePushModel, resolve_staged_checkpoint_root
 from tcd_prg.scripts.infer_state import requires_robot_certification
 from tcd_prg.scripts.train import build_optimizer_parameter_groups
 
@@ -53,8 +53,8 @@ def test_single_stage_explicit_config_is_respected() -> None:
 
 def test_push_evaluator_command_uses_proposal_checkpoint_and_push_semantics(tmp_path) -> None:
     args = train._parse_args(["--stage", "all"])
-    proposal = tmp_path / "push" / "last.pt"
-    output = tmp_path / "push_evaluator" / "best.pt"
+    proposal = tmp_path / "push" / "push_last.pt"
+    output = tmp_path / "push_evaluator" / "push_evaluator_best.pt"
     command = train._push_evaluator_command(args, proposal, output)
     assert command[1].endswith("train_push_evaluator.py")
     assert command[command.index("--proposal-checkpoint") + 1] == str(proposal.resolve())
@@ -81,8 +81,14 @@ def test_all_stage_launcher_runs_push_evaluator_after_stage_c(tmp_path, monkeypa
 
     def fake_run(command, **unused):
         calls.append(command)
-        if "--stage" in command and command[command.index("--stage") + 1] == "push":
-            checkpoint = args.output_dir.resolve() / "push" / "last.pt"
+        if "--stage" in command:
+            stage = command[command.index("--stage") + 1]
+            filename = f"{stage}_last.pt" if stage == "push" else f"{stage}_best.pt"
+            checkpoint = args.output_dir.resolve() / stage / filename
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_bytes(b"checkpoint")
+        elif "--output" in command:
+            checkpoint = Path(command[command.index("--output") + 1])
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
             checkpoint.write_bytes(b"checkpoint")
 
@@ -90,7 +96,16 @@ def test_all_stage_launcher_runs_push_evaluator_after_stage_c(tmp_path, monkeypa
     train._run_all_stages(args)
     assert len(calls) == 4
     assert calls[-1][1].endswith("train_push_evaluator.py")
-    assert calls[-1][calls[-1].index("--proposal-checkpoint") + 1].endswith("push\\last.pt")
+    assert calls[-1][calls[-1].index("--proposal-checkpoint") + 1].endswith(
+        "push\\push_last.pt"
+    )
+    manifest = yaml.safe_load((args.output_dir / "checkpoints.json").read_text())
+    assert manifest["checkpoints"] == {
+        "perception": "perception/perception_best.pt",
+        "grasp": "grasp/grasp_best.pt",
+        "push": "push/push_last.pt",
+        "push_evaluator": "push_evaluator/push_evaluator_best.pt",
+    }
 
 
 def test_all_stage_launcher_rejects_single_stage_resume() -> None:
@@ -103,6 +118,17 @@ def test_all_stage_launcher_rejects_single_stage_resume() -> None:
         assert "all-stage pipeline" in str(error)
     else:
         raise AssertionError("all-stage resume should be rejected")
+
+
+def test_staged_checkpoint_root_resolves_portable_relative_layout(tmp_path) -> None:
+    expected = {}
+    for stage in ("perception", "grasp", "push", "push_evaluator"):
+        path = tmp_path / stage / f"{stage}_best.pt"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"checkpoint")
+        expected[stage] = path.resolve()
+    resolved = resolve_staged_checkpoint_root(tmp_path)
+    assert resolved == expected
 
 
 def test_stagec_optimizer_step_does_not_require_encoder() -> None:

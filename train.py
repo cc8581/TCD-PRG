@@ -56,7 +56,6 @@ def _launcher_defaults(paths_config: Path) -> dict[str, str | Path | None]:
     """Build visible launcher defaults without committing machine-specific paths."""
 
     local = _load_local_paths(paths_config.resolve())
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # 路径优先级：显式命令行参数 > local_paths.yaml > 仓库内约定目录。
     return {
         "dataset_root": _project_relative_path(
@@ -85,9 +84,9 @@ def _launcher_defaults(paths_config: Path) -> dict[str, str | Path | None]:
             )
         ),
         "gpus": 1,
-        "output_dir": _project_relative_path(
+        "output_root": _project_relative_path(
             local.get("output_root", PROJECT / "outputs")
-        ) / f"formal_{stamp}",
+        ),
         "resume": None,
     }
 
@@ -187,11 +186,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override training.num_workers.",
     )
     parser.add_argument(
-        "--validation-num-workers", "--validation_num_workers",
-        dest="validation_num_workers", type=int, default=None,
-        help="Override training.validation_num_workers (0 avoids a validation worker pool).",
-    )
-    parser.add_argument(
         "--gradient-accumulation-steps", "--gradient_accumulation_steps",
         dest="gradient_accumulation_steps", type=int, default=None,
         help="Override training.gradient_accumulation_steps.",
@@ -242,11 +236,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--resume and --pretrain-checkpoint are mutually exclusive")
     # resume checkpoint parent becomes the default output directory
     if args.output_dir is None:
-        args.output_dir = (
-            args.resume.expanduser().resolve().parent
-            if args.resume is not None
-            else Path(defaults["output_dir"])
-        )
+        if args.resume is not None:
+            args.output_dir = args.resume.expanduser().resolve().parent
+        else:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_name = f"all_{stamp}" if args.stage == "all" else f"{args.stage}_{stamp}"
+            args.output_dir = Path(defaults["output_root"]) / run_name
     if args.gpus <= 0:
         parser.error("--gpus must be positive")
     if args.validate_only and args.stage == "all":
@@ -264,7 +259,9 @@ def _training_arguments(
     output = args.output_dir
     if output is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output = PROJECT / "outputs" / f"ptv3_full_{stamp}"
+        stage = getattr(args, "stage", "all")
+        run_name = f"all_{stamp}" if stage == "all" else f"{stage}_{stamp}"
+        output = PROJECT / "outputs" / run_name
     output = output.resolve()
     stage = getattr(args, "stage", "all")
     arguments = ["--config", str(_config_for_stage(args, stage))]
@@ -282,7 +279,6 @@ def _training_arguments(
     named_training_overrides = {
         "batch_size": "batch_size",
         "num_workers": "num_workers",
-        "validation_num_workers": "validation_num_workers",
         "gradient_accumulation_steps": "gradient_accumulation_steps",
         "max_optimizer_steps": "max_optimizer_steps",
         "validation_interval": "validation_interval",
@@ -319,7 +315,7 @@ def _pipeline_command(
         "--gpus", str(args.gpus),
     ]
     for name in (
-        "batch_size", "num_workers", "validation_num_workers", "gradient_accumulation_steps",
+        "batch_size", "num_workers", "gradient_accumulation_steps",
         "max_optimizer_steps", "validation_interval", "data_fraction",
     ):
         value = getattr(args, name, None)
@@ -348,7 +344,6 @@ def _push_evaluator_command(
     named_training_overrides = {
         "batch_size": "batch_size",
         "num_workers": "num_workers",
-        "validation_num_workers": "validation_num_workers",
         "max_optimizer_steps": "max_optimizer_steps",
         "validation_interval": "validation_interval",
         "data_fraction": "data_fraction",
@@ -403,9 +398,9 @@ def _run_all_stages(args: argparse.Namespace) -> None:
         _pipeline_command(args, "push", stage_outputs["push"]),
         check=True, cwd=PROJECT,
     )
-    proposal_checkpoint = stage_outputs["push"] / "best.pt"
+    proposal_checkpoint = stage_outputs["push"] / "push_best.pt"
     if not proposal_checkpoint.is_file():
-        proposal_checkpoint = stage_outputs["push"] / "last.pt"
+        proposal_checkpoint = stage_outputs["push"] / "push_last.pt"
     if not proposal_checkpoint.is_file():
         raise FileNotFoundError(
             "Stage-C completed without a usable proposal checkpoint: "
@@ -416,11 +411,31 @@ def _run_all_stages(args: argparse.Namespace) -> None:
         _push_evaluator_command(
             args,
             proposal_checkpoint,
-            stage_outputs["push_evaluator"] / "best.pt",
+            stage_outputs["push_evaluator"] / "push_evaluator_best.pt",
         ),
         check=True,
         cwd=PROJECT,
     )
+    checkpoint_paths = {
+        stage: stage_outputs[stage] / f"{stage}_best.pt"
+        for stage in stage_outputs
+    }
+    checkpoint_paths["push"] = proposal_checkpoint
+    missing = [str(path) for path in checkpoint_paths.values() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"All-stage checkpoint layout is incomplete: {missing}")
+    manifest = {
+        "schema_version": 1,
+        "layout": "tcd_prg_staged_run_v1",
+        "checkpoints": {
+            stage: path.relative_to(root).as_posix()
+            for stage, path in checkpoint_paths.items()
+        },
+    }
+    manifest_path = root / "checkpoints.json"
+    temporary = manifest_path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    temporary.replace(manifest_path)
 
 
 def main() -> None:

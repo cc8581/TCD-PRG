@@ -28,16 +28,23 @@ def test_launcher_path_arguments_have_local_config_defaults(tmp_path) -> None:
     assert args.pybullet_python == "D:/envs/gapg/python.exe"
     assert args.gpus == 1
     assert args.output_dir.parent == PROJECT / "outputs"
-    assert args.output_dir.name.startswith("formal_")
+    assert args.output_dir.name.startswith("all_")
     assert args.resume is None
     assert args.pretrain_checkpoint is None
     assert args.batch_size is None
     assert args.num_workers is None
-    assert args.validation_num_workers is None
     assert args.gradient_accumulation_steps is None
     assert args.max_optimizer_steps is None
     assert args.validation_interval is None
     assert args.data_fraction is None
+
+
+def test_single_stage_default_output_uses_stage_timestamp(tmp_path) -> None:
+    paths = tmp_path / "local_paths.yaml"
+    paths.write_text("output_root: D:/outputs\n", encoding="utf-8")
+    args = _parse_args(["--paths-config", str(paths), "--stage", "perception"])
+    assert args.output_dir.parent == Path("D:/outputs")
+    assert args.output_dir.name.startswith("perception_")
 
 
 def test_formal_launcher_defaults_and_user_override_order(tmp_path) -> None:
@@ -88,17 +95,6 @@ def test_launcher_only_forwards_explicit_named_training_overrides(tmp_path) -> N
     assert "training.batch_size=3" in arguments
     assert "training.max_optimizer_steps=17" in arguments
     assert not any(argument.startswith("training.num_workers=") for argument in arguments)
-
-
-def test_launcher_forwards_validation_worker_override(tmp_path) -> None:
-    config = tmp_path / "config.yaml"
-    config.write_text("name: test\n", encoding="utf-8")
-    args = _parse_args([
-        "--stage", "perception", "--config", str(config),
-        "--validation-num-workers", "1",
-    ])
-    arguments = _training_arguments(args)
-    assert "training.validation_num_workers=1" in arguments
 
 
 def test_all_stage_pipeline_rejects_missing_stageb_data_before_launch(tmp_path) -> None:

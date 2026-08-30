@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -121,7 +122,7 @@ class TrainerState:
 
 
 class Trainer:
-    VALIDATION_SELECTION_PROTOCOL = "target_iou_plus_region_miou_v1"
+    VALIDATION_SELECTION_PROTOCOL = "stage_aware_validation_v2"
     COUNT_TERMS = {
         "task_grasp_supervised_candidates",
         "push_object_effective_rows",
@@ -240,11 +241,26 @@ class Trainer:
     def _timestamp() -> str:
         return datetime.now(timezone.utc).isoformat()
 
+    def checkpoint_path(self, kind: str) -> Path:
+        if kind not in {"best", "last"}:
+            raise ValueError(f"Unsupported checkpoint kind: {kind}")
+        stage = self.config.training.stage
+        timestamped = re.fullmatch(rf"{re.escape(stage)}_\d{{8}}_\d{{6}}", self.output_dir.name)
+        prefix = self.output_dir.name if timestamped else stage
+        return self.output_dir / f"{prefix}_{kind}.pt"
+
     @staticmethod
     def _validation_selection_score(
         validation_loss_score: float,
         validation_details: dict[str, float],
+        training_stage: str | None = None,
     ) -> float:
+        if training_stage == "grasp":
+            auprc = validation_details.get("task_grasp_validation_auprc")
+            if auprc is None or not np.isfinite(float(auprc)):
+                raise RuntimeError("Grasp validation must produce a finite AUPRC")
+            # Trainer state remains lower-is-better; maximize threshold-independent AUPRC.
+            return 1.0 - float(auprc)
         target_iou = validation_details.get("standard_target_iou")
         region_miou = validation_details.get("standard_region_miou")
         if target_iou is None or region_miou is None:
@@ -436,6 +452,17 @@ class Trainer:
             ("region mIoU", "standard_region_miou"),
             ("region P", "standard_region_foreground_precision"),
             ("region R", "standard_region_foreground_recall"),
+            ("grasp F1", "task_grasp_validation_f1"),
+            ("grasp P", "task_grasp_validation_precision"),
+            ("grasp R", "task_grasp_validation_recall"),
+            ("grasp AUROC", "task_grasp_validation_auroc"),
+            ("grasp AUPRC", "task_grasp_validation_auprc"),
+            ("push obj R@1", "push_object_positive_recall_at_1"),
+            ("push obj R@4", "push_object_positive_recall_at_4"),
+            ("push obj R@K", "push_object_positive_recall_at_deployment_k"),
+            ("push dir coverage", "push_direction_positive_coverage"),
+            ("push utility coverage", "push_utility_valid_coverage"),
+            ("push final R@32", "push_final_positive_recall_at_32"),
         )
         fields.extend(
             f"{label}: {float(metrics[key]):.1%}"
@@ -491,7 +518,7 @@ class Trainer:
             best_validation=self.state.best_validation,
             validation_without_improvement=self.state.validation_without_improvement,
         )
-        self.save_checkpoint(self.output_dir / "last.pt")
+        self.save_checkpoint(self.checkpoint_path("last"))
         return True
 
     def _resume_validation_due(self) -> bool:
@@ -542,7 +569,7 @@ class Trainer:
 
         # BEGIN: durable checkpoint explicitly says this validation is pending.
         self.state.pending_validation_step = step
-        self.save_checkpoint(self.output_dir / "last.pt")
+        self.save_checkpoint(self.checkpoint_path("last"))
         self._write_event(
             "validation_started",
             validation_step=step,
@@ -627,7 +654,11 @@ class Trainer:
             score = float(validation)
 
         validation_loss_score = float(score)
-        score = self._validation_selection_score(validation_loss_score, validation_details)
+        score = self._validation_selection_score(
+            validation_loss_score,
+            validation_details,
+            self.config.training.stage,
+        )
         validation_details["validation_loss_score"] = validation_loss_score
 
         previous_best = self.state.best_validation
@@ -657,7 +688,7 @@ class Trainer:
                 self.task_grasp_probability_threshold
             )
         if improved:
-            self.save_checkpoint(self.output_dir / "best.pt")
+            self.save_checkpoint(self.checkpoint_path("best"))
 
         if self.is_primary:
             if (
@@ -711,7 +742,7 @@ class Trainer:
             validation_items=validation_items,
             metrics=validation_details,
         )
-        self.save_checkpoint(self.output_dir / "last.pt")
+        self.save_checkpoint(self.checkpoint_path("last"))
 
         if (
             self.state.validation_without_improvement
@@ -883,7 +914,7 @@ class Trainer:
                 f"batch={self.config.training.batch_size} accumulation={accumulation} "
                 f"global_stream={'on' if auxiliary_loader is not None else 'off'} "
                 f"workers={self.config.training.num_workers} "
-                f"validation_workers={self.config.training.validation_num_workers} "
+                f"validation_workers={self.config.training.validation_workers} "
                 f"points={point_count} "
                 f"grid={self.config.backbone.grid_size_m:g}m "
                 f"terminal_interval={self.config.logging.log_interval}",
@@ -1266,13 +1297,20 @@ class Trainer:
         ) != compatibility_provenance(self.stageb_provenance):
             raise RuntimeError("Stage-B resume checkpoint provenance does not match the dataset")
         source = self.model.module if hasattr(self.model, "module") else self.model
-        if checkpoint_stage == "push" and set(source.state_dict()) != set(payload["model"]):
-            missing = sorted(set(source.state_dict()) - set(payload["model"]))
-            extra = sorted(set(payload["model"]) - set(source.state_dict()))
-            raise RuntimeError(
-                f"Stage-C checkpoint parameter mismatch: missing={missing[:5]} extra={extra[:5]}"
-            )
-        source.load_state_dict(payload["model"], strict=True)
+        if checkpoint_stage == "push":
+            # Stage C checkpoints intentionally contain only ``push.*``.  The
+            # frozen Stage-D evaluator is trained and checkpointed separately.
+            expected = {key for key in source.state_dict() if key.startswith("push.")}
+            actual = set(payload["model"])
+            if expected != actual:
+                missing = sorted(expected - actual)
+                extra = sorted(actual - expected)
+                raise RuntimeError(
+                    f"Stage-C checkpoint parameter mismatch: missing={missing[:5]} extra={extra[:5]}"
+                )
+            source.load_state_dict(payload["model"], strict=False)
+        else:
+            source.load_state_dict(payload["model"], strict=True)
         self.task_grasp_probability_threshold = float(
             payload.get(
                 "task_grasp_probability_threshold",
@@ -1285,7 +1323,9 @@ class Trainer:
             self.scheduler.load_state_dict(payload["scheduler"])
         self.scaler.load_state_dict(payload["scaler"])
         if self.ema and payload["ema"] is not None:
-            self.ema.model.load_state_dict(payload["ema"], strict=True)
+            self.ema.model.load_state_dict(
+                payload["ema"], strict=checkpoint_stage != "push"
+            )
         self.state = TrainerState(**payload["trainer_state"])
         if payload.get("validation_selection_protocol") != self.VALIDATION_SELECTION_PROTOCOL:
             self.state.best_validation = float("inf")

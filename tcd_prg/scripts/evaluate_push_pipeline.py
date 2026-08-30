@@ -127,7 +127,7 @@ def main() -> None:
         dataset,
         batch_size=config.training.batch_size,
         shuffle=False,
-        num_workers=config.training.validation_num_workers,
+        num_workers=config.training.validation_workers,
         collate_fn=UnifiedBatchCollator(config, training=False, include_graspnet=False),
     )
     stage_a = TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet).to(

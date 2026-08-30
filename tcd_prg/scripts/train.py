@@ -40,7 +40,105 @@ from tcd_prg.runtime import (
     UnifiedBatchCollator,
     create_adapter,
 )
-from tcd_prg.trainers import Trainer, finalize_push_validation_metrics
+from tcd_prg.trainers import (
+    Trainer,
+    aggregate_stageb_validation_payloads,
+    finalize_push_validation_metrics,
+)
+
+
+def summarize_validation_summaries(
+    summaries: list[dict[str, object]], config,
+) -> dict[str, object]:
+    """Aggregate one validation pass, including nonlinear deployment metrics."""
+
+    metric_sums: dict[str, float] = {}
+    metric_counts: dict[str, int] = {}
+    for summary in summaries:
+        for key, value in summary.get("metric_sums", {}).items():
+            metric_sums[str(key)] = metric_sums.get(str(key), 0.0) + float(value)
+        for key, value in summary.get("metric_counts", {}).items():
+            metric_counts[str(key)] = metric_counts.get(str(key), 0) + int(value)
+    metrics = {
+        key: value
+        if key in Trainer.COUNT_TERMS
+        else value / max(1, metric_counts.get(key, 0))
+        for key, value in metric_sums.items()
+    }
+    metrics = finalize_push_validation_metrics(metrics)
+    metrics.update(aggregate_stageb_validation_payloads(summaries))
+    deployment_scores = [
+        np.asarray(item["stageb_deployment_scores"])
+        for item in summaries
+        if "stageb_deployment_scores" in item
+    ]
+    deployment_targets = [
+        np.asarray(item["stageb_deployment_targets"], dtype=bool)
+        for item in summaries
+        if "stageb_deployment_targets" in item
+    ]
+    if deployment_scores and len(deployment_scores) == len(deployment_targets):
+        fixed_score = np.concatenate(deployment_scores)
+        fixed_target = np.concatenate(deployment_targets)
+        fixed_threshold = float(config.model.task_grasp_probability_threshold)
+        fixed_prediction = fixed_score >= fixed_threshold
+        tp = int(np.sum(fixed_prediction & fixed_target))
+        fp = int(np.sum(fixed_prediction & ~fixed_target))
+        fn = int(np.sum(~fixed_prediction & fixed_target))
+        tn = int(np.sum(~fixed_prediction & ~fixed_target))
+        metrics.update(
+            {
+                "task_grasp_fixed_threshold": fixed_threshold,
+                "task_grasp_fixed_threshold_precision": tp / max(1, tp + fp),
+                "task_grasp_fixed_threshold_recall": tp / max(1, tp + fn),
+                "task_grasp_fixed_threshold_f1": 2 * tp / max(1, 2 * tp + fp + fn),
+                "task_grasp_fixed_threshold_accuracy": (tp + tn) / max(1, len(fixed_target)),
+            }
+        )
+    records = [
+        record
+        for summary in summaries
+        for record in summary.get("evaluation_records", [])
+    ]
+    performance: dict[str, object] = {"count": 0, "scene_count": 0, "metrics": {}}
+    if records:
+        evaluator = OfflineModelEvaluator(
+            config.model,
+            config.evaluation.bootstrap_samples,
+            config.evaluation.confidence,
+            config.evaluation,
+        )
+        evaluator.evaluator.records = records
+        performance = evaluator.summarize()
+        metrics.update(
+            {
+                key: float(payload["mean"])
+                for key, payload in performance["metrics"].items()
+                if payload.get("mean") is not None
+            }
+        )
+    score_sum = float(sum(float(item["score_sum"]) for item in summaries))
+    score_count = int(sum(int(item["score_count"]) for item in summaries))
+    loss_score = score_sum / max(1, score_count)
+    selection_score = Trainer._validation_selection_score(
+        loss_score, metrics, config.training.stage
+    )
+    return {
+        "score_sum": score_sum,
+        "score_count": score_count,
+        "validation_loss_score": loss_score,
+        "validation_selection_score": selection_score,
+        "metric_sums": metric_sums,
+        "metric_counts": metric_counts,
+        "metrics": metrics,
+        "performance": performance,
+        "stageb_candidates": int(
+            sum(len(item.get("stageb_scores", ())) for item in summaries)
+        ),
+        "stageb_deployment_candidates": int(
+            sum(len(item.get("stageb_deployment_scores", ())) for item in summaries)
+        ),
+    }
 
 
 def validate_read_through_observation_cache(adapter) -> dict[str, object]:
@@ -376,50 +474,75 @@ def main() -> None:
             config.training.validation_scene_seed,
             os.path.join(config.output_dir, "validation_scene_subset.json"),
         )
-        if config.training.validation_interval > 0 and not stageb
+        if config.training.validation_interval > 0
         else ()
     )
-    if config.training.validation_interval <= 0:
-        validation_dataset = None
-    elif stageb:
-        validation_dataset = (
+
+    def build_validation_dataset(
+        scene_ids: frozenset[int],
+        max_groups: int | None,
+        *,
+        subset_manifest_path: str | None,
+    ):
+        if stageb:
+            return (
             StageBAcronymDataset(
                 adapter,
                 stageb_root,
                 "val",
-                config.training.max_validation_groups,
+                max_groups,
                 config.dataset.stageb_positive_per_state,
                 config.dataset.stageb_negative_per_state,
                 config.training.seed + 1,
+                scene_ids=scene_ids,
             )
             if config.dataset.stageb_source == "acronym_dynamic"
             else StageBBinaryDataset(
                 adapter,
                 config.dataset.stageb_binary_root,
                 "val",
-                config.training.max_validation_groups,
+                max_groups,
                 stageb_provenance,
+                scene_ids=scene_ids,
             )
         )
-    else:
-        validation_dataset = ActionStateGroupDataset(
+        return ActionStateGroupDataset(
             adapter,
             split="val",
-            scene_ids=frozenset(validation_scene_ids),
-            max_groups=config.training.max_validation_groups,
+            scene_ids=scene_ids,
+            max_groups=max_groups,
             allowed_strata=config.training.allowed_action_strata,
             deduplicate_state_task=perception_only_stage,
-            stratified_max_groups=config.training.max_validation_groups is not None,
+            stratified_max_groups=max_groups is not None,
             stratum_quota=config.training.validation_stratum_quota,
+            subset_manifest_path=subset_manifest_path,
+            global_grasp_mode="never",
+            global_grasp_width_bounds=(
+                config.model.min_grasp_width_m,
+                config.model.max_grasp_width_m,
+            ),
+        )
+
+    if config.training.validation_interval <= 0:
+        validation_dataset = None
+        final_validation_dataset = None
+    else:
+        validation_dataset = build_validation_dataset(
+            frozenset(validation_scene_ids),
+            config.training.max_validation_groups,
             subset_manifest_path=(
                 os.path.join(config.output_dir, "validation_subset.json")
                 if config.training.max_validation_groups is not None
                 else None
             ),
-            global_grasp_mode="never",
-            global_grasp_width_bounds=(
-                config.model.min_grasp_width_m,
-                config.model.max_grasp_width_m,
+        )
+        final_validation_dataset = build_validation_dataset(
+            frozenset(adapter.scene_splits["val"]),
+            config.training.max_validation_groups if args.validate_only else None,
+            subset_manifest_path=(
+                os.path.join(config.output_dir, "validation_only_subset.json")
+                if args.validate_only and config.training.max_validation_groups is not None
+                else None
             ),
         )
     if not len(train_dataset):
@@ -441,9 +564,10 @@ def main() -> None:
         )
         if validation_dataset is not None:
             print(
-                f"[val-data] scenes={len(validation_scene_ids)}/"
+                f"[val-data] periodic_scenes={len(validation_scene_ids)}/"
                 f"{len(adapter.scene_splits['val'])} "
-                f"groups={len(validation_dataset)}",
+                f"periodic_groups={len(validation_dataset)} "
+                f"final_groups={len(final_validation_dataset)}",
                 flush=True,
             )
     train_collator = (
@@ -506,15 +630,31 @@ def main() -> None:
             batch_size=config.training.batch_size,
             shuffle=False,
             sampler=validation_sampler,
-            # Validation starts while both persistent training loaders remain
-            # alive.  A separate setting prevents a third Windows worker pool
-            # and its prefetched queue copies from exhausting commit memory.
-            num_workers=config.training.validation_num_workers,
+            num_workers=config.training.validation_workers,
             pin_memory=config.training.pin_memory,
-            persistent_workers=config.training.validation_num_workers > 0,
+            persistent_workers=False,
             collate_fn=validation_collator,
         )
         if validation_dataset is not None and len(validation_dataset)
+        else None
+    )
+    final_validation_sampler = (
+        DistributedEvaluationSampler(len(final_validation_dataset), rank, world_size)
+        if world_size > 1 and final_validation_dataset is not None
+        else None
+    )
+    final_validation_loader = (
+        DataLoader(
+            final_validation_dataset,
+            batch_size=config.training.batch_size,
+            shuffle=False,
+            sampler=final_validation_sampler,
+            num_workers=config.training.validation_workers,
+            pin_memory=config.training.pin_memory,
+            persistent_workers=False,
+            collate_fn=validation_collator,
+        )
+        if final_validation_dataset is not None and len(final_validation_dataset)
         else None
     )
     model = (
@@ -755,8 +895,12 @@ def main() -> None:
                     flush=True,
                 )
 
-    def validate(module: torch.nn.Module) -> dict[str, object]:
-        if validation_loader is None:
+    def validate(
+        module: torch.nn.Module,
+        loader: DataLoader | None = None,
+    ) -> dict[str, object]:
+        active_loader = validation_loader if loader is None else loader
+        if active_loader is None:
             return {
                 "score_sum": float("inf"),
                 "score_count": 1,
@@ -773,15 +917,15 @@ def main() -> None:
             config.evaluation.confidence,
             config.evaluation,
         )
-        validation_batches = len(validation_loader)
-        validation_groups = len(validation_loader.sampler)
+        validation_batches = len(active_loader)
+        validation_groups = len(active_loader.sampler)
         stageb_scores: list[np.ndarray] = []
         stageb_targets: list[np.ndarray] = []
         stageb_deployment_scores: list[np.ndarray] = []
         stageb_deployment_targets: list[np.ndarray] = []
         deployment_selector = DenseCandidateGenerator(config.model) if stageb else None
         with torch.no_grad():
-            for validation_step, raw in enumerate(validation_loader, start=1):
+            for validation_step, raw in enumerate(active_loader, start=1):
                 batch = trainer._move(raw, trainer.device)
                 _, terms, model_output = objective(module, batch, return_output=True)
                 terms = dict(terms)
@@ -889,47 +1033,18 @@ def main() -> None:
         return result
 
     if args.validate_only:
-        validation = validate(trainer.ema.model if trainer.ema else trainer.model)
+        validation = validate(
+            trainer.ema.model if trainer.ema else trainer.model,
+            final_validation_loader,
+        )
         validation_summaries = [validation]
         if torch.distributed.is_initialized():
             gathered = [None for _ in range(torch.distributed.get_world_size())]
             torch.distributed.all_gather_object(gathered, validation)
             validation_summaries = [item for item in gathered if item is not None]
         if rank == 0:
-            metric_sums: dict[str, float] = {}
-            metric_counts: dict[str, int] = {}
-            for summary in validation_summaries:
-                for key, value in summary.get("metric_sums", {}).items():
-                    metric_sums[str(key)] = metric_sums.get(str(key), 0.0) + float(value)
-                for key, value in summary.get("metric_counts", {}).items():
-                    metric_counts[str(key)] = metric_counts.get(str(key), 0) + int(value)
-            metric_details = {
-                key: value
-                if key in Trainer.COUNT_TERMS
-                else value / max(1, metric_counts.get(key, 0))
-                for key, value in metric_sums.items()
-            }
-            serializable = {
-                "score_sum": float(sum(float(item["score_sum"]) for item in validation_summaries)),
-                "score_count": int(sum(int(item["score_count"]) for item in validation_summaries)),
-                "metric_sums": metric_sums,
-                "metric_counts": metric_counts,
-                "metrics": finalize_push_validation_metrics(metric_details),
-            }
-            if any("stageb_scores" in item for item in validation_summaries):
-                serializable.update(
-                    {
-                        "stageb_candidates": int(
-                            sum(len(item.get("stageb_scores", ())) for item in validation_summaries)
-                        ),
-                        "stageb_deployment_candidates": int(
-                            sum(
-                                len(item.get("stageb_deployment_scores", ()))
-                                for item in validation_summaries
-                            )
-                        ),
-                    }
-                )
+            serializable = summarize_validation_summaries(validation_summaries, config)
+            serializable["scope"] = "full_validation_split"
             output = os.path.join(config.output_dir, "validation_only.json")
             Path(output).write_text(
                 json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -944,13 +1059,46 @@ def main() -> None:
             len(train_dataset) if stageb else train_batch_sampler.global_samples_per_epoch
         ),
     )
-    final_checkpoint = os.path.join(config.output_dir, "last.pt")
+    final_checkpoint = trainer.checkpoint_path("last")
     trainer.save_checkpoint(final_checkpoint)
     if world_size > 1:
         torch.distributed.barrier()
+    if final_validation_loader is not None:
+        best_checkpoint = trainer.checkpoint_path("best")
+        if not best_checkpoint.is_file():
+            raise RuntimeError(
+                "Final full validation requires the periodic-validation stage best checkpoint"
+            )
+        trainer.load_checkpoint(best_checkpoint)
+        final_validation = validate(
+            trainer.ema.model if trainer.ema else trainer.model,
+            final_validation_loader,
+        )
+        final_summaries = [final_validation]
+        if torch.distributed.is_initialized():
+            gathered = [None for _ in range(torch.distributed.get_world_size())]
+            torch.distributed.all_gather_object(gathered, final_validation)
+            final_summaries = [item for item in gathered if item is not None]
+        if rank == 0:
+            final_report = summarize_validation_summaries(final_summaries, config)
+            final_report.update(
+                {
+                    "scope": "full_validation_split",
+                    "checkpoint": str(best_checkpoint.resolve()),
+                    "scene_count": len(adapter.scene_splits["val"]),
+                    "periodic_scene_count": len(validation_scene_ids),
+                }
+            )
+            final_output = Path(config.output_dir) / "final_validation.json"
+            final_output.write_text(
+                json.dumps(final_report, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print(f"[final-validation] {json.dumps(final_report, ensure_ascii=False)}", flush=True)
+        if world_size > 1:
+            torch.distributed.barrier()
     if rank == 0:
         print(
-            f"Saved final checkpoint: {os.path.abspath(final_checkpoint)} "
+            f"Saved final checkpoint: {final_checkpoint.resolve()} "
             f"(step {state.optimizer_steps:07d})",
             flush=True,
         )

@@ -13,7 +13,12 @@ import torch
 from tcd_prg.baselines import create_baseline
 from tcd_prg.config import load_config
 from tcd_prg.constants import ActionType
-from tcd_prg.models import TCDPRGModel, load_push_evaluator, load_staged_tcd_prg
+from tcd_prg.models import (
+    TCDPRGModel,
+    load_push_evaluator,
+    load_staged_tcd_prg,
+    resolve_staged_checkpoint_root,
+)
 from tcd_prg.planners import TCDPRGPolicy
 from tcd_prg.runtime import (
     create_action_certifier,
@@ -41,6 +46,10 @@ def requires_robot_certification(action: dict[str, Any]) -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument(
+        "--checkpoint-root",
+        help="Run directory containing checkpoints.json and the four stage subdirectories.",
+    )
     parser.add_argument("--stage-a-checkpoint")
     parser.add_argument("--stage-b-checkpoint")
     parser.add_argument("--stage-c-checkpoint")
@@ -52,6 +61,20 @@ def main() -> None:
     parser.add_argument("--push-evaluator-checkpoint")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
+    if args.checkpoint_root:
+        explicit = (
+            args.stage_a_checkpoint,
+            args.stage_b_checkpoint,
+            args.stage_c_checkpoint,
+            args.push_evaluator_checkpoint,
+        )
+        if any(explicit):
+            parser.error("--checkpoint-root cannot be combined with individual checkpoints")
+        checkpoints = resolve_staged_checkpoint_root(args.checkpoint_root)
+        args.stage_a_checkpoint = str(checkpoints["perception"])
+        args.stage_b_checkpoint = str(checkpoints["grasp"])
+        args.stage_c_checkpoint = str(checkpoints["push"])
+        args.push_evaluator_checkpoint = str(checkpoints["push_evaluator"])
     config = load_config(args.config, args.overrides)
     adapter = create_adapter(config, allow_render=False)
     observation = adapter.load_observation(args.scene_id, args.state_id, args.task_index)

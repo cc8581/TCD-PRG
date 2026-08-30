@@ -36,9 +36,8 @@ observation:
 # Online training-only point-cloud augmentation. Validation and inference never use it.
 augmentation:
   debug:
-    # 0 disables previews. Positive N saves exactly N training batches under
-    # output_dir/augmentation_debug, shared across all DataLoader workers.
-    save_first_batches: 0
+    save_first_batches: 3
+  # 颜色与纹理增强
   zero_rgb:
     probability: 0.50
   grayscale:
@@ -65,8 +64,9 @@ augmentation:
     std: [0.005, 0.04]
   channel_dropout:
     probability: 0.2
+  # 几何与深度增强
   point_dropout:
-    probability: 0.2
+    probability: 0.3
     fraction: [0.01, 0.15]
   depth_noise:
     probability: 0.30
@@ -77,10 +77,10 @@ augmentation:
     radius_m: [0.008, 0.030]
   outlier_injection:
     probability: 0.15
-    fraction: [0.001, 0.010]
+    fraction: [0.01, 0.02]
     displacement_m: [0.005, 0.050]
   view_dropout:
-    probability: 0.15
+    probability: 0.1
     max_views: 1
   density_variation:
     probability: 0.20

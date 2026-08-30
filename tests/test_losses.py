@@ -181,6 +181,21 @@ def test_listwise_activity_requires_positive_and_negative_competitors() -> None:
         torch.tensor([True, False, False]),
     )
 
+
+def test_push_direction_activity_aligns_batch_and_candidate_axes() -> None:
+    positive = torch.zeros((8, 25, 8), dtype=torch.bool)
+    valid = torch.zeros_like(positive)
+    positive[:, 0, 0] = True
+    valid[:, 0, :2] = True
+
+    rank_active = TCDPRGObjective._row_active(
+        TCDPRGObjective._listwise_active_rows(positive, valid)
+    )
+    evaluated_active = TCDPRGObjective._row_active(valid)
+
+    assert rank_active.shape == evaluated_active.shape == (8,)
+    assert torch.equal(rank_active | evaluated_active, torch.ones(8, dtype=torch.bool))
+
 def test_family_gradient_audit_reports_weighted_shared_norms() -> None:
     parameter = torch.tensor([1.0, -2.0], requires_grad=True)
     first = parameter.square().sum()

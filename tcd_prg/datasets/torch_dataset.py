@@ -50,6 +50,7 @@ class StageBBinaryDataset(Dataset[StageBBinarySample]):
         split: str = "train",
         max_groups: int | None = None,
         expected_provenance: dict[str, object] | None = None,
+        scene_ids: set[int] | frozenset[int] | None = None,
     ) -> None:
         self.adapter = adapter
         self.root = Path(root)
@@ -68,7 +69,15 @@ class StageBBinaryDataset(Dataset[StageBBinarySample]):
                 "Stage-B dataset provenance does not match current checkpoints/config"
             )
         self.provenance = dict(actual_provenance)
-        records = [record for record in manifest["records"] if record["split"] == split]
+        allowed_scenes = (
+            None if scene_ids is None else frozenset(int(value) for value in scene_ids)
+        )
+        records = [
+            record
+            for record in manifest["records"]
+            if record["split"] == split
+            and (allowed_scenes is None or int(record["scene_id"]) in allowed_scenes)
+        ]
         if max_groups is not None:
             records = records[:max_groups]
         if not records:
@@ -176,6 +185,7 @@ class StageBAcronymDataset(Dataset[StageBBinarySample]):
         positive_count: int = 8,
         negative_count: int = 16,
         seed: int = 2026,
+        scene_ids: set[int] | frozenset[int] | None = None,
     ) -> None:
         if positive_count <= 0 or negative_count <= 0:
             raise ValueError("Dynamic Stage-B requires positive and negative candidates")
@@ -189,6 +199,7 @@ class StageBAcronymDataset(Dataset[StageBBinarySample]):
             split=split,
             max_groups=max_groups,
             deduplicate_state_task=True,
+            scene_ids=scene_ids,
             global_grasp_mode="never",
         )
         self.units = self.base.units

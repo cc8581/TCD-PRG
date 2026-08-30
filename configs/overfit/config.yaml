@@ -13,7 +13,6 @@ training:
   # A pure memorization check intentionally reuses only the training subset.
   validation_interval: 0
   num_workers: 0
-  validation_num_workers: 0
   pin_memory: true
   max_train_groups: 8
 

@@ -384,9 +384,11 @@ class TCDPRGObjective(nn.Module):
                         "push_positive_actions_direction_covered_count"
                     ],
                 }
-                direction_rank_rows = self._listwise_active_rows(
-                    push_labels["direction_positive"],
-                    push_labels["direction_evaluated"],
+                direction_rank_rows = self._row_active(
+                    self._listwise_active_rows(
+                        push_labels["direction_positive"],
+                        push_labels["direction_evaluated"],
+                    )
                 )
                 activity["active_loss_push_direction"] = (
                     (

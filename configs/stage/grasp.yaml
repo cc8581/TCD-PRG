@@ -28,7 +28,7 @@ training:
   batch_size: 8
   gradient_accumulation_steps: 1
   validation_interval: 1000
-  validation_scene_count: null
+  validation_scene_count: 20
   allowed_action_strata: []
   action_batch_coverage_strata: []
   unfreeze_at_optimizer_step: null
@@ -39,7 +39,6 @@ training:
   ema_decay: 0.999
   early_stopping_patience: 15
   num_workers: 8
-  validation_num_workers: 0
   pin_memory: true
   validation_scene_seed: 2026
   ddp_backend: auto

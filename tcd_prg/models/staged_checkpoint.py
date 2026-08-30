@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import torch
@@ -17,6 +18,35 @@ STAGE_PREFIXES = {
 }
 
 PUSH_EVALUATOR_PROTOCOL_VERSION = 1
+
+
+def resolve_staged_checkpoint_root(root: str | Path) -> dict[str, Path]:
+    """Resolve the four stage-best checkpoints from one portable run directory."""
+
+    root = Path(root).expanduser().resolve()
+    manifest_path = root / "checkpoints.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("layout") != "tcd_prg_staged_run_v1":
+            raise ValueError(f"Unsupported staged checkpoint manifest: {manifest_path}")
+        configured = manifest.get("checkpoints", {})
+    else:
+        configured = {
+            stage: f"{stage}/{stage}_best.pt"
+            for stage in ("perception", "grasp", "push", "push_evaluator")
+        }
+    paths: dict[str, Path] = {}
+    for stage in ("perception", "grasp", "push", "push_evaluator"):
+        relative = configured.get(stage)
+        if not isinstance(relative, str) or not relative:
+            raise ValueError(f"Checkpoint manifest is missing stage {stage!r}")
+        path = (root / relative).resolve()
+        if root not in path.parents:
+            raise ValueError(f"Checkpoint path escapes the run directory: {relative}")
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing {stage} checkpoint: {path}")
+        paths[stage] = path
+    return paths
 
 PERCEPTION_RUNTIME_MODEL_FIELDS = (
     "instance_queries",

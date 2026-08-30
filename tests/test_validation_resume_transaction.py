@@ -85,6 +85,52 @@ def test_best_checkpoint_selection_uses_target_iou_plus_region_miou() -> None:
     assert better_score < score
 
 
+def test_grasp_checkpoint_selection_maximizes_auprc() -> None:
+    score = Trainer._validation_selection_score(
+        0.01, {"task_grasp_validation_auprc": 0.73}, "grasp"
+    )
+    better = Trainer._validation_selection_score(
+        99.0, {"task_grasp_validation_auprc": 0.81}, "grasp"
+    )
+    assert score == pytest.approx(0.27)
+    assert better == pytest.approx(0.19)
+
+
+def test_single_stage_timestamped_directory_names_checkpoint(tmp_path) -> None:
+    output = tmp_path / "perception_20260830_100000"
+    trainer, _ = _make_trainer(output, max_steps=1, interval=1)
+    trainer.config.training.stage = "perception"
+    assert trainer.checkpoint_path("best").name == "perception_20260830_100000_best.pt"
+    assert trainer.checkpoint_path("last").name == "perception_20260830_100000_last.pt"
+
+
+def test_push_validation_summary_prints_deployment_metrics(tmp_path, capsys) -> None:
+    trainer, _ = _make_trainer(tmp_path, max_steps=1, interval=1)
+    trainer._print_validation_summary(
+        {
+            "optimizer_step": 1000,
+            "validation_score": 0.2,
+            "best_validation": 0.2,
+            "metrics": {
+                "training_stage": "push",
+                "push_object_positive_recall_at_1": 0.71,
+                "push_object_positive_recall_at_deployment_k": 0.88,
+                "push_direction_positive_coverage": 0.83,
+                "push_utility_valid_coverage": 0.76,
+                "push_proposal_positive_recall_pre_nms_at_32": 0.92,
+                "push_final_positive_recall_at_32": 0.86,
+            },
+        }
+    )
+    output = capsys.readouterr().out
+    assert "push obj R@1: 71.0%" in output
+    assert "push obj R@K: 88.0%" in output
+    assert "push dir coverage: 83.0%" in output
+    assert "push utility coverage: 76.0%" in output
+    assert "push proposal R@32" not in output
+    assert "push final R@32: 86.0%" in output
+
+
 def test_resume_boundary_uses_completed_validation_log_without_duplicate(tmp_path):
     source, _ = _make_trainer(tmp_path, max_steps=3, interval=2)
     source.state.optimizer_steps = 2
@@ -156,7 +202,7 @@ def test_pending_flag_is_persisted_before_validation_failure(tmp_path):
     else:
         raise AssertionError("validation failure was expected")
 
-    payload = torch.load(tmp_path / "last.pt", map_location="cpu", weights_only=False)
+    payload = torch.load(tmp_path / "joint_last.pt", map_location="cpu", weights_only=False)
     assert payload["trainer_state"]["optimizer_steps"] == 2
     assert payload["trainer_state"]["pending_validation_step"] == 2
     assert payload["trainer_state"]["last_completed_validation_step"] == 0
@@ -176,7 +222,7 @@ def test_best_stageb_threshold_is_saved_in_checkpoint(tmp_path):
         }
 
     trainer.train([batch], validate=validate)
-    payload = torch.load(tmp_path / "best.pt", map_location="cpu", weights_only=False)
+    payload = torch.load(tmp_path / "joint_best.pt", map_location="cpu", weights_only=False)
     assert payload["task_grasp_probability_threshold"] == 0.4
     threshold = json.loads((tmp_path / "stageb_decision_threshold.json").read_text())
     assert threshold["threshold"] == 0.4
@@ -199,7 +245,7 @@ def test_all_negative_deployment_subset_does_not_replace_threshold(tmp_path):
         }
 
     trainer.train([batch], validate=validate)
-    payload = torch.load(tmp_path / "best.pt", map_location="cpu", weights_only=False)
+    payload = torch.load(tmp_path / "joint_best.pt", map_location="cpu", weights_only=False)
     assert payload["task_grasp_probability_threshold"] == initial_threshold
     assert not (tmp_path / "stageb_decision_threshold.json").exists()
 

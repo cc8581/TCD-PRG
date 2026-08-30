@@ -15,10 +15,10 @@ training:
   batch_size: 8
   max_train_groups: null
   max_validation_groups: null
+  validation_scene_count: 20
   allowed_action_strata: [push, push_failure]
   action_batch_coverage_strata: [push, push_failure]
   num_workers: 8
-  validation_num_workers: 0
   pin_memory: true
 
 evaluation:

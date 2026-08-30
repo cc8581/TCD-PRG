@@ -46,7 +46,6 @@ training:
   ema_decay: 0.999
   early_stopping_patience: 15
   num_workers: 8
-  validation_num_workers: 0
   pin_memory: true
   validation_scene_seed: 2026
   ddp_backend: auto

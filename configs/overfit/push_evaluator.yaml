@@ -10,6 +10,5 @@ training:
   max_optimizer_steps: 200
   validation_interval: 20
   num_workers: 0
-  validation_num_workers: 0
   max_train_groups: 64
   max_validation_groups: 64

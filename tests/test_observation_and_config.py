@@ -171,20 +171,23 @@ def test_formal_config_uses_strict_offline_cache_and_scene_splits() -> None:
     assert config.training.max_validation_groups is None
     assert config.training.validation_scene_count is None
     assert config.training.validation_scene_seed == 2026
-    assert config.training.validation_num_workers == 0
+    assert config.training.validation_workers == 2 * config.training.num_workers
     assert config.logging.validation_log_interval == 20
     perception = load_config(PROJECT_ROOT / "configs" / "stage" / "perception.yaml")
     assert perception.training.pretrain_checkpoint is None
     assert perception.training.validation_scene_count == 20
     assert perception.training.max_optimizer_steps == 15000
     assert perception.training.validation_interval == 1000
+    for stage in ("grasp", "push", "push_evaluator"):
+        stage_config = load_config(PROJECT_ROOT / "configs" / "stage" / f"{stage}.yaml")
+        assert stage_config.training.validation_scene_count == 20
 
 
-def test_validation_worker_count_must_be_non_negative() -> None:
+def test_validation_worker_count_is_derived_from_training_workers() -> None:
     config = TCDPRGConfig()
-    config.training.validation_num_workers = -1
-    with pytest.raises(ValueError, match="validation_num_workers"):
-        config.validate()
+    config.training.num_workers = 7
+    assert config.training.validation_workers == 14
+    assert not hasattr(config.training, "validation_num_workers")
 
 
 def test_legacy_renderer_protocol_forbids_render_fallback() -> None:

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -188,10 +190,46 @@ def main() -> None:
         allowed_strata=config.training.allowed_action_strata,
         global_grasp_mode="never",
     )
+    validation_scenes = tuple(int(value) for value in adapter.scene_splits["val"])
+    requested_scenes = config.training.validation_scene_count
+    if requested_scenes is None or requested_scenes >= len(validation_scenes):
+        periodic_validation_scenes = validation_scenes
+    else:
+        periodic_validation_scenes = tuple(
+            sorted(
+                int(value)
+                for value in np.random.default_rng(
+                    config.training.validation_scene_seed
+                ).permutation(validation_scenes)[: int(requested_scenes)]
+            )
+        )
+    subset_path = Path(args.output).with_name("validation_scene_subset.json")
+    subset_path.parent.mkdir(parents=True, exist_ok=True)
+    subset_path.write_text(
+        json.dumps(
+            {
+                "seed": config.training.validation_scene_seed,
+                "source_scene_count": len(validation_scenes),
+                "selected_scene_count": len(periodic_validation_scenes),
+                "scene_ids": periodic_validation_scenes,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     validation_dataset = ActionStateGroupDataset(
         adapter,
         split="val",
+        scene_ids=frozenset(periodic_validation_scenes),
         max_groups=config.training.max_validation_groups,
+        allowed_strata=config.training.allowed_action_strata,
+        global_grasp_mode="never",
+    )
+    final_validation_dataset = ActionStateGroupDataset(
+        adapter,
+        split="val",
+        scene_ids=frozenset(validation_scenes),
+        max_groups=None,
         allowed_strata=config.training.allowed_action_strata,
         global_grasp_mode="never",
     )
@@ -246,9 +284,18 @@ def main() -> None:
         validation_dataset,
         batch_size=config.training.batch_size,
         shuffle=False,
-        num_workers=config.training.validation_num_workers,
+        num_workers=config.training.validation_workers,
         pin_memory=config.training.pin_memory,
-        persistent_workers=config.training.validation_num_workers > 0,
+        persistent_workers=False,
+        collate_fn=UnifiedBatchCollator(config, training=False, include_graspnet=False),
+    )
+    final_validation_loader = DataLoader(
+        final_validation_dataset,
+        batch_size=config.training.batch_size,
+        shuffle=False,
+        num_workers=config.training.validation_workers,
+        pin_memory=config.training.pin_memory,
+        persistent_workers=False,
         collate_fn=UnifiedBatchCollator(config, training=False, include_graspnet=False),
     )
     step = 0
@@ -319,6 +366,15 @@ def main() -> None:
             }
     if best_state is None or best_metrics is None:
         raise RuntimeError("PUSH evaluator validation did not produce a finite AUPRC")
+    model.push_evaluator.load_state_dict(best_state, strict=True)
+    final_metrics = _evaluate(
+        model,
+        final_validation_loader,
+        device=device,
+        config=config,
+        loss_function=loss_function,
+    )
+    print(f"[push-evaluator-final-val] {final_metrics}", flush=True)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -331,6 +387,9 @@ def main() -> None:
             "pos_weight": negatives / positives,
             "optimizer_steps": step,
             "validation_metrics": best_metrics,
+            "final_validation_metrics": final_metrics,
+            "periodic_validation_scene_count": len(periodic_validation_scenes),
+            "final_validation_scene_count": len(validation_scenes),
             "selection_metric": "push_evaluator_auprc",
             "proposal_state_fingerprint": proposal_fingerprint,
             "proposal_state_source": proposal_source,
