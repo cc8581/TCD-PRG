@@ -80,7 +80,7 @@ def oracle_push_pipeline_counts(stage_c, batch, config) -> dict[str, torch.Tenso
             "push_evaluator_top5_evaluable_count"
         ],
         "oracle_push_evaluator_hit_at_1_count": ranking["push_evaluator_hit_at_1_count"],
-        "oracle_push_evaluator_recall_at_5_count": ranking["push_evaluator_recall_at_5_count"],
+        "oracle_push_evaluator_hit_at_5_count": ranking["push_evaluator_hit_at_5_count"],
         "oracle_push_evaluator_known_candidate_count": ranking[
             "push_evaluator_known_candidate_count"
         ],
@@ -125,9 +125,8 @@ def main() -> None:
     stage_a = TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet).to(
         device
     )
-    stage_c = StandalonePushModel(config.model, config.backbone).to(device)
+    stage_c = StandalonePushModel(config.model).to(device)
     load_perception_stage(stage_a, args.perception_checkpoint, config)
-    stage_c.load_perception_geometry(args.perception_checkpoint)
     load_push_evaluator(
         stage_c,
         args.push_evaluator_checkpoint,
@@ -160,9 +159,9 @@ def main() -> None:
             f"{prefix}_push_evaluator_hit_at_1_count",
             f"{prefix}_push_evaluator_top1_evaluable_count",
         )
-        metrics[f"{prefix}_push_evaluator_recall_at_5"] = _ratio(
+        metrics[f"{prefix}_push_evaluator_hit_at_5"] = _ratio(
             totals,
-            f"{prefix}_push_evaluator_recall_at_5_count",
+            f"{prefix}_push_evaluator_hit_at_5_count",
             f"{prefix}_push_evaluator_top5_evaluable_count",
         )
         metrics[f"{prefix}_push_evaluator_top1_evaluable_rate"] = _ratio(

@@ -14,7 +14,7 @@ def test_stage_a_starts_without_checkpoint() -> None:
     validate_checkpoint_gate("perception", resume_payload=None)
 
 
-def test_stage_b_starts_without_stage_a_checkpoint() -> None:
+def test_stage_b_starts_without_perception_checkpoint() -> None:
     validate_checkpoint_gate("grasp", resume_payload=None)
 
 

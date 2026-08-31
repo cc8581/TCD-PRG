@@ -14,7 +14,6 @@ from tcd_prg.datasets.torch_dataset import (
 )
 from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import StandalonePushModel, TCDPRGModel
-from tcd_prg.models.staged_checkpoint import perception_geometry_fingerprint
 from tcd_prg.observation.saved import SavedObservationProvider
 from tcd_prg.trainers import Trainer
 
@@ -98,19 +97,6 @@ def test_checkpoint_rejects_obsolete_schema(tmp_path, tiny_batch) -> None:
     torch.save({"schema_version": 5}, path)
     with pytest.raises(RuntimeError, match="expects schema 12"):
         trainer.load_checkpoint(path)
-
-
-def test_perception_geometry_fingerprint_accepts_scalar_integer_buffers() -> None:
-    payload = {
-        "model": {
-            "encoder.scene_backbone.weight": torch.ones(2, 3),
-            "encoder.scene_backbone.scalar_buffer": torch.tensor(7, dtype=torch.long),
-        }
-    }
-    first = perception_geometry_fingerprint(payload)
-    second = perception_geometry_fingerprint(payload)
-    assert first == second
-    assert len(first) == 64
 
 
 def test_amp_overflow_does_not_advance_optimizer_step(tmp_path) -> None:

@@ -7,7 +7,7 @@ from tcd_prg.models import StandalonePushModel, push_condition_from_gt
 from tcd_prg.models.push import PushActions
 from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
 from tcd_prg.trainers.push_evaluator import logged_push_actions, push_effectiveness_batch_loss
-from tcd_prg.models.staged_checkpoint import load_push_evaluator, PUSH_EVALUATOR_PROTOCOL_VERSION
+from tcd_prg.models.staged_checkpoint import load_push_evaluator, PUSH_EVALUATOR_PROTOCOL_VERSION, PUSH_ARCHITECTURE
 from tcd_prg.planners.push_decoder import decode_push_candidates
 
 
@@ -51,7 +51,7 @@ def test_training_never_calls_rule_generator_or_rejects_far_contact(monkeypatch)
     assert torch.isfinite(loss)
     assert details["effective_logit"].shape == (2,)
     assert any(p.grad is not None for p in m.push_evaluator.parameters())
-    assert all(p.grad is None for p in m.geometry_encoder.parameters())
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in m.push_evaluator.backbone.parameters())
     assert not list(m.push.parameters())
 
 
@@ -59,7 +59,7 @@ def test_rules_keep_multiple_above_objects_and_do_not_read_gt_actions():
     batch = scene()
     m = model().eval()
     condition = push_condition_from_gt(batch, 4)
-    actions = m.push(m.encode_scene(batch), condition)
+    actions = m.push(m._sensor(batch), condition)
     assert set(actions.object.tolist()) == {1, 2}
     actions.validate(1, 4)
     assert (actions.push_distance == .15).all()
@@ -78,7 +78,7 @@ def test_gt_and_rule_action_contract_is_identical():
     batch = scene()
     m = model().eval()
     condition = push_condition_from_gt(batch, 4)
-    rules = m.push(m.encode_scene(batch), condition)
+    rules = m.push(m._sensor(batch), condition)
     a = rules.select(torch.tensor([0]))
     batch["candidate_mask"] = torch.tensor([[True]])
     batch["action_type"] = torch.tensor([[int(ActionType.PUSH)]])
@@ -108,19 +108,18 @@ def test_evaluator_can_overfit_opposite_outcomes_for_same_contact():
     assert details["effective_logit"][0] > 2 and details["effective_logit"][1] < -2
 
 
-def test_checkpoint_is_independent_and_rejects_wrong_geometry(tmp_path):
+def test_checkpoint_is_independent_and_rejects_old_weights(tmp_path):
     m = model()
-    m.perception_geometry_fingerprint = "geometry-a"
-    path = tmp_path / "evaluator.pt"
-    torch.save({"training_stage": "push_evaluator", "push_evaluator_protocol_version": PUSH_EVALUATOR_PROTOCOL_VERSION,
-                "perception_geometry_fingerprint": "geometry-a", "model": m.push_evaluator.state_dict()}, path)
-    other = model()
-    other.perception_geometry_fingerprint = "geometry-a"
-    load_push_evaluator(other, path)
+    path = tmp_path / 'evaluator.pt'
+    payload = dict(training_stage='push_evaluator', push_evaluator_protocol_version=PUSH_EVALUATOR_PROTOCOL_VERSION,
+                   push_architecture=PUSH_ARCHITECTURE, model=m.push_evaluator.state_dict())
+    torch.save(payload,path)
+    other=model(); load_push_evaluator(other,path)
     assert other.push_evaluator_ready
-    other.perception_geometry_fingerprint = "geometry-b"
-    with pytest.raises(RuntimeError, match="geometry mismatch"):
-        load_push_evaluator(other, path)
+    payload['push_evaluator_protocol_version']=3
+    torch.save(payload,path)
+    with pytest.raises(RuntimeError,match='old evaluator weights'):
+        load_push_evaluator(other,path)
 
 
 def test_empty_actions_and_invalid_direction():

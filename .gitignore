@@ -30,3 +30,5 @@ resolved_config.yaml
 .mypy_cache/
 .ruff_cache/
 configs/local_paths.yaml
+third_party/pointnet2_official/
+third_party/pointnet2_yanx27/

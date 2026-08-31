@@ -1,4 +1,4 @@
-# Independent evaluator: logged GT actions only; frozen perception geometry.
+# Fine-tune the complete yanx27 S3DIS PointNet++ evaluator; no perception weights.
 defaults:
   - ../config.yaml
   - _self_
@@ -7,12 +7,17 @@ optimizer:
   learning_rate: 0.0001
   weight_decay: 0.01
 
+scheduler:
+  warmup_steps: 2000
+
 training:
-  pretrain_checkpoint: null
+  pretrain_checkpoint: null       # null: load published yanx27 backbone; otherwise a new-protocol PUSH checkpoint.
   stage: push_evaluator
-  max_optimizer_steps: 15000
+  max_optimizer_steps: 10000
   validation_interval: 1000
   batch_size: 8
+  gradient_accumulation_steps: 3
+  amp: false  # Explicit FP32 PointNet++ training.
   max_train_groups: null
   max_validation_groups: null
   validation_scene_count: 20

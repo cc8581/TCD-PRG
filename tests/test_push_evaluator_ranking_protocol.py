@@ -42,7 +42,7 @@ def test_candidate_ranking_is_conditioned_on_proposal_success() -> None:
     counts = push_candidate_ranking_counts(rows, masks)
     assert counts["push_evaluator_positive_candidate_set_count"] == 1
     assert counts["push_evaluator_hit_at_1_count"] == 1
-    assert counts["push_evaluator_recall_at_5_count"] == 1
+    assert counts["push_evaluator_hit_at_5_count"] == 1
 
 
 def test_proposal_miss_is_not_charged_to_evaluator() -> None:

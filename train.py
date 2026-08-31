@@ -168,7 +168,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--paths-config", type=Path, default=DEFAULT_PATHS_CONFIG)
     parser.add_argument(
-        "--stage", choices=("all", "perception", "grasp"), default="all",
+        "--stage", choices=("all", "perception", "grasp", "push_evaluator"), default="all",
         help="Run one stage, or all three sequentially.",
     )
     parser.add_argument(
@@ -219,6 +219,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "On resume, defaults to the checkpoint parent directory.",
     )
     parser.add_argument("--resume", "--checkpoint", dest="resume", type=Path, default=defaults["resume"], help="Checkpoint used to resume or validate.")
+    parser.add_argument("--checkpoint-interval", type=int, default=None,
+                        help="PUSH evaluator recovery-checkpoint interval (default: 100 optimizer steps).")
     parser.add_argument(
         "--pretrain-checkpoint",
         type=Path,
@@ -233,6 +235,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.resume is not None and args.pretrain_checkpoint is not None:
         parser.error("--resume and --pretrain-checkpoint are mutually exclusive")
+    if args.stage == "push_evaluator":
+        if args.validate_only:
+            parser.error("--validate-only is not supported for push_evaluator; use evaluate_push_pipeline.py")
+        if args.gpus != 1:
+            parser.error("push_evaluator currently supports --gpus 1 only")
+    if args.checkpoint_interval is not None:
+        if args.stage != "push_evaluator" or args.checkpoint_interval <= 0:
+            parser.error("--checkpoint-interval requires --stage push_evaluator and a positive value")
     # resume checkpoint parent becomes the default output directory
     if args.output_dir is None:
         if args.resume is not None:
@@ -327,7 +337,6 @@ def _pipeline_command(
 
 def _push_evaluator_command(
     args: argparse.Namespace,
-    perception_checkpoint: Path,
     output_checkpoint: Path,
 ) -> list[str]:
     dataset, acronym, functional_region, pybullet_python, observation_cache = _resolve_paths(args)
@@ -343,6 +352,7 @@ def _push_evaluator_command(
     named_training_overrides = {
         "batch_size": "batch_size",
         "num_workers": "num_workers",
+        "gradient_accumulation_steps": "gradient_accumulation_steps",
         "max_optimizer_steps": "max_optimizer_steps",
         "validation_interval": "validation_interval",
         "data_fraction": "data_fraction",
@@ -352,17 +362,21 @@ def _push_evaluator_command(
         if value is not None:
             overrides.append(f"training.{config_name}={value:g}")
     overrides.extend(args.overrides)
-    return [
+    command = [
         sys.executable,
         str(PROJECT / "train_push_evaluator.py"),
         "--config",
-        str(STAGE_CONFIGS["push_evaluator"].resolve()),
-        "--perception-checkpoint",
-        str(perception_checkpoint.resolve()),
+        str(_config_for_stage(args, "push_evaluator")),
         "--output",
         str(output_checkpoint.resolve()),
-        *overrides,
     ]
+    for name in ("resume", "pretrain_checkpoint"):
+        value = getattr(args, name, None)
+        if value is not None:
+            command.extend(("--" + name.replace("_", "-"), str(value.resolve())))
+    if getattr(args, "checkpoint_interval", None) is not None:
+        command.extend(("--checkpoint-interval", str(args.checkpoint_interval)))
+    return command + overrides
 
 
 def _run_all_stages(args: argparse.Namespace) -> None:
@@ -399,7 +413,6 @@ def _run_all_stages(args: argparse.Namespace) -> None:
     subprocess.run(
         _push_evaluator_command(
             args,
-            perception_checkpoint,
             stage_outputs["push_evaluator"] / "push_evaluator_best.pt",
         ),
         check=True,
@@ -430,6 +443,12 @@ def main() -> None:
     args = _parse_args()
     if args.stage == "all":
         _run_all_stages(args)
+        return
+    if args.stage == "push_evaluator":
+        command = _push_evaluator_command(
+            args, args.output_dir / "push_evaluator_best.pt"
+        )
+        subprocess.run(command, check=True, cwd=PROJECT)
         return
     # 在创建 DDP 子进程前先核对显卡数量，避免部分 worker 启动后才失败。
     if args.gpus > 1:

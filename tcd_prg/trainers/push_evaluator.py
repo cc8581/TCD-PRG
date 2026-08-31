@@ -5,11 +5,6 @@ from tcd_prg.models import push_condition_from_gt
 from tcd_prg.models.push import PushActions
 
 
-def freeze_perception_geometry(model):
-    model.geometry_encoder.requires_grad_(False).eval()
-    model.push_evaluator.requires_grad_(True).train()
-
-
 def push_effectiveness_eligibility(batch, condition):
     p = batch["action_parameters"]
     obj = batch["acted_object"].long()

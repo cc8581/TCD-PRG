@@ -69,7 +69,8 @@ def integrated_push_proposal_counts(
     perception = stage_a(deterministic_target_prompt_batch(batch), forward_mode="perception")
     stage_c_batch = dict(batch)
     stage_c_batch["push_condition"] = perception["push_condition"]
-    stage_c_batch["geometry_feature"] = perception["encoded"].scene_point_features.detach()
+    # Stage C extracts fixed-order features itself; Stage A remains unchanged.
+    stage_c_batch.pop("geometry_feature", None)
     proposal = stage_c(stage_c_batch, forward_mode="push")
     pre_nms, final = decode_push_candidates(
         proposal["sensor"],
@@ -158,7 +159,7 @@ def integrated_push_proposal_counts(
             "push_evaluator_top5_evaluable_count"
         ],
         "integrated_push_evaluator_hit_at_1_count": ranking["push_evaluator_hit_at_1_count"],
-        "integrated_push_evaluator_recall_at_5_count": ranking["push_evaluator_recall_at_5_count"],
+        "integrated_push_evaluator_hit_at_5_count": ranking["push_evaluator_hit_at_5_count"],
         "integrated_push_evaluator_known_candidate_count": ranking[
             "push_evaluator_known_candidate_count"
         ],

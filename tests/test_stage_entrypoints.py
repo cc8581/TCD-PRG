@@ -51,13 +51,13 @@ def test_single_stage_explicit_config_is_respected() -> None:
     )
 
 
-def test_push_evaluator_command_uses_perception_checkpoint_and_push_semantics(tmp_path) -> None:
+def test_push_evaluator_command_is_independent_of_perception(tmp_path) -> None:
     args = train._parse_args(["--stage", "all"])
     proposal = tmp_path / "perception" / "perception_best.pt"
     output = tmp_path / "push_evaluator" / "push_evaluator_best.pt"
-    command = train._push_evaluator_command(args, proposal, output)
+    command = train._push_evaluator_command(args, output)
     assert command[1].endswith("train_push_evaluator.py")
-    assert command[command.index("--perception-checkpoint") + 1] == str(proposal.resolve())
+    assert "--perception-checkpoint" not in command
     assert command[command.index("--output") + 1] == str(output.resolve())
     assert command[command.index("--config") + 1].endswith(
         "configs\\stage\\push_evaluator.yaml"
@@ -96,9 +96,7 @@ def test_all_stage_launcher_runs_push_evaluator_after_perception_and_grasp(tmp_p
     train._run_all_stages(args)
     assert len(calls) == 3
     assert calls[-1][1].endswith("train_push_evaluator.py")
-    assert calls[-1][calls[-1].index("--perception-checkpoint") + 1].endswith(
-        "perception\\perception_best.pt"
-    )
+    assert "--perception-checkpoint" not in calls[-1]
     manifest = yaml.safe_load((args.output_dir / "checkpoints.json").read_text())
     assert manifest["checkpoints"] == {
         "perception": "perception/perception_best.pt",
@@ -145,7 +143,7 @@ def test_stagec_optimizer_step_does_not_require_encoder() -> None:
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
         for parameter in trainable
     )
-    assert all(parameter.grad is None for parameter in model.geometry_encoder.parameters())
+    assert not hasattr(model, "geometry_encoder")
 
 
 def test_push_bypasses_grasp_robot_certifier() -> None:

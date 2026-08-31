@@ -18,10 +18,27 @@ def polygon(points):
         return None
 
 
-def inside(points, boundary):
-    edge = np.roll(boundary, -1, axis=0) - boundary
-    rel = points[:, None, :2] - boundary[None]
-    return (edge[None, :, 0] * rel[:, :, 1] - edge[None, :, 1] * rel[:, :, 0] >= -1e-8).all(1)
+def projection_overlap(first, second):
+    """Intersect CCW convex footprints, including containment and edge crossings."""
+    output = first.copy()
+    for start, end in zip(second, np.roll(second, -1, axis=0)):
+        if not len(output):
+            break
+        edge = end - start
+        signed = lambda p: edge[0] * (p[1] - start[1]) - edge[1] * (p[0] - start[0])
+        clipped = []
+        previous = output[-1]
+        previous_distance = signed(previous)
+        for current in output:
+            distance = signed(current)
+            if (distance >= 0) != (previous_distance >= 0):
+                clipped.append(previous + (current - previous) *
+                               (previous_distance / (previous_distance - distance)))
+            if distance >= 0:
+                clipped.append(current)
+            previous, previous_distance = current, distance
+        output = np.asarray(clipped, dtype=float).reshape(-1, 2)
+    return output
 
 
 class RulePushGenerator(nn.Module):
@@ -59,14 +76,18 @@ class RulePushGenerator(nn.Module):
                 points = cloud[member.cpu().numpy()]
                 if len(points) < 8:
                     continue
-                overlap = inside(points, footprint)
-                # Compare heights locally within the whole target projection.
-                above = False
-                for p in points[overlap]:
-                    near = np.linalg.norm(target[:, :2] - p[:2], axis=1).argmin()
-                    if p[2] > target[near, 2] + self.config.push_above_margin_m:
-                        above = True
-                        break
+                object_footprint = polygon(points)
+                if object_footprint is None:
+                    continue
+                overlap = projection_overlap(object_footprint, footprint)
+                if not len(overlap):
+                    continue
+                # Heights are observable nearest-surface estimates at shared XY
+                # locations, not a requirement for sampled points inside the target.
+                probes = np.concatenate((overlap, overlap.mean(0, keepdims=True)))
+                target_near = np.linalg.norm(target[:, None, :2] - probes[None], axis=2).argmin(0)
+                object_near = np.linalg.norm(points[:, None, :2] - probes[None], axis=2).argmin(0)
+                above = np.any(points[object_near, 2] > target[target_near, 2] + self.config.push_above_margin_m)
                 if not above:
                     continue
                 low, high = points.min(0), points.max(0)

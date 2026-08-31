@@ -43,7 +43,7 @@ def test_unknown_top1_is_indeterminate_not_negative() -> None:
     assert counts["push_evaluator_positive_candidate_set_count"] == 1
     assert counts["push_evaluator_top1_evaluable_count"] == 0
     assert counts["push_evaluator_top5_evaluable_count"] == 1
-    assert counts["push_evaluator_recall_at_5_count"] == 1
+    assert counts["push_evaluator_hit_at_5_count"] == 1
 
 
 def test_rank_auroc_handles_ties_without_pairwise_matrix() -> None:
@@ -51,4 +51,4 @@ def test_rank_auroc_handles_ties_without_pairwise_matrix() -> None:
         torch.tensor([0.9, 0.8, 0.8, 0.1]),
         torch.tensor([1, 1, 0, 0], dtype=torch.bool),
     )
-    assert torch.allclose(metrics["push_evaluator_auroc"], torch.tensor(0.875))
+    assert metrics["push_evaluator_auroc"].item() == 0.875

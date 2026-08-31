@@ -39,7 +39,8 @@ def push_effectiveness_metrics(
     target: Tensor,
     state_id: Tensor | None = None,
 ) -> dict[str, Tensor]:
-    probability = probability.flatten()
+    # Accumulate large validation populations in float64, including tie groups.
+    probability = probability.flatten().double()
     target = target.flatten().bool()
     if probability.numel() != target.numel():
         raise ValueError("probability and target must have identical lengths")
@@ -48,21 +49,24 @@ def push_effectiveness_metrics(
     order = probability.argsort(descending=True, stable=True)
     ranked = target[order].to(probability.dtype)
     positive_count = ranked.sum()
-    precision = ranked.cumsum(0) / torch.arange(
-        1, len(ranked) + 1, device=probability.device, dtype=probability.dtype
-    )
-    auprc = (
-        (precision * ranked).sum() / positive_count
+    _, tied_counts = torch.unique_consecutive(probability[order], return_counts=True)
+    ends = tied_counts.cumsum(0) - 1
+    true_positives = ranked.cumsum(0)[ends]
+    increments = true_positives - torch.cat((ranked.new_zeros(1), true_positives))[:-1]
+    precision = true_positives / (ends + 1).to(probability.dtype)
+    ap = (
+        (precision * increments).sum() / positive_count
         if int(positive_count)
         else probability.new_tensor(float("nan"))
     )
     negative_count = (~target).sum()
     auroc = _binary_auroc_rank(probability, target)
     result = {
-        "push_evaluator_auprc": auprc,
+        "push_evaluator_ap": ap,
         "push_evaluator_auroc": auroc,
         "push_evaluator_positive_count": positive_count,
         "push_evaluator_negative_count": negative_count.to(probability.dtype),
+        "push_evaluator_positive_fraction": positive_count / max(len(target), 1),
     }
     if state_id is None:
         return result
@@ -70,25 +74,27 @@ def push_effectiveness_metrics(
     if state_id.numel() != probability.numel():
         raise ValueError("state_id must align with probability")
     hit1: list[Tensor] = []
-    recall5: list[Tensor] = []
-    precision1: list[Tensor] = []
-    for state in torch.unique(state_id):
-        mask = state_id == state
-        if not bool(target[mask].any()):
+    hit5: list[Tensor] = []
+    # Each ID denotes one logged sample/action group, not an entire physical scene.
+    # Sort once instead of rescanning all N actions for each of G groups (O(G*N)).
+    group_order = state_id.argsort(stable=True)
+    _, group_sizes = torch.unique_consecutive(state_id[group_order], return_counts=True)
+    sizes = group_sizes.tolist()
+    for scores, labels in zip(probability[group_order].split(sizes), target[group_order].split(sizes)):
+        if not bool(labels.any()):
             continue
-        local_order = probability[mask].argsort(descending=True, stable=True)
-        local_target = target[mask][local_order]
+        local_order = scores.argsort(descending=True, stable=True)
+        local_target = labels[local_order]
         hit1.append(local_target[:1].any().to(probability.dtype))
-        recall5.append(local_target[:5].any().to(probability.dtype))
-        precision1.append(local_target[:1].float().mean())
+        hit5.append(local_target[:5].any().to(probability.dtype))
     empty = probability.new_tensor(float("nan"))
     result.update(
         {
-            "push_evaluator_hit_at_1": torch.stack(hit1).mean() if hit1 else empty,
-            "push_evaluator_recall_at_5": torch.stack(recall5).mean() if recall5 else empty,
-            "push_evaluator_precision_at_1": torch.stack(precision1).mean()
-            if precision1
-            else empty,
+            "push_evaluator_logged_hit_at_1_given_positive": torch.stack(hit1).mean() if hit1 else empty,
+            "push_evaluator_logged_hit_at_5_given_positive": torch.stack(hit5).mean() if hit5 else empty,
+            "push_evaluator_logged_group_count": probability.new_tensor(len(sizes)),
+            "push_evaluator_logged_positive_group_count": probability.new_tensor(len(hit1)),
+            "push_evaluator_logged_negative_group_count": probability.new_tensor(len(sizes) - len(hit1)),
         }
     )
     return result
@@ -222,7 +228,7 @@ def push_candidate_ranking_counts(
         "push_evaluator_top1_evaluable_count": top1_evaluable,
         "push_evaluator_top5_evaluable_count": top5_evaluable,
         "push_evaluator_hit_at_1_count": hit1,
-        "push_evaluator_recall_at_5_count": hit5,
+        "push_evaluator_hit_at_5_count": hit5,
         "push_evaluator_known_candidate_count": known_candidate_count,
         "push_evaluator_total_candidate_count": total_candidate_count,
     }

@@ -57,7 +57,7 @@ def test_effectiveness_metrics_report_binary_and_state_ranking_quality() -> None
         torch.tensor([True, False, False, True]),
         torch.tensor([10, 10, 20, 20]),
     )
-    assert 0.0 <= metrics["push_evaluator_auprc"] <= 1.0
+    assert 0.0 <= metrics["push_evaluator_ap"] <= 1.0
     assert metrics["push_evaluator_auroc"] == 0.5
-    assert metrics["push_evaluator_hit_at_1"] == 0.5
-    assert metrics["push_evaluator_recall_at_5"] == 1.0
+    assert metrics["push_evaluator_logged_hit_at_1_given_positive"] == 0.5
+    assert metrics["push_evaluator_logged_hit_at_5_given_positive"] == 1.0

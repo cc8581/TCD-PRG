@@ -2,10 +2,11 @@
 import torch
 from torch import nn
 from .actions import PushActions
+from .pointnet2 import PushPointNet2
 
 
 class PushEffectivenessEvaluator(nn.Module):
-    def __init__(self, feature_dim=256, num_categories=64, num_task_regions=64):
+    def __init__(self, feature_dim=256, num_categories=64, num_task_regions=64, *, initialize_backbone=True):
         super().__init__()
         d = feature_dim
         self.point_encoder = nn.Sequential(nn.Linear(d + 3, d), nn.LayerNorm(d), nn.GELU())
@@ -14,6 +15,15 @@ class PushEffectivenessEvaluator(nn.Module):
         self.network = nn.Sequential(nn.Linear(6 * d + 10, 2 * d), nn.GELU(),
                                      nn.LayerNorm(2 * d), nn.Linear(2 * d, d),
                                      nn.GELU(), nn.Linear(d, 1))
+        self.feature_dim = d
+        self.backbone = None
+        if initialize_backbone:
+            self.initialize_backbone()
+
+    def initialize_backbone(self):
+        if self.backbone is None:
+            self.backbone = PushPointNet2(self.feature_dim).to(self.network[0].weight.device)
+            self.backbone.train(self.training)
 
     def forward(self, sensor, condition, actions: PushActions):
         xyz = sensor["xyz"]
@@ -25,18 +35,29 @@ class PushEffectivenessEvaluator(nn.Module):
             raise ValueError("PUSH requires a visible target")
         if not bool(condition.object_valid[actions.batch_index, actions.object].all()):
             raise ValueError("PUSH object is not represented")
-        features = sensor["geometry_feature"].detach()
+        self.initialize_backbone()
         mask = sensor["point_mask"].bool()
         def pool(value, weight):
             return (value * weight[:, None]).sum(0) / weight.sum().clamp_min(1e-6)
-        context = {}
+        # Upstream PointNet++ has no padding mask. Batch scenes with the same
+        # visible point count, so invalid padding never enters SA/FP or BatchNorm.
+        # Fixed-size training clouds consequently use one backbone call.
+        groups = {}
         for b in torch.unique(actions.batch_index).tolist():
             valid = mask[b]
             points = xyz[b, valid]
-            target_weight = condition.target_probability[b, valid]
-            target_center = pool(points, target_weight)
-            encoded = self.point_encoder(torch.cat((features[b, valid], points-target_center), -1))
-            context[b] = (points, encoded, target_weight, target_center)
+            if not len(points):
+                raise ValueError("PUSH action scene requires visible points")
+            groups.setdefault(len(points), []).append((b, points, sensor['rgb'][b, valid]))
+        context = {}
+        for scenes in groups.values():
+            features = self.backbone(torch.stack([item[1] for item in scenes]),
+                                     torch.stack([item[2] for item in scenes]))
+            for (b, points, _), scene_features in zip(scenes, features):
+                target_weight = condition.target_probability[b, mask[b]]
+                target_center = pool(points, target_weight)
+                encoded = self.point_encoder(torch.cat((scene_features, points-target_center), -1))
+                context[b] = (points, encoded, target_weight, target_center)
         rows = []
         # Encode each scene once; candidate pooling never retains K x N x D graphs.
         for i in range(len(actions.batch_index)):

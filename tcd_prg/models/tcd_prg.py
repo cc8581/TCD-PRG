@@ -166,7 +166,7 @@ class TCDPRGModel(nn.Module):
         self.push = RulePushGenerator(c)
         self.push_evaluator_ready = False
         self.push_evaluator = PushEffectivenessEvaluator(
-            c.feature_dim, c.num_categories, c.num_task_regions
+            c.feature_dim, c.num_categories, c.num_task_regions, initialize_backbone=False
         )
 
     @staticmethod
@@ -557,8 +557,6 @@ class TCDPRGModel(nn.Module):
     ) -> dict[str, Tensor]:
         """Inference-only rule candidates scored by the independent evaluator."""
         condition.validate(sensor["xyz"].shape[1])
-        if "geometry_feature" not in sensor:
-            raise ValueError("Push inference requires Stage-A geometry_feature")
         actions = self.push(sensor, condition)
         return {"actions": actions, "effective_logit": self.push_evaluator(sensor, condition, actions)}
 

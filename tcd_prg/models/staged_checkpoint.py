@@ -16,23 +16,8 @@ STAGE_PREFIXES = {
     "grasp": ("task_grasp.",),
 }
 
-PUSH_EVALUATOR_PROTOCOL_VERSION = 2
-
-
-def perception_geometry_fingerprint(payload: dict) -> str:
-    source = payload.get("ema") or payload.get("model", {})
-    prefix = "encoder.scene_backbone."
-    tensors = {name[len(prefix):]: value for name, value in source.items() if name.startswith(prefix)}
-    if not tensors:
-        raise RuntimeError("Perception checkpoint contains no scene geometry encoder")
-    digest = hashlib.sha256()
-    for name in sorted(tensors):
-        tensor = tensors[name].detach().cpu().contiguous()
-        digest.update(name.encode("utf-8"))
-        digest.update(str(tuple(tensor.shape)).encode("ascii"))
-        digest.update(str(tensor.dtype).encode("ascii"))
-        digest.update(tensor.numpy().tobytes())
-    return digest.hexdigest()
+PUSH_EVALUATOR_PROTOCOL_VERSION = 5
+PUSH_ARCHITECTURE = "yanx27_pointnet2_sem_seg_s3dis_v1"
 
 
 def resolve_staged_checkpoint_root(root: str | Path) -> dict[str, Path]:
@@ -143,6 +128,11 @@ def load_staged_tcd_prg(
     runtime_config,
 ) -> float:
     stage_a = load_perception_stage(model, perception_checkpoint, runtime_config)
+    # Preserve the existing composed-deployment check for the Stage-A runtime;
+    # C no longer fingerprints or consumes these features.
+    if runtime_config.backbone.backend == "point_transformer_v3":
+        _require_fields(stage_a, runtime_config,
+                        {"backbone": ("enable_flash_attention",)}, "perception")
     stage_b = _load_stage(model, stage_b_checkpoint, "grasp")
     _require_fields(
         stage_b,
@@ -150,7 +140,6 @@ def load_staged_tcd_prg(
         {"model": ("task_grasp_scene_points", "task_grasp_gripper_points")},
         "grasp",
     )
-    model.perception_geometry_fingerprint = perception_geometry_fingerprint(stage_a)
     del stage_a
     saved_stageb = compatibility_provenance(stage_b.get("stageb_provenance", {}))
     runtime_stageb = stageb_compatibility(runtime_config)
@@ -162,19 +151,24 @@ def load_staged_tcd_prg(
     return float(stage_b["task_grasp_probability_threshold"])
 
 
+def validate_push_checkpoint(model, payload):
+    if (payload.get("training_stage") != "push_evaluator" or
+            payload.get("push_evaluator_protocol_version") != PUSH_EVALUATOR_PROTOCOL_VERSION or
+            payload.get("push_architecture") != PUSH_ARCHITECTURE):
+        raise RuntimeError("PUSH requires a new PointNet++ checkpoint; old evaluator weights are unsupported")
+    model.push_evaluator.initialize_backbone()
+    expected = model.push_evaluator.state_dict()
+    supplied = payload.get("model", {})
+    if set(expected) != set(supplied) or any(expected[k].shape != supplied[k].shape for k in expected):
+        raise RuntimeError("PUSH PointNet++ architecture mismatch")
+
+
 def load_push_evaluator(model, checkpoint):
-    """Reject old proposal-dependent checkpoints and mismatched perception features."""
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if payload.get("training_stage") != "push_evaluator":
-        raise RuntimeError("Not a push_evaluator checkpoint")
-    if payload.get("push_evaluator_protocol_version") != PUSH_EVALUATOR_PROTOCOL_VERSION:
-        raise RuntimeError("Obsolete PUSH evaluator: retrain the independent action evaluator")
-    expected = payload.get("perception_geometry_fingerprint")
-    actual = getattr(model, "perception_geometry_fingerprint", None)
-    if not expected or not actual or expected != actual:
-        raise RuntimeError("PUSH evaluator/perception geometry mismatch")
+    validate_push_checkpoint(model, payload)
     model.push_evaluator.load_state_dict(payload["model"], strict=True)
     model.push_evaluator_ready = True
+
 
 def stage_training_state(model, state, stage):
     """Retain strict A/B state loading while discarding obsolete inactive PUSH tensors."""
