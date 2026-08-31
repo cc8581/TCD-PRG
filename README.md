@@ -169,14 +169,15 @@ tcd-prg-build-stageb --config configs/stage/grasp.yaml `
 tcd-prg-train --config configs/stage/grasp.yaml `
   output_dir=outputs/grasp
 
-# Stage C: independent PUSH predictor with GT-derived PushCondition
-tcd-prg-train --config configs/stage/push.yaml `
-  output_dir=outputs/push
+# PUSH: train only the independent evaluator on logged evaluated actions
+python train_push_evaluator.py --config configs/stage/push_evaluator.yaml `
+  --perception-checkpoint outputs/perception/perception_best.pt `
+  --output outputs/push_evaluator/push_evaluator_best.pt
 ```
 
-The Stage-C checkpoint contains only the standalone PUSH module. `--resume` is
-for continuing the same stage. Deployment requires compatible Stage A, Stage B
-and Stage C checkpoints and checks their runtime semantics before composition.
+PUSH generation is inference-only geometry. The evaluator checkpoint contains only
+its trainable weights and a fingerprint of the frozen perception geometry. Old
+proposal-dependent PUSH checkpoints are incompatible. See [PUSH pipeline](docs/push_pipeline.md).
 
 To start a new run from every parameter in a same-stage checkpoint without
 restoring its optimizer, scheduler, AMP scaler, RNG state, best metric or step,
@@ -226,9 +227,9 @@ tcd-prg-eval --config configs/config.yaml --checkpoint outputs/perception/best.p
   --split test --output-dir outputs/evaluation/perception
 
 tcd-prg-infer --config configs/config.yaml `
-  --stage-a-checkpoint outputs/perception/best.pt `
+  --perception-checkpoint outputs/perception/best.pt `
   --stage-b-checkpoint outputs/grasp/best.pt `
-  --stage-c-checkpoint outputs/push/best.pt `
+  --push-evaluator-checkpoint outputs/push_evaluator/push_evaluator_best.pt `
   --scene-id 0 --state-id 0 --task-index 0
 
 tcd-prg-replay --config configs/config.yaml --scene-id 0 --task-index 0

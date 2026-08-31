@@ -155,6 +155,8 @@ class ModelConfig:
     # 每个抓取 query 直接预测平移、连续 SO(3)、夹爪宽度和条件化质量。
     contact_heatmap_sigma_m: float = 0.008
     # Shared train/validation association gate for contact -> visible point.
+    push_contact_spacing_m: float = 0.010
+    push_above_margin_m: float = 0.002
     push_contact_match_max_distance_m: float = 0.024
     max_grasp_width_m: float = 0.095
     min_grasp_width_m: float = 0.0
@@ -332,6 +334,8 @@ class AugmentationConfig:
 class TrainingConfig:
     stage: str = "joint"
     pretrain_checkpoint: str | None = None
+    # Stage-C only: frozen Stage-A checkpoint supplying aligned scene geometry.
+    perception_checkpoint: str | None = None
     # max_optimizer_steps 统计真实参数更新次数，不包含 AMP 溢出后被跳过的 step。
     seed: int = 2026
     device: str = "cuda"

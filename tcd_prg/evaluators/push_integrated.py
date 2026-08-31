@@ -69,13 +69,13 @@ def integrated_push_proposal_counts(
     perception = stage_a(deterministic_target_prompt_batch(batch), forward_mode="perception")
     stage_c_batch = dict(batch)
     stage_c_batch["push_condition"] = perception["push_condition"]
+    stage_c_batch["geometry_feature"] = perception["encoded"].scene_point_features.detach()
     proposal = stage_c(stage_c_batch, forward_mode="push")
     pre_nms, final = decode_push_candidates(
         proposal["sensor"],
         proposal["push_condition"],
         proposal["push"],
         config.model,
-        use_push_potential=config.ablation.use_push_potential,
     )
     wrapped_stage_c = stage_c.module if hasattr(stage_c, "module") else stage_c
     push_evaluator = getattr(wrapped_stage_c, "push_evaluator", None)
@@ -85,12 +85,6 @@ def integrated_push_proposal_counts(
         raise RuntimeError(
             "Integrated PUSH evaluation requires a loaded PushEffectivenessEvaluator"
         )
-    for row_index, row in enumerate(final):
-        if len(row["point_index"]):
-            logits = push_evaluator(proposal["push"], row, batch_index=row_index)
-            row["effective_logit"] = logits
-            row["effective_probability"] = torch.sigmoid(logits)
-
     targets = build_instance_targets(dict(batch), config.model.instance_queries)
     matcher = InstanceSetLoss(matching_points=config.model.instance_matching_points)
     match = matcher.match(perception["instance"], targets)

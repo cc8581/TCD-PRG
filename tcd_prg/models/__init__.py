@@ -5,7 +5,6 @@ from .stageb_condition import StageBCondition, stageb_condition_from_gt
 from .staged_checkpoint import (
     load_perception_stage,
     load_push_evaluator,
-    load_push_stage,
     load_staged_tcd_prg,
     resolve_staged_checkpoint_root,
 )
@@ -19,7 +18,6 @@ __all__ = [
     "TCDPRGModel",
     "load_push_evaluator",
     "load_perception_stage",
-    "load_push_stage",
     "load_staged_tcd_prg",
     "resolve_staged_checkpoint_root",
     "push_condition_from_gt",

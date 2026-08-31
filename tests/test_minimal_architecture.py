@@ -17,7 +17,7 @@ def test_minimal_stage_configs_load() -> None:
     for path, stage in (
         ("configs/stage/perception.yaml", "perception"),
         ("configs/stage/grasp.yaml", "grasp"),
-        ("configs/stage/push.yaml", "push"),
+        ("configs/stage/push_evaluator.yaml", "push_evaluator"),
     ):
         config = load_config(path)
         assert config.ablation.use_task_region_condition

@@ -13,14 +13,11 @@ from tcd_prg.models.push_condition import push_condition_from_gt
 from tcd_prg.config import AblationConfig, LossConfig, ModelConfig, RegionHeadConfig
 from tcd_prg.datasets.capabilities import DatasetCapabilities
 
-from .actions import PushLoss
 from .instance import (
     InstanceSetLoss,
     build_instance_targets,
-    build_push_supervision,
 )
 from .labels import (
-    build_push_training_hints,
     build_region_labels,
 )
 from .task_grasp_binary import TaskGraspBinaryLoss
@@ -72,7 +69,6 @@ class TCDPRGObjective(nn.Module):
             region_config.dice_weight,
         )
         self.task_grasp = TaskGraspBinaryLoss()
-        self.push = PushLoss(model_config.push_object_topk)
         self.total = MultiTaskLoss(
             capabilities,
             ablation,
@@ -223,35 +219,12 @@ class TCDPRGObjective(nn.Module):
         push_families = {"push_object", "push_contact", "push_direction", "push_potential"}
         has_push = bool(enabled & push_families)
         has_grasp = "task_grasp" in enabled
-        if has_push and has_grasp:
-            raise RuntimeError(
-                "Joint Stage-B/Stage-C training is incompatible with independent condition protocols; train grasp and push separately."
-            )
         if has_push:
-            forward_mode = "push"
-        elif has_grasp:
-            forward_mode = "grasp"
-        else:
-            forward_mode = "perception"
-
-        # GT contact forcing is a training-only sparse-compute aid. Validation
-        # and inference must depend exclusively on predicted contact top-k.
-        training_hints = (
-            build_push_training_hints(batch, self.model_config.push_contact_match_max_distance_m)
-            if model.training and has_push
-            else None
-        )
+            raise RuntimeError("PUSH generation training was removed; use train_push_evaluator.py")
+        forward_mode = "grasp" if has_grasp else "perception"
         model_view = self._model_view(batch)
         if forward_mode == "grasp":
             model_view["stageb_condition"] = stageb_condition_from_gt(batch)
-        if forward_mode == "push":
-            model_view["push_condition"] = push_condition_from_gt(
-                batch, self.model_config.instance_queries
-            )
-        if training_hints is not None:
-            model_view["training_hints"] = {
-                "push_direction_point_mask": training_hints["push_direction_point_mask"]
-            }
         output = model(model_view, forward_mode=forward_mode)
 
         families: dict[str, dict[str, Tensor]] = {}
@@ -304,118 +277,6 @@ class TCDPRGObjective(nn.Module):
             activity["active_loss_task_grasp"] = (
                 batch["stageb_candidate_valid"].any(-1).float().mean()
             )
-
-        if has_push:
-            if output.get("push") is None:
-                raise RuntimeError("Push loss enabled but Push output is unavailable")
-            push_output, push_labels = build_push_supervision(
-                output["push"],
-                batch,
-                self.model_config,
-                output["push_condition"],
-                training_hints=training_hints,
-            )
-            push_losses = self.push(push_output, push_labels)
-
-            if self.total.enabled("push_object"):
-                families["push_object"] = {
-                    "loss": push_losses["push_object"],
-                    "push_object_effective_rows": push_losses["push_object_effective_rows"],
-                    "push_known_objects_per_state": push_losses["push_known_objects_per_state"],
-                    "push_multiobject_states": push_losses["push_multiobject_states"],
-                    "push_positive_objects": push_losses["push_positive_objects"],
-                    "push_negative_objects": push_losses["push_negative_objects"],
-                    "push_object_positive_rows_count": push_losses[
-                        "push_object_positive_rows_count"
-                    ],
-                    "push_object_positive_hits_at_1_count": push_losses[
-                        "push_object_positive_hits_at_1_count"
-                    ],
-                    "push_object_positive_hits_at_4_count": push_losses[
-                        "push_object_positive_hits_at_4_count"
-                    ],
-                    "push_object_positive_hits_at_deployment_k_count": push_losses[
-                        "push_object_positive_hits_at_deployment_k_count"
-                    ],
-                    "push_object_bce_active_rows_count": push_losses[
-                        "push_object_bce_active_rows_count"
-                    ],
-                    "push_object_rank_active_rows_count": push_losses[
-                        "push_object_rank_active_rows_count"
-                    ],
-                }
-                activity["active_loss_push_object"] = (
-                    push_labels["object_valid_mask"].any(-1).float().mean()
-                )
-
-            if self.total.enabled("push_contact"):
-                families["push_contact"] = {
-                    "loss": push_losses["push_contact"],
-                    "push_contact_positive_points": push_losses["push_contact_positive_points"],
-                    "push_contact_negative_points": push_losses["push_contact_negative_points"],
-                    "push_contact_valid_points": push_losses["push_contact_valid_points"],
-                }
-                activity["active_loss_push_contact"] = (
-                    self._row_active(push_labels["contact_valid"]).float().mean()
-                )
-
-            if self.total.enabled("push_direction"):
-                families["push_direction"] = {
-                    "loss": push_losses["push_direction"],
-                    "push_direction_bce_diagnostic": push_losses["push_direction_bce_diagnostic"],
-                    "push_direction_rank_diagnostic": push_losses["push_direction_rank_diagnostic"],
-                    "push_direction_bce_active_rows_count": push_losses[
-                        "push_direction_bce_active_rows_count"
-                    ],
-                    "push_direction_rank_active_rows_count": push_losses[
-                        "push_direction_rank_active_rows_count"
-                    ],
-                    "push_direction_residual_diagnostic": push_losses[
-                        "push_direction_residual_diagnostic"
-                    ],
-                    "push_direction_effective_rows": push_losses["push_direction_effective_rows"],
-                    "push_direction_residual_targets": push_losses[
-                        "push_direction_residual_targets"
-                    ],
-                    "push_positive_actions_total_count": push_losses[
-                        "push_positive_actions_total_count"
-                    ],
-                    "push_positive_actions_direction_covered_count": push_losses[
-                        "push_positive_actions_direction_covered_count"
-                    ],
-                }
-                direction_rank_rows = self._row_active(
-                    self._listwise_active_rows(
-                        push_labels["direction_positive"],
-                        push_labels["direction_evaluated"],
-                    )
-                )
-                activity["active_loss_push_direction"] = (
-                    (
-                        self._row_active(push_labels["direction_evaluated"])
-                        | direction_rank_rows
-                        | self._row_active(push_labels["direction_residual_valid"])
-                    )
-                    .float()
-                    .mean()
-                )
-
-            if self.total.enabled("push_potential"):
-                families["push_potential"] = {
-                    "loss": push_losses["push_potential"],
-                    "push_potential_valid_candidates": push_losses[
-                        "push_potential_valid_candidates"
-                    ],
-                    "push_positive_actions_utility_covered_count": push_losses[
-                        "push_positive_actions_utility_covered_count"
-                    ],
-                    "push_positive_actions_utility_eligible_count": push_losses[
-                        "push_positive_actions_utility_eligible_count"
-                    ],
-                }
-                activity["active_loss_push_potential"] = (
-                    self._row_active(push_labels["utility_valid"]).float().mean()
-                )
 
         total, terms = self.total(families)
         terms.update(activity)

@@ -1,68 +1,9 @@
-"""Single deployment-equivalent decoder for Stage-C PUSH proposals."""
-
-from __future__ import annotations
-
+"""Rank rule-generated complete actions by the independent evaluator."""
 import math
-
 import torch
 from torch import Tensor
-
 from tcd_prg.config import ModelConfig
-from tcd_prg.constants import PUSH_DISTANCE_M, ActionType, CandidateStatus
-from tcd_prg.models.push.head import push_contact_joint_score
-from tcd_prg.models.push_condition import PushCondition
-
-
-def _empty(device: torch.device, dtype: torch.dtype) -> dict[str, Tensor]:
-    return {
-        "object": torch.empty(0, dtype=torch.long, device=device),
-        "contact_world": torch.empty(0, 3, dtype=dtype, device=device),
-        "direction_world": torch.empty(0, 3, dtype=dtype, device=device),
-        "point_index": torch.empty(0, dtype=torch.long, device=device),
-        "direction_bin": torch.empty(0, dtype=torch.long, device=device),
-        "direction_residual": torch.empty(0, 2, dtype=dtype, device=device),
-        "push_distance": torch.empty(0, dtype=dtype, device=device),
-        "object_score": torch.empty(0, dtype=dtype, device=device),
-        "contact_score": torch.empty(0, dtype=dtype, device=device),
-        "direction_score": torch.empty(0, dtype=dtype, device=device),
-        "utility": torch.empty(0, dtype=dtype, device=device),
-        "proposal_score": torch.empty(0, dtype=dtype, device=device),
-        "effective_logit": torch.empty(0, dtype=dtype, device=device),
-        "effective_probability": torch.empty(0, dtype=dtype, device=device),
-    }
-
-
-def _top_contacts(
-    contact_logits: Tensor,
-    object_probability: Tensor,
-    object_ids: Tensor,
-    point_mask: Tensor,
-    total: int,
-) -> Tensor:
-    if not len(object_ids) or total <= 0:
-        return torch.empty(0, dtype=torch.long, device=contact_logits.device)
-    per_object = max(1, math.ceil(total / len(object_ids)))
-    owner = object_probability.argmax(0)
-    selected: list[Tensor] = []
-    for object_id in object_ids.tolist():
-        membership = object_probability[object_id]
-        domain = point_mask & (owner == object_id) & (membership >= 0.5)
-        if not bool(domain.any()):
-            domain = point_mask & (owner == object_id)
-        points = torch.nonzero(domain, as_tuple=False).flatten()
-        count = min(per_object, len(points))
-        if count:
-            joint = push_contact_joint_score(contact_logits[points], membership[points])
-            selected.append(points[joint.topk(count).indices])
-    if not selected:
-        return torch.empty(0, dtype=torch.long, device=contact_logits.device)
-    candidates = torch.unique(torch.cat(selected), sorted=True)
-    membership = object_probability[object_ids][:, candidates]
-    joint = push_contact_joint_score(
-        contact_logits[candidates][None], membership
-    ).amax(0)
-    return candidates[joint.topk(min(total, len(candidates))).indices]
-
+from tcd_prg.constants import ActionType, CandidateStatus
 
 def push_nms_mask(candidates: dict[str, Tensor], config: ModelConfig) -> Tensor:
     """Return the deployment NMS mask for one unpadded candidate row."""
@@ -97,112 +38,36 @@ def push_nms_mask(candidates: dict[str, Tensor], config: ModelConfig) -> Tensor:
     return keep
 
 
-def decode_push_candidates(
-    sensor: dict[str, Tensor],
-    condition: PushCondition,
-    push: dict[str, Tensor],
-    config: ModelConfig,
-    *,
-    use_push_potential: bool,
-) -> tuple[list[dict[str, Tensor]], list[dict[str, Tensor]]]:
-    """Decode pre-NMS and final candidates through the one formal protocol."""
-    condition.validate(sensor["xyz"].shape[1])
-    pre_nms_rows: list[dict[str, Tensor]] = []
-    final_rows: list[dict[str, Tensor]] = []
-    for row in range(sensor["xyz"].shape[0]):
-        xyz = sensor["xyz"][row]
-        if not bool(condition.target_valid[row]):
-            empty = _empty(xyz.device, xyz.dtype)
-            pre_nms_rows.append(empty)
-            final_rows.append(_empty(xyz.device, xyz.dtype))
-            continue
-        object_probability = condition.object_probability[row]
-        active = condition.object_valid[row]
-        object_score_all = torch.sigmoid(push["object_logits"][row])
-        objects = torch.nonzero(active, as_tuple=False).flatten()
-        if len(objects):
-            objects = objects[
-                object_score_all[objects].argsort(descending=True, stable=True)[
-                    : config.push_object_topk
-                ]
-            ]
-        point_index = _top_contacts(
-            push["contact_logits"][row],
-            object_probability,
-            objects,
-            sensor["point_mask"][row].bool() & push["direction_point_mask"][row].bool(),
-            config.push_candidates,
-        )
-        if not len(point_index):
-            pre_nms_rows.append(_empty(xyz.device, xyz.dtype))
-            final_rows.append(_empty(xyz.device, xyz.dtype))
-            continue
-        direction_probability = torch.sigmoid(push["direction_logits"][row, point_index])
-        directions_per_contact = min(
-            config.push_directions_per_contact, direction_probability.shape[-1]
-        )
-        direction_score, direction_bin = direction_probability.topk(
-            directions_per_contact, dim=-1
-        )
-        expanded_point = point_index[:, None].expand(-1, directions_per_contact).reshape(-1)
-        direction_bin = direction_bin.reshape(-1)
-        direction_score = direction_score.reshape(-1)
-        contact_score = torch.sigmoid(push["contact_logits"][row, expanded_point])
-        membership = object_probability[objects[:, None], expanded_point[None]].T
-        pushed_object = objects[membership.argmax(-1)]
-        object_score = object_score_all[pushed_object]
-        utility = push["utility_delta"][row, expanded_point, direction_bin]
-        if use_push_potential:
-            utility_factor = torch.sigmoid(utility / float(config.push_utility_temperature))
-            eligible = utility > float(config.push_utility_threshold)
-        else:
-            utility_factor = torch.ones_like(utility)
-            eligible = torch.ones_like(utility, dtype=torch.bool)
-        proposal_score = object_score * contact_score * direction_score * utility_factor
-        eligible &= proposal_score >= float(config.push_candidate_probability_threshold)
-        expanded_point = expanded_point[eligible]
-        direction_bin = direction_bin[eligible]
-        direction_score = direction_score[eligible]
-        contact_score = contact_score[eligible]
-        pushed_object = pushed_object[eligible]
-        object_score = object_score[eligible]
-        utility = utility[eligible]
-        proposal_score = proposal_score[eligible]
-        if len(expanded_point) > config.max_push_candidates:
-            keep = proposal_score.topk(config.max_push_candidates).indices
-            expanded_point, direction_bin = expanded_point[keep], direction_bin[keep]
-            direction_score, contact_score = direction_score[keep], contact_score[keep]
-            pushed_object, object_score = pushed_object[keep], object_score[keep]
-            utility, proposal_score = utility[keep], proposal_score[keep]
-        angle = (direction_bin.float() + 0.5) * 2.0 * math.pi / config.num_direction_bins
-        center = torch.stack((torch.cos(angle), torch.sin(angle)), -1)
-        residual = push["direction_residual"][row, expanded_point, direction_bin]
-        planar = torch.nn.functional.normalize(center + residual, dim=-1)
-        direction_world = torch.cat(
-            (planar, torch.zeros(len(planar), 1, dtype=xyz.dtype, device=xyz.device)), -1
-        )
-        decoded = {
-            "object": pushed_object,
-            "contact_world": xyz[expanded_point],
-            "direction_world": direction_world,
-            "point_index": expanded_point,
-            "direction_bin": direction_bin,
-            "direction_residual": residual,
-            "push_distance": torch.full_like(proposal_score, PUSH_DISTANCE_M),
-            "object_score": object_score,
-            "contact_score": contact_score,
-            "direction_score": direction_score,
-            "utility": utility,
-            "proposal_score": proposal_score,
-            # Filled only after exact action decoding by PushEffectivenessEvaluator.
-            "effective_logit": torch.full_like(proposal_score, float("nan")),
-            "effective_probability": torch.full_like(proposal_score, float("nan")),
-        }
-        pre_nms_rows.append(decoded)
-        nms = push_nms_mask(decoded, config)
-        final_rows.append({key: value[nms] for key, value in decoded.items()})
-    return pre_nms_rows, final_rows
 
+def decode_push_candidates(sensor, condition, push, config):
+    actions, logits = push["actions"], push["effective_logit"]
+    pre, final = [], []
+    for b in range(len(sensor["xyz"])):
+        ids = torch.nonzero(actions.batch_index == b, as_tuple=False).flatten()
+        ids = ids[logits[ids].argsort(descending=True, stable=True)]
+        ids = ids[:config.max_push_candidates]
+        a = actions.select(ids)
+        score = logits[ids].sigmoid()
+        k = len(ids)
+        angle = torch.atan2(a.direction_world[:, 1], a.direction_world[:, 0]).remainder(2*math.pi)
+        bins = (angle * config.num_direction_bins / (2*math.pi)).long()
+        # Point index is output metadata only, never used for action scoring.
+        anchors = []
+        for i in range(k):
+            member = sensor["point_mask"][b].bool() & (condition.object_probability[b, a.object[i]] >= .5)
+            points = torch.nonzero(member, as_tuple=False).flatten()
+            anchors.append(points[(sensor["xyz"][b, points]-a.contact_world[i]).norm(dim=-1).argmin()])
+        row = {"object": a.object, "contact_world": a.contact_world,
+               "direction_world": a.direction_world, "push_distance": a.push_distance,
+               "point_index": torch.stack(anchors) if anchors else a.object.new_empty(0),
+               "direction_bin": bins, "direction_residual": score.new_zeros((k, 2)),
+               "object_score": torch.ones_like(score), "contact_score": torch.ones_like(score),
+               "direction_score": torch.ones_like(score), "utility": score,
+               "proposal_score": score, "effective_logit": logits[ids], "effective_probability": score}
+        pre.append(row)
+        keep = push_nms_mask(row, config)
+        final.append({key: value[keep] for key, value in row.items()})
+    return pre, final
 
 def proposal_recall_counts(
     rows: list[dict[str, Tensor]],

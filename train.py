@@ -26,7 +26,6 @@ DEFAULT_PATHS_CONFIG = PROJECT / "configs" / "local_paths.yaml"
 STAGE_CONFIGS = {
     "perception": PROJECT / "configs" / "stage" / "perception.yaml",
     "grasp": PROJECT / "configs" / "stage" / "grasp.yaml",
-    "push": PROJECT / "configs" / "stage" / "push.yaml",
     "push_evaluator": PROJECT / "configs" / "stage" / "push_evaluator.yaml",
 }
 
@@ -169,7 +168,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--paths-config", type=Path, default=DEFAULT_PATHS_CONFIG)
     parser.add_argument(
-        "--stage", choices=("all", "perception", "grasp", "push"), default="all",
+        "--stage", choices=("all", "perception", "grasp"), default="all",
         help="Run one stage, or all three sequentially.",
     )
     parser.add_argument(
@@ -328,7 +327,7 @@ def _pipeline_command(
 
 def _push_evaluator_command(
     args: argparse.Namespace,
-    proposal_checkpoint: Path,
+    perception_checkpoint: Path,
     output_checkpoint: Path,
 ) -> list[str]:
     dataset, acronym, functional_region, pybullet_python, observation_cache = _resolve_paths(args)
@@ -358,8 +357,8 @@ def _push_evaluator_command(
         str(PROJECT / "train_push_evaluator.py"),
         "--config",
         str(STAGE_CONFIGS["push_evaluator"].resolve()),
-        "--proposal-checkpoint",
-        str(proposal_checkpoint.resolve()),
+        "--perception-checkpoint",
+        str(perception_checkpoint.resolve()),
         "--output",
         str(output_checkpoint.resolve()),
         *overrides,
@@ -383,7 +382,6 @@ def _run_all_stages(args: argparse.Namespace) -> None:
     stage_outputs = {
         "perception": root / "perception",
         "grasp": root / "grasp",
-        "push": root / "push",
         "push_evaluator": root / "push_evaluator",
     }
     subprocess.run(
@@ -394,23 +392,14 @@ def _run_all_stages(args: argparse.Namespace) -> None:
         _pipeline_command(args, "grasp", stage_outputs["grasp"]),
         check=True, cwd=PROJECT,
     )
-    subprocess.run(
-        _pipeline_command(args, "push", stage_outputs["push"]),
-        check=True, cwd=PROJECT,
-    )
-    proposal_checkpoint = stage_outputs["push"] / "push_best.pt"
-    if not proposal_checkpoint.is_file():
-        proposal_checkpoint = stage_outputs["push"] / "push_last.pt"
-    if not proposal_checkpoint.is_file():
-        raise FileNotFoundError(
-            "Stage-C completed without a usable proposal checkpoint: "
-            f"{stage_outputs['push']}"
-        )
+    perception_checkpoint = stage_outputs["perception"] / "perception_best.pt"
+    if not perception_checkpoint.is_file():
+        raise FileNotFoundError(f"Missing perception checkpoint: {perception_checkpoint}")
     stage_outputs["push_evaluator"].mkdir(parents=True, exist_ok=True)
     subprocess.run(
         _push_evaluator_command(
             args,
-            proposal_checkpoint,
+            perception_checkpoint,
             stage_outputs["push_evaluator"] / "push_evaluator_best.pt",
         ),
         check=True,
@@ -420,7 +409,6 @@ def _run_all_stages(args: argparse.Namespace) -> None:
         stage: stage_outputs[stage] / f"{stage}_best.pt"
         for stage in stage_outputs
     }
-    checkpoint_paths["push"] = proposal_checkpoint
     missing = [str(path) for path in checkpoint_paths.values() if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"All-stage checkpoint layout is incomplete: {missing}")

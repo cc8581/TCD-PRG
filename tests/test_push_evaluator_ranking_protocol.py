@@ -7,7 +7,6 @@ from tcd_prg.evaluators.push_effectiveness import (
     proposal_positive_match_masks,
     push_candidate_ranking_counts,
 )
-from tcd_prg.models.staged_checkpoint import push_checkpoint_fingerprint
 
 
 def _batch() -> dict[str, object]:
@@ -61,20 +60,3 @@ def test_proposal_miss_is_not_charged_to_evaluator() -> None:
     )
     counts = push_candidate_ranking_counts(rows, masks)
     assert counts["push_evaluator_positive_candidate_set_count"] == 0
-
-
-def test_stage_c_fingerprint_tracks_ema_and_exact_tensor_state(tmp_path) -> None:
-    first = tmp_path / "first.pt"
-    second = tmp_path / "second.pt"
-    payload = {
-        "model": {"push.weight": torch.tensor([1.0])},
-        "ema": {"push.weight": torch.tensor([2.0])},
-    }
-    torch.save(payload, first)
-    torch.save(payload, second)
-    digest, source = push_checkpoint_fingerprint(first)
-    assert source == "ema"
-    assert push_checkpoint_fingerprint(second)[0] == digest
-    payload["ema"]["push.weight"] += 1.0
-    torch.save(payload, second)
-    assert push_checkpoint_fingerprint(second)[0] != digest

@@ -14,6 +14,7 @@ from tcd_prg.datasets.torch_dataset import (
 )
 from tcd_prg.losses import TCDPRGObjective
 from tcd_prg.models import StandalonePushModel, TCDPRGModel
+from tcd_prg.models.staged_checkpoint import perception_geometry_fingerprint
 from tcd_prg.observation.saved import SavedObservationProvider
 from tcd_prg.trainers import Trainer
 
@@ -99,52 +100,17 @@ def test_checkpoint_rejects_obsolete_schema(tmp_path, tiny_batch) -> None:
         trainer.load_checkpoint(path)
 
 
-def test_stage_c_checkpoint_round_trip_excludes_frozen_push_evaluator(tmp_path) -> None:
-    config = TCDPRGConfig(
-        model=ModelConfig(feature_dim=32, push_direction_feature_dim=16),
-        training=TrainingConfig(stage="push", device="cpu", amp=False),
-        losses=LossConfig(
-            instance=0.0,
-            region=0.0,
-            task_grasp=0.0,
-            push_object=0.25,
-            push_contact=0.25,
-            push_direction=0.25,
-            push_potential=0.25,
-        ),
-        output_dir=str(tmp_path),
-    )
-    model = StandalonePushModel(config.model)
-    model.push_evaluator.requires_grad_(False)
-    trainer = Trainer(
-        model,
-        torch.optim.AdamW(model.push.parameters(), lr=1e-4),
-        config,
-        lambda _module, _batch: (torch.zeros((), requires_grad=True), {}),
-    )
-    expected_push = {key: value.clone() for key, value in model.push.state_dict().items()}
-    path = tmp_path / "push_best.pt"
-    trainer.save_checkpoint(path)
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    assert payload["model"]
-    assert all(key.startswith("push.") for key in payload["model"])
-    assert not any(key.startswith("push_evaluator.") for key in payload["model"])
-
-    evaluator_before = {
-        key: value.clone() for key, value in model.push_evaluator.state_dict().items()
+def test_perception_geometry_fingerprint_accepts_scalar_integer_buffers() -> None:
+    payload = {
+        "model": {
+            "encoder.scene_backbone.weight": torch.ones(2, 3),
+            "encoder.scene_backbone.scalar_buffer": torch.tensor(7, dtype=torch.long),
+        }
     }
-    with torch.no_grad():
-        for parameter in model.push.parameters():
-            parameter.add_(1.0)
-    trainer.load_checkpoint(path)
-
-    assert all(
-        torch.equal(expected_push[key], model.push.state_dict()[key]) for key in expected_push
-    )
-    assert all(
-        torch.equal(evaluator_before[key], model.push_evaluator.state_dict()[key])
-        for key in evaluator_before
-    )
+    first = perception_geometry_fingerprint(payload)
+    second = perception_geometry_fingerprint(payload)
+    assert first == second
+    assert len(first) == 64
 
 
 def test_amp_overflow_does_not_advance_optimizer_step(tmp_path) -> None:

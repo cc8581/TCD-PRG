@@ -1,4 +1,4 @@
-# Stage C2: freeze the PUSH proposal generator and train exact-action effectiveness ranking.
+# Independent evaluator: logged GT actions only; frozen perception geometry.
 defaults:
   - ../config.yaml
   - _self_

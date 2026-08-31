@@ -22,7 +22,7 @@ from .backbones import (
     TaskConditionedPointTransformer,
 )
 from .graspnet import FrozenGraspNetProposalGenerator
-from .push import PushEffectivenessEvaluator, PushHead
+from .push import PushEffectivenessEvaluator, RulePushGenerator
 from .region import TaskRegionHead
 from .stageb_condition import StageBCondition
 from .push_condition import PushCondition
@@ -36,6 +36,7 @@ SENSOR_KEYS = frozenset(
         "point_mask",
         "grid_coord",
         "source_view",
+        "geometry_feature",
         "graspnet_xyz_world",
         "graspnet_point_mask",
         "camera2_eye_world",
@@ -162,20 +163,10 @@ class TCDPRGModel(nn.Module):
             scene_points=c.task_grasp_scene_points,
             gripper_points=c.task_grasp_gripper_points,
         )
-        self.push = PushHead(
-            c.feature_dim,
-            c.num_direction_bins,
-            c.push_direction_feature_dim,
-            c.push_direction_transformer_layers,
-            c.push_direction_transformer_heads,
-            c.push_direction_contact_topk,
-            c.push_object_topk,
-            c.num_categories,
-            c.num_task_regions,
-        )
+        self.push = RulePushGenerator(c)
         self.push_evaluator_ready = False
         self.push_evaluator = PushEffectivenessEvaluator(
-            c.feature_dim, c.push_direction_feature_dim
+            c.feature_dim, c.num_categories, c.num_task_regions
         )
 
     @staticmethod
@@ -563,12 +554,13 @@ class TCDPRGModel(nn.Module):
         self,
         sensor: dict[str, Tensor],
         condition: PushCondition,
-        training_hints: Mapping[str, Tensor] | None = None,
     ) -> dict[str, Tensor]:
-        """Shared Stage-C path for GT standalone training and A+C inference."""
+        """Inference-only rule candidates scored by the independent evaluator."""
         condition.validate(sensor["xyz"].shape[1])
-        hints = training_hints or {}
-        return self.push(sensor, condition, hints.get("push_direction_point_mask"))
+        if "geometry_feature" not in sensor:
+            raise ValueError("Push inference requires Stage-A geometry_feature")
+        actions = self.push(sensor, condition)
+        return {"actions": actions, "effective_logit": self.push_evaluator(sensor, condition, actions)}
 
     def forward_instances(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         """Task-free sensor-only instance inference for real-scene acquisition."""
@@ -633,7 +625,7 @@ class TCDPRGModel(nn.Module):
         condition = batch.get("push_condition")
         if not isinstance(condition, PushCondition):
             raise TypeError("Stage-C forward requires a PushCondition")
-        push = self.forward_push_from_condition(sensor, condition, batch.get("training_hints"))
+        push = self.forward_push_from_condition(sensor, condition)
         return {
             "push_condition": condition,
             "encoded": None,
@@ -680,12 +672,14 @@ class TCDPRGModel(nn.Module):
         task_grasp = self.forward_task_grasp_from_condition(sensor, condition)
         global_grasp = self._forward_global_grasp(encoded, sensor)
         push_condition = self._push_condition(encoded, region, task)
-        push = self.forward_push_from_condition(sensor, push_condition, batch.get("training_hints"))
+        push_sensor = dict(sensor)
+        push_sensor["geometry_feature"] = encoded.scene_point_features
+        push = self.forward_push_from_condition(push_sensor, push_condition)
         return {
             "stageb_condition": condition,
             "push_condition": push_condition,
             "encoded": encoded,
-            "sensor": sensor,
+            "sensor": push_sensor,
             "task": task,
             "instance": encoded.instance,
             "region": region,

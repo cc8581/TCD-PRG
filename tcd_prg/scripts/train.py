@@ -27,13 +27,10 @@ from tcd_prg.datasets import (
 from tcd_prg.datasets.stageb_manifest import build_dynamic_acronym_provenance, build_provenance
 from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.losses import TCDPRGObjective
-from tcd_prg.models import StandalonePushModel, TCDPRGModel
+from tcd_prg.models.staged_checkpoint import stage_training_state
+from tcd_prg.models import TCDPRGModel
 from tcd_prg.observation.cached import CachedObservationProvider
 from tcd_prg.planners.candidate_generator import DenseCandidateGenerator
-from tcd_prg.planners.push_decoder import (
-    decode_push_candidates,
-    proposal_recall_counts,
-)
 from tcd_prg.pretrained import load_pretrained_backbone, prepare_pretrained_checkpoint
 from tcd_prg.runtime import (
     StageBBinaryBatchCollator,
@@ -61,7 +58,7 @@ def summarize_validation_summaries(
             metric_counts[str(key)] = metric_counts.get(str(key), 0) + int(value)
     metrics = {
         key: value
-        if key in Trainer.COUNT_TERMS
+        if Trainer.is_count_term(key)
         else value / max(1, metric_counts.get(key, 0))
         for key, value in metric_sums.items()
     }
@@ -275,6 +272,7 @@ def load_pretrain_checkpoint(model: torch.nn.Module, payload: dict, stage: str) 
     supplied = payload.get("model")
     if not isinstance(supplied, dict):
         raise RuntimeError("Pretrain checkpoint does not contain a model state_dict")
+    supplied = stage_training_state(source, supplied, stage)
     if set(current) != set(supplied):
         missing = sorted(set(current) - set(supplied))
         extra = sorted(set(supplied) - set(current))
@@ -347,6 +345,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_config(args.config, args.overrides)
+    if config.training.stage == "push":
+        raise ValueError("Push generation training was removed; use train_push_evaluator.py")
     pretrain_checkpoint = args.pretrain_checkpoint or config.training.pretrain_checkpoint
     if args.resume and pretrain_checkpoint:
         raise ValueError("--resume and --pretrain-checkpoint are mutually exclusive")
@@ -657,11 +657,7 @@ def main() -> None:
         if final_validation_dataset is not None and len(final_validation_dataset)
         else None
     )
-    model = (
-        StandalonePushModel(config.model)
-        if config.training.stage == "push"
-        else TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet)
-    )
+    model = TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet)
     if pretrain_payload is not None:
         load_pretrain_checkpoint(model, pretrain_payload, config.training.stage)
         if rank == 0:
@@ -670,8 +666,6 @@ def main() -> None:
                 f"{Path(pretrain_checkpoint).resolve()}; trainer state starts at step 0",
                 flush=True,
             )
-    if config.training.stage == "push":
-        model.push_evaluator.requires_grad_(False)
     pretrained_report = None
     resume_pretrained_names: list[str] = []
     resume_validation_protocol_changed = False
@@ -929,35 +923,6 @@ def main() -> None:
                 batch = trainer._move(raw, trainer.device)
                 _, terms, model_output = objective(module, batch, return_output=True)
                 terms = dict(terms)
-                if config.training.stage == "push":
-                    pre_nms, final = decode_push_candidates(
-                        model_output["sensor"],
-                        model_output["push_condition"],
-                        model_output["push"],
-                        config.model,
-                        use_push_potential=config.ablation.use_push_potential,
-                    )
-                    pre_hits, proposal_total = proposal_recall_counts(
-                        pre_nms,
-                        batch,
-                        contact_threshold_m=config.evaluation.push_match_contact_m,
-                        direction_threshold_deg=config.evaluation.push_match_direction_deg,
-                    )
-                    final_hits, final_total = proposal_recall_counts(
-                        final,
-                        batch,
-                        contact_threshold_m=config.evaluation.push_match_contact_m,
-                        direction_threshold_deg=config.evaluation.push_match_direction_deg,
-                    )
-                    if not bool(torch.equal(proposal_total, final_total)):
-                        raise RuntimeError("PUSH proposal recall denominator changed across NMS")
-                    terms.update(
-                        {
-                            "push_proposal_positive_total_count": proposal_total,
-                            "push_proposal_positive_pre_nms_hits_count": pre_hits,
-                            "push_proposal_positive_final_hits_count": final_hits,
-                        }
-                    )
                 if stageb:
                     valid = (
                         batch["stageb_candidate_valid"].bool()
@@ -998,7 +963,7 @@ def main() -> None:
                 total += score * groups
                 count += groups
                 for key, value in terms.items():
-                    if key in Trainer.COUNT_TERMS:
+                    if Trainer.is_count_term(key):
                         metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
                         metric_counts[key] = metric_counts.get(key, 0) + 1
                     else:

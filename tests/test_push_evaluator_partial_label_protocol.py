@@ -8,7 +8,6 @@ from tcd_prg.evaluators.push_effectiveness import (
     push_candidate_ranking_counts,
     push_effectiveness_metrics,
 )
-from tcd_prg.models.push.evaluator import nearest_object_contact_point
 
 
 def _batch() -> dict[str, object]:
@@ -45,17 +44,6 @@ def test_unknown_top1_is_indeterminate_not_negative() -> None:
     assert counts["push_evaluator_top1_evaluable_count"] == 0
     assert counts["push_evaluator_top5_evaluable_count"] == 1
     assert counts["push_evaluator_recall_at_5_count"] == 1
-
-
-def test_object_anchor_cannot_jump_to_nearby_other_object() -> None:
-    point = nearest_object_contact_point(
-        torch.tensor([[0.000, 0.0, 0.0], [0.002, 0.0, 0.0]]),
-        torch.tensor([True, True]),
-        torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-        0,
-        torch.tensor([0.0019, 0.0, 0.0]),
-    )
-    assert int(point) == 0
 
 
 def test_rank_auroc_handles_ties_without_pairwise_matrix() -> None:

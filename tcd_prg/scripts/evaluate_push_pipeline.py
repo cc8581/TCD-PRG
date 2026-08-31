@@ -21,7 +21,6 @@ from tcd_prg.models import StandalonePushModel, TCDPRGModel, push_condition_from
 from tcd_prg.models.staged_checkpoint import (
     load_perception_stage,
     load_push_evaluator,
-    load_push_stage,
 )
 from tcd_prg.planners.push_decoder import decode_push_candidates, proposal_recall_counts
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter
@@ -45,7 +44,6 @@ def oracle_push_pipeline_counts(stage_c, batch, config) -> dict[str, torch.Tenso
         proposal["push_condition"],
         proposal["push"],
         config.model,
-        use_push_potential=config.ablation.use_push_potential,
     )
     pre_hits, total = proposal_recall_counts(
         pre_nms,
@@ -61,11 +59,6 @@ def oracle_push_pipeline_counts(stage_c, batch, config) -> dict[str, torch.Tenso
     )
     if not bool(torch.equal(total, final_total)):
         raise RuntimeError("Oracle PUSH denominator changed across NMS")
-    for row_index, row in enumerate(final):
-        if len(row["point_index"]):
-            logits = stage_c.push_evaluator(proposal["push"], row, batch_index=row_index)
-            row["effective_logit"] = logits
-            row["effective_probability"] = torch.sigmoid(logits)
     positive_masks, _, known_masks = proposal_known_outcome_masks(
         final,
         batch,
@@ -105,8 +98,7 @@ def _ratio(payload: dict[str, float], numerator: str, denominator: str) -> float
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
-    parser.add_argument("--stage-a-checkpoint", required=True)
-    parser.add_argument("--stage-c-checkpoint", required=True)
+    parser.add_argument("--perception-checkpoint", required=True)
     parser.add_argument("--push-evaluator-checkpoint", required=True)
     parser.add_argument("--split", default="val", choices=("val", "test"))
     parser.add_argument("--output", default="outputs/push_pipeline_metrics.json")
@@ -133,13 +125,12 @@ def main() -> None:
     stage_a = TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet).to(
         device
     )
-    stage_c = StandalonePushModel(config.model).to(device)
-    load_perception_stage(stage_a, args.stage_a_checkpoint, config)
-    load_push_stage(stage_c, args.stage_c_checkpoint, config)
+    stage_c = StandalonePushModel(config.model, config.backbone).to(device)
+    load_perception_stage(stage_a, args.perception_checkpoint, config)
+    stage_c.load_perception_geometry(args.perception_checkpoint)
     load_push_evaluator(
         stage_c,
         args.push_evaluator_checkpoint,
-        proposal_checkpoint=args.stage_c_checkpoint,
     )
     stage_a.eval()
     stage_c.eval()

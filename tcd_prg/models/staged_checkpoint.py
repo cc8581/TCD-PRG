@@ -14,14 +14,29 @@ from tcd_prg.datasets.stageb_manifest import compatibility_provenance, stageb_co
 STAGE_PREFIXES = {
     "perception": ("encoder.", "region_head."),
     "grasp": ("task_grasp.",),
-    "push": ("push.",),
 }
 
-PUSH_EVALUATOR_PROTOCOL_VERSION = 1
+PUSH_EVALUATOR_PROTOCOL_VERSION = 2
+
+
+def perception_geometry_fingerprint(payload: dict) -> str:
+    source = payload.get("ema") or payload.get("model", {})
+    prefix = "encoder.scene_backbone."
+    tensors = {name[len(prefix):]: value for name, value in source.items() if name.startswith(prefix)}
+    if not tensors:
+        raise RuntimeError("Perception checkpoint contains no scene geometry encoder")
+    digest = hashlib.sha256()
+    for name in sorted(tensors):
+        tensor = tensors[name].detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
 
 
 def resolve_staged_checkpoint_root(root: str | Path) -> dict[str, Path]:
-    """Resolve the four stage-best checkpoints from one portable run directory."""
+    """Resolve the three stage-best checkpoints from one portable run directory."""
 
     root = Path(root).expanduser().resolve()
     manifest_path = root / "checkpoints.json"
@@ -33,10 +48,10 @@ def resolve_staged_checkpoint_root(root: str | Path) -> dict[str, Path]:
     else:
         configured = {
             stage: f"{stage}/{stage}_best.pt"
-            for stage in ("perception", "grasp", "push", "push_evaluator")
+            for stage in ("perception", "grasp", "push_evaluator")
         }
     paths: dict[str, Path] = {}
-    for stage in ("perception", "grasp", "push", "push_evaluator"):
+    for stage in ("perception", "grasp", "push_evaluator"):
         relative = configured.get(stage)
         if not isinstance(relative, str) or not relative:
             raise ValueError(f"Checkpoint manifest is missing stage {stage!r}")
@@ -66,27 +81,6 @@ PERCEPTION_RUNTIME_MODEL_FIELDS = (
     "target_reid_max_center_distance_m",
     "target_prompt_min_support",
     "target_prompt_min_margin",
-)
-
-PUSH_RUNTIME_MODEL_FIELDS = (
-    "instance_queries",
-    "num_categories",
-    "num_task_regions",
-    "num_direction_bins",
-    "push_contact_match_max_distance_m",
-    "push_direction_feature_dim",
-    "push_direction_transformer_layers",
-    "push_direction_transformer_heads",
-    "push_direction_contact_topk",
-    "push_object_topk",
-    "push_candidates",
-    "push_directions_per_contact",
-    "max_push_candidates",
-    "push_utility_threshold",
-    "push_candidate_probability_threshold",
-    "push_utility_temperature",
-    "push_nms_contact_m",
-    "push_nms_direction_deg",
 )
 
 
@@ -136,56 +130,28 @@ def validate_perception_stage_runtime(payload: dict, runtime_config) -> None:
     )
 
 
-def validate_push_stage_runtime(payload: dict, runtime_config) -> None:
-    """Reject shape-invariant decoder/proposal protocol drift."""
-    _require_fields(
-        payload,
-        runtime_config,
-        {"model": PUSH_RUNTIME_MODEL_FIELDS, "backbone": ("grid_size_m",)},
-        "push",
-    )
-    saved_ablation = payload.get("config", {}).get("ablation", {})
-    saved_use_potential = bool(saved_ablation.get("use_push_potential", False))
-    runtime_use_potential = bool(runtime_config.ablation.use_push_potential)
-    if saved_use_potential != runtime_use_potential:
-        raise RuntimeError("push runtime mismatch: ablation.use_push_potential")
-    if runtime_use_potential:
-        saved_losses = payload.get("config", {}).get("losses", {})
-        if float(saved_losses.get("push_potential", 0.0)) <= 0.0:
-            raise RuntimeError(
-                "push runtime requires a Stage-C checkpoint trained with push potential"
-            )
-
-
 def load_perception_stage(model: nn.Module, checkpoint: str | Path, runtime_config) -> dict:
     payload = _load_stage(model, checkpoint, "perception")
     validate_perception_stage_runtime(payload, runtime_config)
     return payload
 
 
-def load_push_stage(model: nn.Module, checkpoint: str | Path, runtime_config) -> dict:
-    payload = _load_stage(model, checkpoint, "push")
-    validate_push_stage_runtime(payload, runtime_config)
-    return payload
-
-
 def load_staged_tcd_prg(
     model: nn.Module,
-    stage_a_checkpoint: str | Path,
+    perception_checkpoint: str | Path,
     stage_b_checkpoint: str | Path,
-    stage_c_checkpoint: str | Path,
     runtime_config,
 ) -> float:
-    stage_a = load_perception_stage(model, stage_a_checkpoint, runtime_config)
+    stage_a = load_perception_stage(model, perception_checkpoint, runtime_config)
     stage_b = _load_stage(model, stage_b_checkpoint, "grasp")
-    stage_c = load_push_stage(model, stage_c_checkpoint, runtime_config)
     _require_fields(
         stage_b,
         runtime_config,
         {"model": ("task_grasp_scene_points", "task_grasp_gripper_points")},
         "grasp",
     )
-    del stage_a, stage_c
+    model.perception_geometry_fingerprint = perception_geometry_fingerprint(stage_a)
+    del stage_a
     saved_stageb = compatibility_provenance(stage_b.get("stageb_provenance", {}))
     runtime_stageb = stageb_compatibility(runtime_config)
     for key in ("scene_preprocess", "target_graspnet", "proposal_label_protocol"):
@@ -196,54 +162,57 @@ def load_staged_tcd_prg(
     return float(stage_b["task_grasp_probability_threshold"])
 
 
-def push_checkpoint_fingerprint(checkpoint: str | Path) -> tuple[str, str]:
-    """Fingerprint the exact Stage-C state used by deployment."""
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    source = payload.get("ema") or payload.get("model", payload)
-    source_kind = "ema" if payload.get("ema") else "model"
-    tensors = {name: value for name, value in source.items() if name.startswith("push.")}
-    if not tensors:
-        raise RuntimeError(f"{checkpoint} does not contain Stage-C push.* tensors")
-    digest = hashlib.sha256()
-    for name in sorted(tensors):
-        tensor = tensors[name].detach().cpu().contiguous()
-        digest.update(name.encode("utf-8"))
-        digest.update(str(tuple(tensor.shape)).encode("ascii"))
-        digest.update(str(tensor.dtype).encode("ascii"))
-        digest.update(tensor.view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest(), source_kind
-
-
-def load_push_evaluator(
-    model: nn.Module,
-    checkpoint: str | Path,
-    *,
-    proposal_checkpoint: str | Path | None = None,
-) -> None:
-    """Load an evaluator and optionally verify its exact Stage-C provenance."""
+def load_push_evaluator(model, checkpoint):
+    """Reject old proposal-dependent checkpoints and mismatched perception features."""
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if payload.get("training_stage") != "push_evaluator":
-        raise RuntimeError(f"{checkpoint} is not a push_evaluator checkpoint")
-    version = int(payload.get("push_evaluator_protocol_version", -1))
-    if version != PUSH_EVALUATOR_PROTOCOL_VERSION:
-        raise RuntimeError(
-            f"{checkpoint} uses PUSH evaluator protocol {version}; "
-            f"runtime requires {PUSH_EVALUATOR_PROTOCOL_VERSION}. "
-            "Retrain the evaluator under the current exact-action protocol."
-        )
-    if proposal_checkpoint is not None:
-        expected = payload.get("proposal_state_fingerprint")
-        expected_source = payload.get("proposal_state_source")
-        if not expected:
-            raise RuntimeError(
-                "PUSH evaluator checkpoint lacks proposal provenance; retrain it "
-                "against the Stage-C checkpoint used for deployment"
-            )
-        actual, actual_source = push_checkpoint_fingerprint(proposal_checkpoint)
-        if actual != expected or (expected_source is not None and expected_source != actual_source):
-            raise RuntimeError(
-                "PUSH evaluator/Stage-C mismatch: evaluator and deployment use "
-                "different proposal states"
-            )
+        raise RuntimeError("Not a push_evaluator checkpoint")
+    if payload.get("push_evaluator_protocol_version") != PUSH_EVALUATOR_PROTOCOL_VERSION:
+        raise RuntimeError("Obsolete PUSH evaluator: retrain the independent action evaluator")
+    expected = payload.get("perception_geometry_fingerprint")
+    actual = getattr(model, "perception_geometry_fingerprint", None)
+    if not expected or not actual or expected != actual:
+        raise RuntimeError("PUSH evaluator/perception geometry mismatch")
     model.push_evaluator.load_state_dict(payload["model"], strict=True)
     model.push_evaluator_ready = True
+
+def stage_training_state(model, state, stage):
+    """Retain strict A/B state loading while discarding obsolete inactive PUSH tensors."""
+    if stage not in {"perception", "grasp"}:
+        return state
+    current = model.state_dict()
+    prefixes = ("push.", "push_evaluator.")
+    old = {k: v for k, v in state.items() if k.startswith(prefixes)}
+    new = {k: v for k, v in current.items() if k.startswith(prefixes)}
+    if old.keys() == new.keys() and all(old[k].shape == new[k].shape for k in old):
+        return state
+    return {**{k: v for k, v in state.items() if not k.startswith(prefixes)}, **new}
+
+
+def stage_training_optimizer_state(model, optimizer, payload):
+    """Preserve A/B optimizer moments; replace only obsolete unused trailing evaluator slots."""
+    import copy
+    saved = payload["optimizer"]
+    if payload.get("training_stage") not in {"perception", "grasp"}:
+        return saved
+    legacy = payload["model"]
+    if not any(k.startswith("push.") for k in legacy):
+        return saved
+    old_count = sum(k.startswith("push_evaluator.") for k in legacy)
+    new_count = sum(k.startswith("push_evaluator.") and p.requires_grad for k, p in model.named_parameters())
+    current = optimizer.state_dict()
+    if [len(g["params"]) for g in saved["param_groups"]] == [len(g["params"]) for g in current["param_groups"]]:
+        return saved
+    result = copy.deepcopy(saved)
+    if len(result["param_groups"]) != len(current["param_groups"]):
+        raise RuntimeError("A/B optimizer group mismatch")
+    group, destination = result["param_groups"][-1], current["param_groups"][-1]
+    if not old_count or len(group["params"]) - old_count + new_count != len(destination["params"]):
+        raise RuntimeError("A/B optimizer mismatch beyond inactive PUSH evaluator")
+    if any(p in result["state"] for p in group["params"][-old_count:]):
+        raise RuntimeError("Old A/B checkpoint unexpectedly optimized its PUSH evaluator")
+    if any(len(a["params"]) != len(b["params"]) for a, b in zip(result["param_groups"][:-1], current["param_groups"][:-1])):
+        raise RuntimeError("A/B active optimizer groups changed")
+    next_id = max(p for g in result["param_groups"] for p in g["params"]) + 1
+    group["params"] = group["params"][:-old_count] + list(range(next_id, next_id + new_count))
+    return result

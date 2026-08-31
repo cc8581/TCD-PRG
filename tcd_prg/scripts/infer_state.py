@@ -50,9 +50,8 @@ def main() -> None:
         "--checkpoint-root",
         help="Run directory containing checkpoints.json and the four stage subdirectories.",
     )
-    parser.add_argument("--stage-a-checkpoint")
+    parser.add_argument("--perception-checkpoint")
     parser.add_argument("--stage-b-checkpoint")
-    parser.add_argument("--stage-c-checkpoint")
     parser.add_argument("--scene-id", type=int, required=True)
     parser.add_argument("--state-id", type=int, required=True)
     parser.add_argument("--task-index", type=int, required=True)
@@ -63,17 +62,15 @@ def main() -> None:
     args = parser.parse_args()
     if args.checkpoint_root:
         explicit = (
-            args.stage_a_checkpoint,
+            args.perception_checkpoint,
             args.stage_b_checkpoint,
-            args.stage_c_checkpoint,
             args.push_evaluator_checkpoint,
         )
         if any(explicit):
             parser.error("--checkpoint-root cannot be combined with individual checkpoints")
         checkpoints = resolve_staged_checkpoint_root(args.checkpoint_root)
-        args.stage_a_checkpoint = str(checkpoints["perception"])
+        args.perception_checkpoint = str(checkpoints["perception"])
         args.stage_b_checkpoint = str(checkpoints["grasp"])
-        args.stage_c_checkpoint = str(checkpoints["push"])
         args.push_evaluator_checkpoint = str(checkpoints["push_evaluator"])
     config = load_config(args.config, args.overrides)
     adapter = create_adapter(config, allow_render=False)
@@ -82,8 +79,8 @@ def main() -> None:
     if config.baseline.type == "original_gapg_wrapper":
         policy = create_baseline(config)
     else:
-        if not all((args.stage_a_checkpoint, args.stage_b_checkpoint, args.stage_c_checkpoint)):
-            raise ValueError("learned inference requires all three staged checkpoints")
+        if not all((args.perception_checkpoint, args.stage_b_checkpoint)):
+            raise ValueError("learned inference requires perception and grasp checkpoints")
         if not args.push_evaluator_checkpoint:
             raise ValueError("learned PUSH inference requires --push-evaluator-checkpoint")
         device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
@@ -92,15 +89,13 @@ def main() -> None:
         )
         config.model.task_grasp_probability_threshold = load_staged_tcd_prg(
             model,
-            args.stage_a_checkpoint,
+            args.perception_checkpoint,
             args.stage_b_checkpoint,
-            args.stage_c_checkpoint,
             config,
         )
         load_push_evaluator(
             model,
             args.push_evaluator_checkpoint,
-            proposal_checkpoint=args.stage_c_checkpoint,
         )
         model.to(device)
         # Candidate scoring remains robot-agnostic. The deterministic
@@ -163,12 +158,11 @@ def main() -> None:
         "final_certification": final_certification,
         "checkpoints": (
             {
-                "perception": str(Path(args.stage_a_checkpoint).resolve()),
+                "perception": str(Path(args.perception_checkpoint).resolve()),
                 "grasp": str(Path(args.stage_b_checkpoint).resolve()),
-                "push": str(Path(args.stage_c_checkpoint).resolve()),
                 "push_evaluator": str(Path(args.push_evaluator_checkpoint).resolve()),
             }
-            if args.stage_a_checkpoint
+            if args.perception_checkpoint
             else None
         ),
         "baseline": config.baseline.type,

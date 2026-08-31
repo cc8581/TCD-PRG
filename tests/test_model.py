@@ -9,7 +9,6 @@ from tcd_prg.config import AblationConfig, GraspNetConfig, ModelConfig
 from tcd_prg.constants import ActionType
 from tcd_prg.evaluators import OfflineModelEvaluator
 from tcd_prg.models import StandalonePushModel, TCDPRGModel, push_condition_from_gt
-from tcd_prg.models.push import PushHead
 from tcd_prg.planners import DenseCandidateGenerator
 
 
@@ -70,21 +69,10 @@ def test_policy_heads_match_training_contract(tiny_batch) -> None:
         "target_crop_points",
     } <= set(output["task_grasp"])
     assert "object_logits" in output["global_grasp"]
-    assert output["push"]["utility_delta"].shape[-1] == _config().num_direction_bins
+    assert output["push"]["effective_logit"].ndim == 1
     assert "approach_logits" not in output["push"]
     assert "risk_logits" not in output["push"]
     assert "pick_remove" not in output
-
-
-def test_stagec_push_forward_uses_public_gt_condition(tiny_batch) -> None:
-    model = TCDPRGModel(_config()).eval()
-    batch = dict(tiny_batch)
-    batch["region_target"] = torch.zeros_like(batch["point_mask"])
-    batch["region_valid"] = torch.zeros_like(batch["point_mask"])
-    batch["push_condition"] = push_condition_from_gt(batch, _config().instance_queries)
-    output = model(batch, forward_mode="push")
-    assert output["encoded"] is None and output["instance"] is None
-    assert output["push"]["object_logits"].shape == (tiny_batch["xyz"].shape[0], _config().instance_queries)
 
 
 def test_perception_returns_push_condition(tiny_batch) -> None:
@@ -93,34 +81,6 @@ def test_perception_returns_push_condition(tiny_batch) -> None:
     assert condition.object_probability.shape[:2] == (tiny_batch["xyz"].shape[0], _config().instance_queries)
     assert condition.target_probability.shape == tiny_batch["point_mask"].shape
     assert torch.all(condition.region_probability <= condition.target_probability + 1e-6)
-
-
-def test_standalone_push_model_contains_only_push_parameters(tiny_batch) -> None:
-    config = _config(); batch = dict(tiny_batch)
-    batch["region_target"] = torch.zeros_like(batch["point_mask"])
-    batch["region_valid"] = torch.zeros_like(batch["point_mask"])
-    batch["push_condition"] = push_condition_from_gt(batch, config.instance_queries)
-    model = StandalonePushModel(config)
-    output = model(batch)
-    assert output["push"]["object_logits"].shape[-1] == config.instance_queries
-    assert all(
-        name.startswith(("push.", "push_evaluator."))
-        for name, _ in model.named_parameters()
-    )
-
-
-def test_standalone_push_sparse_outputs_are_autocast_safe(tiny_batch) -> None:
-    config = _config()
-    batch = dict(tiny_batch)
-    batch["region_target"] = torch.zeros_like(batch["point_mask"])
-    batch["region_valid"] = torch.zeros_like(batch["point_mask"])
-    batch["push_condition"] = push_condition_from_gt(batch, config.instance_queries)
-    # Training mode avoids the CPU-only Transformer inference fast path, while
-    # exercising the same autocast sparse assignments used by Stage C.
-    model = StandalonePushModel(config).train()
-    with torch.no_grad(), torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-        output = model(batch)
-    assert torch.isfinite(output["push"]["proposal_direction_feature"]).all()
 
 
 def test_camera2_to_task_evaluator_to_dense_candidate_end_to_end(tiny_batch) -> None:

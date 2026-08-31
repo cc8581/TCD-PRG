@@ -12,7 +12,6 @@ from tcd_prg.config import ModelConfig
 from tcd_prg.constants import PUSH_DISTANCE_M, ActionType
 from tcd_prg.geometry.grasp_nms import task_grasp_nms
 from tcd_prg.geometry.se3 import matrix_to_quaternion_xyzw
-from tcd_prg.models.push.head import push_contact_joint_score
 
 from .push_decoder import decode_push_candidates, push_nms_mask
 
@@ -43,42 +42,6 @@ class DenseCandidateGenerator:
             "effective_logit": torch.empty(0, device=device),
             "effective_probability": torch.empty(0, device=device),
         }
-
-    @staticmethod
-    def _top_per_object(
-        score: Tensor,
-        object_probability: Tensor,  # [Q,N]
-        object_ids: Tensor,
-        point_mask: Tensor,
-        total: int,
-    ) -> Tensor:
-        if not len(object_ids) or total <= 0:
-            return torch.empty(0, dtype=torch.long, device=score.device)
-        per_object = max(1, math.ceil(total / len(object_ids)))
-        owner = object_probability.argmax(0)
-        selected = []
-        for object_id in object_ids.tolist():
-            membership = object_probability[object_id]
-            domain = point_mask & (owner == object_id) & (membership >= 0.5)
-            if not bool(domain.any()):
-                domain = point_mask & (owner == object_id)
-            points = torch.nonzero(domain, as_tuple=False).flatten()
-            count = min(per_object, len(points))
-            if count:
-                joint = push_contact_joint_score(score[points], membership[points])
-                selected.append(points[torch.topk(joint, k=count).indices])
-        if not selected:
-            return torch.empty(0, dtype=torch.long, device=score.device)
-        candidates = torch.unique(torch.cat(selected), sorted=True)
-        # Preserve the same contact/object joint semantics when the balanced
-        # per-object pool is truncated globally. Raw contact logits alone can
-        # otherwise promote a point with weak membership in every shortlisted
-        # object over a geometrically consistent contact.
-        candidate_membership = object_probability[object_ids][:, candidates]
-        candidate_joint = push_contact_joint_score(
-            score[candidates][None], candidate_membership
-        ).amax(0)
-        return candidates[candidate_joint.topk(min(total, len(candidates))).indices]
 
     @staticmethod
     def _nearest_scene_point(translation: Tensor, xyz: Tensor, point_mask: Tensor) -> Tensor:
@@ -254,17 +217,12 @@ class DenseCandidateGenerator:
             output["push_condition"],
             output["push"],
             self.config,
-            use_push_potential=self.use_push_potential,
         )
-        push_evaluator = getattr(model, "push_evaluator", None)
-        evaluator_ready = bool(getattr(model, "push_evaluator_ready", False))
-        if push_evaluator is not None and evaluator_ready:
-            for batch_row, decoded in enumerate(decoded_push_rows):
-                if len(decoded["point_index"]):
-                    logits = push_evaluator(output["push"], decoded, batch_index=batch_row)
-                    decoded["effective_logit"] = logits
-                    decoded["effective_probability"] = torch.sigmoid(logits)
-
+        if not bool(getattr(model, "push_evaluator_ready", False)):
+            # Unloaded evaluation weights must never authorize a PUSH selection.
+            for decoded in decoded_push_rows:
+                decoded["effective_logit"] = torch.full_like(decoded["effective_logit"], float("nan"))
+                decoded["effective_probability"] = torch.full_like(decoded["effective_probability"], float("nan"))
         for batch_row in range(sensor["xyz"].shape[0]):
             xyz = sensor["xyz"][batch_row]
             point_mask = sensor["point_mask"][batch_row]

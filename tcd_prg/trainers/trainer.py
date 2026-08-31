@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from tcd_prg.models.staged_checkpoint import stage_training_state, stage_training_optimizer_state
 from torch import Tensor, nn
 
 from tcd_prg.config import TCDPRGConfig
@@ -66,6 +67,24 @@ def finalize_push_validation_metrics(details: Mapping[str, float]) -> dict[str, 
         result["push_direction_positive_coverage"] = (
             result.get("push_positive_actions_direction_covered_count", 0.0) / positive_total
         )
+        result["push_contact_visible_rate"] = result.get(
+            "push_positive_actions_visible_count", 0.0
+        ) / positive_total
+        result["push_contact_matchable_within_24mm_rate"] = result.get(
+            "push_positive_actions_matchable_count", 0.0
+        ) / positive_total
+        for name in ("predicted_only", "forced_only", "predicted_and_forced", "neither"):
+            result[f"push_direction_{name}_coverage"] = result.get(
+                f"push_positive_actions_{name}_count", 0.0
+            ) / positive_total
+        for k in (1, 4, 8, 16, 32, 64, 128):
+            result[f"push_contact_recall_at_{k}"] = result.get(
+                f"push_contact_top{k}_hits_count", 0.0
+            ) / positive_total
+        for k in (1, 2, 4):
+            result[f"push_direction_gt_bin_recall_at_{k}"] = result.get(
+                f"push_direction_top{k}_hits_count", 0.0
+            ) / positive_total
     utility_eligible = result.get("push_positive_actions_utility_eligible_count", 0.0)
     if utility_eligible > 0:
         result["push_utility_valid_coverage"] = (
@@ -90,6 +109,14 @@ def finalize_push_validation_metrics(details: Mapping[str, float]) -> dict[str, 
         result["push_final_positive_recall_at_32"] = (
             result.get("push_proposal_positive_final_hits_count", 0.0) / proposal_total
         )
+    no_utility_total = result.get("push_no_utility_positive_total_count", 0.0)
+    if no_utility_total > 0:
+        result["push_no_utility_recall_pre_nms_at_32"] = result.get(
+            "push_no_utility_pre_nms_hits_count", 0.0
+        ) / no_utility_total
+        result["push_no_utility_recall_final_at_32"] = result.get(
+            "push_no_utility_final_hits_count", 0.0
+        ) / no_utility_total
     integrated_total = result.get("integrated_push_proposal_positive_total_count", 0.0)
     if integrated_total > 0:
         result["integrated_push_proposal_positive_recall_pre_nms_at_32"] = (
@@ -289,12 +316,23 @@ class Trainer:
             )
 
     @classmethod
+    def is_count_term(cls, key: str) -> bool:
+        """Push counters are additive at every aggregation level.
+
+        Preserve the existing classification for all non-Push metrics.
+        """
+        return key in cls.COUNT_TERMS or (
+            key.startswith(("push_", "integrated_push_", "oracle_push_"))
+            and key.endswith("_count")
+        )
+
+    @classmethod
     def _aggregate_window_terms(
         cls, sums: Mapping[str, Tensor], counts: Mapping[str, int]
     ) -> dict[str, float]:
         return {
             key: float(value.cpu())
-            if key in cls.COUNT_TERMS
+            if cls.is_count_term(key)
             else float((value / counts[key]).cpu())
             for key, value in sums.items()
         }
@@ -314,7 +352,7 @@ class Trainer:
         world_size = torch.distributed.get_world_size()
         return {
             key: float(values[index])
-            if key in self.COUNT_TERMS
+            if self.is_count_term(key)
             else float(values[index] / world_size)
             for index, key in enumerate(keys)
         }
@@ -372,7 +410,7 @@ class Trainer:
             ]
             if not values:
                 continue
-            if key in cls.COUNT_TERMS:
+            if cls.is_count_term(key):
                 summary[key] = sum(values)
             elif key.startswith("loss_") or key.startswith("weighted_loss_"):
                 # 缺失监督的 family 对总损失贡献为零；终端也必须按完整窗口平均。
@@ -607,7 +645,7 @@ class Trainer:
                     metric_counts[key] = metric_counts.get(key, 0) + int(value)
             validation_details = {
                 key: (
-                    value if key in self.COUNT_TERMS else value / max(1, metric_counts.get(key, 0))
+                    value if self.is_count_term(key) else value / max(1, metric_counts.get(key, 0))
                 )
                 for key, value in metric_sums.items()
             }
@@ -1240,18 +1278,8 @@ class Trainer:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         source = self.model.module if hasattr(self.model, "module") else self.model
-        # Stage C is independently trainable/deployable: persist exactly the
-        # Push module rather than a misleading snapshot of frozen A/B modules.
         model_state = source.state_dict()
         ema_state = self.ema.model.state_dict() if self.ema else None
-        if self.config.training.stage == "push":
-            model_state = {
-                key: value for key, value in model_state.items() if key.startswith("push.")
-            }
-            if ema_state is not None:
-                ema_state = {
-                    key: value for key, value in ema_state.items() if key.startswith("push.")
-                }
         payload = {
             "schema_version": 12,
             "training_stage": self.config.training.stage,
@@ -1268,6 +1296,9 @@ class Trainer:
             "task_grasp_probability_threshold": self.task_grasp_probability_threshold,
             "stageb_provenance": self.stageb_provenance,
             "validation_selection_protocol": self.VALIDATION_SELECTION_PROTOCOL,
+            "perception_geometry_fingerprint": getattr(
+                source, "perception_geometry_fingerprint", None
+            ),
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
         torch.save(payload, temporary)
@@ -1297,20 +1328,7 @@ class Trainer:
         ) != compatibility_provenance(self.stageb_provenance):
             raise RuntimeError("Stage-B resume checkpoint provenance does not match the dataset")
         source = self.model.module if hasattr(self.model, "module") else self.model
-        if checkpoint_stage == "push":
-            # Stage C checkpoints intentionally contain only ``push.*``.  The
-            # frozen Stage-D evaluator is trained and checkpointed separately.
-            expected = {key for key in source.state_dict() if key.startswith("push.")}
-            actual = set(payload["model"])
-            if expected != actual:
-                missing = sorted(expected - actual)
-                extra = sorted(actual - expected)
-                raise RuntimeError(
-                    f"Stage-C checkpoint parameter mismatch: missing={missing[:5]} extra={extra[:5]}"
-                )
-            source.load_state_dict(payload["model"], strict=False)
-        else:
-            source.load_state_dict(payload["model"], strict=True)
+        source.load_state_dict(stage_training_state(source, payload["model"], checkpoint_stage), strict=True)
         self.task_grasp_probability_threshold = float(
             payload.get(
                 "task_grasp_probability_threshold",
@@ -1318,13 +1336,13 @@ class Trainer:
             )
         )
         self.config.model.task_grasp_probability_threshold = self.task_grasp_probability_threshold
-        self.optimizer.load_state_dict(payload["optimizer"])
+        self.optimizer.load_state_dict(stage_training_optimizer_state(source, self.optimizer, payload))
         if self.scheduler and payload["scheduler"] is not None:
             self.scheduler.load_state_dict(payload["scheduler"])
         self.scaler.load_state_dict(payload["scaler"])
         if self.ema and payload["ema"] is not None:
             self.ema.model.load_state_dict(
-                payload["ema"], strict=checkpoint_stage != "push"
+                stage_training_state(self.ema.model, payload["ema"], checkpoint_stage), strict=True
             )
         self.state = TrainerState(**payload["trainer_state"])
         if payload.get("validation_selection_protocol") != self.VALIDATION_SELECTION_PROTOCOL:

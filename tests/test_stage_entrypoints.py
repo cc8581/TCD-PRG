@@ -33,7 +33,7 @@ def test_common_and_formal_stage_configs_have_no_duplicate_leaf_parameters() -> 
 
 
 def test_stage_entrypoints_share_base_config_and_select_stage() -> None:
-    for stage in ("perception", "grasp", "push"):
+    for stage in ("perception", "grasp"):
         args = train._parse_args(["--stage", stage])
         command = train._pipeline_command(args, stage, Path("outputs/test-stage"))
         assert command[command.index("--config") + 1].endswith(
@@ -51,20 +51,20 @@ def test_single_stage_explicit_config_is_respected() -> None:
     )
 
 
-def test_push_evaluator_command_uses_proposal_checkpoint_and_push_semantics(tmp_path) -> None:
+def test_push_evaluator_command_uses_perception_checkpoint_and_push_semantics(tmp_path) -> None:
     args = train._parse_args(["--stage", "all"])
-    proposal = tmp_path / "push" / "push_last.pt"
+    proposal = tmp_path / "perception" / "perception_best.pt"
     output = tmp_path / "push_evaluator" / "push_evaluator_best.pt"
     command = train._push_evaluator_command(args, proposal, output)
     assert command[1].endswith("train_push_evaluator.py")
-    assert command[command.index("--proposal-checkpoint") + 1] == str(proposal.resolve())
+    assert command[command.index("--perception-checkpoint") + 1] == str(proposal.resolve())
     assert command[command.index("--output") + 1] == str(output.resolve())
     assert command[command.index("--config") + 1].endswith(
         "configs\\stage\\push_evaluator.yaml"
     )
 
 
-def test_all_stage_launcher_runs_push_evaluator_after_stage_c(tmp_path, monkeypatch) -> None:
+def test_all_stage_launcher_runs_push_evaluator_after_perception_and_grasp(tmp_path, monkeypatch) -> None:
     dataset = tmp_path / "dataset"
     manifest = dataset / "task_training_labels" / "acronym_binary_grasps" / "manifest.json"
     manifest.parent.mkdir(parents=True)
@@ -83,7 +83,7 @@ def test_all_stage_launcher_runs_push_evaluator_after_stage_c(tmp_path, monkeypa
         calls.append(command)
         if "--stage" in command:
             stage = command[command.index("--stage") + 1]
-            filename = f"{stage}_last.pt" if stage == "push" else f"{stage}_best.pt"
+            filename = f"{stage}_best.pt"
             checkpoint = args.output_dir.resolve() / stage / filename
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
             checkpoint.write_bytes(b"checkpoint")
@@ -94,16 +94,15 @@ def test_all_stage_launcher_runs_push_evaluator_after_stage_c(tmp_path, monkeypa
 
     monkeypatch.setattr(train.subprocess, "run", fake_run)
     train._run_all_stages(args)
-    assert len(calls) == 4
+    assert len(calls) == 3
     assert calls[-1][1].endswith("train_push_evaluator.py")
-    assert calls[-1][calls[-1].index("--proposal-checkpoint") + 1].endswith(
-        "push\\push_last.pt"
+    assert calls[-1][calls[-1].index("--perception-checkpoint") + 1].endswith(
+        "perception\\perception_best.pt"
     )
     manifest = yaml.safe_load((args.output_dir / "checkpoints.json").read_text())
     assert manifest["checkpoints"] == {
         "perception": "perception/perception_best.pt",
         "grasp": "grasp/grasp_best.pt",
-        "push": "push/push_last.pt",
         "push_evaluator": "push_evaluator/push_evaluator_best.pt",
     }
 
@@ -122,7 +121,7 @@ def test_all_stage_launcher_rejects_single_stage_resume() -> None:
 
 def test_staged_checkpoint_root_resolves_portable_relative_layout(tmp_path) -> None:
     expected = {}
-    for stage in ("perception", "grasp", "push", "push_evaluator"):
+    for stage in ("perception", "grasp", "push_evaluator"):
         path = tmp_path / stage / f"{stage}_best.pt"
         path.parent.mkdir(parents=True)
         path.write_bytes(b"checkpoint")
@@ -138,13 +137,15 @@ def test_stagec_optimizer_step_does_not_require_encoder() -> None:
     groups = build_optimizer_parameter_groups(model, config)
     assert [group["name"] for group in groups] == ["new_modules"]
     optimizer = torch.optim.AdamW(groups)
-    loss = sum(parameter.square().mean() for parameter in model.parameters())
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    loss = sum(parameter.square().mean() for parameter in trainable)
     loss.backward()
     optimizer.step()
     assert all(
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
-        for parameter in model.parameters()
+        for parameter in trainable
     )
+    assert all(parameter.grad is None for parameter in model.geometry_encoder.parameters())
 
 
 def test_push_bypasses_grasp_robot_certifier() -> None:

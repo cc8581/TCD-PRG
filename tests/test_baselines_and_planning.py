@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tcd_prg.models.push import PushActions
 
 from tcd_prg.baselines import GAPGPolicyWrapper
 from tcd_prg.config import ModelConfig
@@ -82,14 +83,7 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
         "attention_point_index": torch.zeros(1, 2, dtype=torch.long),
         "object_logits": torch.zeros(1, 2, 1),
     }
-    push = {
-        "object_logits": torch.zeros(1, 1),
-        "contact_logits": torch.zeros(1, 4),
-        "direction_logits": torch.zeros(1, 4, 16),
-        "direction_residual": torch.zeros(1, 4, 16, 2),
-        "utility_delta": torch.zeros(1, 4, 16),
-        "direction_point_mask": torch.ones(1, 4, dtype=torch.bool),
-    }
+    push = {"actions": PushActions.empty(batch["xyz"]), "effective_logit": torch.empty(0)}
     encoded = _predicted_encoded(torch.ones(1, 1, 4), batch["object_mask"])
 
     class Model:
@@ -137,14 +131,3 @@ def test_push_action_nms_uses_router_order_for_near_duplicate_actions() -> None:
     }
     keep = generator.apply_push_nms(candidates, torch.tensor([[0.2, 0.9, 0.1]]))
     assert keep.tolist() == [[False, True, True]]
-
-
-def test_push_contact_global_trim_preserves_object_membership_score() -> None:
-    selected = DenseCandidateGenerator._top_per_object(
-        torch.tensor([8.0, 2.0]),
-        torch.tensor([[0.001, 0.9], [0.002, 0.0]]),
-        torch.tensor([0, 1]),
-        torch.tensor([True, True]),
-        total=1,
-    )
-    assert selected.tolist() == [1]
