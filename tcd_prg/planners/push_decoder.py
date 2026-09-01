@@ -40,14 +40,24 @@ def push_nms_mask(candidates: dict[str, Tensor], config: ModelConfig) -> Tensor:
 
 
 def decode_push_candidates(sensor, condition, push, config):
-    actions, logits = push["actions"], push["effective_logit"]
+    actions = push["actions"]
+    q_value = push.get("q_value")
+    if q_value is None:
+        logits = push["effective_logit"]
+        score_all = logits.sigmoid()
+        safety_all = torch.ones_like(score_all)
+    else:
+        score_all = q_value[:, -1]
+        logits = torch.logit(score_all.clamp(1e-6, 1-1e-6))
+        safety_all = push["safety_probability"]
     pre, final = [], []
     for b in range(len(sensor["xyz"])):
         ids = torch.nonzero(actions.batch_index == b, as_tuple=False).flatten()
-        ids = ids[logits[ids].argsort(descending=True, stable=True)]
+        ids = ids[safety_all[ids] >= config.push_safety_probability_threshold]
+        ids = ids[score_all[ids].argsort(descending=True, stable=True)]
         ids = ids[:config.max_push_candidates]
         a = actions.select(ids)
-        score = logits[ids].sigmoid()
+        score = score_all[ids]
         k = len(ids)
         angle = torch.atan2(a.direction_world[:, 1], a.direction_world[:, 0]).remainder(2*math.pi)
         bins = (angle * config.num_direction_bins / (2*math.pi)).long()
@@ -63,7 +73,9 @@ def decode_push_candidates(sensor, condition, push, config):
                "direction_bin": bins, "direction_residual": score.new_zeros((k, 2)),
                "object_score": torch.ones_like(score), "contact_score": torch.ones_like(score),
                "direction_score": torch.ones_like(score), "utility": score,
-               "proposal_score": score, "effective_logit": logits[ids], "effective_probability": score}
+               "proposal_score": score, "effective_logit": logits[ids], "effective_probability": score,
+               "q_value": q_value[ids] if q_value is not None else score[:, None],
+               "safety_probability": safety_all[ids]}
         pre.append(row)
         keep = push_nms_mask(row, config)
         final.append({key: value[keep] for key, value in row.items()})

@@ -16,8 +16,8 @@ STAGE_PREFIXES = {
     "grasp": ("task_grasp.",),
 }
 
-PUSH_EVALUATOR_PROTOCOL_VERSION = 5
-PUSH_ARCHITECTURE = "yanx27_pointnet2_sem_seg_s3dis_v1"
+PUSH_EVALUATOR_PROTOCOL_VERSION = 6
+PUSH_ARCHITECTURE = "instance_relation_pointnet2_q5_safety_aux_v1"
 
 
 def resolve_staged_checkpoint_root(root: str | Path) -> dict[str, Path]:

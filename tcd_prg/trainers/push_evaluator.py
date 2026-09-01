@@ -44,16 +44,37 @@ def push_effectiveness_batch_loss(model, batch, *, instance_queries, loss_functi
             from .push_sampling import sample_push_training_input
             sensor, sampled_condition, sampled_actions = sample_push_training_input(
                 model._sensor(batch), condition, actions, scene_sample_points)
-            logits = model.score_actions(sensor, sampled_condition, sampled_actions)
+            prediction = model.score_actions(sensor, sampled_condition, sampled_actions)
         else:
-            logits = model.score_actions(batch, condition, actions)
-        losses = loss_function(logits, batch["evaluation_status"][valid],
-                               batch["action_improves_state"][valid])
+            prediction = model.score_actions(batch, condition, actions)
+        losses = loss_function(
+            prediction,
+            q_target=batch["push_q_target"][valid],
+            q_valid=batch["push_q_valid"][valid],
+            safety_target=batch["push_safe_target"][valid],
+            safety_valid=batch["push_safety_valid"][valid],
+            auxiliary_target=batch["potential_delta"][valid],
+            auxiliary_valid=batch["potential_after_valid"][valid],
+            group_index=actions.batch_index,
+        )
         loss = losses["push_effectiveness"]
     else:
         loss = sum(p.sum() * 0. for p in model.push_evaluator.parameters())
-        logits = loss.expand(0)
+        prediction = {
+            "q_value": loss.expand(0, 5),
+            "safety_logit": loss.expand(0),
+            "safety_probability": loss.expand(0),
+            "potential_delta": loss.expand(0, 5),
+            "effective_logit": loss.expand(0),
+            "effective_probability": loss.expand(0),
+        }
         losses = {"push_effectiveness": loss}
-    return loss, {**losses, "effective_logit": logits,
-                  "effective_target": batch["action_improves_state"][valid].bool(),
-                  "effective_group_index": actions.batch_index}
+    return loss, {
+        **losses,
+        **prediction,
+        "q_target": batch["push_q_target"][valid],
+        "q_valid": batch["push_q_valid"][valid],
+        "safety_target": batch["push_safe_target"][valid].bool(),
+        "safety_valid": batch["push_safety_valid"][valid].bool(),
+        "effective_group_index": actions.batch_index,
+    }

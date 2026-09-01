@@ -120,13 +120,12 @@ def test_legacy_push_checkpoint_phase_is_recovered_from_boundary_and_log(tmp_pat
 
 def test_validation_short_labels(capsys):
     metrics = {'push_evaluator_' + key: value for key, value in {
-        'loss': .6783, 'ap': .5906, 'auroc': .5720,
-        'logged_hit_at_1_given_positive': .6641,
-        'logged_hit_at_5_given_positive': .9212, 'positive_fraction': .5471}.items()}
+        'loss': .6783, 'pairwise_ranking_accuracy': .5906, 'q_mae': .072,
+        'top1_regret': .031, 'safety_accuracy': .91}.items()}
     print_validation_summary(metrics, 5000, .60)
     output = capsys.readouterr().out
     assert output.startswith('Val [push_evaluator] [0005000]  loss: 0.6783')
-    assert 'AP: 59.1%' in output and 'AUROC: 57.2%' in output
+    assert 'rank: 59.1%' in output and 'Q-MAE: 0.0720' in output
     assert '{' not in output and 'push_evaluator_' not in output
     print_validation_summary(metrics, 10000, .60, 'final')
-    assert 'best AP(subset)' in capsys.readouterr().out
+    assert 'best rank(subset)' in capsys.readouterr().out

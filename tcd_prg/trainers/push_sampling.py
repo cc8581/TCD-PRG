@@ -1,4 +1,4 @@
-"""Stage-C training-only scene FPS using PyTorch3D's compiled operator."""
+"""Stage-C scene FPS using PyTorch3D's compiled operator."""
 from dataclasses import replace
 from functools import lru_cache
 
@@ -19,7 +19,7 @@ def compiled_fps():
 
 
 def sample_push_training_input(sensor, condition, actions, count):
-    """Compact action-bearing scenes and gather all point conditions together.
+    """Sample action-bearing scenes and gather all point conditions together.
 
     Preserve action eligibility/labels computed on the original observation.
     Short clouds retain only real FPS points; masked padding never enters FPS.

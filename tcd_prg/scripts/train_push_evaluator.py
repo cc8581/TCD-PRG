@@ -17,7 +17,6 @@ from tqdm import tqdm
 
 from tcd_prg.config import load_config
 from tcd_prg.datasets import ActionStateGroupDataset
-from tcd_prg.evaluators import push_effectiveness_metrics
 from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
 from tcd_prg.models import StandalonePushModel
 from tcd_prg.models.staged_checkpoint import load_push_evaluator
@@ -25,7 +24,7 @@ from tcd_prg.trainers.push_checkpoint import PushTrainingCheckpoint
 from tcd_prg.trainers.push_progress import PushTrainingProgress, append_record, print_validation_summary
 from tcd_prg.trainers.push_scheduler import PushLRScheduler
 from tcd_prg.trainers.push_sampling import compiled_fps
-from tcd_prg.runtime import UnifiedBatchCollator, create_adapter
+from tcd_prg.runtime import PushValueBatchCollator, create_adapter
 from tcd_prg.trainers import (
     push_effectiveness_batch_loss,
 )
@@ -57,15 +56,15 @@ def accumulated_batches(model, loader, *, device, config, loss_function, optimiz
         loss, details = push_effectiveness_batch_loss(
             model, batch, instance_queries=config.model.instance_queries, loss_function=loss_function,
             scene_sample_points=config.training.push_fps_points)
-        logits = details['effective_logit']
-        count = logits.numel()
+        q_value = details['q_value']
+        count = q_value.shape[0]
         if count:
-            if not torch.isfinite(loss) or not torch.isfinite(logits).all():
-                raise RuntimeError('Non-finite PUSH training logits/loss')
+            if not torch.isfinite(loss) or not torch.isfinite(q_value).all():
+                raise RuntimeError('Non-finite PUSH training values/loss')
             (loss * count).backward()
             micro += 1
             actions += count
-            positives += int(details['effective_target'].sum())
+            positives += int(details['safety_target'].sum())
             loss_sum += float(loss.detach()) * count
         if micro == limit:
             for parameter in model.push_evaluator.parameters():
@@ -96,8 +95,12 @@ def _evaluate(
     """Validate logged actions only; candidate generation is a separate evaluation."""
     model.eval()
     started = time.monotonic()
-    probabilities: list[torch.Tensor] = []
-    targets: list[torch.Tensor] = []
+    q_predictions: list[torch.Tensor] = []
+    q_targets: list[torch.Tensor] = []
+    q_masks: list[torch.Tensor] = []
+    safety_predictions: list[torch.Tensor] = []
+    safety_targets: list[torch.Tensor] = []
+    safety_masks: list[torch.Tensor] = []
     group_ids: list[torch.Tensor] = []
     weighted_loss = 0.0
     evaluated = 0
@@ -111,17 +114,26 @@ def _evaluate(
                 batch,
                 instance_queries=config.model.instance_queries,
                 loss_function=loss_function,
+                scene_sample_points=config.training.push_fps_points,
             )
             # Keep accumulated validation predictions off GPU.
-            logits = details["effective_logit"].detach().float().cpu()
-            target = details["effective_target"].detach().bool().cpu()
+            q_prediction = details["q_value"].detach().float().cpu()
+            q_target = details["q_target"].detach().float().cpu()
+            q_valid = details["q_valid"].detach().bool().cpu()
+            safety_prediction = details["safety_probability"].detach().float().cpu()
+            safety_target = details["safety_target"].detach().bool().cpu()
+            safety_valid = details["safety_valid"].detach().bool().cpu()
             local_group = details["effective_group_index"].detach().long().cpu()
-            if not torch.isfinite(logits).all() or not torch.isfinite(loss):
-                raise RuntimeError("Non-finite PUSH validation logits/loss")
-            count = int(logits.numel())
+            if not torch.isfinite(q_prediction).all() or not torch.isfinite(safety_prediction).all() or not torch.isfinite(loss):
+                raise RuntimeError("Non-finite PUSH validation prediction/loss")
+            count = int(q_prediction.shape[0])
             if count:
-                probabilities.append(torch.sigmoid(logits))
-                targets.append(target)
+                q_predictions.append(q_prediction)
+                q_targets.append(q_target)
+                q_masks.append(q_valid)
+                safety_predictions.append(safety_prediction)
+                safety_targets.append(safety_target)
+                safety_masks.append(safety_valid)
                 group_ids.append(local_group + group_offset)
                 weighted_loss += float(loss.detach()) * count
                 evaluated += count
@@ -132,13 +144,53 @@ def _evaluate(
 
     if not evaluated:
         raise RuntimeError("Validation split contains no evaluated PUSH actions")
-    probability = torch.cat(probabilities)
-    target = torch.cat(targets)
-    if not bool(target.any()) or not bool((~target).any()):
-        raise RuntimeError("Validation split requires both positive and negative PUSH actions")
+    q_prediction = torch.cat(q_predictions)
+    q_target = torch.cat(q_targets)
+    q_valid = torch.cat(q_masks)
+    safety_prediction = torch.cat(safety_predictions)
+    safety_target = torch.cat(safety_targets)
+    safety_valid = torch.cat(safety_masks)
+    groups = torch.cat(group_ids)
     print(f"Val [push_evaluator]  aggregating: {evaluated} actions", flush=True)
-    metrics = push_effectiveness_metrics(probability, target, torch.cat(group_ids))
-    result = {key: float(value) for key, value in metrics.items()}
+    if not bool(q_valid.any()):
+        raise RuntimeError("Validation split contains no valid offline Q targets")
+    pair_correct = pair_total = 0
+    regrets = []
+    for group_id in torch.unique(groups):
+        members = torch.nonzero(groups == group_id, as_tuple=False).flatten()
+        for horizon in range(q_prediction.shape[1]):
+            ids = members[q_valid[members, horizon]]
+            if len(ids) < 2:
+                continue
+            truth = q_target[ids, horizon]
+            pred = q_prediction[ids, horizon]
+            difference = truth[:, None] - truth[None, :]
+            left, right = torch.where(difference > config.training.push_rank_margin)
+            if len(left):
+                pair_correct += int((pred[left] > pred[right]).sum())
+                pair_total += int(len(left))
+        ids = members[q_valid[members, -1]]
+        if len(ids):
+            truth = q_target[ids, -1]
+            chosen = int(torch.argmax(q_prediction[ids, -1]))
+            regrets.append(float(truth.max() - truth[chosen]))
+    result = {
+        "push_evaluator_q_mae": float((q_prediction[q_valid] - q_target[q_valid]).abs().mean()),
+        "push_evaluator_pairwise_ranking_accuracy": (
+            pair_correct / pair_total if pair_total else float("nan")
+        ),
+        "push_evaluator_pairwise_count": float(pair_total),
+        "push_evaluator_top1_regret": float(np.mean(regrets)) if regrets else float("nan"),
+        "push_evaluator_logged_group_count": float(torch.unique(groups).numel()),
+    }
+    if bool(safety_valid.any()):
+        result["push_evaluator_safety_accuracy"] = float(
+            ((safety_prediction[safety_valid] >= 0.5) == safety_target[safety_valid]).float().mean()
+        )
+        result["push_evaluator_safety_fraction"] = float(safety_target[safety_valid].float().mean())
+    else:
+        result["push_evaluator_safety_accuracy"] = float("nan")
+        result["push_evaluator_safety_fraction"] = float("nan")
     result["push_evaluator_loss"] = weighted_loss / evaluated
     result["push_evaluator_evaluated_count"] = float(evaluated)
     result["push_evaluator_logged_empty_group_count"] = group_offset - result["push_evaluator_logged_group_count"]
@@ -225,8 +277,8 @@ def _main() -> None:
     if not len(validation_dataset):
         raise RuntimeError("Formal PUSH evaluator training requires a non-empty val split")
     print(f"[push-evaluator-init] train_groups={len(dataset)} "
-          f"validation_groups={len(validation_dataset)} pos_weight=1.0; "
-          "no label-count prescan; fine-tuning yanx27 PointNet++", flush=True)
+          f"validation_groups={len(validation_dataset)}; "
+          "offline Q1-Q5 + safety supervision; fine-tuning yanx27 PointNet++", flush=True)
     model = StandalonePushModel(config.model).to(device)
     pretrain_checkpoint = args.pretrain_checkpoint or config.training.pretrain_checkpoint
     if not pretrain_checkpoint and not args.resume:
@@ -240,7 +292,14 @@ def _main() -> None:
             "optimizer and step start fresh",
             flush=True,
         )
-    loss_function = PushEffectivenessLoss(pos_weight=1.0)
+    loss_function = PushEffectivenessLoss(
+        q_weight=config.training.push_q_loss_weight,
+        rank_weight=config.training.push_rank_loss_weight,
+        safety_weight=config.training.push_safety_loss_weight,
+        auxiliary_weight=config.training.push_aux_loss_weight,
+        rank_margin=config.training.push_rank_margin,
+        delta_scales=config.training.push_delta_scales,
+    )
     optimizer = torch.optim.AdamW(
         model.push_evaluator.parameters(),
         lr=config.optimizer.learning_rate,
@@ -254,7 +313,7 @@ def _main() -> None:
         num_workers=config.training.num_workers,
         pin_memory=config.training.pin_memory,
         persistent_workers=config.training.num_workers > 0,
-        collate_fn=UnifiedBatchCollator(config, training=True, include_graspnet=False),
+        collate_fn=PushValueBatchCollator(config, training=True),
     )
     validation_loader = DataLoader(
         validation_dataset,
@@ -263,7 +322,7 @@ def _main() -> None:
         num_workers=config.training.validation_workers,
         pin_memory=config.training.pin_memory,
         persistent_workers=False,
-        collate_fn=UnifiedBatchCollator(config, training=False, include_graspnet=False),
+        collate_fn=PushValueBatchCollator(config, training=False),
     )
     final_validation_loader = DataLoader(
         final_validation_dataset,
@@ -272,7 +331,7 @@ def _main() -> None:
         num_workers=config.training.validation_workers,
         pin_memory=config.training.pin_memory,
         persistent_workers=False,
-        collate_fn=UnifiedBatchCollator(config, training=False, include_graspnet=False),
+        collate_fn=PushValueBatchCollator(config, training=False),
     )
     signature = asdict(config)
     # Device/worker changes and a longer run do not change the training objective.
@@ -283,11 +342,10 @@ def _main() -> None:
         signature["training"].pop(name, None)
     checkpoints = PushTrainingCheckpoint(args.output, model, {
         "training_scene_sampling": {"operator": "pytorch3d.compiled_fps", "points": fps_points},
-        "pos_weight": 1.0,
         "periodic_validation_scene_count": len(periodic_validation_scenes),
         "final_validation_scene_count": len(validation_scenes),
-        "selection_metric": "push_evaluator_ap",
-    }, {"config": signature, "pos_weight": 1.0,
+        "selection_metric": "push_evaluator_pairwise_ranking_accuracy",
+    }, {"config": signature,
         "periodic_scenes": periodic_validation_scenes, "final_scenes": validation_scenes}, scheduler=scheduler)
     step = checkpoints.restore(args.resume, optimizer) if args.resume else 0
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
@@ -321,8 +379,8 @@ def _main() -> None:
                                 loss_function=loss_function, phase=phase)
             if phase == "periodic":
                 checkpoints.consider_best(metrics, step)
-            best_ap = checkpoints.best_metrics["push_evaluator_ap"] if checkpoints.best_metrics else float("nan")
-            print_validation_summary(metrics, step, best_ap, phase)
+            best_score = checkpoints.best_metrics["push_evaluator_pairwise_ranking_accuracy"] if checkpoints.best_metrics else float("nan")
+            print_validation_summary(metrics, step, best_score, phase)
             append_record(Path(args.output).parent / "validation_metrics.jsonl",
                           {"optimizer_step": step, "phase": phase,
                            "weights_step": checkpoints.best_step if phase == "final" else step, **metrics})
@@ -346,7 +404,7 @@ def _main() -> None:
           f"validation_batch={config.training.validation_batch_size}, "
           f"workers={config.training.num_workers}; waiting for first batch", flush=True)
     print(f"[push-evaluator-train] scheduler: warmup({config.scheduler.warmup_steps}) + cosine; "
-          f"eta excludes validation; H@k+ uses groups containing positives; output: {config.output_dir}", flush=True)
+          f"eta excludes validation; best checkpoint uses within-state ranking; output: {config.output_dir}", flush=True)
     model.train()
     if args.resume and checkpoints.validation_due(step, validation_interval):
         print(f"[resume] periodic validation at step={step} is pending; validating before training", flush=True)

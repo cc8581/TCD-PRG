@@ -61,7 +61,7 @@ def test_window_mean_is_action_weighted_and_eta_excludes_validation(tmp_path,cap
     clock[0] += 2
     record = logger.log(12,1e-4)
     assert record['loss']==pytest.approx(.65)
-    assert record['positive_fraction']==3/8
+    assert record['safe_fraction']==3/8
     assert record['window_steps']==2
     assert record['seconds_per_step']==2
     assert record['eta_train_seconds']==16
@@ -93,12 +93,12 @@ def test_validation_progress_finishes_and_counts_empty_groups(monkeypatch):
     empty['candidate_mask'].zero_()
     result=entry._evaluate(model(),[scene(),empty],device=torch.device('cpu'),
                            config=TCDPRGConfig(model=ModelConfig(instance_queries=4)),
-                           loss_function=PushEffectivenessLoss(1.0),phase='test')
+                           loss_function=PushEffectivenessLoss(),phase='test')
     assert bars[0].n==bars[0].total==2 and bars[0].disable
     assert '100%' in output.getvalue()
     assert result['push_evaluator_evaluated_count']==2
     assert result['push_evaluator_logged_empty_group_count']==1
-    assert result['push_evaluator_positive_fraction']==.5
+    assert result['push_evaluator_safety_fraction']==.5
 
 
 def test_resume_preserves_optimizer_but_discards_old_metric_best(tmp_path,capsys):
@@ -107,7 +107,7 @@ def test_resume_preserves_optimizer_but_discards_old_metric_best(tmp_path,capsys
     model,optimizer=tiny_training()
     update(model,optimizer)
     checkpoint=PushTrainingCheckpoint(tmp_path/'best.pt',model,{}, {})
-    checkpoint.consider_best({'push_evaluator_ap':.9},1)
+    checkpoint.consider_best({'push_evaluator_pairwise_ranking_accuracy':.9},1)
     checkpoint.save_latest(optimizer,1)
     payload=torch.load(checkpoint.latest,weights_only=False)
     payload.pop('push_metric_protocol_version')

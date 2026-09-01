@@ -265,6 +265,7 @@ def collate_unified(
     object_active, _ = _pad([x.object_active for x in observations], False)
     object_category_id, _ = _pad([x.object_category_id for x in observations], -1)
     action_type, candidate_mask = _pad([x.action_type for x in candidates], -1)
+    candidate_action_id, _ = _pad([x.candidate_action_ids for x in candidates], -1)
     acted_object, _ = _pad([x.acted_object for x in candidates], -1)
     valid_mask, _ = _pad([x.valid_mask for x in candidates], False)
     status, _ = _pad([x.evaluation_status for x in candidates], -1)
@@ -354,6 +355,7 @@ def collate_unified(
             [x.object_category_id[x.target_object] for x in observations], dtype=torch.long
         ),
         "action_type": action_type.long(),
+        "candidate_action_id": candidate_action_id.long(),
         "acted_object": acted_object.long(),
         "candidate_mask": candidate_mask & valid_mask.bool(),
         "evaluation_status": status.long(),

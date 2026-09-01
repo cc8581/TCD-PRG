@@ -16,8 +16,16 @@ scheduler:
   warmup_steps: 2000
 
 training:
+  push_value_root: runtime/push_value/action
+  push_value_horizons: 5
+  push_q_loss_weight: 1.0
+  push_rank_loss_weight: 0.25
+  push_safety_loss_weight: 0.5
+  push_aux_loss_weight: 0.1
+  push_rank_margin: 0.02
+  push_delta_scales: [10.0, 1.0, 1.0, 5.0, 1.0]
   # 网络输入点数，可改为 1024 等；应不大于上面的 scene_points（0 表示不限）。
-  push_fps_points: 1024
+  push_fps_points: 16384
   pretrain_checkpoint: null       # null: load published yanx27 backbone; otherwise a new-protocol PUSH checkpoint.
   stage: push_evaluator
   max_optimizer_steps: 10000

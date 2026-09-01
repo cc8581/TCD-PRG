@@ -60,7 +60,7 @@ class PushTrainingProgress:
         seconds_per_step = max(0.0, active - self.last_active) / steps
         record = dict(optimizer_step=step, max_optimizer_steps=self.maximum,
                       window_steps=steps, loss=self.loss_sum / self.actions,
-                      positive_fraction=self.positive / self.actions, actions=self.actions,
+                      safe_fraction=self.positive / self.actions, actions=self.actions,
                       learning_rate=float(learning_rate), seconds_per_step=seconds_per_step,
                       elapsed_seconds=now - self.started,
                       eta_train_seconds=active / max(1, step-self.initial_step) * max(0, self.maximum-step),
@@ -68,7 +68,7 @@ class PushTrainingProgress:
                       **{key:value/steps for key,value in self.diagnostics.items()})
         fields = [f"Train [push_evaluator] [{step:07d}/{self.maximum:07d}]",
                   f"eta: {duration(record['eta_train_seconds'])}",
-                  f"loss: {record['loss']:.4f}", f"pos: {record['positive_fraction']:.1%}",
+                  f"loss: {record['loss']:.4f}", f"safe: {record['safe_fraction']:.1%}",
                   f"lr: {learning_rate:.3e}",
                   f"grad: {record['gradient_norm']:.3f}->{record['gradient_norm_after_clip']:.3f}",
                   f"clip: {record['gradient_clip_scale']:.3f}",
@@ -84,17 +84,16 @@ class PushTrainingProgress:
         return record
 
 
-def print_validation_summary(metrics, step, best_ap, phase='periodic'):
+def print_validation_summary(metrics, step, best_score, phase='periodic'):
     """Same short-label/colon/spacing conventions as the A/B terminal summaries."""
     fields = [f"Val [push_evaluator] [{step:07d}]",
               f"loss: {metrics['push_evaluator_loss']:.4f}",
-              f"AP: {metrics['push_evaluator_ap']:.1%}", f"best AP: {best_ap:.1%}",
-              f"AUROC: {metrics['push_evaluator_auroc']:.1%}",
-              f"H@1+: {metrics['push_evaluator_logged_hit_at_1_given_positive']:.1%}",
-              f"H@5+: {metrics['push_evaluator_logged_hit_at_5_given_positive']:.1%}",
-              f"pos: {metrics['push_evaluator_positive_fraction']:.1%}"]
+              f"rank: {metrics['push_evaluator_pairwise_ranking_accuracy']:.1%}",
+              f"best rank: {best_score:.1%}",
+              f"Q-MAE: {metrics['push_evaluator_q_mae']:.4f}",
+              f"top1 regret: {metrics['push_evaluator_top1_regret']:.4f}",
+              f"safe acc: {metrics['push_evaluator_safety_accuracy']:.1%}"]
     if phase == 'final':
         fields.append('split: full validation')
-        # best AP was selected on the periodic subset, not this larger population.
-        fields[3] = f"best AP(subset): {best_ap:.1%}"
+        fields[3] = f"best rank(subset): {best_score:.1%}"
     print('  '.join(fields), flush=True)

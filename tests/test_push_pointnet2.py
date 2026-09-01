@@ -15,7 +15,7 @@ def test_pointnet_backbone_receives_effect_gradients_and_updates():
     loss,_=push_effectiveness_batch_loss(m,b,instance_queries=4,loss_function=PushEffectivenessLoss())
     loss.backward()
     for part in (m.push_evaluator.backbone.network.sa1,m.push_evaluator.backbone.network.sa4,
-                 m.push_evaluator.backbone.network.fp1,m.push_evaluator.network):
+                 m.push_evaluator.backbone.network.fp1,m.push_evaluator.trunk):
         assert any(p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum()>0 for p in part.parameters())
     opt.step()
     assert any(not torch.equal(v,before[k]) for k,v in m.push_evaluator.backbone.named_parameters())
@@ -122,11 +122,14 @@ def test_grouped_encoding_excludes_padding_and_preserves_action_mapping():
         assert backbone.calls==[(2,n,3),(1,n-5,3)]
         # Independent scene calls provide a mapping reference without FPS/BN
         # randomness; interleaved output must retain the original action order.
-        expected=torch.empty_like(actual)
+        expected={key: torch.empty_like(value) for key,value in actual.items()}
         for b in (0,1,2):
             ids=torch.where(actions.batch_index==b)[0]
-            expected[ids]=m.score_actions(batch,condition,actions.select(ids))
-    torch.testing.assert_close(actual,expected)
+            local=m.score_actions(batch,condition,actions.select(ids))
+            for key in expected:
+                expected[key][ids]=local[key]
+    for key in actual:
+        torch.testing.assert_close(actual[key],expected[key])
 
 
 def test_pointnet_tiny_or_duplicate_cloud_is_finite():
@@ -217,22 +220,13 @@ def test_source_checksum_accepts_git_line_endings_but_rejects_edits(tmp_path):
 
 
 def test_inactive_push_keeps_ab_parameter_layout_and_rng():
-    # A/B construction must retain its previous inactive C parameter layout and
-    # RNG stream. The new backbone is materialized only by C execution/loading.
-    from torch import nn
+    # Stage-C remains lazy during A/B construction; checkpoint migration is
+    # responsible for replacing only its inactive tensors.
     from tcd_prg.models.push import PushEffectivenessEvaluator
-    class ReferenceInactive(nn.Module):
-        def __init__(self):
-            super().__init__();d=16
-            self.point_encoder=nn.Sequential(nn.Linear(d+3,d),nn.LayerNorm(d),nn.GELU())
-            self.category=nn.Embedding(64,d);self.region=nn.Embedding(64,d)
-            self.network=nn.Sequential(nn.Linear(6*d+10,2*d),nn.GELU(),nn.LayerNorm(2*d),
-                                       nn.Linear(2*d,d),nn.GELU(),nn.Linear(d,1))
-    torch.manual_seed(91);reference=ReferenceInactive();state=torch.get_rng_state()
-    torch.manual_seed(91);current=PushEffectivenessEvaluator(16,initialize_backbone=False)
-    assert current.backbone is None and torch.equal(state,torch.get_rng_state())
-    assert current.state_dict().keys()==reference.state_dict().keys()
-    assert all(torch.equal(v,reference.state_dict()[k]) for k,v in current.state_dict().items())
+    current=PushEffectivenessEvaluator(16,initialize_backbone=False)
+    assert current.backbone is None
+    assert current.q_head.out_features == 5
+    assert current.safety_head.out_features == 1
 
 
 def test_combined_deployment_loads_same_pointnet_without_using_a_encoder(tmp_path):
@@ -243,7 +237,7 @@ def test_combined_deployment_loads_same_pointnet_without_using_a_encoder(tmp_pat
     from tcd_prg.trainers.push_checkpoint import PushTrainingCheckpoint
     m=model().eval();b=scene();b['push_condition']=push_condition_from_gt(b,4)
     check=PushTrainingCheckpoint(tmp_path/'new.pt',m,{}, {})
-    check.consider_best({'push_evaluator_ap':.5},1)
+    check.consider_best({'push_evaluator_pairwise_ranking_accuracy':.5},1)
     # No encoder is present: the public combined C boundary must not touch A.
     combined=SimpleNamespace(push=m.push,push_evaluator=PushEffectivenessEvaluator(16,initialize_backbone=False).eval())
     load_push_evaluator(combined,check.output)

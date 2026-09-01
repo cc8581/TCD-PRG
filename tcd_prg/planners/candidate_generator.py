@@ -41,6 +41,8 @@ class DenseCandidateGenerator:
             "direction_residual": torch.empty(0, 2, device=device),
             "effective_logit": torch.empty(0, device=device),
             "effective_probability": torch.empty(0, device=device),
+            "push_q_value": torch.empty(0, 5, device=device),
+            "push_safety_probability": torch.empty(0, device=device),
         }
 
     @staticmethod
@@ -254,6 +256,8 @@ class DenseCandidateGenerator:
             direction_residual_parts: list[Tensor] = []
             effective_logit_parts: list[Tensor] = []
             effective_probability_parts: list[Tensor] = []
+            push_q_parts: list[Tensor] = []
+            push_safety_parts: list[Tensor] = []
 
             # Terminal task grasp candidates belong to the predicted target query.
             task = output["task_grasp"]
@@ -312,6 +316,8 @@ class DenseCandidateGenerator:
                 effective_probability_parts.append(
                     torch.full_like(task_score[selected], float("nan"))
                 )
+                push_q_parts.append(torch.full((len(selected), 5), float("nan"), device=xyz.device))
+                push_safety_parts.append(torch.full_like(task_score[selected], float("nan")))
 
             # Generic remove grasps are assigned to predicted object queries.
             global_head = output["global_grasp"]
@@ -394,6 +400,8 @@ class DenseCandidateGenerator:
                 effective_probability_parts.append(
                     torch.full_like(candidate_score[local], float("nan"))
                 )
+                push_q_parts.append(torch.full((len(selected), 5), float("nan"), device=xyz.device))
+                push_safety_parts.append(torch.full_like(candidate_score[local], float("nan")))
 
             decoded_push = decoded_push_rows[batch_row]
             if len(decoded_push["point_index"]):
@@ -433,6 +441,8 @@ class DenseCandidateGenerator:
                 direction_residual_parts.append(decoded_push["direction_residual"])
                 effective_logit_parts.append(decoded_push["effective_logit"])
                 effective_probability_parts.append(decoded_push["effective_probability"])
+                push_q_parts.append(decoded_push["q_value"])
+                push_safety_parts.append(decoded_push["safety_probability"])
 
             def joined(
                 parts: list[Tensor],
@@ -465,6 +475,8 @@ class DenseCandidateGenerator:
                     "direction_residual": joined(direction_residual_parts, (0, 2), xyz.dtype),
                     "effective_logit": joined(effective_logit_parts, (0,), xyz.dtype),
                     "effective_probability": joined(effective_probability_parts, (0,), xyz.dtype),
+                    "push_q_value": joined(push_q_parts, (0, 5), xyz.dtype),
+                    "push_safety_probability": joined(push_safety_parts, (0,), xyz.dtype),
                 }
             )
 
@@ -482,6 +494,8 @@ class DenseCandidateGenerator:
             "direction_residual": float("nan"),
             "effective_logit": float("nan"),
             "effective_probability": float("nan"),
+            "push_q_value": float("nan"),
+            "push_safety_probability": float("nan"),
             "proposal_score": -1.0,
             "contact_world": float("nan"),
             "direction_world": float("nan"),

@@ -27,6 +27,6 @@ class StandalonePushModel(nn.Module):
         sensor = self._sensor(batch)
         condition = batch['push_condition']
         actions = self.push(sensor, condition)
-        logits = self.push_evaluator(sensor, condition, actions)
+        evaluation = self.push_evaluator(sensor, condition, actions)
         return {'sensor': sensor, 'push_condition': condition,
-                'push': {'actions': actions, 'effective_logit': logits}}
+                'push': {'actions': actions, **evaluation}}

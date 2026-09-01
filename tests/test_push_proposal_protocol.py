@@ -37,18 +37,21 @@ def test_proposal_recall_uses_fixed_gt_denominator_and_ignores_unknown() -> None
     assert total == 2
 
 
-def test_effectiveness_loss_uses_improves_state_and_ignores_unknown() -> None:
-    effective = torch.zeros(3, requires_grad=True)
+def test_effectiveness_loss_uses_offline_q_and_safety_masks() -> None:
+    q = torch.zeros(3, 5, requires_grad=True)
+    safety = torch.zeros(3, requires_grad=True)
+    delta = torch.zeros(3, 5, requires_grad=True)
     losses = PushEffectivenessLoss()(
-        effective,
-        torch.tensor([1, 0, -1]),
-        torch.tensor([False, True, True]),
+        {'q_value':q, 'safety_logit':safety, 'potential_delta':delta},
+        q_target=torch.ones(3,5), q_valid=torch.tensor([[True]*5,[True]*5,[False]*5]),
+        safety_target=torch.tensor([False,True,True]), safety_valid=torch.tensor([True,True,False]),
+        auxiliary_target=torch.ones(3,5), auxiliary_valid=torch.tensor([True,True,False]),
+        group_index=torch.tensor([0,0,0]),
     )
     losses["push_effectiveness"].backward()
-    assert effective.grad[2] == 0
-    assert effective.grad[0] > 0
-    assert effective.grad[1] < 0
-    assert losses["push_effectiveness_evaluated_count"] == 2
+    assert q.grad[2].abs().sum() == 0
+    assert safety.grad[2] == 0
+    assert losses["push_q_supervised_count"] == 10
 
 
 def test_effectiveness_metrics_report_binary_and_state_ranking_quality() -> None:

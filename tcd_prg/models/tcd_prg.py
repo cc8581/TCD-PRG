@@ -558,7 +558,7 @@ class TCDPRGModel(nn.Module):
         """Inference-only rule candidates scored by the independent evaluator."""
         condition.validate(sensor["xyz"].shape[1])
         actions = self.push(sensor, condition)
-        return {"actions": actions, "effective_logit": self.push_evaluator(sensor, condition, actions)}
+        return {"actions": actions, **self.push_evaluator(sensor, condition, actions)}
 
     def forward_instances(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         """Task-free sensor-only instance inference for real-scene acquisition."""

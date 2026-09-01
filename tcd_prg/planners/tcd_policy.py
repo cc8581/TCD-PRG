@@ -400,6 +400,8 @@ class TCDPRGPolicy(ManipulationPolicy):
                 push_direction_world=array("direction_world"),
                 push_distance_m=float(array("push_distance_m")),
                 effective_probability=float(array("effective_probability")),
+                q_value=array("push_q_value"),
+                safety_probability=float(array("push_safety_probability")),
             )
         else:
             action.update(

@@ -10,7 +10,8 @@ import torch
 
 from tcd_prg.models.staged_checkpoint import PUSH_EVALUATOR_PROTOCOL_VERSION, PUSH_ARCHITECTURE, validate_push_checkpoint
 
-PUSH_METRIC_PROTOCOL_VERSION = 2
+PUSH_METRIC_PROTOCOL_VERSION = 3
+SELECTION_METRIC = "push_evaluator_pairwise_ranking_accuracy"
 
 
 def resume_compatibility(signature):
@@ -118,10 +119,10 @@ class PushTrainingCheckpoint:
         atomic_save(payload, self.latest)
 
     def consider_best(self, metrics, step):
-        score = metrics["push_evaluator_ap"]
+        score = metrics[SELECTION_METRIC]
         if not math.isfinite(score):
             return
-        if self.best_metrics is not None and score <= self.best_metrics["push_evaluator_ap"]:
+        if self.best_metrics is not None and score <= self.best_metrics[SELECTION_METRIC]:
             return
         self.best_state = {k: v.detach().cpu().clone()
                            for k, v in self.model.push_evaluator.state_dict().items()}
@@ -130,7 +131,7 @@ class PushTrainingCheckpoint:
 
     def save_best(self, final_metrics=None):
         if self.best_state is None:
-            raise RuntimeError("PUSH evaluator validation did not produce a finite AP")
+            raise RuntimeError("PUSH evaluator validation did not produce a finite ranking score")
         payload = self._payload(self.best_state, self.best_step)
         payload["validation_metrics"] = self.best_metrics
         if final_metrics is not None:
@@ -179,14 +180,14 @@ class PushTrainingCheckpoint:
         if self.output.is_file():
             published = torch.load(self.output, map_location="cpu", weights_only=False)
             metrics = published.get("validation_metrics", {})
-            score = metrics.get("push_evaluator_ap", float("nan"))
+            score = metrics.get(SELECTION_METRIC, float("nan"))
             compatible = all(published.get(key) == payload.get(key) for key in
                              ("training_stage", "push_evaluator_protocol_version",
                               "push_architecture"))
             compatible = compatible and resume_compatibility(published.get("resume_signature", {})) == resume_compatibility(self.resume_signature)
             compatible = compatible and published.get("push_metric_protocol_version") == PUSH_METRIC_PROTOCOL_VERSION
             if compatible and math.isfinite(score) and (
-                    self.best_metrics is None or score > self.best_metrics["push_evaluator_ap"]):
+                    self.best_metrics is None or score > self.best_metrics[SELECTION_METRIC]):
                 self.best_state = published["model"]
                 self.best_metrics = metrics
                 self.best_step = published["optimizer_steps"]

@@ -189,6 +189,7 @@ model:
   push_object_topk: 4              # 推理时只展开最高分的 Push 作用对象
   push_utility_threshold: 0.0
   push_candidate_probability_threshold: 0.0
+  push_safety_probability_threshold: 0.5
   push_utility_temperature: 1.0
   pick_remove_target_margin_m: 0.05 # 仅移除预测目标邻域内的非目标物体
   push_direction_feature_dim: 64

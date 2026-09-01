@@ -51,7 +51,7 @@ def test_training_fps_uses_requested_count(count):
     sampled.validate(count)
 
 
-def test_training_uses_configured_count_but_default_validation_does_not():
+def test_training_and_validation_use_the_same_configured_count():
     from torch import nn
     from test_independent_push import model
     from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
@@ -82,5 +82,7 @@ def test_training_uses_configured_count_but_default_validation_does_not():
     assert probe.shapes == [(2, 1024, 3)]
     assert torch.equal(batch['xyz'], original)
     with torch.no_grad():
-        push_effectiveness_batch_loss(m.eval(), batch, instance_queries=4, loss_function=PushEffectivenessLoss())
-    assert probe.shapes[-1] == (2, original.shape[1], 3)
+        push_effectiveness_batch_loss(
+            m.eval(), batch, instance_queries=4, loss_function=PushEffectivenessLoss(),
+            scene_sample_points=config.training.push_fps_points)
+    assert probe.shapes[-1] == (2, config.training.push_fps_points, 3)
