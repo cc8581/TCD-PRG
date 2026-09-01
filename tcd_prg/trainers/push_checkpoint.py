@@ -4,6 +4,7 @@ import os
 import math
 import tempfile
 import copy
+import json
 
 import torch
 
@@ -18,6 +19,11 @@ def resume_compatibility(signature):
     # Output location and terminal frequency do not change the training objective.
     config.pop("output_dir", None)
     config.pop("logging", None)
+    # Batch size controls memory use and gradient noise, but it does not change
+    # checkpoint tensor shapes, labels, loss definitions, or optimizer state.
+    # Allow reducing it after an OOM while keeping all objective-defining fields
+    # (including gradient accumulation) under strict compatibility checks.
+    config.get("training", {}).pop("batch_size", None)
     return signature
 
 
@@ -48,6 +54,8 @@ class PushTrainingCheckpoint:
         self.best_state = None
         self.best_metrics = None
         self.best_step = None
+        self.last_completed_validation_step = 0
+        self.pending_validation_step = 0
 
     def _payload(self, state, step):
         return {**self.metadata, "model": state, "optimizer_steps": step,
@@ -55,7 +63,50 @@ class PushTrainingCheckpoint:
                 "training_stage": "push_evaluator",
                 "push_evaluator_protocol_version": PUSH_EVALUATOR_PROTOCOL_VERSION,
                 "push_metric_protocol_version": PUSH_METRIC_PROTOCOL_VERSION,
-                "resume_signature": self.resume_signature}
+                "resume_signature": self.resume_signature,
+                "last_completed_validation_step": self.last_completed_validation_step,
+                "pending_validation_step": self.pending_validation_step}
+
+    def _completed_validation_from_log(self, maximum_step):
+        path = self.output.parent / "validation_metrics.jsonl"
+        completed = 0
+        if not path.is_file():
+            return completed
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if record.get("phase") != "periodic":
+                continue
+            step = int(record.get("optimizer_step", 0))
+            if 0 < step <= int(maximum_step):
+                completed = max(completed, step)
+        return completed
+
+    def validation_due(self, step, interval):
+        step, interval = int(step), int(interval)
+        pending = int(self.pending_validation_step)
+        if pending not in (0, step):
+            raise RuntimeError(
+                "PUSH checkpoint validation transaction is inconsistent: "
+                f"optimizer_step={step}, pending_validation_step={pending}"
+            )
+        if pending == step:
+            return True
+        return (
+            step > 0 and interval > 0 and step % interval == 0
+            and int(self.last_completed_validation_step) < step
+        )
+
+    def begin_validation(self, optimizer, step):
+        self.pending_validation_step = int(step)
+        self.save_latest(optimizer, step)
+
+    def complete_validation(self, optimizer, step):
+        self.last_completed_validation_step = int(step)
+        self.pending_validation_step = 0
+        self.save_latest(optimizer, step)
 
     def save_latest(self, optimizer, step):
         payload = self._payload(self.model.push_evaluator.state_dict(), step)
@@ -104,6 +155,25 @@ class PushTrainingCheckpoint:
         self.best_state = payload["best_state"]
         self.best_metrics = payload["best_metrics"]
         self.best_step = payload["best_step"]
+        if "last_completed_validation_step" in payload:
+            self.last_completed_validation_step = int(payload["last_completed_validation_step"])
+            self.pending_validation_step = int(payload.get("pending_validation_step", 0))
+        else:
+            # Protocol-5 checkpoints created before validation transactions were
+            # explicit are recovered from the durable periodic-validation log.
+            step = int(payload["optimizer_steps"])
+            self.last_completed_validation_step = self._completed_validation_from_log(step)
+            self.pending_validation_step = 0
+        completed_from_log = self._completed_validation_from_log(payload["optimizer_steps"])
+        if self.pending_validation_step and completed_from_log >= self.pending_validation_step:
+            self.last_completed_validation_step = max(
+                self.last_completed_validation_step, self.pending_validation_step
+            )
+            self.pending_validation_step = 0
+        if not (0 <= self.last_completed_validation_step <= int(payload["optimizer_steps"])):
+            raise RuntimeError("PUSH checkpoint completed-validation step is inconsistent")
+        if self.pending_validation_step not in (0, int(payload["optimizer_steps"])):
+            raise RuntimeError("PUSH checkpoint pending-validation step is inconsistent")
         # A crash can occur after publishing best but before refreshing latest.
         # Do not overwrite that newer best with the older snapshot's selection.
         if self.output.is_file():

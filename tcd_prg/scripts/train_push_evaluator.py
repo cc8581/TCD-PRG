@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from tcd_prg.trainers.push_workers import PushDataLoader as DataLoader, managed_push_workers
 from tqdm import tqdm
 
 from tcd_prg.config import load_config
@@ -24,6 +24,7 @@ from tcd_prg.models.staged_checkpoint import load_push_evaluator
 from tcd_prg.trainers.push_checkpoint import PushTrainingCheckpoint
 from tcd_prg.trainers.push_progress import PushTrainingProgress, append_record, print_validation_summary
 from tcd_prg.trainers.push_scheduler import PushLRScheduler
+from tcd_prg.trainers.push_sampling import compiled_fps
 from tcd_prg.runtime import UnifiedBatchCollator, create_adapter
 from tcd_prg.trainers import (
     push_effectiveness_batch_loss,
@@ -54,7 +55,8 @@ def accumulated_batches(model, loader, *, device, config, loss_function, optimiz
         data_seconds += time.monotonic() - finished
         batch = _device(cpu_batch, device)
         loss, details = push_effectiveness_batch_loss(
-            model, batch, instance_queries=config.model.instance_queries, loss_function=loss_function)
+            model, batch, instance_queries=config.model.instance_queries, loss_function=loss_function,
+            scene_sample_points=config.training.push_fps_points)
         logits = details['effective_logit']
         count = logits.numel()
         if count:
@@ -144,7 +146,7 @@ def _evaluate(
     return result
 
 
-def main() -> None:
+def _main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/stage/push_evaluator.yaml")
     parser.add_argument(
@@ -153,13 +155,21 @@ def main() -> None:
     )
     parser.add_argument("--output", default="outputs/push_evaluator.pt")
     parser.add_argument("--resume", help="Continue weights, optimizer and steps from a *_last.pt checkpoint; reshuffle data.")
-    parser.add_argument("--checkpoint-interval", type=int, default=100)
+    parser.add_argument(
+        "--checkpoint-interval", type=int, default=100,
+        help="Deprecated compatibility option; PUSH restart snapshots are validation transactions.",
+    )
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
     args.output = str(Path(args.output).expanduser().resolve())
     # One run directory for checkpoints, logs AND augmentation debug snapshots.
     config.output_dir = str(Path(args.output).parent)
+    fps_points = config.training.push_fps_points
+    if isinstance(fps_points, bool) or not isinstance(fps_points, int) or fps_points <= 0:
+        parser.error("training.push_fps_points must be a positive integer")
+    if config.dataset.scene_points > 0 and fps_points > config.dataset.scene_points:
+        parser.error("training.push_fps_points must not exceed dataset.scene_points")
     if config.training.perception_checkpoint:
         parser.error("PointNet++ PUSH does not use training.perception_checkpoint; remove it")
     if config.training.amp:
@@ -170,6 +180,9 @@ def main() -> None:
         parser.error("--resume and pretrain_checkpoint are mutually exclusive")
     seed_everything(config.training.seed, config.training.deterministic)
     device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
+    # Fail before loading data when the required compiled operator is unavailable.
+    compiled_fps()(torch.zeros(1, 1, 3, device=device), K=1)
+    print(f'PUSH training input: up to {fps_points} points via compiled PyTorch3D FPS', flush=True)
     adapter = create_adapter(config, allow_render=False)
     dataset = ActionStateGroupDataset(
         adapter,
@@ -245,7 +258,7 @@ def main() -> None:
     )
     validation_loader = DataLoader(
         validation_dataset,
-        batch_size=config.training.batch_size,
+        batch_size=config.training.validation_batch_size,
         shuffle=False,
         num_workers=config.training.validation_workers,
         pin_memory=config.training.pin_memory,
@@ -254,7 +267,7 @@ def main() -> None:
     )
     final_validation_loader = DataLoader(
         final_validation_dataset,
-        batch_size=config.training.batch_size,
+        batch_size=config.training.validation_batch_size,
         shuffle=False,
         num_workers=config.training.validation_workers,
         pin_memory=config.training.pin_memory,
@@ -263,9 +276,13 @@ def main() -> None:
     )
     signature = asdict(config)
     # Device/worker changes and a longer run do not change the training objective.
-    for name in ("device", "num_workers", "validation_workers", "pin_memory", "max_optimizer_steps"):
+    for name in (
+        "device", "num_workers", "validation_workers", "validation_batch_size",
+        "pin_memory", "max_optimizer_steps",
+    ):
         signature["training"].pop(name, None)
     checkpoints = PushTrainingCheckpoint(args.output, model, {
+        "training_scene_sampling": {"operator": "pytorch3d.compiled_fps", "points": fps_points},
         "pos_weight": 1.0,
         "periodic_validation_scene_count": len(periodic_validation_scenes),
         "final_validation_scene_count": len(validation_scenes),
@@ -291,8 +308,8 @@ def main() -> None:
         encoding="utf-8",
     )
     if args.resume:
-        print(f"[resume] restored optimizer and step={step}; starting a fresh shuffled data pass", flush=True)
-    last_validation_step = -1
+        print(f"[resume] restored optimizer and step={step}", flush=True)
+    last_validation_step = checkpoints.last_completed_validation_step
     validation_interval = max(0, int(config.training.validation_interval))
     log_interval = max(1, int(config.logging.log_interval))
     progress = PushTrainingProgress(Path(args.output).parent, config.training.max_optimizer_steps, step)
@@ -313,11 +330,29 @@ def main() -> None:
         finally:
             progress.resume()
 
+    def run_periodic_validation():
+        nonlocal last_validation_step
+        # BEGIN and COMMIT are separate durable snapshots. An interruption
+        # between them resumes this same validation before any training batch.
+        checkpoints.begin_validation(optimizer, step)
+        metrics = validate(validation_loader, "periodic")
+        checkpoints.complete_validation(optimizer, step)
+        last_validation_step = step
+        model.train()
+        return metrics
+
     print(f"[push-evaluator-train] starting at step={step}; log_interval={log_interval}, "
+          f"batch={config.training.batch_size}, "
+          f"validation_batch={config.training.validation_batch_size}, "
           f"workers={config.training.num_workers}; waiting for first batch", flush=True)
     print(f"[push-evaluator-train] scheduler: warmup({config.scheduler.warmup_steps}) + cosine; "
           f"eta excludes validation; H@k+ uses groups containing positives; output: {config.output_dir}", flush=True)
     model.train()
+    if args.resume and checkpoints.validation_due(step, validation_interval):
+        print(f"[resume] periodic validation at step={step} is pending; validating before training", flush=True)
+        run_periodic_validation()
+    elif args.resume:
+        print(f"[resume] checkpoint step={step} is in the training phase; training continues first", flush=True)
     while step < config.training.max_optimizer_steps:
         made_progress = False
         for mean_loss, count, positives, data_seconds in accumulated_batches(
@@ -334,31 +369,28 @@ def main() -> None:
             progress.add(mean_loss, count, positives,
                          gradient_norm=grad_norm, clip_scale=clip_scale, data_seconds=data_seconds,
                          max_memory_mb=torch.cuda.max_memory_allocated(device)/2**20 if device.type == "cuda" else 0.)
-            if step == 1 or step % args.checkpoint_interval == 0:
-                checkpoints.save_latest(optimizer, step)
             if (step == 1 or step % log_interval == 0 or step >= config.training.max_optimizer_steps
                     or (validation_interval > 0 and step % validation_interval == 0)):
                 progress.log(step, optimizer.param_groups[0]["lr"])
             if validation_interval > 0 and step % validation_interval == 0:
-                checkpoints.save_latest(optimizer, step)
-                metrics = validate(validation_loader, "periodic")
-                last_validation_step = step
-                checkpoints.save_latest(optimizer, step)
-                model.train()
+                run_periodic_validation()
             if step >= config.training.max_optimizer_steps:
                 break
         if not made_progress:
             raise RuntimeError(
                 "A complete PUSH evaluator epoch contained no known evaluated PUSH actions"
             )
-    checkpoints.save_latest(optimizer, step)
     if last_validation_step != step:
-        metrics = validate(validation_loader, "periodic")
-    checkpoints.save_latest(optimizer, step)
+        run_periodic_validation()
     checkpoints.save_best()
     model.push_evaluator.load_state_dict(checkpoints.best_state, strict=True)
     final_metrics = validate(final_validation_loader, "final")
     checkpoints.save_best(final_metrics)
+
+
+def main() -> None:
+    with managed_push_workers():
+        _main()
 
 
 if __name__ == "__main__":

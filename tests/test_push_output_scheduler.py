@@ -50,12 +50,72 @@ def test_checkpoint_restores_schedule_and_next_update(tmp_path, scheduled):
 
 
 def test_resume_output_changes_do_not_hide_objective_changes():
-    old = {'config': {'output_dir': 'outputs/full', 'logging': {'log_interval': 20}, 'optimizer': {'learning_rate': .001}}}
-    new = {'config': {'output_dir': 'outputs/run', 'logging': {'log_interval': 10}, 'optimizer': {'learning_rate': .001}}}
+    old = {'config': {'output_dir': 'outputs/full', 'logging': {'log_interval': 20},
+                      'training': {'batch_size': 64, 'gradient_accumulation_steps': 1},
+                      'optimizer': {'learning_rate': .001}}}
+    new = {'config': {'output_dir': 'outputs/run', 'logging': {'log_interval': 10},
+                      'training': {'batch_size': 16, 'gradient_accumulation_steps': 1},
+                      'optimizer': {'learning_rate': .001}}}
     assert resume_compatibility(old) == resume_compatibility(new)
     assert old['config']['output_dir'] == 'outputs/full'
+    assert old['config']['training']['batch_size'] == 64
+    new['config']['training']['gradient_accumulation_steps'] = 2
+    assert resume_compatibility(old) != resume_compatibility(new)
+    new['config']['training']['gradient_accumulation_steps'] = 1
     new['config']['optimizer']['learning_rate'] = .002
     assert resume_compatibility(old) != resume_compatibility(new)
+
+
+def test_push_validation_transaction_controls_resume_order(tmp_path):
+    from test_push_review_regressions import tiny_training
+
+    model, optimizer = tiny_training()
+    checkpoint = PushTrainingCheckpoint(tmp_path / 'best.pt', model, {}, {})
+    checkpoint.begin_validation(optimizer, 2000)
+    pending = torch.load(checkpoint.latest, weights_only=False)
+    assert pending['optimizer_steps'] == 2000
+    assert pending['pending_validation_step'] == 2000
+    assert pending['last_completed_validation_step'] == 0
+
+    restored_model, restored_optimizer = tiny_training()
+    restored = PushTrainingCheckpoint(tmp_path / 'best.pt', restored_model, {}, {})
+    assert restored.restore(checkpoint.latest, restored_optimizer) == 2000
+    assert restored.validation_due(2000, 1000)
+
+    checkpoint.complete_validation(optimizer, 2000)
+    completed = PushTrainingCheckpoint(tmp_path / 'best.pt', restored_model, {}, {})
+    assert completed.restore(checkpoint.latest, restored_optimizer) == 2000
+    assert not completed.validation_due(2000, 1000)
+
+
+def test_legacy_push_checkpoint_phase_is_recovered_from_boundary_and_log(tmp_path):
+    from test_push_review_regressions import tiny_training
+
+    model, optimizer = tiny_training()
+    checkpoint = PushTrainingCheckpoint(tmp_path / 'best.pt', model, {}, {})
+    checkpoint.save_latest(optimizer, 2000)
+    payload = torch.load(checkpoint.latest, weights_only=False)
+    payload.pop('last_completed_validation_step')
+    payload.pop('pending_validation_step')
+    torch.save(payload, checkpoint.latest)
+
+    restored_model, restored_optimizer = tiny_training()
+    pending = PushTrainingCheckpoint(tmp_path / 'best.pt', restored_model, {}, {})
+    pending.restore(checkpoint.latest, restored_optimizer)
+    assert pending.validation_due(2000, 1000)
+
+    (tmp_path / 'validation_metrics.jsonl').write_text(
+        '{"phase":"periodic","optimizer_step":2000}\n', encoding='utf-8'
+    )
+    completed = PushTrainingCheckpoint(tmp_path / 'best.pt', restored_model, {}, {})
+    completed.restore(checkpoint.latest, restored_optimizer)
+    assert not completed.validation_due(2000, 1000)
+
+    payload['optimizer_steps'] = 2200
+    torch.save(payload, checkpoint.latest)
+    middle = PushTrainingCheckpoint(tmp_path / 'best.pt', restored_model, {}, {})
+    middle.restore(checkpoint.latest, restored_optimizer)
+    assert not middle.validation_due(2200, 1000)
 
 
 def test_validation_short_labels(capsys):

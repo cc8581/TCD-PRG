@@ -23,13 +23,15 @@ def _yaml_leaf_paths(value, prefix="") -> set[str]:
     return result
 
 
-def test_common_and_formal_stage_configs_have_no_duplicate_leaf_parameters() -> None:
+def test_stage_configs_only_override_explicitly_supported_common_parameters() -> None:
     common = _yaml_leaf_paths(
         yaml.safe_load((train.PROJECT / "configs/config.yaml").read_text(encoding="utf-8"))
     )
     for path in train.STAGE_CONFIGS.values():
         stage = _yaml_leaf_paths(yaml.safe_load(path.read_text(encoding="utf-8"))) - {"defaults"}
-        assert not common.intersection(stage), path
+        # C explicitly exposes the inherited raw point count for user tuning.
+        allowed = {'dataset.scene_points'} if path == train.STAGE_CONFIGS['push_evaluator'] else set()
+        assert not (common.intersection(stage) - allowed), path
 
 
 def test_stage_entrypoints_share_base_config_and_select_stage() -> None:

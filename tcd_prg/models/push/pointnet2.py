@@ -96,6 +96,14 @@ class PushPointNet2(nn.Module):
             indices = torch.arange(32, device=xyz.device) % count
             values = values[:, :, indices]
         features = []
+        # Keep upstream layers/weights, but never request more centres than the
+        # preceding layer supplies. Restore counts even when forward fails.
+        stages = (self.network.sa1, self.network.sa2, self.network.sa3, self.network.sa4)
+        original_counts = [stage.npoint for stage in stages]
+        available = values.shape[2]
+        for stage in stages:
+            stage.npoint = min(stage.npoint, available)
+            available = stage.npoint
         hook = self.network.drop1.register_forward_pre_hook(lambda module, args: features.append(args[0]))
         try:
             if self.training:
@@ -112,3 +120,5 @@ class PushPointNet2(nn.Module):
             return self.projection(features[0][:, :, :count].transpose(1, 2))
         finally:
             hook.remove()
+            for stage, original_count in zip(stages, original_counts):
+                stage.npoint = original_count

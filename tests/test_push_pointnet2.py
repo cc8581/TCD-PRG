@@ -30,7 +30,10 @@ def test_fixed_input_repeats_and_ignores_external_perception_features():
     assert torch.equal(a,c)
 
 
-def test_accumulation_matches_action_weighted_batch_and_flushes_tail():
+def test_accumulation_matches_action_weighted_batch_and_flushes_tail(monkeypatch):
+    # FPS alignment is tested separately; isolate accumulation from resampling.
+    monkeypatch.setattr('tcd_prg.trainers.push_sampling.sample_push_training_input',
+                        lambda sensor, condition, actions, count: (sensor, condition, actions))
     torch.manual_seed(17)
     # Isolate weighted gradient algebra from upstream random FPS and the
     # ill-conditioned BatchNorm statistics of this tiny, repeated-point fixture.
@@ -39,7 +42,7 @@ def test_accumulation_matches_action_weighted_batch_and_flushes_tail():
     first=scene();second=copy.deepcopy(first)
     second['candidate_mask'][0,1]=False  # Two actions then one; not equal batch means.
     empty=copy.deepcopy(first);empty['candidate_mask'].zero_()
-    config=SimpleNamespace(training=SimpleNamespace(gradient_accumulation_steps=2),model=SimpleNamespace(instance_queries=4))
+    config=SimpleNamespace(training=SimpleNamespace(gradient_accumulation_steps=2, push_fps_points=32),model=SimpleNamespace(instance_queries=4))
     opt=torch.optim.SGD(m.parameters(),lr=.01)
     batches=accumulated_batches(m,[first,empty,second,first],device=torch.device('cpu'),config=config,
                                 loss_function=PushEffectivenessLoss(),optimizer=opt)
@@ -133,6 +136,33 @@ def test_pointnet_tiny_or_duplicate_cloud_is_finite():
         assert out.shape==(1,n,16) and torch.isfinite(out).all()
 
 
+def test_sa_counts_adapt_to_small_cloud_and_restore_after_failure():
+    import pytest
+    m=PushPointNet2(16).eval()
+    stages=(m.network.sa1,m.network.sa2,m.network.sa3,m.network.sa4)
+    observed=[]
+    hooks=[stage.register_forward_pre_hook(lambda module,args:observed.append((module.npoint,args[0].shape[-1])))
+           for stage in stages]
+    try:
+        with torch.no_grad():
+            out=m(torch.rand(1,40,3),torch.rand(1,40,3))
+        assert out.shape==(1,40,16)
+        assert observed==[(40,40),(40,40),(40,40),(16,40)]
+        assert [stage.npoint for stage in stages]==[1024,256,64,16]
+        def fail(*args):
+            raise RuntimeError('injected forward failure')
+        failure=stages[0].register_forward_pre_hook(fail)
+        try:
+            with pytest.raises(RuntimeError,match='injected'):
+                m(torch.rand(1,40,3),torch.rand(1,40,3))
+        finally:
+            failure.remove()
+        assert [stage.npoint for stage in stages]==[1024,256,64,16]
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
 def test_upstream_pretrained_weights_load_completely_and_stay_trainable():
     from tcd_prg.models.push.pointnet2 import SOURCE_ROOT, PRETRAINED_RELATIVE
     m=PushPointNet2(16)
@@ -146,7 +176,7 @@ def test_upstream_pretrained_weights_load_completely_and_stay_trainable():
 
 def test_upstream_feature_adapter_matches_original_and_preserves_rng():
     m=PushPointNet2(16).eval();m.load_pretrained()
-    xyz=torch.rand(1,64,3);rgb=torch.rand_like(xyz)
+    xyz=torch.rand(1,1024,3);rgb=torch.rand_like(xyz)
     state=torch.get_rng_state()
     with torch.no_grad():
         actual=m(xyz,rgb)

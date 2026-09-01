@@ -30,9 +30,13 @@ checkpoint or frozen perception encoder is involved.
 ## Network and input adaptation
 
 Upstream `models/pointnet2_sem_seg.py:get_model(13)` runs its original forward:
-SA centres 1024/256/64/16, radii 0.1/0.2/0.4/0.8 m, 32 neighbours, four feature
+SA centre limits 1024/256/64/16, radii 0.1/0.2/0.4/0.8 m, 32 neighbours, four feature
 propagation levels and original convolution/BatchNorm layers. No SA/FP block,
 channel count, sampler or normalization layer has been replaced or reduced.
+The adapter caps each SA layer's centre count at its actual input point count
+for that call, then restores the original limits. Thus 1024/4096-point inputs
+use 1024->256->64->16 centres; a 512-point input uses 512->256->64->16. Upstream
+source and pretrained tensor shapes are unchanged; radii remain metric values.
 A pre-hook captures the 128-channel per-point features before classifier dropout;
 a Linear projection connects them to the existing PUSH feature width.
 The original 13-class S3DIS conv2 remains for strict state loading and has
@@ -45,8 +49,42 @@ centred XY and Z above its lowest visible point, RGB in [0,1], and scene-bounds-
 normalized XYZ in [0,1]. S3DIS originally uses indoor room/block coordinates;
 this is an explicit scene-domain adaptation, not identical S3DIS preprocessing
 and not a guarantee of transfer performance. RGB is not treated as normals.
-World action geometry and masks stay aligned to original points. No point-count
-reduction is performed. Fewer than 32 visible points are repeated to meet upstream
+World action geometry and masks stay aligned to their sampled points. During
+training only, the original observation is reduced to the configured point count before the
+PUSH network using `pytorch3d.ops.sample_farthest_points` and its compiled extension
+(CUDA on GPU). XYZ, RGB, object, target and functional-region point fields use the
+same FPS indices. Masked padding is excluded; short clouds retain only their valid
+FPS selections and padded slots are masked out before the backbone. Actions and
+GT outcomes are not resampled or relabeled.
+Pure FPS can omit small objects/regions; their original action eligibility is
+retained, and their sampled probability may be all zero. No forced point insertion
+is performed. Validation and deployed inference retain their original point counts.
+This training/inference density difference is intentional for this change.
+
+Stage-C training requires a CUDA-enabled official PyTorch3D build (v0.7.7,
+commit `89653419d0973396f3eff1a381ba09a07fffc2ed`); install using the upstream
+Windows/Linux build instructions. Training probes compiled FPS before loading
+data and fails if unavailable. There is no Python FPS fallback. This optional C
+dependency is not imported by Stage A/B. The raw dataset/cache point count remains
+unchanged on disk. Restart the training process to adopt changed point settings.
+
+Both settings live in `configs/stage/push_evaluator.yaml`:
+
+```yaml
+dataset:
+  scene_points: 16384  # Raw collated points; 0 retains all observed points.
+training:
+  push_fps_points: 4096  # Network input limit after compiled FPS; e.g. 1024.
+```
+
+`push_fps_points` must be a positive integer and must not exceed a positive
+`scene_points` limit. No network-input count is hardcoded in the trainer. Setting
+both to 1024 means 1024 raw points and at most 1024 valid network points; FPS
+cannot recover geometry removed by earlier collation. Changing the raw point
+limit also affects this C configuration's validation inputs, but does not alter
+the A/B configurations. The FPS setting itself applies only during training.
+
+For direct network inputs, fewer than 32 visible points are repeated to meet upstream
 ball-query/BatchNorm requirements, then outputs are sliced to original count.
 Only valid points enter the network.
 
@@ -71,6 +109,22 @@ are required by C inference. Rule contacts are proposals, not collision/reachabi
 certification. Scores estimate improvement, not robot execution feasibility.
 
 ## Checkpoints and stage isolation
+
+On Windows, launch C through `train.py --stage push_evaluator` or the root
+`train_push_evaluator.py`. The C supervisor requires `pywin32` (`python -m pip
+install pywin32`) and assigns the suspended training process to a kill-on-close
+Job Object before it can spawn workers. Ctrl+C requests graceful shutdown, waits
+up to five seconds, then closes the job to terminate remaining descendants.
+Workers ignore console interrupts so queue/DLL teardown is owned by the trainer;
+the C child environment sets `FOR_DISABLE_CONSOLE_CTRL_HANDLER=1` before loading
+numerical libraries, preventing Intel Fortran's console handler from aborting
+Python before cleanup. This does not change the parent's or A/B's environment.
+training and validation DataLoader iterators are explicitly shut down in `finally`.
+This also covers exceptions and forced supervisor exit. Interrupted partial
+optimizer updates are not saved; resume from the latest completed checkpoint.
+The Job Object guarantee is Windows-specific and does not cover kernel/driver
+termination failures; a successful termination request is not itself proof that
+the process has finished exiting. A/B launch and training paths are unchanged.
 
 Scene encoding batches all action-bearing scenes with the same visible point
 count into one upstream PointNet++ call. Fixed-size clouds therefore share one

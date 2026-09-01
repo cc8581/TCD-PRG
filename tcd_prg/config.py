@@ -391,6 +391,12 @@ class TrainingConfig:
 
         return 2 * self.num_workers
 
+    @property
+    def validation_batch_size(self) -> int:
+        """Validation uses twice the configured training batch size."""
+
+        return 2 * self.batch_size
+
     # Restrict the published scene snapshot before deterministic splitting.
     scene_start: int = 0
     scene_count: int | None = None
@@ -413,6 +419,10 @@ class TrainingConfig:
             "push_potential": 0.1,
         }
     )
+
+
+    # Stage-C only; required by its training entrypoint, unused by A/B.
+    push_fps_points: int | None = None
 
 
 @dataclass(slots=True)

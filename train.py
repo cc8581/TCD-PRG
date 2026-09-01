@@ -448,7 +448,12 @@ def main() -> None:
         command = _push_evaluator_command(
             args, args.output_dir / "push_evaluator_best.pt"
         )
-        subprocess.run(command, check=True, cwd=PROJECT)
+        from tcd_prg.scripts.push_process import run_push_process
+        try:
+            run_push_process(command, cwd=PROJECT)
+        except KeyboardInterrupt:
+            print('PUSH training interrupted; process-tree shutdown requested.', flush=True)
+            raise SystemExit(130)
         return
     # 在创建 DDP 子进程前先核对显卡数量，避免部分 worker 启动后才失败。
     if args.gpus > 1:

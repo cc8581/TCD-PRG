@@ -129,6 +129,7 @@ def test_training_entry_survives_final_validation_failure_and_resumes(tmp_path,m
     config = TCDPRGConfig(model=ModelConfig(feature_dim=16,instance_queries=4),
                          backbone=BackboneConfig(backend='legacy',attention_points=8),
                          training=TrainingConfig(device='cpu',amp=False,batch_size=1,num_workers=0,
+                                                 push_fps_points=32,
                                                  max_optimizer_steps=2,
                                                  validation_interval=1,pretrain_checkpoint=None))
     monkeypatch.setattr(entry,'load_config',lambda *args:config)

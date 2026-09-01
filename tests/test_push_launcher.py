@@ -28,7 +28,7 @@ def test_push_main_without_perception_and_with_accumulation(tmp_path,monkeypatch
     monkeypatch.setattr(sys,'argv',['train.py','--stage','push_evaluator','--paths-config',str(paths),
                                    '--gradient-accumulation-steps','3'])
     calls=[]
-    monkeypatch.setattr(train.subprocess,'run',lambda cmd,**kw:calls.append(cmd))
+    monkeypatch.setattr('tcd_prg.scripts.push_process.run_push_process',lambda cmd,**kw:calls.append(cmd))
     train.main()
     assert len(calls)==1
     assert 'training.gradient_accumulation_steps=3' in calls[0]

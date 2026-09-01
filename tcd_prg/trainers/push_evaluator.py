@@ -36,11 +36,17 @@ def logged_push_actions(batch, condition):
     return actions, valid
 
 
-def push_effectiveness_batch_loss(model, batch, *, instance_queries, loss_function):
+def push_effectiveness_batch_loss(model, batch, *, instance_queries, loss_function, scene_sample_points=None):
     condition = push_condition_from_gt(batch, instance_queries)
     actions, valid = logged_push_actions(batch, condition)
     if len(actions.batch_index):
-        logits = model.score_actions(batch, condition, actions)
+        if scene_sample_points is not None:
+            from .push_sampling import sample_push_training_input
+            sensor, sampled_condition, sampled_actions = sample_push_training_input(
+                model._sensor(batch), condition, actions, scene_sample_points)
+            logits = model.score_actions(sensor, sampled_condition, sampled_actions)
+        else:
+            logits = model.score_actions(batch, condition, actions)
         losses = loss_function(logits, batch["evaluation_status"][valid],
                                batch["action_improves_state"][valid])
         loss = losses["push_effectiveness"]

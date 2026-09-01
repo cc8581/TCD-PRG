@@ -3,6 +3,11 @@ defaults:
   - ../config.yaml
   - _self_
 
+dataset:
+  # 仅覆盖 PushEvaluator 的原始场景点数，可调整为 4096 或 1024。
+  # FPS 的网络输入点数由下面 training.push_fps_points 单独设置。
+  scene_points: 16384
+
 optimizer:
   learning_rate: 0.0001
   weight_decay: 0.01
@@ -11,12 +16,15 @@ scheduler:
   warmup_steps: 2000
 
 training:
+  # 网络输入点数，可改为 1024 等；应不大于上面的 scene_points（0 表示不限）。
+  push_fps_points: 1024
   pretrain_checkpoint: null       # null: load published yanx27 backbone; otherwise a new-protocol PUSH checkpoint.
   stage: push_evaluator
   max_optimizer_steps: 10000
   validation_interval: 1000
+  # 验证 batch 由代码固定为该值的 2 倍；RTX 3090 实测 32/64 在验证首批 OOM。
   batch_size: 8
-  gradient_accumulation_steps: 3
+  gradient_accumulation_steps: 1
   amp: false  # Explicit FP32 PointNet++ training.
   max_train_groups: null
   max_validation_groups: null
