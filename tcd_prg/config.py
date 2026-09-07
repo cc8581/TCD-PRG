@@ -36,6 +36,7 @@ class ObservationConfig:
     render_height: int = 200
     camera_profile: str = "mecheye_pro_s_three_view"
     renderer_version: str = "tcd_prg_pybullet_v3_sensor_only_instance_query"
+    renderer_by_scene: dict[str, str] = field(default_factory=dict)
     pybullet_python: str = "python"
     worker_script: str = "scripts/render_observation_worker_py38.py"
     runtime_mesh_root: str = "runtime/cache/meshes"
@@ -53,6 +54,7 @@ class CacheConfig:
     index_directory: str = "runtime/cache/dataset_indexes"
     max_gb: float = 5.0
     min_free_gb: float = 20.0
+    eviction_enabled: bool = True
     prefetch_workers: int = 4
 
 

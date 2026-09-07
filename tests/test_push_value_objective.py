@@ -1,7 +1,9 @@
 import torch
+import pytest
 
 from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
 from tcd_prg.models.staged_checkpoint import stage_training_state
+from tcd_prg.scripts.train_push_evaluator import push_optimizer_groups
 
 
 def test_q_objective_trains_value_ranking_safety_and_auxiliary():
@@ -23,6 +25,47 @@ def test_q_objective_trains_value_ranking_safety_and_auxiliary():
     losses["push_effectiveness"].backward()
     assert losses["push_rank"] > 0
     assert all(value.grad is not None for value in prediction.values())
+
+
+def test_ranking_is_normalized_and_safety_classes_are_balanced():
+    prediction = {
+        "q_value": torch.full((4, 1), .5, requires_grad=True),
+        "safety_logit": torch.zeros(4, requires_grad=True),
+        "potential_delta": torch.zeros(4, 5, requires_grad=True),
+    }
+    losses = PushEffectivenessLoss(rank_margin=.02)(
+        prediction, q_target=torch.tensor([[.9], [.1], [.8], [.7]]),
+        q_valid=torch.ones(4, 1, dtype=torch.bool),
+        safety_target=torch.tensor([True, True, True, False]),
+        safety_valid=torch.ones(4, dtype=torch.bool),
+        auxiliary_target=torch.zeros(4, 5), auxiliary_valid=torch.zeros(4, dtype=torch.bool),
+        group_index=torch.zeros(4, dtype=torch.long),
+    )
+    assert losses["push_rank"].item() == pytest.approx(1.0)
+    assert losses["push_safety_bce"].item() == pytest.approx(torch.log(torch.tensor(2.)).item())
+
+
+def test_push_optimizer_uses_configured_lower_backbone_learning_rate():
+    class Evaluator(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Linear(2, 2)
+            self.head = torch.nn.Linear(2, 1)
+
+    class Model:
+        push_evaluator = Evaluator()
+
+    class Config:
+        class optimizer:
+            learning_rate = 1e-4
+            backbone_learning_rate = 2e-5
+
+    groups = push_optimizer_groups(Model(), Config())
+    assert [group["name"] for group in groups] == ["push_heads", "pointnet2_backbone"]
+    assert [group["lr"] for group in groups] == [pytest.approx(1e-4), pytest.approx(2e-5)]
+    assert {id(p) for p in groups[0]["params"]}.isdisjoint(
+        {id(p) for p in groups[1]["params"]}
+    )
 
 
 def test_ab_checkpoint_migration_replaces_only_push_tensors():

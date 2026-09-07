@@ -39,7 +39,11 @@ def push_nms_mask(candidates: dict[str, Tensor], config: ModelConfig) -> Tensor:
 
 
 
-def decode_push_candidates(sensor, condition, push, config):
+def decode_push_candidates(
+    sensor, condition, push, config, *, remaining_preparation_actions: int = 5
+):
+    if not 0 <= int(remaining_preparation_actions) <= 5:
+        raise ValueError("remaining_preparation_actions must lie in [0,5]")
     actions = push["actions"]
     q_value = push.get("q_value")
     if q_value is None:
@@ -47,12 +51,15 @@ def decode_push_candidates(sensor, condition, push, config):
         score_all = logits.sigmoid()
         safety_all = torch.ones_like(score_all)
     else:
-        score_all = q_value[:, -1]
+        horizon_index = max(int(remaining_preparation_actions), 1) - 1
+        score_all = q_value[:, horizon_index]
         logits = torch.logit(score_all.clamp(1e-6, 1-1e-6))
         safety_all = push["safety_probability"]
     pre, final = [], []
     for b in range(len(sensor["xyz"])):
         ids = torch.nonzero(actions.batch_index == b, as_tuple=False).flatten()
+        if remaining_preparation_actions == 0:
+            ids = ids[:0]
         ids = ids[safety_all[ids] >= config.push_safety_probability_threshold]
         ids = ids[score_all[ids].argsort(descending=True, stable=True)]
         ids = ids[:config.max_push_candidates]
@@ -74,7 +81,8 @@ def decode_push_candidates(sensor, condition, push, config):
                "object_score": torch.ones_like(score), "contact_score": torch.ones_like(score),
                "direction_score": torch.ones_like(score), "utility": score,
                "proposal_score": score, "effective_logit": logits[ids], "effective_probability": score,
-               "q_value": q_value[ids] if q_value is not None else score[:, None],
+               "q_value": q_value[ids] if q_value is not None else score[:, None].expand(-1, 5),
+               "q_horizon": torch.full_like(a.object, int(remaining_preparation_actions)),
                "safety_probability": safety_all[ids]}
         pre.append(row)
         keep = push_nms_mask(row, config)

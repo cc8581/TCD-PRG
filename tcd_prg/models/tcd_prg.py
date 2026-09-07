@@ -487,7 +487,7 @@ class TCDPRGModel(nn.Module):
         )
 
     def _push_condition(
-        self, encoded: Any, region: dict[str, Tensor], task: dict[str, Tensor]
+        self, encoded: Any, region: dict[str, Tensor], task: dict[str, Tensor],
     ) -> PushCondition:
         target_valid = self._target_identity_gate(encoded)
         object_valid = encoded.object_mask.clone()

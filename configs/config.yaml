@@ -39,65 +39,67 @@ augmentation:
     save_first_batches: 3
   # 颜色与纹理增强
   zero_rgb:
-    probability: 0.50
+    probability: 0.10
   grayscale:
-    probability: 0.50
+    probability: 0.10
   color_jitter:
-    probability: 0.50
+    probability: 0.30
     brightness: 0.35
     contrast: 0.35
     saturation: 0.35
     hue: 0.08
     gamma: [0.75, 1.35]
   object_recolor:
-    probability: 0.5
+    probability: 0.35
     strength: [0.35, 0.90]
   material_jitter:
-    probability: 0.5
+    probability: 0.30
     noise_std: [0.01, 0.08]
   lighting_jitter:
-    probability: 0.50
+    probability: 0.30
     gain: [0.65, 1.35]
     bias: [-0.12, 0.12]
   sensor_noise:
-    probability: 0.5
+    probability: 0.30
     std: [0.005, 0.04]
   channel_dropout:
-    probability: 0.2
+    probability: 0.2        # default 0.2
+
   # 几何与深度增强
   point_dropout:
-    probability: 0.3
+    probability: 0.0        # default 0.3
     fraction: [0.01, 0.15]
   depth_noise:
-    probability: 0.30
+    probability: 0.00       # default 0.30
     std_m: [0.0005, 0.0030]
   hole_dropout:
-    probability: 0.20
+    probability: 0.0       # default 0.20
     count: [1, 3]
     radius_m: [0.008, 0.030]
   outlier_injection:
-    probability: 0.15
+    probability: 0.0       # default 0.15
     fraction: [0.01, 0.02]
     displacement_m: [0.005, 0.050]
   view_dropout:
-    probability: 0.1
+    probability: 0.0        # default 0.1
     max_views: 1
   density_variation:
-    probability: 0.20
+    probability: 0.0       # default 0.20
     keep_ratio: [0.60, 0.95]
   extrinsic_jitter:
-    probability: 0.20
+    probability: 0.0       # default 0.20
     translation_std_m: [0.0005, 0.0030]
     rotation_degrees: [0.10, 1.00]
   occlusion:
-    probability: 0.20
+    probability: 0.0       # default 0.20
     fraction: [0.05, 0.20]
 
 cache:
-  # 命中会刷新访问时间；达到容量或磁盘余量阈值时，LRU 自动淘汰最久未访问条目。
+  # eviction_enabled=false 时空间不足会报错停止，绝不删除已有缓存。
   directory: runtime/cache/observations
   max_gb: 10
-  min_free_gb: 20
+  min_free_gb: 10
+  eviction_enabled: false
   prefetch_workers: 4
 
 backbone:

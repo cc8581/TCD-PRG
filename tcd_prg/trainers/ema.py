@@ -22,4 +22,3 @@ class ModelEMA:
             ema.lerp_(current.detach(), 1.0 - self.decay)
         for ema, current in zip(self.model.buffers(), source.buffers(), strict=True):
             ema.copy_(current)
-

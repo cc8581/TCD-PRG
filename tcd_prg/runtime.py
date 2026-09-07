@@ -52,6 +52,7 @@ def create_observation_provider(config: TCDPRGConfig, allow_render: bool = False
         fallback,
         max_bytes=int(config.cache.max_gb * (1 << 30)),
         min_free_bytes=int(config.cache.min_free_gb * (1 << 30)),
+        eviction_enabled=config.cache.eviction_enabled,
     )
 
 
@@ -71,6 +72,7 @@ def create_adapter(config: TCDPRGConfig, allow_render: bool = False):
         observation_provider=create_observation_provider(config, allow_render),
         point_count=cache_point_count,
         renderer_version=config.observation.renderer_version,
+        renderer_by_scene=config.observation.renderer_by_scene,
         camera_profile=config.observation.camera_profile,
         functional_region_root=config.dataset.functional_region_root,
         verifier_wrong_region_negatives=config.sampling.wrong_region_grasps,
@@ -105,8 +107,9 @@ def create_action_certifier(config: TCDPRGConfig) -> ExternalFR5AG16095Certifier
 
 
 def _apply_training_augmentation(
-    config: TCDPRGConfig, batch: dict[str, Any]
+    config: TCDPRGConfig, batch: dict[str, Any], *, disable_extrinsic_jitter: bool = False
 ) -> dict[str, Any]:
+    import copy
     from tcd_prg.datasets.augmentation_debug import claim_debug_batch, save_debug_batch
     from tcd_prg.datasets.pointcloud_augmentation import PointCloudAugmentation
 
@@ -119,7 +122,11 @@ def _apply_training_augmentation(
     point_mask_before = (
         batch["point_mask"].clone() if debug_directory is not None else None
     )
-    PointCloudAugmentation(config.augmentation)(batch)
+    augmentation = config.augmentation
+    if disable_extrinsic_jitter and augmentation.extrinsic_jitter.probability > 0:
+        augmentation = copy.deepcopy(augmentation)
+        augmentation.extrinsic_jitter.probability = 0.0
+    PointCloudAugmentation(augmentation)(batch)
     if debug_directory is not None and rgb_before is not None:
         save_debug_batch(
             debug_directory, batch, rgb_before, xyz_before, point_mask_before
@@ -173,8 +180,14 @@ class PushValueBatchCollator:
         from tcd_prg.datasets.push_value import PushActionValueStore
 
         batch = UnifiedBatchCollator(
-            self.config, training=self.training, include_graspnet=False
+            self.config, training=False, include_graspnet=False
         )(samples)
+        if self.training:
+            # Per-view extrinsic jitter changes point coordinates without changing
+            # logged world-frame PUSH contacts/directions, so it is invalid for C.
+            batch = _apply_training_augmentation(
+                self.config, batch, disable_extrinsic_jitter=True
+            )
         root = self.config.training.push_value_root
         if not root:
             raise RuntimeError("Stage-C Q training requires training.push_value_root")

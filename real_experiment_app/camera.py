@@ -19,7 +19,7 @@ class CameraSource(Protocol):
 class LegacyMechEyeCamera:
     """Adapter over the previously validated Mech-Eye camera implementation."""
 
-    def __init__(self, camera_id: str, ip: str, camera_to_base,
+    def __init__(self, camera_id: str, ip: str, camera_to_base, model_view_index: int,
                  sdk_windows_root: Path):
         import sys
         root = str(sdk_windows_root.resolve())
@@ -27,6 +27,7 @@ class LegacyMechEyeCamera:
         self.camera_id = camera_id
         self._ip = ip
         self._camera = None
+        self.model_view_index = int(model_view_index)
         self._transform = (None if camera_to_base is None
                            else np.asarray(camera_to_base, np.float64))
 
@@ -50,7 +51,7 @@ class LegacyMechEyeCamera:
             raise RuntimeError(f"{self.camera_id}: capture failed")
         return RGBDFrame(self.camera_id, np.asarray(color, np.uint8),
                          np.asarray(depth, np.float32), self._camera.get_intrinsics(),
-                         self._transform.copy())
+                         self._transform.copy(), self.model_view_index)
 
     def disconnect(self) -> None:
         if self._camera is not None:
@@ -59,10 +60,15 @@ class LegacyMechEyeCamera:
 
 
 def build_cameras(config) -> list[CameraSource]:
-    enabled = [x for x in config.raw.get("cameras", []) if x.get("enabled", True)]
+    entries = config.raw.get("cameras", [])
+    enabled = [x for x in entries if x.get("enabled", True)]
     if not enabled:
         raise ValueError("至少需要启用一台 Mech-Eye 相机")
+    view_indices = [int(item.get("model_view_index", index)) for index, item in enumerate(enabled)]
+    if len(view_indices) != len(set(view_indices)) or any(index < 0 for index in view_indices):
+        raise ValueError("启用相机的模型视角编号必须是互不重复的非负整数")
     root = config.resolve(config.raw["robot"]["sdk_windows_root"])
     return [LegacyMechEyeCamera(str(item["id"]), str(item["ip"]),
-                               item.get("camera_to_robot_base"), root)
-            for item in enabled]
+                               item.get("camera_to_robot_base"),
+                               int(item.get("model_view_index", index)), root)
+            for index, item in enumerate(enabled)]

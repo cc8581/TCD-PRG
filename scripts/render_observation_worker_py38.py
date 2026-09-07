@@ -200,9 +200,28 @@ def main():
                 instance[body_id == body] = object_index
             near, far = float(camera["z_near"]), float(camera["z_far"])
             depth = far * near / (far - (far - near) * depth_buffer)
+            bounded_sensor_protocols = {
+                "tcd_prg_pybullet_v4_sensor_valid_depth_20k_per_view": 20000,
+                "tcd_prg_pybullet_v5_sensor_valid_depth_10k_per_view": 10000,
+            }
+            if renderer_version in bounded_sensor_protocols:
+                # Pixels without a rendered surface sit at the far plane.  Due
+                # to float rounding, reconstructing metric depth first can make
+                # them microscopically smaller than z_far and retain all pixels.
+                depth[depth_buffer >= (1.0 - 1e-6)] = np.inf
             scaled = dict(camera)
             scaled.update(fx=fx, fy=fy, cx=cx, cy=cy)
-            outputs.append(project_world(depth, rgba[..., :3], instance, scaled, view_index))
+            view_output = project_world(depth, rgba[..., :3], instance, scaled, view_index)
+            if renderer_version in bounded_sensor_protocols:
+                view_output = deterministic_sample(
+                    view_output[0],
+                    view_output[1],
+                    view_output[2],
+                    view_output[3],
+                    bounded_sensor_protocols[renderer_version],
+                    render_seed + 1000003 * view_index,
+                )
+            outputs.append(view_output)
         xyz = np.concatenate([item[0] for item in outputs])
         rgb = np.concatenate([item[1] for item in outputs])
         instance = np.concatenate([item[2] for item in outputs])

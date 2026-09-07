@@ -229,6 +229,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         split_seed: int = 2026,
         scene_start: int = 0,
         scene_count: int | None = None,
+        renderer_by_scene: dict[str, str] | None = None,
     ) -> None:
         self.root = Path(root)
         self.scene_root = self.root / scene_subdir
@@ -270,6 +271,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         self.relation_names = ("near", "contact", "support", "press", "occlude")
         self.point_count = point_count
         self.renderer_version = renderer_version
+        self.renderer_by_scene = {int(key): str(value) for key, value in (renderer_by_scene or {}).items()}
         self.camera_profile = camera_profile
         self.verifier_sampling = (
             int(verifier_wrong_region_negatives),
@@ -1204,7 +1206,7 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
             render_seed=render_seed,
             camera_profile=self.camera_profile,
             point_count=self.point_count,
-            renderer_version=self.renderer_version,
+            renderer_version=self.renderer_by_scene.get(int(scene_id), self.renderer_version),
         )
 
     def observation_available(self, scene_id: int, state_id: int, task_index: int) -> bool:

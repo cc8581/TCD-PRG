@@ -28,6 +28,7 @@ class PushTrainingProgress:
         self.last_step = initial_step
         self.initial_step = initial_step
         self.loss_sum = 0.0
+        self.component_sums = dict(q=0.0, rank=0.0, safety=0.0, auxiliary=0.0)
         self.actions = self.positive = 0
         self.diagnostics = dict(gradient_norm=0., gradient_norm_after_clip=0., gradient_clip_scale=0., data_seconds=0.)
         self.max_memory_mb = 0.
@@ -41,8 +42,12 @@ class PushTrainingProgress:
             self.excluded += self.clock() - self.paused_at
             self.paused_at = None
 
-    def add(self, loss, actions, positive, *, gradient_norm=0., clip_scale=1., data_seconds=0., max_memory_mb=0.):
+    def add(self, loss, actions, positive, *, components=None, gradient_norm=0., clip_scale=1.,
+            data_seconds=0., max_memory_mb=0.):
         self.loss_sum += float(loss) * int(actions)
+        if components is not None:
+            for key in self.component_sums:
+                self.component_sums[key] += float(components[key]) * int(actions)
         self.actions += int(actions)
         self.positive += int(positive)
         self.diagnostics['gradient_norm'] += gradient_norm
@@ -60,6 +65,10 @@ class PushTrainingProgress:
         seconds_per_step = max(0.0, active - self.last_active) / steps
         record = dict(optimizer_step=step, max_optimizer_steps=self.maximum,
                       window_steps=steps, loss=self.loss_sum / self.actions,
+                      q_loss=self.component_sums['q'] / self.actions,
+                      rank_loss=self.component_sums['rank'] / self.actions,
+                      safety_loss=self.component_sums['safety'] / self.actions,
+                      auxiliary_loss=self.component_sums['auxiliary'] / self.actions,
                       safe_fraction=self.positive / self.actions, actions=self.actions,
                       learning_rate=float(learning_rate), seconds_per_step=seconds_per_step,
                       elapsed_seconds=now - self.started,
@@ -68,7 +77,11 @@ class PushTrainingProgress:
                       **{key:value/steps for key,value in self.diagnostics.items()})
         fields = [f"Train [push_evaluator] [{step:07d}/{self.maximum:07d}]",
                   f"eta: {duration(record['eta_train_seconds'])}",
-                  f"loss: {record['loss']:.4f}", f"safe: {record['safe_fraction']:.1%}",
+                  f"loss: {record['loss']:.4f}",
+                  f"Q: {record['q_loss']:.4f}", f"rank: {record['rank_loss']:.4f}",
+                  f"safe BCE: {record['safety_loss']:.4f}",
+                  f"aux: {record['auxiliary_loss']:.4f}",
+                  f"safe: {record['safe_fraction']:.1%}",
                   f"lr: {learning_rate:.3e}",
                   f"grad: {record['gradient_norm']:.3f}->{record['gradient_norm_after_clip']:.3f}",
                   f"clip: {record['gradient_clip_scale']:.3f}",
@@ -79,6 +92,7 @@ class PushTrainingProgress:
         append_record(self.path, record)
         self.last_step, self.last_active = step, active
         self.loss_sum = 0.0
+        self.component_sums = dict.fromkeys(self.component_sums, 0.0)
         self.actions = self.positive = 0
         self.diagnostics = dict.fromkeys(self.diagnostics, 0.)
         return record

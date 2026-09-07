@@ -16,8 +16,8 @@ STAGE_PREFIXES = {
     "grasp": ("task_grasp.",),
 }
 
-PUSH_EVALUATOR_PROTOCOL_VERSION = 6
-PUSH_ARCHITECTURE = "instance_relation_pointnet2_q5_safety_aux_v1"
+PUSH_EVALUATOR_PROTOCOL_VERSION = 10
+PUSH_ARCHITECTURE = "instance_relation_pointnet2_q5_safety_aux_gt_trajectory_v3"
 
 
 def resolve_staged_checkpoint_root(root: str | Path) -> dict[str, Path]:
@@ -143,9 +143,54 @@ def load_staged_tcd_prg(
     del stage_a
     saved_stageb = compatibility_provenance(stage_b.get("stageb_provenance", {}))
     runtime_stageb = stageb_compatibility(runtime_config)
-    for key in ("scene_preprocess", "target_graspnet", "proposal_label_protocol"):
-        if saved_stageb.get(key) != runtime_stageb.get(key):
-            raise RuntimeError(f"grasp runtime provenance mismatch: {key}")
+    dataset_protocol = saved_stageb.get("dataset_protocol_version")
+    if dataset_protocol == "task_oriented_clutter_acronym_dynamic_v1":
+        # Dynamic ACRONYM training provenance describes label sampling, not the
+        # observation/proposal runtime. Those fields remain strictly checked
+        # against the schema-12 checkpoint's resolved configuration instead.
+        _require_fields(
+            stage_b,
+            runtime_config,
+            {
+                "dataset": ("scene_points",),
+                "backbone": ("grid_size_m",),
+                "observation": (
+                    "camera_profile", "render_width", "render_height",
+                ),
+                "graspnet": (
+                    "scene_input_points", "target_input_points", "target_proposals",
+                    "target_selection_mode", "diversity_quality_fraction",
+                    "diversity_translation_m", "diversity_rotation_deg",
+                    "diversity_pool_factor", "camera_view_index", "target_crop_probability",
+                    "target_min_crop_points", "camera_transfer_max_distance_m", "num_view",
+                    "num_angle", "num_depth", "cylinder_radius", "hmin",
+                ),
+            },
+            "grasp",
+        )
+        saved_hmax = stage_b.get("config", {}).get("graspnet", {}).get("hmax_list")
+        if tuple(saved_hmax or ()) != tuple(runtime_config.graspnet.hmax_list):
+            raise RuntimeError("grasp runtime mismatch: graspnet.hmax_list")
+        saved_renderer = stage_b.get("config", {}).get("observation", {}).get(
+            "renderer_version"
+        )
+        runtime_renderer = runtime_config.observation.renderer_version
+        renderer_family = {
+            "tcd_prg_pybullet_v2_variable_grid",
+            "tcd_prg_pybullet_v3_sensor_only_instance_query",
+            "tcd_prg_pybullet_v4_sensor_valid_depth_20k_per_view",
+            "tcd_prg_pybullet_v5_sensor_valid_depth_10k_per_view",
+        }
+        # These protocols share the calibrated cameras and projection.  v4
+        # corrects far-plane validity; v4/v5 bound each sensor view to 20k/10k.
+        if saved_renderer != runtime_renderer and not {
+            saved_renderer, runtime_renderer
+        }.issubset(renderer_family):
+            raise RuntimeError("grasp runtime mismatch: observation.renderer_version")
+    else:
+        for key in ("scene_preprocess", "target_graspnet", "proposal_label_protocol"):
+            if saved_stageb.get(key) != runtime_stageb.get(key):
+                raise RuntimeError(f"grasp runtime provenance mismatch: {key}")
     if "task_grasp_probability_threshold" not in stage_b:
         raise RuntimeError("Stage-B checkpoint is missing its calibrated deployment threshold")
     return float(stage_b["task_grasp_probability_threshold"])

@@ -5,6 +5,7 @@ import pytest
 import yaml
 
 from real_experiment_app.config import AppConfig
+from real_experiment_app.camera import build_cameras
 from real_experiment_app.perception import (
     fuse_frames,
     remove_calibrated_table,
@@ -115,3 +116,19 @@ def test_operator_can_record_and_persist_table_calibration(tmp_path: Path):
         "normal": [0.0, 0.0, 1.0],
         "offset_m": -0.42,
     }
+
+
+def test_enabled_cameras_need_unique_model_view_indices(tmp_path: Path):
+    path = tmp_path / "settings.yaml"
+    path.write_text("robot:\n  sdk_windows_root: .\ncameras:\n  - {id: camera_0, enabled: true, ip: a, model_view_index: 2}\n  - {id: camera_1, enabled: true, ip: b, model_view_index: 2}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="互不重复"):
+        build_cameras(AppConfig.load(path))
+
+
+def test_single_camera_can_map_to_stage_b_reference_view():
+    frame = synthetic_frame("only-camera")
+    frame.model_view_index = 2
+    scene = fuse_frames([frame], None, fusion_settings())
+    assert set(scene.source_view.tolist()) == {2}
+    assert len(scene.camera_to_world) == 3
+    assert np.allclose(scene.camera_to_world[2], frame.camera_to_base)

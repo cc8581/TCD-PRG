@@ -46,7 +46,15 @@ class PushEffectivenessLoss(nn.Module):
                 left, right = torch.where(difference > self.rank_margin)
                 if len(left):
                     predicted_difference = prediction[ids[left], horizon] - prediction[ids[right], horizon]
-                    terms.append(torch.relu(self.rank_margin - predicted_difference).mean())
+                    # RankNet supplies a smooth, confidence-dependent gradient.
+                    # Normalizing by log(2) keeps a tied prediction at exactly 1
+                    # without the 1 / margin gradient amplification of the old
+                    # normalized hinge.
+                    temperature = max(5.0 * self.rank_margin, 0.05)
+                    term = torch.nn.functional.softplus(
+                        -predicted_difference / temperature
+                    ) / prediction.new_tensor(2.0).log()
+                    terms.append(term.mean())
         return torch.stack(terms).mean() if terms else prediction.sum() * 0.0
 
     def forward(
@@ -72,9 +80,24 @@ class PushEffectivenessLoss(nn.Module):
         rank_loss = self._ranking(q_prediction, q_target, q_valid, group_index)
         if not bool(safety_valid.any()):
             raise RuntimeError("Stage-C batch contains no valid safety targets")
-        safety_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-            prediction["safety_logit"][safety_valid], safety_target[safety_valid].float()
+        safety_logit = prediction["safety_logit"][safety_valid]
+        safety_label = safety_target[safety_valid].float()
+        safety_terms = torch.nn.functional.binary_cross_entropy_with_logits(
+            safety_logit, safety_label, reduction="none"
         )
+        positive = safety_label.sum()
+        negative = safety_label.numel() - positive
+        if bool((positive > 0) & (negative > 0)):
+            # Equal aggregate weight for safe and unsafe actions prevents the
+            # observed all-safe classifier from attaining the majority baseline.
+            weights = torch.where(
+                safety_label.bool(),
+                safety_label.new_tensor(safety_label.numel() / 2) / positive,
+                safety_label.new_tensor(safety_label.numel() / 2) / negative,
+            )
+            safety_loss = (safety_terms * weights).mean()
+        else:
+            safety_loss = safety_terms.mean()
         aux_mask = auxiliary_valid[:, None] & torch.isfinite(auxiliary_target)
         if bool(aux_mask.any()):
             scaled_target = auxiliary_target / self.delta_scales.to(auxiliary_target)

@@ -122,37 +122,67 @@ class PushEffectivenessEvaluator(nn.Module):
                 target_center = self._pool(points, target_weight)
                 encoded = self.point_encoder(torch.cat((scene_features, points - target_center), -1))
                 context[b] = (points, encoded, target_weight, target_center)
-        rows = []
-        for i in range(len(actions.batch_index)):
-            b, obj = int(actions.batch_index[i]), int(actions.object[i])
+        rows, row_ids = [], []
+        for b, (points, encoded, target_weight, target_center) in context.items():
+            ids = torch.where(actions.batch_index == b)[0]
+            obj = actions.object[ids]
             valid = mask[b]
-            points, encoded, target_weight, target_center = context[b]
-            contact, direction = actions.contact_world[i], actions.direction_world[i]
-            relative = points - contact
-            object_weight = condition.object_probability[b, obj, valid]
-            object_center = self._pool(points, object_weight)
+            weights = condition.object_probability[b, :, valid]
+            # Preserve the original weighted reduction, but build it once per
+            # scene, rather than once per action. No parameter/layout changes.
+            centers = torch.stack([self._pool(points, w) for w in weights])
+            extents = torch.stack([
+                self._pool((points - center).square(), w).sqrt()
+                for w, center in zip(weights, centers)
+            ])
+            pooled = torch.stack([self._pool(encoded, w) for w in weights])
+            slots = torch.where(condition.object_valid[b] & (weights.sum(-1) > 0))[0]
+            contact, direction = actions.contact_world[ids], actions.direction_world[ids]
+            distance = actions.push_distance[ids]
+            relative = points[None] - contact[:, None]
+            object_center = centers[obj]
             local_ids = relative.square().sum(-1).topk(min(64, len(points)), largest=False).indices
-            along = (relative * direction).sum(-1).clamp(min=0)
-            along = torch.minimum(along, actions.push_distance[i])
-            corridor = (relative - along[:, None] * direction).square().sum(-1)
+            along = (relative * direction[:, None]).sum(-1).clamp(min=0)
+            along = torch.minimum(along, distance[:, None])
+            corridor = (relative - along[..., None] * direction[:, None]).square().sum(-1)
             path_ids = corridor.topk(min(128, len(points)), largest=False).indices
-            task = self.category(condition.task_category_id[b]) + self.region(condition.task_region_id[b])
-            region_weight = condition.region_probability[b, valid]
-            relation = self._instance_context(
-                points, encoded, condition.object_probability[b, :, valid],
-                condition.object_valid[b], contact, direction, actions.push_distance[i],
-                obj, target_center,
+            task = self.category(condition.task_category_id[b]) + self.region(
+                condition.task_region_id[b]
             )
+            region_weight = condition.region_probability[b, valid]
+            if len(slots):
+                relative_center = centers[slots][None] - contact[:, None]
+                center_along = torch.minimum(
+                    (relative_center * direction[:, None]).sum(-1).clamp_min(0), distance[:, None])
+                offset = torch.linalg.vector_norm(
+                    relative_center - center_along[..., None] * direction[:, None], dim=-1)
+                relation_geometry = torch.cat((
+                    (centers[slots] - target_center)[None].expand(len(ids), -1, -1),
+                    relative_center, extents[slots][None].expand(len(ids), -1, -1),
+                    center_along[..., None], offset[..., None],
+                    (slots[None] == obj[:, None]).to(points.dtype)[..., None],
+                ), -1)
+                relation_input = torch.cat((
+                    pooled[slots][None].expand(len(ids), -1, -1), relation_geometry), -1)
+                tokens = self.instance_relation(relation_input)
+                attention = self.relation_attention(relation_input).softmax(dim=1)
+                relation = (tokens * attention).sum(1)
+            else:
+                relation = encoded.new_zeros(len(ids), self.feature_dim)
             geometry = torch.cat((
                 contact - target_center, contact - object_center, direction,
-                actions.push_distance[i:i + 1],
-            ))
+                distance[:, None],
+            ), -1)
             rows.append(torch.cat((
-                self._pool(encoded, object_weight), self._pool(encoded, target_weight),
-                encoded[local_ids].mean(0), encoded[path_ids].mean(0),
-                self._pool(encoded, region_weight), task, relation, geometry,
-            )))
-        shared = self.trunk(torch.stack(rows))
+                pooled[obj], self._pool(encoded, target_weight)[None].expand(len(ids), -1),
+                encoded[local_ids].mean(1), encoded[path_ids].mean(1),
+                self._pool(encoded, region_weight)[None].expand(len(ids), -1),
+                task[None].expand(len(ids), -1), relation, geometry,
+            ), -1))
+            row_ids.append(ids)
+        # Callers align supervision with the original (possibly interleaved)
+        # action order, not with the scene grouping used above.
+        shared = self.trunk(torch.cat(rows)[torch.cat(row_ids).argsort()])
         q_value = self._monotonic_q(self.q_head(shared))
         safety_logit = self.safety_head(shared).squeeze(-1)
         safety_probability = torch.sigmoid(safety_logit)

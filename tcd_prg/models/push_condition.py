@@ -24,7 +24,8 @@ class PushCondition:
             raise ValueError("PushCondition object tensors have incompatible shapes")
         if self.target_probability.shape != (b, n) or self.region_probability.shape != (b, n):
             raise ValueError("PushCondition point tensors have incompatible shapes")
-        if self.target_valid.shape != (b,) or self.task_category_id.shape != (b,) or self.task_region_id.shape != (b,):
+        if (self.target_valid.shape != (b,) or self.task_category_id.shape != (b,)
+                or self.task_region_id.shape != (b,)):
             raise ValueError("PushCondition batch tensors have incompatible shapes")
         if not torch.isfinite(self.object_probability).all() or not torch.isfinite(self.target_probability).all() or not torch.isfinite(self.region_probability).all():
             raise ValueError("PushCondition probabilities must be finite")
@@ -54,4 +55,7 @@ def push_condition_from_gt(batch: Mapping[str, Tensor], query_count: int) -> Pus
         valid[:, slot] = object_mask[:, slot] & membership.any(-1)
     target = (point_mask & batch["target_mask"].bool()).to(probability.dtype)
     region = (point_mask & batch["target_mask"].bool() & batch["region_valid"].bool() & batch["region_target"].bool()).to(probability.dtype)
-    return PushCondition(probability, valid, target, region, target.any(-1), batch["task_category_id"].long(), batch["task_region_id"].long()).validate(n)
+    return PushCondition(
+        probability, valid, target, region, target.any(-1),
+        batch["task_category_id"].long(), batch["task_region_id"].long(),
+    ).validate(n)

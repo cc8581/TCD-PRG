@@ -13,7 +13,8 @@ import numpy as np
 from tcd_prg.constants import ActionType, OutcomeCode
 
 
-PUSH_VALUE_SCHEMA_VERSION = 1
+PUSH_VALUE_SCHEMA_VERSION = 1  # State-sidecar schema retained for compatibility.
+PUSH_ACTION_VALUE_SCHEMA_VERSION = 3
 PUSH_VALUE_HORIZONS = 5
 
 
@@ -94,17 +95,18 @@ def write_state_values(path: str | Path, values: StateValues) -> None:
 
 def build_action_value_sidecar(
     scene_label_path: str | Path,
-    state_value_path: str | Path,
     output_path: str | Path,
     *,
     gamma: float = 0.95,
     horizons: int = PUSH_VALUE_HORIZONS,
 ) -> None:
-    """Propagate frozen state values over the published preparation-action graph.
+    """Build finite-horizon values from verified successful trajectories.
 
     Both PUSH and PICK_REMOVE transitions contribute to continuation values,
-    while only PUSH rows are emitted as Stage-C supervision. Unknown/unexecuted
-    actions are never assigned a value. Unsafe outcomes receive zero continuation.
+    while only PUSH rows are emitted as Stage-C supervision.  Stage-B is not
+    consulted.  Demonstrated sequence actions are positive; unsafe and observed
+    no-improvement actions outside every successful sequence are negative.
+    Improved alternatives outside the demonstrated trajectories remain unknown.
     """
 
     if not 0.0 < gamma <= 1.0 or horizons <= 0:
@@ -115,7 +117,6 @@ def build_action_value_sidecar(
         scene = handle[next(iter(handle.keys()))]
         states, actions = scene["states"], scene["actions"]
         state_count = len(states["task_index"])
-        teacher = load_state_values(state_value_path, state_count)
         action_type = actions["action_type"][:].astype(np.int8)
         executed = actions["executed"][:].astype(bool)
         outcome = actions["outcome_code"][:].astype(np.int8)
@@ -131,11 +132,8 @@ def build_action_value_sidecar(
         if "direct_goal_valid" in states:
             terminal |= states["direct_goal_valid"][:].astype(bool)
 
-    teacher.validate(state_count)
-    base = np.where(terminal | teacher.directly_graspable, 1.0, teacher.graspability).astype(
-        np.float32
-    )
-    base[~teacher.valid & ~terminal] = np.nan
+    base = np.full(state_count, np.nan, np.float32)
+    base[terminal] = 1.0
     values = np.repeat(base[None], horizons + 1, axis=0)
     preparation = (action_type == int(ActionType.PUSH)) | (
         action_type == int(ActionType.PICK_REMOVE)
@@ -160,13 +158,24 @@ def build_action_value_sidecar(
     )
     action_q = np.full((len(action_type), horizons), np.nan, np.float32)
     for horizon in range(1, horizons + 1):
-        valid_edge = linked & safe & np.isfinite(values[horizon - 1, to_state.clip(0, state_count - 1)])
+        valid_edge = (
+            linked
+            & safe
+            & part_of_sequence
+            & np.isfinite(values[horizon - 1, to_state.clip(0, state_count - 1)])
+        )
         continuation = np.full(len(action_type), np.nan, np.float32)
         continuation[valid_edge] = gamma * values[
             horizon - 1, to_state[valid_edge]
         ]
-        unsafe = preparation & executed & ~safe
-        continuation[unsafe] = 0.0
+        # A demonstrated action that needs more remaining steps has value zero
+        # for this horizon.  This is a budget label, not a failed-action label.
+        demonstrated = preparation & executed & part_of_sequence
+        continuation[demonstrated & ~valid_edge] = 0.0
+        known_negative = preparation & executed & ~part_of_sequence & (
+            ~safe | (outcome == int(OutcomeCode.NO_IMPROVEMENT))
+        )
+        continuation[known_negative] = 0.0
         action_q[:, horizon - 1] = continuation
         next_value = base.copy()
         for action_index in np.flatnonzero(np.isfinite(continuation)):
@@ -182,14 +191,11 @@ def build_action_value_sidecar(
     action_ids = np.flatnonzero(push).astype(np.int64)
 
     def writer(output: h5py.File) -> None:
-        output.attrs["schema_version"] = PUSH_VALUE_SCHEMA_VERSION
+        output.attrs["schema_version"] = PUSH_ACTION_VALUE_SCHEMA_VERSION
+        output.attrs["value_definition"] = "verified_success_trajectory_finite_horizon_v1"
         output.attrs["horizons"] = int(horizons)
         output.attrs["gamma"] = float(gamma)
-        output.attrs["stage_b_checkpoint_sha256"] = teacher.stage_b_checkpoint_sha256
-        output.attrs["render_protocol_sha256"] = teacher.render_protocol_sha256
-        output.attrs["task_grasp_probability_threshold"] = (
-            teacher.task_grasp_probability_threshold
-        )
+        output.attrs["teacher"] = "none"
         output.create_dataset("action_id", data=action_ids, compression="gzip")
         output.create_dataset("from_state", data=from_state[push], compression="gzip")
         output.create_dataset("to_state", data=to_state[push], compression="gzip")
@@ -216,8 +222,25 @@ class PushActionValueStore:
     def load_scene(self, scene_id: int) -> dict[str, np.ndarray]:
         path = self.root / f"scene_{int(scene_id):04d}.h5"
         with h5py.File(path, "r", swmr=True) as handle:
-            if int(handle.attrs.get("schema_version", -1)) != PUSH_VALUE_SCHEMA_VERSION:
+            if int(handle.attrs.get("schema_version", -1)) != PUSH_ACTION_VALUE_SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported action-value schema: {path}")
             if int(handle.attrs.get("horizons", -1)) != self.horizons:
                 raise RuntimeError(f"Action-value horizon mismatch: {path}")
             return {name: handle[name][:] for name in handle.keys()}
+
+
+class PushStateValueStore:
+    """Read-only current-state Stage-B values used as causal Stage-C input."""
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+
+    def load_scene(self, scene_id: int) -> dict[str, np.ndarray]:
+        path = self.root / f"scene_{int(scene_id):04d}.h5"
+        with h5py.File(path, "r", swmr=True) as handle:
+            if int(handle.attrs.get("schema_version", -1)) != PUSH_VALUE_SCHEMA_VERSION:
+                raise RuntimeError(f"Unsupported state-value schema: {path}")
+            return {
+                "graspability": handle["graspability"][:].astype(np.float32),
+                "valid": handle["valid"][:].astype(bool),
+            }

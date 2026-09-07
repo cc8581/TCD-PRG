@@ -20,6 +20,7 @@ from tcd_prg.datasets import ActionStateGroupDataset
 from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
 from tcd_prg.models import StandalonePushModel
 from tcd_prg.models.staged_checkpoint import load_push_evaluator
+from tcd_prg.evaluators.push_effectiveness import _binary_auroc_rank
 from tcd_prg.trainers.push_checkpoint import PushTrainingCheckpoint
 from tcd_prg.trainers.push_progress import PushTrainingProgress, append_record, print_validation_summary
 from tcd_prg.trainers.push_scheduler import PushLRScheduler
@@ -39,6 +40,22 @@ def _device(value: Any, device: torch.device) -> Any:
     return value
 
 
+def push_optimizer_groups(model: StandalonePushModel, config) -> list[dict[str, Any]]:
+    """Keep the pretrained PointNet++ step size separate from random PUSH heads."""
+    backbone = list(model.push_evaluator.backbone.parameters())
+    backbone_ids = {id(parameter) for parameter in backbone}
+    heads = [
+        parameter for parameter in model.push_evaluator.parameters()
+        if id(parameter) not in backbone_ids
+    ]
+    if not backbone or not heads:
+        raise RuntimeError("PUSH optimizer requires nonempty backbone and head parameter groups")
+    return [
+        {"params": heads, "lr": config.optimizer.learning_rate, "name": "push_heads"},
+        {"params": backbone, "lr": config.optimizer.backbone_learning_rate, "name": "pointnet2_backbone"},
+    ]
+
+
 def accumulated_batches(model, loader, *, device, config, loss_function, optimizer):
     """Accumulate action sums, then normalize by actual known-action count.
 
@@ -48,6 +65,7 @@ def accumulated_batches(model, loader, *, device, config, loss_function, optimiz
     limit = config.training.gradient_accumulation_steps
     micro = actions = positives = 0
     loss_sum = data_seconds = 0.
+    component_sums = dict(q=0.0, rank=0.0, safety=0.0, auxiliary=0.0)
     optimizer.zero_grad(set_to_none=True)
     finished = time.monotonic()
     for cpu_batch in loader:
@@ -66,20 +84,28 @@ def accumulated_batches(model, loader, *, device, config, loss_function, optimiz
             actions += count
             positives += int(details['safety_target'].sum())
             loss_sum += float(loss.detach()) * count
+            for key, detail_key in (
+                ('q', 'push_q_huber'), ('rank', 'push_rank'),
+                ('safety', 'push_safety_bce'), ('auxiliary', 'push_auxiliary_huber'),
+            ):
+                component_sums[key] += float(details[detail_key]) * count
         if micro == limit:
             for parameter in model.push_evaluator.parameters():
                 if parameter.grad is not None:
                     parameter.grad.div_(actions)
-            yield loss_sum / actions, actions, positives, data_seconds
+            yield (loss_sum / actions, actions, positives, data_seconds,
+                   {key: value / actions for key, value in component_sums.items()})
             optimizer.zero_grad(set_to_none=True)
             micro = actions = positives = 0
             loss_sum = data_seconds = 0.
+            component_sums = dict.fromkeys(component_sums, 0.0)
         finished = time.monotonic()
     if micro:
         for parameter in model.push_evaluator.parameters():
             if parameter.grad is not None:
                 parameter.grad.div_(actions)
-        yield loss_sum / actions, actions, positives, data_seconds
+        yield (loss_sum / actions, actions, positives, data_seconds,
+               {key: value / actions for key, value in component_sums.items()})
 
 
 @torch.no_grad()
@@ -91,9 +117,14 @@ def _evaluate(
     config,
     loss_function: PushEffectivenessLoss,
     phase: str = "periodic",
+    use_batch_norm_batch_statistics: bool = False,
 ) -> dict[str, float]:
     """Validate logged actions only; candidate generation is a separate evaluation."""
     model.eval()
+    if use_batch_norm_batch_statistics:
+        for module in model.push_evaluator.modules():
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                module.train()
     started = time.monotonic()
     q_predictions: list[torch.Tensor] = []
     q_targets: list[torch.Tensor] = []
@@ -184,10 +215,19 @@ def _evaluate(
         "push_evaluator_logged_group_count": float(torch.unique(groups).numel()),
     }
     if bool(safety_valid.any()):
-        result["push_evaluator_safety_accuracy"] = float(
-            ((safety_prediction[safety_valid] >= 0.5) == safety_target[safety_valid]).float().mean()
+        safety_score = safety_prediction[safety_valid]
+        safety_truth = safety_target[safety_valid]
+        safety_class = safety_score >= 0.5
+        result["push_evaluator_safety_accuracy"] = float((safety_class == safety_truth).float().mean())
+        result["push_evaluator_safety_fraction"] = float(safety_truth.float().mean())
+        positive_accuracy = (safety_class[safety_truth]).float().mean()
+        negative_accuracy = (~safety_class[~safety_truth]).float().mean()
+        result["push_evaluator_safety_balanced_accuracy"] = float(
+            (positive_accuracy + negative_accuracy) / 2
         )
-        result["push_evaluator_safety_fraction"] = float(safety_target[safety_valid].float().mean())
+        result["push_evaluator_safety_auroc"] = float(
+            _binary_auroc_rank(safety_score.double(), safety_truth)
+        )
     else:
         result["push_evaluator_safety_accuracy"] = float("nan")
         result["push_evaluator_safety_fraction"] = float("nan")
@@ -231,6 +271,11 @@ def _main() -> None:
     if args.resume and (args.pretrain_checkpoint or config.training.pretrain_checkpoint):
         parser.error("--resume and pretrain_checkpoint are mutually exclusive")
     seed_everything(config.training.seed, config.training.deterministic)
+    # Batched relation GEMMs change reduction order. Use full FP32 throughout
+    # this independent stage so cuDNN TF32 does not amplify those small changes
+    # in the PointNet++ backward pass. A/B entry points are unaffected.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
     # Fail before loading data when the required compiled operator is unavailable.
     compiled_fps()(torch.zeros(1, 1, 3, device=device), K=1)
@@ -268,7 +313,9 @@ def _main() -> None:
         adapter,
         split="val",
         scene_ids=frozenset(validation_scenes),
-        max_groups=None,
+        # A bounded validation set marks a diagnostic run.  Formal configs use
+        # None and therefore still evaluate the complete validation split.
+        max_groups=config.training.max_validation_groups,
         allowed_strata=config.training.allowed_action_strata,
         global_grasp_mode="never",
     )
@@ -301,9 +348,7 @@ def _main() -> None:
         delta_scales=config.training.push_delta_scales,
     )
     optimizer = torch.optim.AdamW(
-        model.push_evaluator.parameters(),
-        lr=config.optimizer.learning_rate,
-        weight_decay=config.optimizer.weight_decay,
+        push_optimizer_groups(model, config), weight_decay=config.optimizer.weight_decay,
     )
     scheduler = PushLRScheduler(optimizer, config.scheduler.warmup_steps, config.training.max_optimizer_steps)
     loader = DataLoader(
@@ -319,7 +364,12 @@ def _main() -> None:
         validation_dataset,
         batch_size=config.training.validation_batch_size,
         shuffle=False,
-        num_workers=config.training.validation_workers,
+        # The training loader keeps its workers alive.  On Windows, starting a
+        # second 2*num_workers pool here duplicates the Python/Torch address
+        # space and can exhaust host commit memory before the second validation
+        # batch.  Validation is infrequent and deterministic, so load it in the
+        # owner process without changing samples, batch size, or metrics.
+        num_workers=0,
         pin_memory=config.training.pin_memory,
         persistent_workers=False,
         collate_fn=PushValueBatchCollator(config, training=False),
@@ -328,7 +378,7 @@ def _main() -> None:
         final_validation_dataset,
         batch_size=config.training.validation_batch_size,
         shuffle=False,
-        num_workers=config.training.validation_workers,
+        num_workers=0,
         pin_memory=config.training.pin_memory,
         persistent_workers=False,
         collate_fn=PushValueBatchCollator(config, training=False),
@@ -341,6 +391,7 @@ def _main() -> None:
     ):
         signature["training"].pop(name, None)
     checkpoints = PushTrainingCheckpoint(args.output, model, {
+        "arithmetic_precision": "fp32_no_tf32",
         "training_scene_sampling": {"operator": "pytorch3d.compiled_fps", "points": fps_points},
         "periodic_validation_scene_count": len(periodic_validation_scenes),
         "final_validation_scene_count": len(validation_scenes),
@@ -413,7 +464,7 @@ def _main() -> None:
         print(f"[resume] checkpoint step={step} is in the training phase; training continues first", flush=True)
     while step < config.training.max_optimizer_steps:
         made_progress = False
-        for mean_loss, count, positives, data_seconds in accumulated_batches(
+        for mean_loss, count, positives, data_seconds, components in accumulated_batches(
             model, loader, device=device, config=config, loss_function=loss_function,
             optimizer=optimizer,
         ):
@@ -424,7 +475,7 @@ def _main() -> None:
             optimizer.step()
             scheduler.step()
             step += 1
-            progress.add(mean_loss, count, positives,
+            progress.add(mean_loss, count, positives, components=components,
                          gradient_norm=grad_norm, clip_scale=clip_scale, data_seconds=data_seconds,
                          max_memory_mb=torch.cuda.max_memory_allocated(device)/2**20 if device.type == "cuda" else 0.)
             if (step == 1 or step % log_interval == 0 or step >= config.training.max_optimizer_steps

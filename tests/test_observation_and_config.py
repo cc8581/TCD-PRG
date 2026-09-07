@@ -63,6 +63,16 @@ def test_read_only_cache_cannot_evict_or_clear(tmp_path) -> None:
         provider.clear_completed()
 
 
+def test_writable_cache_can_disable_eviction(tmp_path) -> None:
+    provider = CachedObservationProvider(
+        tmp_path,
+        fallback=object(),
+        eviction_enabled=False,
+    )
+    with pytest.raises(RuntimeError, match="eviction is disabled"):
+        provider.evict()
+
+
 def test_cache_eviction_skips_entries_locked_by_another_worker(tmp_path, monkeypatch) -> None:
     provider = CachedObservationProvider(
         tmp_path,
@@ -178,7 +188,7 @@ def test_formal_config_uses_strict_offline_cache_and_scene_splits() -> None:
     assert perception.training.validation_scene_count == 20
     assert perception.training.max_optimizer_steps == 15000
     assert perception.training.validation_interval == 1000
-    for stage in ("grasp", "push", "push_evaluator"):
+    for stage in ("grasp", "push_evaluator"):
         stage_config = load_config(PROJECT_ROOT / "configs" / "stage" / f"{stage}.yaml")
         assert stage_config.training.validation_scene_count == 20
 

@@ -7,6 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from tcd_prg.geometry.numpy_se3 import quaternion_xyzw_to_matrix_numpy
 
@@ -101,18 +102,13 @@ class FunctionalRegionRegistry:
             return FunctionalRegion(data["point_xyz"].astype(np.float32), data["point_labels"].astype(np.int64), keys)
 
     @lru_cache(maxsize=512)
-    def _voxel_index(
+    def _spatial_index(
         self, category_key: str, model_id: str, scale_key: float
-    ) -> tuple[np.ndarray, dict[tuple[int, int, int], np.ndarray]]:
-        """Build a cached tolerance-sized grid without SciPy/OpenMP worker conflicts."""
+    ) -> tuple[np.ndarray, cKDTree]:
+        """Build one immutable nearest-neighbor index per scaled CAD object."""
 
         points = self.load(category_key, model_id).xyz_object * scale_key
-        cells = np.floor(points / self.association_tolerance_m).astype(np.int32)
-        buckets: dict[tuple[int, int, int], list[int]] = {}
-        for index, cell in enumerate(cells):
-            buckets.setdefault((int(cell[0]), int(cell[1]), int(cell[2])), []).append(index)
-        packed = {key: np.asarray(value, dtype=np.int32) for key, value in buckets.items()}
-        return points, packed
+        return points, cKDTree(points)
 
     def visible_labels(
         self,
@@ -133,26 +129,14 @@ class FunctionalRegionRegistry:
         if not np.isfinite(object_scale) or object_scale <= 0:
             raise ValueError(f"Invalid object scale {object_scale}")
         scale_key = round(float(object_scale), 12)
-        reference, buckets = self._voxel_index(category_key, model_id, scale_key)
-        nearest = np.full(len(xyz_object), -1, dtype=np.int64)
-        nearest_distance_sq = np.full(len(xyz_object), np.inf, dtype=np.float64)
-        query_cells = np.floor(xyz_object / self.association_tolerance_m).astype(np.int32)
-        neighbor_offsets = (-1, 0, 1)
-        for query_index, (point, cell) in enumerate(zip(xyz_object, query_cells, strict=True)):
-            for dx in neighbor_offsets:
-                for dy in neighbor_offsets:
-                    for dz in neighbor_offsets:
-                        key = (int(cell[0] + dx), int(cell[1] + dy), int(cell[2] + dz))
-                        candidates = buckets.get(key)
-                        if candidates is None:
-                            continue
-                        delta = reference[candidates] - point
-                        distance_sq = np.sum(delta * delta, axis=1)
-                        local = int(np.argmin(distance_sq))
-                        if float(distance_sq[local]) < nearest_distance_sq[query_index]:
-                            nearest_distance_sq[query_index] = float(distance_sq[local])
-                            nearest[query_index] = int(candidates[local])
-        valid = nearest_distance_sq <= self.association_tolerance_m**2
+        _, index = self._spatial_index(category_key, model_id, scale_key)
+        distance, nearest = index.query(
+            xyz_object,
+            k=1,
+            distance_upper_bound=self.association_tolerance_m,
+            workers=1,
+        )
+        valid = np.isfinite(distance)
         labels = np.full(len(xyz_world), -1, dtype=np.int64)
         labels[valid] = region.labels[nearest[valid]]
         return labels, valid

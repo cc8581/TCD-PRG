@@ -42,6 +42,7 @@ class DenseCandidateGenerator:
             "effective_logit": torch.empty(0, device=device),
             "effective_probability": torch.empty(0, device=device),
             "push_q_value": torch.empty(0, 5, device=device),
+            "push_q_horizon": torch.empty(0, dtype=torch.long, device=device),
             "push_safety_probability": torch.empty(0, device=device),
         }
 
@@ -211,7 +212,11 @@ class DenseCandidateGenerator:
         model: Any,
         batch: dict[str, Tensor],
         output: dict[str, Any],
+        *,
+        remaining_preparation_actions: int = 5,
     ) -> dict[str, Tensor]:
+        if not 0 <= int(remaining_preparation_actions) <= 5:
+            raise ValueError("remaining_preparation_actions must lie in [0,5]")
         rows: list[dict[str, Tensor]] = []
         sensor = output.get("sensor", batch.get("model_inputs", batch))
         _, decoded_push_rows = decode_push_candidates(
@@ -219,6 +224,7 @@ class DenseCandidateGenerator:
             output["push_condition"],
             output["push"],
             self.config,
+            remaining_preparation_actions=remaining_preparation_actions,
         )
         if not bool(getattr(model, "push_evaluator_ready", False)):
             # Unloaded evaluation weights must never authorize a PUSH selection.
@@ -257,6 +263,7 @@ class DenseCandidateGenerator:
             effective_logit_parts: list[Tensor] = []
             effective_probability_parts: list[Tensor] = []
             push_q_parts: list[Tensor] = []
+            push_q_horizon_parts: list[Tensor] = []
             push_safety_parts: list[Tensor] = []
 
             # Terminal task grasp candidates belong to the predicted target query.
@@ -317,6 +324,7 @@ class DenseCandidateGenerator:
                     torch.full_like(task_score[selected], float("nan"))
                 )
                 push_q_parts.append(torch.full((len(selected), 5), float("nan"), device=xyz.device))
+                push_q_horizon_parts.append(torch.full_like(selected, -1))
                 push_safety_parts.append(torch.full_like(task_score[selected], float("nan")))
 
             # Generic remove grasps are assigned to predicted object queries.
@@ -343,6 +351,8 @@ class DenseCandidateGenerator:
                 self.config.pick_remove_target_margin_m,
             )
             remove_eligible = remove_domain & target_local
+            if remaining_preparation_actions == 0:
+                remove_eligible.zero_()
             valid_remove = (global_object >= 0) & remove_eligible[
                 global_object.clamp(0, len(active) - 1)
             ]
@@ -401,6 +411,7 @@ class DenseCandidateGenerator:
                     torch.full_like(candidate_score[local], float("nan"))
                 )
                 push_q_parts.append(torch.full((len(selected), 5), float("nan"), device=xyz.device))
+                push_q_horizon_parts.append(torch.full_like(selected, -1))
                 push_safety_parts.append(torch.full_like(candidate_score[local], float("nan")))
 
             decoded_push = decoded_push_rows[batch_row]
@@ -442,6 +453,7 @@ class DenseCandidateGenerator:
                 effective_logit_parts.append(decoded_push["effective_logit"])
                 effective_probability_parts.append(decoded_push["effective_probability"])
                 push_q_parts.append(decoded_push["q_value"])
+                push_q_horizon_parts.append(decoded_push["q_horizon"])
                 push_safety_parts.append(decoded_push["safety_probability"])
 
             def joined(
@@ -476,6 +488,7 @@ class DenseCandidateGenerator:
                     "effective_logit": joined(effective_logit_parts, (0,), xyz.dtype),
                     "effective_probability": joined(effective_probability_parts, (0,), xyz.dtype),
                     "push_q_value": joined(push_q_parts, (0, 5), xyz.dtype),
+                    "push_q_horizon": joined(push_q_horizon_parts, (0,), torch.long, -1),
                     "push_safety_probability": joined(push_safety_parts, (0,), xyz.dtype),
                 }
             )
@@ -495,6 +508,7 @@ class DenseCandidateGenerator:
             "effective_logit": float("nan"),
             "effective_probability": float("nan"),
             "push_q_value": float("nan"),
+            "push_q_horizon": -1,
             "push_safety_probability": float("nan"),
             "proposal_score": -1.0,
             "contact_world": float("nan"),

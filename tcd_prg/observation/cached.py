@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -38,10 +39,9 @@ class ObservationCacheMissError(FileNotFoundError):
 
 
 class CachedObservationProvider(ObservationProvider):
-    EVICTION_CHECK_INTERVAL = 128
-
     def __init__(self, cache_dir: str | Path, fallback: ObservationProvider | None = None,
-                 max_bytes: int = 15 << 30, min_free_bytes: int = 20 << 30):
+                 max_bytes: int = 15 << 30, min_free_bytes: int = 20 << 30,
+                 eviction_enabled: bool = True):
         self.cache_dir = Path(cache_dir)
         self.fallback = fallback
         self.read_only = fallback is None
@@ -49,7 +49,35 @@ class CachedObservationProvider(ObservationProvider):
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_bytes
         self.min_free_bytes = min_free_bytes
-        self._writes_since_eviction = 0
+        self.eviction_enabled = eviction_enabled
+        self._size_lock = threading.Lock()
+        self._eviction_lock = threading.Lock()
+        # Stat the cache once at startup.  Afterwards writes update this value
+        # in O(1), avoiding periodic full scans of hundreds of thousands of
+        # files while the cache is comfortably below its limit.
+        self._cache_bytes = 0 if self.read_only else self._measure_cache_bytes()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_size_lock", None)
+        state.pop("_eviction_lock", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._size_lock = threading.Lock()
+        self._eviction_lock = threading.Lock()
+
+    def _measure_cache_bytes(self) -> int:
+        total = 0
+        for path in self.cache_dir.glob("*/*.npz"):
+            if path.name.endswith(".tmp.npz"):
+                continue
+            try:
+                total += path.stat().st_size
+            except FileNotFoundError:
+                continue
+        return total
 
     def _path(self, key: str) -> Path:
         return self.cache_dir / key[:2] / f"{key}.npz"
@@ -69,8 +97,11 @@ class CachedObservationProvider(ObservationProvider):
                 if not self.read_only:
                     os.utime(path, None)
                 with np.load(path, allow_pickle=False) as data:
+                    rgb = data["rgb"]
+                    if rgb.dtype == np.uint8:
+                        rgb = rgb.astype(np.float32) / 255.0
                     return PointObservation(
-                        data["xyz"], data["rgb"], data["instance_id"], data["source_view"]
+                        data["xyz"], rgb, data["instance_id"], data["source_view"]
                     )
             except FileNotFoundError:
                 # Another DataLoader worker may evict this entry between the
@@ -91,64 +122,83 @@ class CachedObservationProvider(ObservationProvider):
         )
         free = shutil.disk_usage(self.cache_dir).free
         if free < self.min_free_bytes + estimated_bytes:
-            self.evict(reserve_bytes=estimated_bytes)
-            free = shutil.disk_usage(self.cache_dir).free
+            if self.eviction_enabled:
+                self.evict(reserve_bytes=estimated_bytes)
+                free = shutil.disk_usage(self.cache_dir).free
         if free < self.min_free_bytes + estimated_bytes:
             raise OSError(
-                "Observation cache write refused: configured free-space reserve "
+                "Observation cache write refused without deleting existing entries: "
+                "configured free-space reserve "
                 f"({self.min_free_bytes} bytes) cannot be maintained"
             )
         path.parent.mkdir(parents=True, exist_ok=True)
         # 先写进程唯一的临时文件再原子替换，读取方永远只看到完整条目。
         temp = path.with_name(f"{path.stem}.{os.getpid()}.tmp.npz")
+        rgb = np.asarray(observation.rgb)
+        quantized_rgb = np.rint(rgb * 255.0)
+        if (
+            np.issubdtype(rgb.dtype, np.floating)
+            and np.isfinite(rgb).all()
+            and np.all((rgb >= 0.0) & (rgb <= 1.0))
+            and np.allclose(rgb * 255.0, quantized_rgb, atol=1e-5, rtol=0.0)
+        ):
+            rgb = quantized_rgb.astype(np.uint8)
+        instance_id = np.asarray(observation.instance_id)
+        if (
+            np.issubdtype(instance_id.dtype, np.integer)
+            and instance_id.size
+            and instance_id.min() >= np.iinfo(np.int16).min
+            and instance_id.max() <= np.iinfo(np.int16).max
+        ):
+            instance_id = instance_id.astype(np.int16)
         np.savez_compressed(
             temp,
             xyz=observation.xyz,
-            rgb=observation.rgb,
-            instance_id=observation.instance_id,
+            rgb=rgb,
+            instance_id=instance_id,
             source_view=observation.source_view,
         )
         os.replace(temp, path)
-        # A full recursive LRU scan on every miss becomes quadratic once the
-        # cache contains tens of thousands of states. Bounded overshoot between
-        # periodic checks is at most a few worker batches.
-        self._writes_since_eviction += 1
-        if self._writes_since_eviction >= self.EVICTION_CHECK_INTERVAL:
+        written_bytes = path.stat().st_size
+        with self._size_lock:
+            self._cache_bytes += written_bytes
+            over_capacity = self._cache_bytes > self.max_bytes
+        if over_capacity and self.eviction_enabled:
             self.evict()
-            self._writes_since_eviction = 0
         return observation
 
     def evict(self, reserve_bytes: int = 0) -> None:
         if self.read_only:
             raise RuntimeError("Read-only observation cache cannot evict entries")
-        entries: list[tuple[Path, int, float]] = []
-        for path in self.cache_dir.glob("*/*.npz"):
-            if path.name.endswith(".tmp.npz"):
-                continue
-            try:
-                stat = path.stat()
-            except FileNotFoundError:
-                continue
-            entries.append((path, stat.st_size, stat.st_atime))
-        total = sum(size for _, size, _ in entries)
-        free = shutil.disk_usage(self.cache_dir).free
-        if total <= self.max_bytes and free >= self.min_free_bytes + reserve_bytes:
-            return
-        for path, size, _ in sorted(entries, key=lambda item: item[2]):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                continue
-            except PermissionError:
-                # Windows does not allow unlinking an npz while another
-                # DataLoader worker has it open.  A locked cache entry is not
-                # corrupt and will be eligible again during the next eviction
-                # pass, so continue with the remaining LRU candidates.
-                continue
-            total -= size
-            free = shutil.disk_usage(self.cache_dir).free
-            if total <= self.max_bytes and free >= self.min_free_bytes + reserve_bytes:
-                break
+        if not self.eviction_enabled:
+            raise RuntimeError("Observation cache eviction is disabled")
+        with self._eviction_lock, self._size_lock:
+            entries: list[tuple[Path, int, float]] = []
+            for path in self.cache_dir.glob("*/*.npz"):
+                if path.name.endswith(".tmp.npz"):
+                    continue
+                try:
+                    stat = path.stat()
+                except FileNotFoundError:
+                    continue
+                entries.append((path, stat.st_size, stat.st_atime))
+            total = sum(size for _, size, _ in entries)
+            for path, size, _ in sorted(entries, key=lambda item: item[2]):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    continue
+                except PermissionError:
+                    # Windows does not allow unlinking an npz while another
+                    # DataLoader worker has it open.  A locked cache entry is not
+                    # corrupt and will be eligible again during the next eviction
+                    # pass, so continue with the remaining LRU candidates.
+                    continue
+                total -= size
+                free = shutil.disk_usage(self.cache_dir).free
+                if total <= self.max_bytes and free >= self.min_free_bytes + reserve_bytes:
+                    break
+            self._cache_bytes = total
 
     def clear_completed(self) -> dict[str, int]:
         """Remove completed observations while tolerating active worker readers."""
@@ -172,6 +222,8 @@ class CachedObservationProvider(ObservationProvider):
                 continue
             removed_files += 1
             removed_bytes += size
+        with self._size_lock:
+            self._cache_bytes = max(0, self._cache_bytes - removed_bytes)
         return {
             "removed_files": removed_files,
             "removed_bytes": removed_bytes,

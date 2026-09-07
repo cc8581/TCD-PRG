@@ -87,7 +87,8 @@ def fuse_frames(frames: list[RGBDFrame], segments, settings: dict) -> FusedScene
     """Fuse raw RGB-D into XYZRGB without external instance segmentation."""
     del segments
     xyzs, rgbs, views = [], [], []
-    for view, frame in enumerate(frames):
+    for capture_index, frame in enumerate(frames):
+        view = capture_index if frame.model_view_index is None else int(frame.model_view_index)
         xyz, rgb = _points(
             frame, settings["depth_min_mm"], settings["depth_max_mm"]
         )
@@ -126,11 +127,19 @@ def fuse_frames(frames: list[RGBDFrame], segments, settings: dict) -> FusedScene
 
     # -1 means "not assigned yet". The integrated InstanceQueryHead fills it.
     instance = np.full(len(xyz), -1, np.int64)
+    maximum_view = max(int(source.max()), max(
+        (i if frame.model_view_index is None else int(frame.model_view_index))
+        for i, frame in enumerate(frames)
+    ))
+    camera_to_world = [np.eye(4, dtype=np.float32) for _ in range(maximum_view + 1)]
+    for capture_index, frame in enumerate(frames):
+        view = capture_index if frame.model_view_index is None else int(frame.model_view_index)
+        camera_to_world[view] = np.asarray(frame.camera_to_base, np.float32)
     return FusedScene(
         xyz,
         rgb,
         instance,
         source,
         {},
-        tuple(np.asarray(frame.camera_to_base, np.float32) for frame in frames),
+        tuple(camera_to_world),
     )

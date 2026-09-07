@@ -13,6 +13,8 @@ class RGBDFrame:
     depth_mm: np.ndarray
     intrinsics: dict[str, float]
     camera_to_base: np.ndarray
+    # Logical training-view identity. None means capture-list order.
+    model_view_index: int | None = None
 
 
 @dataclass(slots=True)

@@ -11,7 +11,7 @@ from torch import Tensor
 
 from tcd_prg.baselines.base import GlobalGraspPrediction, ManipulationPolicy
 from tcd_prg.config import TCDPRGConfig
-from tcd_prg.constants import ActionType
+from tcd_prg.constants import ActionType, MAX_PREPARATION_ACTIONS
 from tcd_prg.datasets.collate import grid_sample_indices
 from tcd_prg.datasets.types import SceneObservation
 from tcd_prg.models import TCDPRGModel
@@ -44,6 +44,28 @@ class TCDPRGPolicy(ManipulationPolicy):
         self.preparation_actions = 0
         self.target_tracker = TargetIdentityTracker()
 
+    def sensor_point_indices(
+        self, xyz: np.ndarray, point_valid: np.ndarray | None = None
+    ) -> np.ndarray:
+        """Deterministic fused-scene indices used by the deployment input path."""
+        valid = (
+            np.ones(len(xyz), dtype=bool)
+            if point_valid is None
+            else np.asarray(point_valid, dtype=bool)
+        )
+        if valid.shape != (len(xyz),):
+            raise ValueError("point_valid must be [N]")
+        valid_index = np.flatnonzero(valid)
+        if not len(valid_index):
+            raise ValueError("Sensor observation contains no valid points")
+        return valid_index[
+            grid_sample_indices(
+                np.asarray(xyz)[valid_index],
+                self.config.backbone.grid_size_m,
+                training=False,
+            )
+        ]
+
     def _sensor_task_batch(
         self,
         xyz: np.ndarray,
@@ -67,16 +89,7 @@ class TCDPRGPolicy(ManipulationPolicy):
             source_view = np.asarray(source_view)
             if source_view.shape != (len(xyz),):
                 raise ValueError("source_view must be [N]")
-        valid_index = np.flatnonzero(point_valid)
-        if not len(valid_index):
-            raise ValueError("Sensor observation contains no valid points")
-        selected = valid_index[
-            grid_sample_indices(
-                xyz[valid_index],
-                self.config.backbone.grid_size_m,
-                training=False,
-            )
-        ]
+        selected = self.sensor_point_indices(xyz, point_valid)
         model_inputs = {
             "xyz": torch.from_numpy(xyz[selected])[None].float(),
             "rgb": torch.from_numpy(rgb[selected])[None].float(),
@@ -401,6 +414,7 @@ class TCDPRGPolicy(ManipulationPolicy):
                 push_distance_m=float(array("push_distance_m")),
                 effective_probability=float(array("effective_probability")),
                 q_value=array("push_q_value"),
+                q_horizon=int(array("push_q_horizon")),
                 safety_probability=float(array("push_safety_probability")),
             )
         else:
@@ -413,7 +427,13 @@ class TCDPRGPolicy(ManipulationPolicy):
 
     def generate_candidates(self, encoded: EncodedPolicyState) -> dict[str, Any]:
         with torch.no_grad():
-            candidates = self.generator.generate(self.model, encoded.device_batch, encoded.output)
+            remaining = max(0, MAX_PREPARATION_ACTIONS - self.preparation_actions)
+            candidates = self.generator.generate(
+                self.model,
+                encoded.device_batch,
+                encoded.output,
+                remaining_preparation_actions=remaining,
+            )
             task_mask = candidates["type"] == int(ActionType.TASK_GRASP)
             candidates["task_grasp_query_count"] = torch.full(
                 (candidates["type"].shape[0],),

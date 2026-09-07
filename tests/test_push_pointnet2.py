@@ -47,7 +47,8 @@ def test_accumulation_matches_action_weighted_batch_and_flushes_tail(monkeypatch
     batches=accumulated_batches(m,[first,empty,second,first],device=torch.device('cpu'),config=config,
                                 loss_function=PushEffectivenessLoss(),optimizer=opt)
     rng = torch.get_rng_state()
-    _,count,_,_=next(batches);assert count==3
+    _,count,_,_,components=next(batches);assert count==3
+    assert set(components) == {'q', 'rank', 'safety', 'auxiliary'}
     torch.set_rng_state(rng)  # Match upstream random FPS choices for the reference.
     l1,_=push_effectiveness_batch_loss(reference,first,instance_queries=4,loss_function=PushEffectivenessLoss())
     l2,_=push_effectiveness_batch_loss(reference,second,instance_queries=4,loss_function=PushEffectivenessLoss())
@@ -55,7 +56,7 @@ def test_accumulation_matches_action_weighted_batch_and_flushes_tail(monkeypatch
     for p,q in zip(m.parameters(),reference.parameters()):
         torch.testing.assert_close(p.grad,q.grad,atol=2e-6,rtol=2e-4)
     opt.step()
-    _,count,_,_=next(batches);assert count==2
+    _,count,_,_,_=next(batches);assert count==2
     assert list(batches)==[]
 
 

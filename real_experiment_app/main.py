@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QDockWidget,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -138,7 +139,7 @@ QComboBox QAbstractItemView {
 }
 QTextEdit { padding: 8px; }
 QPushButton {
-    min-height: 31px;
+    min-height: 29px;
     background: #18253a;
     color: #dbe5f2;
     border: 1px solid #31425e;
@@ -146,17 +147,29 @@ QPushButton {
     padding: 0 11px;
     font-weight: 500;
 }
-QPushButton:hover { background: #20324d; border-color: #48617f; }
-QPushButton:pressed { background: #122033; }
+QPushButton:hover { background: #255079; border-color: #65bdf0; color: #ffffff; }
+QPushButton:pressed { background: #0d6fa8; border: 2px solid #a8ddff; padding: 0 10px; }
+QPushButton:focus { border: 2px solid #56bff5; color: #ffffff; }
 QPushButton:disabled { color: #718097; background: #111a28; border-color: #263349; }
-QPushButton[role="primary"] { background: #1678b5; border-color: #2696d3; color: white; }
-QPushButton[role="primary"]:hover { background: #1b8ccc; }
-QPushButton[role="execute"] { background: #14785a; border-color: #24956f; color: white; }
-QPushButton[role="execute"]:hover { background: #198e6a; }
-QPushButton[role="danger"] { background: #2b1821; border-color: #6d3040; color: #ff8f9c; }
-QPushButton[role="danger"]:hover { background: #3a1d29; border-color: #954358; }
-QPushButton[role="ghost"] { background: transparent; border-color: #293950; color: #93a2b8; }
+QPushButton[role="primary"], QPushButton[role="execute"], QPushButton[role="danger"], QPushButton[role="ghost"] {
+    background: #18253a; border-color: #31425e; color: #dbe5f2;
+}
+QPushButton[role="primary"]:hover, QPushButton[role="execute"]:hover,
+QPushButton[role="danger"]:hover, QPushButton[role="ghost"]:hover {
+    background: #255079; border-color: #65bdf0; color: #ffffff;
+}
+QPushButton[role="primary"]:pressed, QPushButton[role="execute"]:pressed,
+QPushButton[role="danger"]:pressed, QPushButton[role="ghost"]:pressed {
+    background: #0d6fa8; border: 2px solid #a8ddff;
+}
+QPushButton[role="primary"]:focus, QPushButton[role="execute"]:focus,
+QPushButton[role="danger"]:focus, QPushButton[role="ghost"]:focus {
+    border: 2px solid #56bff5; color: #ffffff;
+}
 QPushButton#TcpToggle { min-height: 25px; text-align: left; background: transparent; border: none; padding: 0; color: #aab6c8; }
+QPushButton#RunCompact { min-height: 28px; padding: 0 6px; font-size: 13px; }
+QDockWidget { color: #e7edf6; font-weight: 600; }
+QDockWidget::title { background: #101a2b; border: 1px solid #263750; padding: 7px 10px; text-align: left; }
 QScrollArea { border: none; background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 QScrollBar:vertical { background: transparent; width: 8px; margin: 4px 0; }
@@ -307,11 +320,40 @@ class DeviceSettingsDialog(QDialog):
     def __init__(self, config: AppConfig, parent=None):
         super().__init__(parent)
         self.config = config
-        self.setWindowTitle("设备与夹爪设置")
-        self.setMinimumWidth(620)
+        self.setWindowTitle("真机实验参数设置")
+        self.resize(860, 820)
+        self.setMinimumWidth(760)
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(9)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        cards = QVBoxLayout(content)
+        cards.setContentsMargins(4, 4, 4, 4)
+        cards.setSpacing(9)
+        scroll.setWidget(content)
+        root.addWidget(scroll, 1)
+
+        model = config.raw["tcd_prg"]
+        self.model_fields = {}
+        model_card = SectionCard("A / B / C 模型", "相对路径以本配置文件所在目录为基准")
+        model_form = QFormLayout()
+        for label, key in (
+            ("模型配置", "config"), ("路径配置", "paths_config"),
+            ("阶段 A 权重", "perception_checkpoint"), ("阶段 B 权重", "grasp_checkpoint"),
+            ("阶段 C 权重", "push_evaluator_checkpoint"),
+        ):
+            field = QLineEdit(str(model.get(key, "")))
+            self.model_fields[key] = field
+            model_form.addRow(label, field)
+        self.model_device = QComboBox()
+        self.model_device.addItems(["cuda", "cpu"])
+        self.model_device.setCurrentText(str(model.get("device", "cuda")))
+        model_form.addRow("推理设备", self.model_device)
+        model_card.body.addLayout(model_form)
+        cards.addWidget(model_card)
 
         robot = config.raw["robot"]
         self.robot_ip = QLineEdit(str(robot.get("ip", "192.168.58.2")))
@@ -327,7 +369,7 @@ class DeviceSettingsDialog(QDialog):
         robot_form.addRow("工件坐标系", self.user_id)
         robot_form.addRow("运动速度 / %", self.speed)
         robot_card.body.addLayout(robot_form)
-        root.addWidget(robot_card)
+        cards.addWidget(robot_card)
 
         self.camera_rows = []
         camera_card = SectionCard("Mech-Eye 相机")
@@ -336,18 +378,82 @@ class DeviceSettingsDialog(QDialog):
         camera_grid.addWidget(QLabel("启用"), 0, 0)
         camera_grid.addWidget(QLabel("相机 ID"), 0, 1)
         camera_grid.addWidget(QLabel("IP 地址"), 0, 2)
+        camera_grid.addWidget(QLabel("模型视角"), 0, 3)
+        camera_grid.addWidget(QLabel("相机到基座外参（4×4，行优先）"), 0, 4)
         for row, item in enumerate(config.raw.get("cameras", []), start=1):
             enabled = QCheckBox()
             enabled.setChecked(bool(item.get("enabled", True)))
             camera_id = QLineEdit(str(item.get("id", f"camera_{row-1}")))
             ip = QLineEdit(str(item.get("ip", "")))
             ip.setPlaceholderText("例如 192.168.3.100")
+            matrix = QLineEdit(self._format_numbers(item.get("camera_to_robot_base")))
+            matrix.setPlaceholderText("16 个数，例如 1,0,0,0,...,0,0,0,1")
+            model_view = self._spin(0, 31, int(item.get("model_view_index", row - 1)))
             camera_grid.addWidget(enabled, row, 0)
             camera_grid.addWidget(camera_id, row, 1)
             camera_grid.addWidget(ip, row, 2)
-            self.camera_rows.append((enabled, camera_id, ip, item))
+            camera_grid.addWidget(model_view, row, 3)
+            camera_grid.addWidget(matrix, row, 4)
+            self.camera_rows.append((enabled, camera_id, ip, model_view, matrix, item))
         camera_card.body.addLayout(camera_grid)
-        root.addWidget(camera_card)
+        cards.addWidget(camera_card)
+
+        fusion = config.raw["fusion"]
+        fusion_card = SectionCard("点云融合与场景标定", "坐标单位为米；桌面法向量必须朝向工作空间")
+        fusion_form = QFormLayout()
+        self.workspace_min = QLineEdit(self._format_numbers(fusion.get("workspace_min_m")))
+        self.workspace_max = QLineEdit(self._format_numbers(fusion.get("workspace_max_m")))
+        plane = fusion.get("table_plane_base") or {}
+        self.table_normal = QLineEdit(self._format_numbers(plane.get("normal")))
+        self.table_offset = self._double(-5, 5, float(plane.get("offset_m", 0)), 6)
+        self.table_clearance = self._double(0, .03, float(fusion.get("table_clearance_m", .003)), 4)
+        self.voxel_size = self._double(0, .05, float(fusion.get("voxel_size_m", .005)), 4)
+        self.depth_min = self._spin(1, 10000, int(fusion.get("depth_min_mm", 150)))
+        self.depth_max = self._spin(1, 10000, int(fusion.get("depth_max_mm", 1500)))
+        self.scene_points = self._spin(0, 2000000, int(fusion.get("target_scene_points", 0)))
+        self.association_distance = self._double(0, 1, float(fusion.get("instance_association_distance_m", .06)), 3)
+        self.temporal_distance = self._double(0, 1, float(fusion.get("temporal_instance_distance_m", .10)), 3)
+        for label, widget in (
+            ("工作空间最小 XYZ", self.workspace_min), ("工作空间最大 XYZ", self.workspace_max),
+            ("桌面法向量 XYZ", self.table_normal), ("桌面平面 offset", self.table_offset),
+            ("桌面清除距离", self.table_clearance), ("体素尺寸", self.voxel_size),
+            ("最小深度 / mm", self.depth_min), ("最大深度 / mm", self.depth_max),
+            ("融合点数上限（0=不限）", self.scene_points),
+            ("跨视角关联距离", self.association_distance), ("跨帧重识别距离", self.temporal_distance),
+        ):
+            fusion_form.addRow(label, widget)
+        fusion_card.body.addLayout(fusion_form)
+        cards.addWidget(fusion_card)
+
+        motion_card = SectionCard("动作与工具参数")
+        motion_form = QFormLayout()
+        self.motion_fields = {}
+        for label, key, low, high, default in (
+            ("预抓取距离 / m", "pregrasp_distance_m", 0, .5, .10),
+            ("抓取抬升距离 / m", "lift_distance_m", 0, .5, .10),
+            ("推动距离 / m", "push_distance_m", 0, .5, .15),
+            ("推动回撤距离 / m", "push_retreat_m", 0, .5, .05),
+            ("夹爪最大宽度 / m", "gripper_max_width_m", 0, .3, .095),
+            ("夹爪闭合余量 / m", "gripper_close_margin_m", 0, .05, .003),
+        ):
+            field = self._double(low, high, float(robot.get(key, default)), 4)
+            self.motion_fields[key] = field
+            motion_form.addRow(label, field)
+        self.removal_pose = QLineEdit(self._format_numbers(robot.get("removal_pose_mm_rpy_deg")))
+        motion_form.addRow("移除放置位姿 XYZRPY", self.removal_pose)
+        tcp = robot.get("model_tcp_to_robot_tcp", {}).get("xyz_mm_rpy_deg", [0] * 6)
+        self.tcp_pose = QLineEdit(self._format_numbers(tcp))
+        motion_form.addRow("TCP 补偿 XYZRPY", self.tcp_pose)
+        self.home_joints = QLineEdit(self._format_numbers(robot.get("home_joints_deg")))
+        self.home_speed = self._spin(1, 30, int(robot.get("home_speed_percent", 10)))
+        self.motion_workspace_min = QLineEdit(self._format_numbers(robot.get("motion_workspace_min_m")))
+        self.motion_workspace_max = QLineEdit(self._format_numbers(robot.get("motion_workspace_max_m")))
+        motion_form.addRow("安全原点关节角 J1～J6", self.home_joints)
+        motion_form.addRow("回原点速度 / %", self.home_speed)
+        motion_form.addRow("运动安全区最小 XYZ", self.motion_workspace_min)
+        motion_form.addRow("运动安全区最大 XYZ", self.motion_workspace_max)
+        motion_card.body.addLayout(motion_form)
+        cards.addWidget(motion_card)
 
         gripper_card = SectionCard("AG-160-95 夹爪")
         grid = QGridLayout()
@@ -356,6 +462,9 @@ class DeviceSettingsDialog(QDialog):
         specs = (
             ("厂商编号", "gripper_company", 1, 16, 4),
             ("夹爪编号", "gripper_index", 1, 16, 1),
+            ("设备编号", "gripper_device", 0, 16, 0),
+            ("总线编号", "gripper_bus", 0, 16, 0),
+            ("软件版本", "gripper_softversion", 0, 100, 0),
             ("打开位置 / %", "gripper_open_position", 0, 100, 100),
             ("闭合位置 / %", "gripper_closed_position", 0, 100, 5),
             ("运动速度 / %", "gripper_speed", 1, 100, 48),
@@ -375,7 +484,18 @@ class DeviceSettingsDialog(QDialog):
             cell.addWidget(field)
             grid.addLayout(cell, row, column)
         gripper_card.body.addLayout(grid)
-        root.addWidget(gripper_card)
+        cards.addWidget(gripper_card)
+
+        task = config.raw.setdefault("task", {})
+        task_card = SectionCard("默认任务")
+        task_form = QFormLayout()
+        self.default_category = self._spin(0, 63, int(task.get("default_category_id", 0)))
+        self.default_region = self._spin(0, 63, int(task.get("default_region_id", 0)))
+        task_form.addRow("默认类别 ID", self.default_category)
+        task_form.addRow("默认功能区 ID", self.default_region)
+        task_card.body.addLayout(task_form)
+        cards.addWidget(task_card)
+        cards.addStretch(1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存设置")
@@ -392,16 +512,71 @@ class DeviceSettingsDialog(QDialog):
         field.setValue(value)
         return field
 
+    @staticmethod
+    def _double(low: float, high: float, value: float, decimals: int = 3) -> QDoubleSpinBox:
+        field = QDoubleSpinBox()
+        field.setDecimals(decimals)
+        field.setRange(low, high)
+        field.setValue(value)
+        return field
+
+    @staticmethod
+    def _format_numbers(value) -> str:
+        if value is None:
+            return ""
+        return ", ".join(f"{float(x):.8g}" for x in np.asarray(value).reshape(-1))
+
+    @staticmethod
+    def _numbers(field: QLineEdit, count: int, name: str) -> list[float]:
+        text = field.text().replace(";", ",").replace(" ", ",")
+        values = [float(item) for item in text.split(",") if item]
+        if len(values) != count or not np.isfinite(values).all():
+            raise ValueError(f"{name}必须包含 {count} 个有限数字")
+        return values
+
     def save(self):
         try:
             ipaddress.ip_address(self.robot_ip.text().strip())
             enabled_cameras = [row for row in self.camera_rows if row[0].isChecked()]
             if not enabled_cameras:
                 raise ValueError("至少需要启用一台相机")
-            for _, camera_id, ip, _ in enabled_cameras:
+            model_views = [row[3].value() for row in enabled_cameras]
+            if len(model_views) != len(set(model_views)):
+                raise ValueError("启用相机的模型视角编号不能重复")
+            if 2 not in model_views:
+                raise ValueError("阶段 B 需要一台相机映射到模型参考视角 2")
+            camera_matrices = []
+            for _, camera_id, ip, _, matrix, _ in enabled_cameras:
                 if not camera_id.text().strip():
                     raise ValueError("相机 ID 不能为空")
                 ipaddress.ip_address(ip.text().strip())
+                value = np.asarray(self._numbers(matrix, 16, f"{camera_id.text()} 外参")).reshape(4, 4)
+                if not np.allclose(value[3], [0, 0, 0, 1], atol=1e-5):
+                    raise ValueError(f"{camera_id.text()} 外参最后一行必须为 0,0,0,1")
+                if not np.allclose(value[:3, :3].T @ value[:3, :3], np.eye(3), atol=1e-3) or not np.isclose(np.linalg.det(value[:3, :3]), 1, atol=1e-3):
+                    raise ValueError(f"{camera_id.text()} 外参旋转矩阵无效")
+                camera_matrices.append(value.tolist())
+            workspace_min = self._numbers(self.workspace_min, 3, "工作空间最小 XYZ")
+            workspace_max = self._numbers(self.workspace_max, 3, "工作空间最大 XYZ")
+            if np.any(np.asarray(workspace_min) >= np.asarray(workspace_max)):
+                raise ValueError("工作空间最大值必须逐轴大于最小值")
+            table_normal = np.asarray(self._numbers(self.table_normal, 3, "桌面法向量"))
+            length = np.linalg.norm(table_normal)
+            if length < 1e-8 or table_normal[2] <= 0:
+                raise ValueError("桌面法向量必须非零并朝上")
+            table_normal = (table_normal / length).tolist()
+            removal_pose = self._numbers(self.removal_pose, 6, "移除放置位姿")
+            tcp_pose = self._numbers(self.tcp_pose, 6, "TCP 补偿")
+            home_joints = self._numbers(self.home_joints, 6, "安全原点关节角")
+            motion_min = self._numbers(self.motion_workspace_min, 3, "运动安全区最小 XYZ")
+            motion_max = self._numbers(self.motion_workspace_max, 3, "运动安全区最大 XYZ")
+            if np.any(np.asarray(motion_min) >= np.asarray(motion_max)):
+                raise ValueError("运动安全区最大值必须逐轴大于最小值")
+            if self.depth_min.value() >= self.depth_max.value():
+                raise ValueError("最大深度必须大于最小深度")
+            for key, field in self.model_fields.items():
+                if not field.text().strip():
+                    raise ValueError(f"模型参数 {key} 不能为空")
         except ValueError as error:
             QMessageBox.warning(self, "设置无效", str(error))
             return
@@ -412,12 +587,46 @@ class DeviceSettingsDialog(QDialog):
             "user_id": self.user_id.value(),
             "speed_percent": self.speed.value(),
         })
+        for key, field in self.motion_fields.items():
+            robot[key] = field.value()
+        robot["removal_pose_mm_rpy_deg"] = removal_pose
+        robot["model_tcp_to_robot_tcp"] = {"xyz_mm_rpy_deg": tcp_pose}
+        robot["home_joints_deg"] = home_joints
+        robot["home_speed_percent"] = self.home_speed.value()
+        robot["motion_workspace_min_m"] = motion_min
+        robot["motion_workspace_max_m"] = motion_max
         for key, field in self.gripper_fields.items():
             robot[key] = field.value()
-        for enabled, camera_id, ip, item in self.camera_rows:
+        matrix_index = 0
+        for enabled, camera_id, ip, model_view, matrix, item in self.camera_rows:
             item["enabled"] = enabled.isChecked()
             item["id"] = camera_id.text().strip()
             item["ip"] = ip.text().strip()
+            item["model_view_index"] = model_view.value()
+            if enabled.isChecked():
+                item["camera_to_robot_base"] = camera_matrices[matrix_index]
+                matrix_index += 1
+            elif matrix.text().strip():
+                item["camera_to_robot_base"] = np.asarray(
+                    self._numbers(matrix, 16, f"{camera_id.text()} 外参")
+                ).reshape(4, 4).tolist()
+        fusion = self.config.raw["fusion"]
+        fusion.update({
+            "workspace_min_m": workspace_min, "workspace_max_m": workspace_max,
+            "table_plane_base": {"normal": table_normal, "offset_m": self.table_offset.value() / length},
+            "table_clearance_m": self.table_clearance.value(), "voxel_size_m": self.voxel_size.value(),
+            "depth_min_mm": self.depth_min.value(), "depth_max_mm": self.depth_max.value(),
+            "target_scene_points": self.scene_points.value(),
+            "instance_association_distance_m": self.association_distance.value(),
+            "temporal_instance_distance_m": self.temporal_distance.value(),
+        })
+        model = self.config.raw["tcd_prg"]
+        model.update({key: field.text().strip() for key, field in self.model_fields.items()})
+        model["device"] = self.model_device.currentText()
+        self.config.raw["task"].update({
+            "default_category_id": self.default_category.value(),
+            "default_region_id": self.default_region.value(),
+        })
         self.config.save()
         self.accept()
 
@@ -438,8 +647,10 @@ class MainWindow(QMainWindow):
         self.instance.setPlaceholderText("采集后选择实例")
         self.category = QSpinBox()
         self.category.setRange(0, 63)
+        self.category.setValue(int(config.raw.get("task", {}).get("default_category_id", 0)))
         self.region = QSpinBox()
         self.region.setRange(0, 63)
+        self.region.setValue(int(config.raw.get("task", {}).get("default_region_id", 0)))
         tcp_values = config.raw["robot"]["model_tcp_to_robot_tcp"].get("xyz_mm_rpy_deg", [0] * 6)
         self.tcp_fields = []
         for index, value in enumerate(tcp_values):
@@ -455,6 +666,19 @@ class MainWindow(QMainWindow):
         self.result.setReadOnly(True)
         self.result.setPlaceholderText("模型预测结果将在这里显示")
         self.result.setMinimumHeight(120)
+        self.result_dock = QDockWidget("预测结果", self)
+        self.result_dock.setObjectName("PredictionDock")
+        self.result_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea |
+            Qt.DockWidgetArea.BottomDockWidgetArea
+        )
+        self.result_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable |
+            QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+        self.result_dock.setWidget(self.result)
+        self.result_dock.setMinimumSize(460, 140)
+        self.result_dock.setMaximumHeight(230)
         self.status = QLabel("设备未连接")
         self.status.setObjectName("StatusBadge")
         self.status.setProperty("state", "idle")
@@ -466,6 +690,14 @@ class MainWindow(QMainWindow):
         self.gripper_init_button = QPushButton("初始化夹爪")
         self.gripper_open_button = QPushButton("打开夹爪")
         self.gripper_close_button = QPushButton("闭合夹爪")
+        self.enable_button = QPushButton("FR5 使能")
+        self.enable_button.setProperty("role", "execute")
+        self.disable_button = QPushButton("FR5 下使能")
+        self.clear_error_button = QPushButton("清除故障")
+        self.status_button = QPushButton("读取状态")
+        self.home_button = QPushButton("回安全原点")
+        self.pause_button = QPushButton("暂停运动")
+        self.resume_button = QPushButton("继续运动")
         self.acquire_button = QPushButton("点云采集")
         self.segment_button = QPushButton("实例分割")
         self.fuse_button = QPushButton("点云融合")
@@ -563,6 +795,19 @@ class MainWindow(QMainWindow):
         device_buttons.addWidget(self.settings_button)
         device_buttons.addWidget(self.gripper_init_button)
         device.body.addLayout(device_buttons)
+        servo_buttons = QHBoxLayout()
+        servo_buttons.addWidget(self.enable_button)
+        servo_buttons.addWidget(self.disable_button)
+        servo_buttons.addWidget(self.clear_error_button)
+        device.body.addLayout(servo_buttons)
+        recovery_buttons = QHBoxLayout()
+        recovery_buttons.addWidget(self.status_button)
+        recovery_buttons.addWidget(self.home_button)
+        device.body.addLayout(recovery_buttons)
+        motion_buttons = QHBoxLayout()
+        motion_buttons.addWidget(self.pause_button)
+        motion_buttons.addWidget(self.resume_button)
+        device.body.addLayout(motion_buttons)
         gripper_buttons = QHBoxLayout()
         gripper_buttons.setSpacing(6)
         gripper_buttons.addWidget(self.gripper_open_button)
@@ -581,11 +826,21 @@ class MainWindow(QMainWindow):
         task.body.addLayout(form)
 
         action = SectionCard("运行控制")
-        action.body.addWidget(self.acquire_button)
-        action.body.addWidget(self.segment_button)
-        action.body.addWidget(self.fuse_button)
-        action.body.addWidget(self.predict_button)
-        action.body.addWidget(self.execute_button)
+        run_buttons = QHBoxLayout()
+        run_buttons.setSpacing(5)
+        for button, short_text, tip in (
+            (self.acquire_button, "采集", "采集单相机 RGB-D 点云"),
+            (self.segment_button, "分割", "执行实例分割"),
+            (self.fuse_button, "融合", "生成机器人基座坐标系点云"),
+            (self.predict_button, "预测", "预测闭环下一步动作"),
+            (self.execute_button, "执行", "确认并执行当前预测动作"),
+        ):
+            button.setText(short_text)
+            button.setToolTip(tip)
+            button.setObjectName("RunCompact")
+            button.setMinimumWidth(0)
+            run_buttons.addWidget(button, 1)
+        action.body.addLayout(run_buttons)
         secondary = QHBoxLayout()
         secondary.setSpacing(6)
         secondary.addWidget(self.next_button)
@@ -593,10 +848,8 @@ class MainWindow(QMainWindow):
         action.body.addLayout(secondary)
         action.body.addWidget(self.stop_button)
 
-        prediction = SectionCard("预测结果")
-        prediction.body.addWidget(self.result)
-
         tcp = SectionCard("工具坐标补偿")
+        self.tcp_card = tcp
         toggle = QPushButton("展开补偿参数  ▾")
         toggle.setObjectName("TcpToggle")
         toggle.setCheckable(True)
@@ -622,7 +875,7 @@ class MainWindow(QMainWindow):
         toggle.toggled.connect(tcp_panel.setVisible)
         toggle.toggled.connect(lambda checked: toggle.setText("收起补偿参数  ▴" if checked else "展开补偿参数  ▾"))
 
-        for widget in (device, task, action, prediction, tcp):
+        for widget in (device, tcp, action, task):
             column.addWidget(widget)
         column.addStretch(1)
         return content
@@ -652,6 +905,9 @@ class MainWindow(QMainWindow):
         body_layout.addWidget(splitter)
         root_layout.addWidget(body, 1)
         self.setCentralWidget(root)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.result_dock)
+        self.result_dock.setFloating(True)
+        self.result_dock.resize(560, 200)
 
     def _signals(self):
         self.connect_button.clicked.connect(lambda: self.run_job(self.controller.connect, self.on_connected))
@@ -662,6 +918,13 @@ class MainWindow(QMainWindow):
             lambda: self.run_job(self.controller.open_gripper, self.on_device_action))
         self.gripper_close_button.clicked.connect(
             lambda: self.run_job(self.controller.close_gripper, self.on_device_action))
+        self.enable_button.clicked.connect(lambda: self.run_job(self.controller.enable_robot, self.on_device_action))
+        self.disable_button.clicked.connect(self.disable_robot)
+        self.clear_error_button.clicked.connect(lambda: self.run_job(self.controller.clear_errors, self.on_device_action))
+        self.status_button.clicked.connect(lambda: self.run_job(self.controller.robot_status, self.on_status_read))
+        self.home_button.clicked.connect(self.home_robot)
+        self.pause_button.clicked.connect(lambda: self.run_job(self.controller.pause_robot, self.on_device_action))
+        self.resume_button.clicked.connect(lambda: self.run_job(self.controller.resume_robot, self.on_device_action))
         self.acquire_button.clicked.connect(lambda: self.start_acquire(0))
         self.segment_button.clicked.connect(lambda: self.start_acquire(1))
         self.fuse_button.clicked.connect(lambda: self.start_acquire(2))
@@ -720,11 +983,20 @@ class MainWindow(QMainWindow):
         self.gripper_init_button.setEnabled(connected)
         self.gripper_open_button.setEnabled(connected)
         self.gripper_close_button.setEnabled(connected)
+        self.enable_button.setEnabled(connected and not self.controller.robot_enabled)
+        self.disable_button.setEnabled(connected and self.controller.robot_enabled)
+        self.clear_error_button.setEnabled(connected and not self.controller.robot_enabled)
+        self.status_button.setEnabled(connected)
+        self.home_button.setEnabled(connected and self.controller.robot_enabled)
+        self.pause_button.setEnabled(connected and self.controller.robot_enabled and not self.controller.robot_paused)
+        self.resume_button.setEnabled(connected and self.controller.robot_enabled and self.controller.robot_paused)
         self.acquire_button.setEnabled(connected)
         self.segment_button.setEnabled(connected)
         self.fuse_button.setEnabled(connected)
         has_scene = self.controller.scene is not None
-        self.predict_button.setEnabled(connected and has_scene)
+        self.predict_button.setEnabled(connected and has_scene and not self.controller.task_finished)
+        for widget in (self.instance, self.category, self.region):
+            widget.setEnabled(not self.busy and self.controller.active_task is None)
         self.execute_button.setEnabled(connected and self.controller.prediction is not None)
         self.next_button.setEnabled(connected)
         self.finish_button.setEnabled(not self.busy)
@@ -766,6 +1038,25 @@ class MainWindow(QMainWindow):
     def on_device_action(self, message):
         self._set_status(message, "ready")
 
+    def on_status_read(self, message):
+        self.result.setPlainText(message)
+        self._set_status("FR5 状态已刷新", "ready")
+
+    def disable_robot(self):
+        answer = QMessageBox.question(self, "确认下使能", "确认停止当前运动并下使能 FR5？")
+        if answer == QMessageBox.StandardButton.Yes:
+            self.run_job(self.controller.disable_robot, self.on_device_action)
+
+    def home_robot(self):
+        answer = QMessageBox.warning(
+            self, "确认回安全原点",
+            "回原点会执行关节运动。确认路径周围无人、无障碍物且夹持物不会碰撞后继续。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.run_job(self.controller.home_robot, self.on_device_action)
+
     def open_device_settings(self):
         if self.controller.connected:
             QMessageBox.warning(self, "设备已连接", "请先断开设备，再修改连接与夹爪参数。")
@@ -787,11 +1078,11 @@ class MainWindow(QMainWindow):
         index = self.instance.findData(previous)
         self.instance.setCurrentIndex(max(0, index))
         self.instance.blockSignals(False)
-        if self.instance.currentData() is not None:
+        if self.instance.currentData() is not None and self.controller.active_task is None:
             self.category.setValue(int(scene.category_by_instance.get(self.instance.currentData(), 0)))
         self.result.setPlainText(f"融合点数    {len(scene.xyz_m):,}\n实例数量    {len(scene.instance_ids)}\n实例列表    {scene.instance_ids}")
         self.scene_metric.setText(f"点云  {len(scene.xyz_m):,}    实例  {len(scene.instance_ids)}")
-        self._set_status("场景已更新，请选择目标并运行模型预测", "ready")
+        self._set_status("场景已更新，预测将重识别并继续原目标" if self.controller.active_task else "场景已更新，请选择目标并运行模型预测", "ready")
         self._complete_steps(3)
         self.refresh_highlight()
 
@@ -802,7 +1093,8 @@ class MainWindow(QMainWindow):
         return int(value)
 
     def start_prediction(self):
-        target, category, region = self.target(), self.category.value(), self.region.value()
+        target = -1 if self.controller.active_task else self.target()
+        category, region = self.category.value(), self.region.value()
         self._set_step(3)
         self.run_job(lambda: self.controller.predict(target, category, region), self.on_prediction)
 
@@ -820,6 +1112,9 @@ class MainWindow(QMainWindow):
                 f"接触点      {np.round(action['push_contact_world'], 4).tolist()}",
                 f"推动方向    {np.round(action['push_direction_world'], 4).tolist()}",
                 f"推动距离    {action['push_distance_m']:.3f} m",
+                f"Q1～Q5      {np.round(action.get('q_value', []), 4).tolist()}",
+                f"剩余预算    {action.get('q_horizon', '?')}",
+                f"安全评分    {action.get('safety_probability', float('nan')):.4f}",
             ]
         else:
             lines += [
@@ -829,10 +1124,10 @@ class MainWindow(QMainWindow):
         self.result.setPlainText("\n".join(lines))
         self._set_status("预测完成，确认后可执行", "ready")
         self._complete_steps(4)
-        self.canvas.set_data(self.controller.scene, self.target(), action)
+        self.canvas.set_data(self.controller.scene, action.get('target_query'), action)
 
     def start_execution(self):
-        target, category, region = self.target(), self.category.value(), self.region.value()
+        target, category, region = -1, self.category.value(), self.region.value()
         answer = QMessageBox.question(self, "确认执行", "是否将当前预测动作发送给机械臂？")
         if answer == QMessageBox.StandardButton.Yes:
             self._set_step(4)
@@ -844,7 +1139,7 @@ class MainWindow(QMainWindow):
         self._complete_steps(5)
 
     def refresh_highlight(self):
-        if self.controller.scene is not None and self.instance.currentData() is not None:
+        if self.controller.active_task is None and self.controller.scene is not None and self.instance.currentData() is not None:
             value = int(self.instance.currentData())
             self.category.setValue(int(self.controller.scene.category_by_instance.get(value, 0)))
             self.canvas.set_data(self.controller.scene, value, None)
@@ -861,6 +1156,7 @@ class MainWindow(QMainWindow):
         try:
             self.controller.stop()
             self._set_status("已发送机械臂停止命令", "error")
+            self._enable()
         except Exception as error:
             QMessageBox.critical(self, "停止失败", str(error))
 

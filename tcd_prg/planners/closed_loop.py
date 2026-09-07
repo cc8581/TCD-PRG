@@ -44,25 +44,45 @@ class ClosedLoopPlanner:
     def run(self) -> PlanResult:
         self.policy.reset()
         actions: list[Any] = []
+        preparation_count = 0
         # 每次执行后重新观测和生成候选；H=5 只限制准备动作，不包含最终 Task Grasp。
         for preparation_step in range(self.max_preparation_actions + 1):
             observation = self.observations.observe()
             encoded = self.policy.encode_observation(observation)
             candidates = self.policy.generate_candidates(encoded)
+            if preparation_count == self.max_preparation_actions:
+                self._keep_task_grasps_only(candidates)
             action, rejection = self._select_certified(candidates)
             if action is None:
-                reason = "no_valid_action" if rejection is None else f"certification:{rejection}"
-                return PlanResult(False, preparation_step, actions, reason)
+                reason = (
+                    "horizon_exhausted"
+                    if preparation_count == self.max_preparation_actions
+                    else "no_valid_action" if rejection is None else f"certification:{rejection}"
+                )
+                return PlanResult(False, preparation_count, actions, reason)
+            action_type = int(action["action_type"] if isinstance(action, dict) else action.action_type)
+            if (
+                preparation_count == self.max_preparation_actions
+                and action_type != int(ActionType.TASK_GRASP)
+            ):
+                return PlanResult(False, preparation_count, actions, "horizon_exhausted")
             if not self.executor.execute(action):
-                return PlanResult(False, preparation_step, actions, "execution_failed")
+                return PlanResult(False, preparation_count, actions, "execution_failed")
             actions.append(action)
             self.policy.update_after_action(action, observation)
-            action_type = int(action["action_type"] if isinstance(action, dict) else action.action_type)
             if action_type == int(ActionType.TASK_GRASP):
-                return PlanResult(True, preparation_step, actions)
-            if preparation_step == self.max_preparation_actions:
-                break
-        return PlanResult(False, self.max_preparation_actions, actions, "horizon_exhausted")
+                return PlanResult(True, preparation_count, actions)
+            preparation_count += 1
+        return PlanResult(False, preparation_count, actions, "horizon_exhausted")
+
+    @staticmethod
+    def _keep_task_grasps_only(candidates: Any) -> None:
+        """At H=0, preserve the terminal grasp attempt and mask every preparation action."""
+        if not isinstance(candidates, dict) or "candidates" not in candidates:
+            return
+        tensors = candidates["candidates"]
+        if "valid" in tensors and "type" in tensors:
+            tensors["valid"] &= tensors["type"] == int(ActionType.TASK_GRASP)
 
     def _select_certified(self, candidates: Any) -> tuple[Any | None, str | None]:
         """Try the next ranked candidate after deterministic safety rejection."""
