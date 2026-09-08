@@ -180,7 +180,6 @@ class ModelConfig:
     push_object_topk: int = 4
     push_utility_threshold: float = 0.0
     push_candidate_probability_threshold: float = 0.0
-    push_safety_probability_threshold: float = 0.5
     push_utility_temperature: float = 1.0
     pick_remove_target_margin_m: float = 0.05
     push_direction_feature_dim: int = 64
@@ -426,14 +425,11 @@ class TrainingConfig:
 
     # Stage-C only; required by its training entrypoint, unused by A/B.
     push_fps_points: int | None = None
+    # Stage-C single-head structural action-value sidecars.
     push_value_root: str | None = None
-    push_value_horizons: int = 5
-    push_q_loss_weight: float = 1.0
-    push_rank_loss_weight: float = 0.25
-    push_safety_loss_weight: float = 0.5
-    push_aux_loss_weight: float = 0.1
-    push_rank_margin: float = 0.02
-    push_delta_scales: tuple[float, ...] = (10.0, 1.0, 1.0, 5.0, 1.0)
+    push_value_loss_weight: float = 1.0
+    push_rank_loss_weight: float = 1.0
+    push_score_temperature: float = 0.1
 
 
 @dataclass(slots=True)
@@ -554,18 +550,11 @@ class TCDPRGConfig:
 
     def validate(self) -> None:
         training = self.training
-        if training.push_value_horizons != 5:
-            raise ValueError("training.push_value_horizons must be 5 for the current Stage-C protocol")
-        if len(training.push_delta_scales) != 5 or any(
-            float(value) <= 0 for value in training.push_delta_scales
-        ):
-            raise ValueError("training.push_delta_scales must contain five positive values")
-        for name in (
-            "push_q_loss_weight", "push_rank_loss_weight", "push_safety_loss_weight",
-            "push_aux_loss_weight", "push_rank_margin",
-        ):
+        for name in ("push_value_loss_weight", "push_rank_loss_weight"):
             if float(getattr(training, name)) < 0:
                 raise ValueError(f"training.{name} cannot be negative")
+        if training.push_score_temperature <= 0:
+            raise ValueError("training.push_score_temperature must be positive")
         augmentation = self.augmentation
         if augmentation.debug.save_first_batches < 0:
             raise ValueError("augmentation.debug.save_first_batches cannot be negative")
@@ -850,8 +839,6 @@ class TCDPRGConfig:
             raise ValueError("push_coverage_penalty_weight must be non-negative")
         if not 0.0 <= self.model.push_candidate_probability_threshold < 1.0:
             raise ValueError("push_candidate_probability_threshold must be in [0,1)")
-        if not 0.0 <= self.model.push_safety_probability_threshold <= 1.0:
-            raise ValueError("push_safety_probability_threshold must be in [0,1]")
         if (
             min(
                 self.sampling.global_positive_grasps_per_object,

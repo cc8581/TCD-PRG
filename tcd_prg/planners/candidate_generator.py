@@ -39,11 +39,7 @@ class DenseCandidateGenerator:
             "contact_score": torch.empty(0, device=device),
             "utility": torch.empty(0, device=device),
             "direction_residual": torch.empty(0, 2, device=device),
-            "effective_logit": torch.empty(0, device=device),
-            "effective_probability": torch.empty(0, device=device),
-            "push_q_value": torch.empty(0, 5, device=device),
-            "push_q_horizon": torch.empty(0, dtype=torch.long, device=device),
-            "push_safety_probability": torch.empty(0, device=device),
+            "push_value": torch.empty(0, device=device),
         }
 
     @staticmethod
@@ -229,8 +225,7 @@ class DenseCandidateGenerator:
         if not bool(getattr(model, "push_evaluator_ready", False)):
             # Unloaded evaluation weights must never authorize a PUSH selection.
             for decoded in decoded_push_rows:
-                decoded["effective_logit"] = torch.full_like(decoded["effective_logit"], float("nan"))
-                decoded["effective_probability"] = torch.full_like(decoded["effective_probability"], float("nan"))
+                decoded["push_value"] = torch.full_like(decoded["push_value"], float("nan"))
         for batch_row in range(sensor["xyz"].shape[0]):
             xyz = sensor["xyz"][batch_row]
             point_mask = sensor["point_mask"][batch_row]
@@ -260,11 +255,7 @@ class DenseCandidateGenerator:
             contact_score_parts: list[Tensor] = []
             utility_parts: list[Tensor] = []
             direction_residual_parts: list[Tensor] = []
-            effective_logit_parts: list[Tensor] = []
-            effective_probability_parts: list[Tensor] = []
-            push_q_parts: list[Tensor] = []
-            push_q_horizon_parts: list[Tensor] = []
-            push_safety_parts: list[Tensor] = []
+            push_value_parts: list[Tensor] = []
 
             # Terminal task grasp candidates belong to the predicted target query.
             task = output["task_grasp"]
@@ -319,13 +310,7 @@ class DenseCandidateGenerator:
                 direction_residual_parts.append(
                     torch.full((len(selected), 2), float("nan"), device=xyz.device)
                 )
-                effective_logit_parts.append(torch.full_like(task_score[selected], float("nan")))
-                effective_probability_parts.append(
-                    torch.full_like(task_score[selected], float("nan"))
-                )
-                push_q_parts.append(torch.full((len(selected), 5), float("nan"), device=xyz.device))
-                push_q_horizon_parts.append(torch.full_like(selected, -1))
-                push_safety_parts.append(torch.full_like(task_score[selected], float("nan")))
+                push_value_parts.append(torch.full_like(task_score[selected], float("nan")))
 
             # Generic remove grasps are assigned to predicted object queries.
             global_head = output["global_grasp"]
@@ -406,13 +391,7 @@ class DenseCandidateGenerator:
                 direction_residual_parts.append(
                     torch.full((len(selected), 2), float("nan"), device=xyz.device)
                 )
-                effective_logit_parts.append(torch.full_like(candidate_score[local], float("nan")))
-                effective_probability_parts.append(
-                    torch.full_like(candidate_score[local], float("nan"))
-                )
-                push_q_parts.append(torch.full((len(selected), 5), float("nan"), device=xyz.device))
-                push_q_horizon_parts.append(torch.full_like(selected, -1))
-                push_safety_parts.append(torch.full_like(candidate_score[local], float("nan")))
+                push_value_parts.append(torch.full_like(candidate_score[local], float("nan")))
 
             decoded_push = decoded_push_rows[batch_row]
             if len(decoded_push["point_index"]):
@@ -450,11 +429,7 @@ class DenseCandidateGenerator:
                 contact_score_parts.append(decoded_push["contact_score"])
                 utility_parts.append(decoded_push["utility"])
                 direction_residual_parts.append(decoded_push["direction_residual"])
-                effective_logit_parts.append(decoded_push["effective_logit"])
-                effective_probability_parts.append(decoded_push["effective_probability"])
-                push_q_parts.append(decoded_push["q_value"])
-                push_q_horizon_parts.append(decoded_push["q_horizon"])
-                push_safety_parts.append(decoded_push["safety_probability"])
+                push_value_parts.append(decoded_push["push_value"])
 
             def joined(
                 parts: list[Tensor],
@@ -485,11 +460,7 @@ class DenseCandidateGenerator:
                     "contact_score": joined(contact_score_parts, (0,), xyz.dtype),
                     "utility": joined(utility_parts, (0,), xyz.dtype),
                     "direction_residual": joined(direction_residual_parts, (0, 2), xyz.dtype),
-                    "effective_logit": joined(effective_logit_parts, (0,), xyz.dtype),
-                    "effective_probability": joined(effective_probability_parts, (0,), xyz.dtype),
-                    "push_q_value": joined(push_q_parts, (0, 5), xyz.dtype),
-                    "push_q_horizon": joined(push_q_horizon_parts, (0,), torch.long, -1),
-                    "push_safety_probability": joined(push_safety_parts, (0,), xyz.dtype),
+                    "push_value": joined(push_value_parts, (0,), xyz.dtype),
                 }
             )
 
@@ -505,11 +476,7 @@ class DenseCandidateGenerator:
             "contact_score": float("nan"),
             "utility": float("nan"),
             "direction_residual": float("nan"),
-            "effective_logit": float("nan"),
-            "effective_probability": float("nan"),
-            "push_q_value": float("nan"),
-            "push_q_horizon": -1,
-            "push_safety_probability": float("nan"),
+            "push_value": float("nan"),
             "proposal_score": -1.0,
             "contact_world": float("nan"),
             "direction_world": float("nan"),

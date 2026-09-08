@@ -1,9 +1,10 @@
-"""Rank rule-generated complete actions by the independent evaluator."""
+"""Rank rule-generated PUSH actions by the single learned core value."""
 import math
 import torch
 from torch import Tensor
 from tcd_prg.config import ModelConfig
 from tcd_prg.constants import ActionType, CandidateStatus
+
 
 def push_nms_mask(candidates: dict[str, Tensor], config: ModelConfig) -> Tensor:
     """Return the deployment NMS mask for one unpadded candidate row."""
@@ -38,56 +39,64 @@ def push_nms_mask(candidates: dict[str, Tensor], config: ModelConfig) -> Tensor:
     return keep
 
 
-
 def decode_push_candidates(
     sensor, condition, push, config, *, remaining_preparation_actions: int = 5
 ):
     if not 0 <= int(remaining_preparation_actions) <= 5:
         raise ValueError("remaining_preparation_actions must lie in [0,5]")
     actions = push["actions"]
-    q_value = push.get("q_value")
-    if q_value is None:
-        logits = push["effective_logit"]
-        score_all = logits.sigmoid()
-        safety_all = torch.ones_like(score_all)
-    else:
-        horizon_index = max(int(remaining_preparation_actions), 1) - 1
-        score_all = q_value[:, horizon_index]
-        logits = torch.logit(score_all.clamp(1e-6, 1-1e-6))
-        safety_all = push["safety_probability"]
+    score_all = push.get("push_value")
+    if score_all is None:
+        raise RuntimeError("Stage-C PUSH output is missing push_value")
     pre, final = [], []
     for b in range(len(sensor["xyz"])):
         ids = torch.nonzero(actions.batch_index == b, as_tuple=False).flatten()
         if remaining_preparation_actions == 0:
             ids = ids[:0]
-        ids = ids[safety_all[ids] >= config.push_safety_probability_threshold]
+        # No learned safety gate. Deterministic certification in ClosedLoopPlanner
+        # rejects invalid actions and immediately tries the next ranked candidate.
         ids = ids[score_all[ids].argsort(descending=True, stable=True)]
-        ids = ids[:config.max_push_candidates]
+        ids = ids[: config.max_push_candidates]
         a = actions.select(ids)
         score = score_all[ids]
         k = len(ids)
-        angle = torch.atan2(a.direction_world[:, 1], a.direction_world[:, 0]).remainder(2*math.pi)
-        bins = (angle * config.num_direction_bins / (2*math.pi)).long()
-        # Point index is output metadata only, never used for action scoring.
+        angle = torch.atan2(a.direction_world[:, 1], a.direction_world[:, 0]).remainder(
+            2 * math.pi
+        )
+        bins = (angle * config.num_direction_bins / (2 * math.pi)).long()
         anchors = []
         for i in range(k):
-            member = sensor["point_mask"][b].bool() & (condition.object_probability[b, a.object[i]] >= .5)
+            member = sensor["point_mask"][b].bool() & (
+                condition.object_probability[b, a.object[i]] >= 0.5
+            )
             points = torch.nonzero(member, as_tuple=False).flatten()
-            anchors.append(points[(sensor["xyz"][b, points]-a.contact_world[i]).norm(dim=-1).argmin()])
-        row = {"object": a.object, "contact_world": a.contact_world,
-               "direction_world": a.direction_world, "push_distance": a.push_distance,
-               "point_index": torch.stack(anchors) if anchors else a.object.new_empty(0),
-               "direction_bin": bins, "direction_residual": score.new_zeros((k, 2)),
-               "object_score": torch.ones_like(score), "contact_score": torch.ones_like(score),
-               "direction_score": torch.ones_like(score), "utility": score,
-               "proposal_score": score, "effective_logit": logits[ids], "effective_probability": score,
-               "q_value": q_value[ids] if q_value is not None else score[:, None].expand(-1, 5),
-               "q_horizon": torch.full_like(a.object, int(remaining_preparation_actions)),
-               "safety_probability": safety_all[ids]}
+            anchors.append(
+                points[
+                    (sensor["xyz"][b, points] - a.contact_world[i])
+                    .norm(dim=-1)
+                    .argmin()
+                ]
+            )
+        row = {
+            "object": a.object,
+            "contact_world": a.contact_world,
+            "direction_world": a.direction_world,
+            "push_distance": a.push_distance,
+            "point_index": torch.stack(anchors) if anchors else a.object.new_empty(0),
+            "direction_bin": bins,
+            "direction_residual": score.new_zeros((k, 2)),
+            "object_score": torch.ones_like(score),
+            "contact_score": torch.ones_like(score),
+            "direction_score": torch.ones_like(score),
+            "utility": score,
+            "proposal_score": score,
+            "push_value": score,
+        }
         pre.append(row)
         keep = push_nms_mask(row, config)
         final.append({key: value[keep] for key, value in row.items()})
     return pre, final
+
 
 def proposal_recall_counts(
     rows: list[dict[str, Tensor]],
@@ -126,7 +135,9 @@ def proposal_recall_counts(
             predicted_direction = torch.nn.functional.normalize(
                 decoded["direction_world"][:, :2], dim=-1
             )
-            direction_match = (predicted_direction * gt_direction[None]).sum(-1) >= cosine_threshold
+            direction_match = (
+                predicted_direction * gt_direction[None]
+            ).sum(-1) >= cosine_threshold
             if bool(
                 (
                     same_object

@@ -24,9 +24,9 @@ def test_pointnet_backbone_receives_effect_gradients_and_updates():
 def test_fixed_input_repeats_and_ignores_external_perception_features():
     m=model().eval();b=scene()
     with torch.no_grad():
-        a=push_effectiveness_batch_loss(m,b,instance_queries=4,loss_function=PushEffectivenessLoss())[1]['effective_logit']
+        a=push_effectiveness_batch_loss(m,b,instance_queries=4,loss_function=PushEffectivenessLoss())[1]['push_value']
         b['geometry_feature'].fill_(float('nan'))
-        c=push_effectiveness_batch_loss(m,b,instance_queries=4,loss_function=PushEffectivenessLoss())[1]['effective_logit']
+        c=push_effectiveness_batch_loss(m,b,instance_queries=4,loss_function=PushEffectivenessLoss())[1]['push_value']
     assert torch.equal(a,c)
 
 
@@ -48,7 +48,7 @@ def test_accumulation_matches_action_weighted_batch_and_flushes_tail(monkeypatch
                                 loss_function=PushEffectivenessLoss(),optimizer=opt)
     rng = torch.get_rng_state()
     _,count,_,_,components=next(batches);assert count==3
-    assert set(components) == {'q', 'rank', 'safety', 'auxiliary'}
+    assert set(components) == {'value', 'rank'}
     torch.set_rng_state(rng)  # Match upstream random FPS choices for the reference.
     l1,_=push_effectiveness_batch_loss(reference,first,instance_queries=4,loss_function=PushEffectivenessLoss())
     l2,_=push_effectiveness_batch_loss(reference,second,instance_queries=4,loss_function=PushEffectivenessLoss())
@@ -89,7 +89,7 @@ def test_multiple_scenes_share_backbone_call_and_receive_gradients():
     finally:
         hook.remove()
     assert calls==[(2,batch['xyz'].shape[1],3)]
-    assert details['effective_logit'].shape==(4,)
+    assert details['push_value'].shape==(4,)
     assert torch.isfinite(batch['rgb'].grad).all()
     assert (batch['rgb'].grad.abs().flatten(1).sum(1)>0).all()
     assert any(p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum()>0
@@ -226,8 +226,9 @@ def test_inactive_push_keeps_ab_parameter_layout_and_rng():
     from tcd_prg.models.push import PushEffectivenessEvaluator
     current=PushEffectivenessEvaluator(16,initialize_backbone=False)
     assert current.backbone is None
-    assert current.q_head.out_features == 5
-    assert current.safety_head.out_features == 1
+    assert current.value_head.out_features == 1
+    assert not hasattr(current, "safety_head")
+    assert not hasattr(current, "auxiliary_delta_head")
 
 
 def test_combined_deployment_loads_same_pointnet_without_using_a_encoder(tmp_path):
@@ -246,4 +247,4 @@ def test_combined_deployment_loads_same_pointnet_without_using_a_encoder(tmp_pat
         expected=m(b)['push']
         actual=TCDPRGModel.forward_push_from_condition(combined,m._sensor(b),b['push_condition'])
     assert torch.equal(expected['actions'].contact_world,actual['actions'].contact_world)
-    assert torch.equal(expected['effective_logit'],actual['effective_logit'])
+    assert torch.equal(expected['push_value'],actual['push_value'])

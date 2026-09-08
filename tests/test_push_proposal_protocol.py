@@ -37,21 +37,23 @@ def test_proposal_recall_uses_fixed_gt_denominator_and_ignores_unknown() -> None
     assert total == 2
 
 
-def test_effectiveness_loss_uses_offline_q_and_safety_masks() -> None:
-    q = torch.zeros(3, 5, requires_grad=True)
-    safety = torch.zeros(3, requires_grad=True)
-    delta = torch.zeros(3, 5, requires_grad=True)
+def test_effectiveness_loss_uses_structural_value_masks() -> None:
+    score = torch.zeros(3, requires_grad=True)
     losses = PushEffectivenessLoss()(
-        {'q_value':q, 'safety_logit':safety, 'potential_delta':delta},
-        q_target=torch.ones(3,5), q_valid=torch.tensor([[True]*5,[True]*5,[False]*5]),
-        safety_target=torch.tensor([False,True,True]), safety_valid=torch.tensor([True,True,False]),
-        auxiliary_target=torch.ones(3,5), auxiliary_valid=torch.tensor([True,True,False]),
+        {"push_value": score},
+        value_target=torch.tensor([1.0, -1.0, float("nan")]),
+        value_valid=torch.tensor([True, True, False]),
+        rank_key=torch.tensor([
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+            [0.0, -1.0, -1.0, 0.0, 0.0, 0.5, 0.0],
+            [float("nan")] * 7,
+        ]),
+        rank_valid=torch.tensor([True, True, False]),
         group_index=torch.tensor([0,0,0]),
     )
     losses["push_effectiveness"].backward()
-    assert q.grad[2].abs().sum() == 0
-    assert safety.grad[2] == 0
-    assert losses["push_q_supervised_count"] == 10
+    assert score.grad[2] == 0
+    assert losses["push_value_supervised_count"] == 2
 
 
 def test_effectiveness_metrics_report_binary_and_state_ranking_quality() -> None:

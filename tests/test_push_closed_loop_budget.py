@@ -11,7 +11,7 @@ from tcd_prg.planners.tcd_policy import EncodedPolicyState, TCDPRGPolicy
 from tcd_prg.runtime import _apply_training_augmentation
 
 
-def test_decoder_uses_q_for_remaining_budget():
+def test_decoder_uses_same_single_push_value_for_every_nonzero_budget():
     from test_independent_push import model, scene
     from tcd_prg.trainers.push_evaluator import logged_push_actions
 
@@ -19,12 +19,7 @@ def test_decoder_uses_q_for_remaining_budget():
     network = model().eval()
     condition = push_condition_from_gt(batch, 4)
     actions, _ = logged_push_actions(batch, condition)
-    q = torch.tensor([[.1, .2, .3, .4, .9], [.8, .7, .6, .5, .2]])
-    push = {
-        "actions": actions,
-        "q_value": q,
-        "safety_probability": torch.ones(2),
-    }
+    push = {"actions": actions, "push_value": torch.tensor([.2, .8])}
     sensor = network._sensor(batch)
     first, _ = decode_push_candidates(
         sensor, condition, push, network.push.config, remaining_preparation_actions=1
@@ -35,10 +30,8 @@ def test_decoder_uses_q_for_remaining_budget():
     exhausted, _ = decode_push_candidates(
         sensor, condition, push, network.push.config, remaining_preparation_actions=0
     )
-    assert first[0]["effective_probability"].tolist() == [q[1, 0], q[0, 0]]
-    assert fifth[0]["effective_probability"].tolist() == [q[0, 4], q[1, 4]]
-    assert first[0]["q_horizon"].unique().item() == 1
-    assert fifth[0]["q_horizon"].unique().item() == 5
+    torch.testing.assert_close(first[0]["proposal_score"], fifth[0]["proposal_score"])
+    torch.testing.assert_close(first[0]["proposal_score"], torch.tensor([.8, .2]))
     assert not len(exhausted[0]["object"])
 
 

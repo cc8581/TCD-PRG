@@ -95,7 +95,7 @@ def test_one_shot_uses_effectiveness_for_push_ranking() -> None:
                     "type": torch.tensor([[0, 1, 2]]),
                     "object": torch.tensor([[1, 2, 0]]),
                     "proposal_score": torch.tensor([[0.8, 0.6, 0.9]]),
-                    "effective_probability": torch.tensor([[float("nan"), 0.9, 0.1]]),
+                    "push_value": torch.tensor([[0.9, float("nan"), float("nan")]]),
                 }
             }
 

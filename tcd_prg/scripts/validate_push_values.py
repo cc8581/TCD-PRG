@@ -11,11 +11,7 @@ from tqdm import tqdm
 
 from tcd_prg.config import load_config
 from tcd_prg.constants import ActionType
-from tcd_prg.datasets.push_value import (
-    PUSH_VALUE_HORIZONS,
-    PUSH_ACTION_VALUE_SCHEMA_VERSION,
-    PushActionValueStore,
-)
+from tcd_prg.datasets.push_value import PUSH_ACTION_VALUE_SCHEMA_VERSION, PushActionValueStore
 from tcd_prg.runtime import create_adapter
 
 
@@ -27,9 +23,7 @@ def main() -> None:
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
     adapter = create_adapter(config, allow_render=False)
-    action_store = PushActionValueStore(
-        args.action_value_root, config.training.push_value_horizons
-    )
+    action_store = PushActionValueStore(args.action_value_root)
     expected = tuple(adapter.snapshot_scene_ids)
     expected_names = {f"scene_{scene_id:04d}.h5" for scene_id in expected}
     action_names = {path.name for path in Path(args.action_value_root).glob("scene_*.h5")}
@@ -38,7 +32,8 @@ def main() -> None:
         extra = sorted(action_names - expected_names)[:10]
         raise RuntimeError(f"action sidecar coverage mismatch: missing={missing}, extra={extra}")
 
-    state_total = push_total = valid_q_total = positive_q_total = 0
+    state_total = push_total = valid_total = 0
+    improved = neutral = worsened = 0
     for scene_id in tqdm(expected, desc="Validate PUSH values", unit="scene"):
         label_path = adapter._path_by_scene[int(scene_id)]
         with h5py.File(label_path, "r", swmr=True) as handle:
@@ -53,32 +48,37 @@ def main() -> None:
         ).astype(np.int64)
         if not np.array_equal(payload["action_id"].astype(np.int64), expected_ids):
             raise RuntimeError(f"scene {scene_id}: PUSH action IDs are not source-aligned")
-        q = payload["q_value"].astype(np.float32)
-        q_valid = payload["q_valid"].astype(bool)
-        expected_shape = (len(expected_ids), config.training.push_value_horizons)
-        if q.shape != expected_shape or q_valid.shape != expected_shape:
-            raise RuntimeError(f"scene {scene_id}: invalid Q shape")
-        if np.any(q_valid & (~np.isfinite(q) | (q < 0) | (q > 1))):
-            raise RuntimeError(f"scene {scene_id}: invalid finite-horizon Q values")
-        if np.any(~q_valid & np.isfinite(q)):
-            raise RuntimeError(f"scene {scene_id}: invalid Q entries must remain NaN")
-        if np.any(np.diff(np.where(q_valid, q, 0.0), axis=1) < -1e-6):
-            raise RuntimeError(f"scene {scene_id}: Q horizons must be monotonic")
-        if not np.asarray(payload["safety_valid"], bool).all():
-            raise RuntimeError(f"scene {scene_id}: missing PUSH safety labels")
+        target = payload["value_target"].astype(np.float32)
+        valid = payload["value_valid"].astype(bool)
+        before = payload["before_rank_key"].astype(np.float32)
+        after = payload["after_rank_key"].astype(np.float32)
+        if target.shape != (len(expected_ids),) or valid.shape != target.shape:
+            raise RuntimeError(f"scene {scene_id}: invalid value target shape")
+        if before.shape != after.shape or before.shape != (len(expected_ids), 7):
+            raise RuntimeError(f"scene {scene_id}: invalid rank-key shape")
+        allowed = np.isin(target, np.asarray([-1.0, 0.0, 1.0], np.float32))
+        if np.any(valid & (~np.isfinite(target) | ~allowed)):
+            raise RuntimeError(f"scene {scene_id}: invalid core PUSH values")
+        if np.any(~valid & np.isfinite(target)):
+            raise RuntimeError(f"scene {scene_id}: invalid targets must remain NaN")
+        if np.any(~np.isfinite(before[valid])) or np.any(~np.isfinite(after[valid])):
+            raise RuntimeError(f"scene {scene_id}: valid rank keys must be finite")
         push_total += len(expected_ids)
-        valid_q_total += int(q_valid.sum())
-        positive_q_total += int(np.count_nonzero(q_valid & (q > 0)))
+        valid_total += int(valid.sum())
+        improved += int((valid & (target > 0)).sum())
+        neutral += int((valid & (target == 0)).sum())
+        worsened += int((valid & (target < 0)).sum())
 
     print(
         {
             "action_schema_version": PUSH_ACTION_VALUE_SCHEMA_VERSION,
-            "horizons": PUSH_VALUE_HORIZONS,
             "scenes": len(expected),
             "states": state_total,
             "push_actions": push_total,
-            "valid_q_values": valid_q_total,
-            "positive_q_values": positive_q_total,
+            "valid_push_values": valid_total,
+            "improved": improved,
+            "neutral": neutral,
+            "worsened": worsened,
             "teacher": "none",
         },
         flush=True,

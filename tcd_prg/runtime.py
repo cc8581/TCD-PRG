@@ -169,7 +169,7 @@ class UnifiedBatchCollator:
 
 @dataclass(slots=True)
 class PushValueBatchCollator:
-    """Attach immutable offline Q/safety labels to the ordinary Stage-C batch."""
+    """Attach immutable structural PUSH-value labels to the current-state batch."""
 
     config: TCDPRGConfig
     training: bool = False
@@ -179,26 +179,21 @@ class PushValueBatchCollator:
         import torch
         from tcd_prg.datasets.push_value import PushActionValueStore
 
+        # Stage C first learns the core causal mapping on a deployment-matched
+        # clean sensor distribution. The old shared RGB/geometric augmentation
+        # polluted PointNet++ BN statistics and is intentionally not applied here.
         batch = UnifiedBatchCollator(
             self.config, training=False, include_graspnet=False
         )(samples)
-        if self.training:
-            # Per-view extrinsic jitter changes point coordinates without changing
-            # logged world-frame PUSH contacts/directions, so it is invalid for C.
-            batch = _apply_training_augmentation(
-                self.config, batch, disable_extrinsic_jitter=True
-            )
         root = self.config.training.push_value_root
         if not root:
-            raise RuntimeError("Stage-C Q training requires training.push_value_root")
-        horizons = self.config.training.push_value_horizons
-        store = PushActionValueStore(root, horizons)
-        shape = (*batch["candidate_action_id"].shape, horizons)
-        q = torch.full(shape, float("nan"), dtype=torch.float32)
-        q_valid = torch.zeros(shape, dtype=torch.bool)
-        safe = torch.zeros(shape[:2], dtype=torch.bool)
-        safety_valid = torch.zeros(shape[:2], dtype=torch.bool)
-        sequence = torch.zeros(shape[:2], dtype=torch.bool)
+            raise RuntimeError("Stage-C training requires training.push_value_root")
+        store = PushActionValueStore(root)
+        shape = batch["candidate_action_id"].shape
+        value = torch.full(shape, float("nan"), dtype=torch.float32)
+        value_valid = torch.zeros(shape, dtype=torch.bool)
+        rank_key = torch.full((*shape, 7), float("nan"), dtype=torch.float32)
+        rank_valid = torch.zeros(shape, dtype=torch.bool)
         scene_payloads: dict[int, dict[str, Any]] = {}
         for row, sample in enumerate(samples):
             scene_id = int(sample.observation.scene_id)
@@ -207,7 +202,7 @@ class PushValueBatchCollator:
             payload = scene_payloads[scene_id]
             action_ids = np.asarray(payload["action_id"], np.int64)
             if len(action_ids) and np.any(action_ids[1:] <= action_ids[:-1]):
-                raise RuntimeError("Action-value IDs must be strictly increasing")
+                raise RuntimeError("Stage-C action-value IDs must be strictly increasing")
             candidates = np.asarray(sample.candidates.candidate_action_ids, np.int64)
             if len(action_ids):
                 locations = np.searchsorted(action_ids, candidates)
@@ -218,17 +213,17 @@ class PushValueBatchCollator:
                 matched = np.zeros_like(candidates, dtype=bool)
             for local in np.flatnonzero(matched):
                 source = int(locations[local])
-                q[row, local] = torch.from_numpy(payload["q_value"][source].astype(np.float32))
-                q_valid[row, local] = torch.from_numpy(payload["q_valid"][source].astype(bool))
-                safe[row, local] = bool(payload["safe"][source])
-                safety_valid[row, local] = bool(payload["safety_valid"][source])
-                sequence[row, local] = bool(payload["part_of_success_sequence"][source])
+                value[row, local] = float(payload["value_target"][source])
+                value_valid[row, local] = bool(payload["value_valid"][source])
+                rank_key[row, local] = torch.from_numpy(
+                    np.asarray(payload["after_rank_key"][source], np.float32)
+                )
+                rank_valid[row, local] = bool(payload["value_valid"][source])
         batch.update(
-            push_q_target=q,
-            push_q_valid=q_valid,
-            push_safe_target=safe,
-            push_safety_valid=safety_valid,
-            push_part_of_success_sequence=sequence,
+            push_value_target=value,
+            push_value_valid=value_valid,
+            push_rank_key=rank_key,
+            push_rank_valid=rank_valid,
         )
         return batch
 

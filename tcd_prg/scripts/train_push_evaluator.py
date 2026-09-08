@@ -17,10 +17,11 @@ from tqdm import tqdm
 
 from tcd_prg.config import load_config
 from tcd_prg.datasets import ActionStateGroupDataset
-from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
+from tcd_prg.losses.push_effectiveness import (
+    PushEffectivenessLoss, lexicographic_order_matrix,
+)
 from tcd_prg.models import StandalonePushModel
 from tcd_prg.models.staged_checkpoint import load_push_evaluator
-from tcd_prg.evaluators.push_effectiveness import _binary_auroc_rank
 from tcd_prg.trainers.push_checkpoint import PushTrainingCheckpoint
 from tcd_prg.trainers.push_progress import PushTrainingProgress, append_record, print_validation_summary
 from tcd_prg.trainers.push_scheduler import PushLRScheduler
@@ -57,55 +58,62 @@ def push_optimizer_groups(model: StandalonePushModel, config) -> list[dict[str, 
 
 
 def accumulated_batches(model, loader, *, device, config, loss_function, optimizer):
-    """Accumulate action sums, then normalize by actual known-action count.
-
-    Empty microbatches do not consume accumulation slots. An epoch tail is
-    flushed rather than dropped. All optimizer/checkpoint counters count updates.
-    """
+    """Accumulate only microbatches that contain core PUSH-value supervision."""
     limit = config.training.gradient_accumulation_steps
     micro = actions = positives = 0
-    loss_sum = data_seconds = 0.
-    component_sums = dict(q=0.0, rank=0.0, safety=0.0, auxiliary=0.0)
+    loss_sum = data_seconds = 0.0
+    component_sums = dict(value=0.0, rank=0.0)
     optimizer.zero_grad(set_to_none=True)
     finished = time.monotonic()
     for cpu_batch in loader:
         data_seconds += time.monotonic() - finished
         batch = _device(cpu_batch, device)
         loss, details = push_effectiveness_batch_loss(
-            model, batch, instance_queries=config.model.instance_queries, loss_function=loss_function,
-            scene_sample_points=config.training.push_fps_points)
-        q_value = details['q_value']
-        count = q_value.shape[0]
+            model,
+            batch,
+            instance_queries=config.model.instance_queries,
+            loss_function=loss_function,
+            scene_sample_points=config.training.push_fps_points,
+        )
+        valid = details["value_valid"]
+        count = int(valid.sum())
         if count:
-            if not torch.isfinite(loss) or not torch.isfinite(q_value).all():
-                raise RuntimeError('Non-finite PUSH training values/loss')
+            if not torch.isfinite(loss) or not torch.isfinite(details["push_value"]).all():
+                raise RuntimeError("Non-finite PUSH core-value training values/loss")
             (loss * count).backward()
             micro += 1
             actions += count
-            positives += int(details['safety_target'].sum())
+            positives += int((details["value_target"][valid] > 0.5).sum())
             loss_sum += float(loss.detach()) * count
-            for key, detail_key in (
-                ('q', 'push_q_huber'), ('rank', 'push_rank'),
-                ('safety', 'push_safety_bce'), ('auxiliary', 'push_auxiliary_huber'),
-            ):
-                component_sums[key] += float(details[detail_key]) * count
+            component_sums["value"] += float(details["push_value_ordinal"]) * count
+            component_sums["rank"] += float(details["push_rank"]) * count
         if micro == limit:
             for parameter in model.push_evaluator.parameters():
                 if parameter.grad is not None:
                     parameter.grad.div_(actions)
-            yield (loss_sum / actions, actions, positives, data_seconds,
-                   {key: value / actions for key, value in component_sums.items()})
+            yield (
+                loss_sum / actions,
+                actions,
+                positives,
+                data_seconds,
+                {key: value / actions for key, value in component_sums.items()},
+            )
             optimizer.zero_grad(set_to_none=True)
             micro = actions = positives = 0
-            loss_sum = data_seconds = 0.
+            loss_sum = data_seconds = 0.0
             component_sums = dict.fromkeys(component_sums, 0.0)
         finished = time.monotonic()
     if micro:
         for parameter in model.push_evaluator.parameters():
             if parameter.grad is not None:
                 parameter.grad.div_(actions)
-        yield (loss_sum / actions, actions, positives, data_seconds,
-               {key: value / actions for key, value in component_sums.items()})
+        yield (
+            loss_sum / actions,
+            actions,
+            positives,
+            data_seconds,
+            {key: value / actions for key, value in component_sums.items()},
+        )
 
 
 @torch.no_grad()
@@ -119,25 +127,30 @@ def _evaluate(
     phase: str = "periodic",
     use_batch_norm_batch_statistics: bool = False,
 ) -> dict[str, float]:
-    """Validate logged actions only; candidate generation is a separate evaluation."""
+    """Validate the single learned PUSH score on logged one-step transitions."""
     model.eval()
     if use_batch_norm_batch_statistics:
         for module in model.push_evaluator.modules():
             if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
                 module.train()
     started = time.monotonic()
-    q_predictions: list[torch.Tensor] = []
-    q_targets: list[torch.Tensor] = []
-    q_masks: list[torch.Tensor] = []
-    safety_predictions: list[torch.Tensor] = []
-    safety_targets: list[torch.Tensor] = []
-    safety_masks: list[torch.Tensor] = []
+    scores: list[torch.Tensor] = []
+    targets: list[torch.Tensor] = []
+    valids: list[torch.Tensor] = []
+    rank_keys: list[torch.Tensor] = []
+    rank_valids: list[torch.Tensor] = []
     group_ids: list[torch.Tensor] = []
     weighted_loss = 0.0
-    evaluated = 0
+    weighted_value_loss = 0.0
+    supervised = 0
     group_offset = 0
-    with tqdm(total=len(loader), desc=f"Val [push_evaluator] [{phase}]", unit="batch",
-              dynamic_ncols=True, mininterval=1.0) as progress:
+    with tqdm(
+        total=len(loader),
+        desc=f"Val [push_evaluator] [{phase}]",
+        unit="batch",
+        dynamic_ncols=True,
+        mininterval=1.0,
+    ) as progress:
         for cpu_batch in loader:
             batch = _device(cpu_batch, device)
             loss, details = push_effectiveness_batch_loss(
@@ -147,94 +160,88 @@ def _evaluate(
                 loss_function=loss_function,
                 scene_sample_points=config.training.push_fps_points,
             )
-            # Keep accumulated validation predictions off GPU.
-            q_prediction = details["q_value"].detach().float().cpu()
-            q_target = details["q_target"].detach().float().cpu()
-            q_valid = details["q_valid"].detach().bool().cpu()
-            safety_prediction = details["safety_probability"].detach().float().cpu()
-            safety_target = details["safety_target"].detach().bool().cpu()
-            safety_valid = details["safety_valid"].detach().bool().cpu()
+            score = details["push_value"].detach().float().cpu()
+            target = details["value_target"].detach().float().cpu()
+            valid = details["value_valid"].detach().bool().cpu()
+            key = details["rank_key"].detach().float().cpu()
+            rank_valid = details["rank_valid"].detach().bool().cpu()
             local_group = details["effective_group_index"].detach().long().cpu()
-            if not torch.isfinite(q_prediction).all() or not torch.isfinite(safety_prediction).all() or not torch.isfinite(loss):
-                raise RuntimeError("Non-finite PUSH validation prediction/loss")
-            count = int(q_prediction.shape[0])
+            if not torch.isfinite(score).all() or not torch.isfinite(loss):
+                raise RuntimeError("Non-finite PUSH core-value validation prediction/loss")
+            count = int(valid.sum())
             if count:
-                q_predictions.append(q_prediction)
-                q_targets.append(q_target)
-                q_masks.append(q_valid)
-                safety_predictions.append(safety_prediction)
-                safety_targets.append(safety_target)
-                safety_masks.append(safety_valid)
+                scores.append(score)
+                targets.append(target)
+                valids.append(valid)
+                rank_keys.append(key)
+                rank_valids.append(rank_valid)
                 group_ids.append(local_group + group_offset)
                 weighted_loss += float(loss.detach()) * count
-                evaluated += count
+                weighted_value_loss += float(details["push_value_ordinal"]) * count
+                supervised += count
             sensor = batch.get("model_inputs", batch)
             group_offset += int(sensor["point_mask"].shape[0])
-            progress.set_postfix(actions=evaluated, loss=weighted_loss / max(evaluated, 1), refresh=False)
+            progress.set_postfix(
+                actions=supervised,
+                loss=weighted_loss / max(supervised, 1),
+                refresh=False,
+            )
             progress.update(1)
 
-    if not evaluated:
-        raise RuntimeError("Validation split contains no evaluated PUSH actions")
-    q_prediction = torch.cat(q_predictions)
-    q_target = torch.cat(q_targets)
-    q_valid = torch.cat(q_masks)
-    safety_prediction = torch.cat(safety_predictions)
-    safety_target = torch.cat(safety_targets)
-    safety_valid = torch.cat(safety_masks)
+    if not supervised:
+        raise RuntimeError("Validation split contains no valid structural PUSH-value targets")
+    score = torch.cat(scores)
+    target = torch.cat(targets)
+    valid = torch.cat(valids)
+    rank_key = torch.cat(rank_keys)
+    rank_valid = torch.cat(rank_valids)
     groups = torch.cat(group_ids)
-    print(f"Val [push_evaluator]  aggregating: {evaluated} actions", flush=True)
-    if not bool(q_valid.any()):
-        raise RuntimeError("Validation split contains no valid offline Q targets")
+    print(f"Val [push_evaluator]  aggregating: {supervised} supervised actions", flush=True)
+
     pair_correct = pair_total = 0
-    regrets = []
+    top1_best: list[float] = []
+    top1_improvement: list[float] = []
     for group_id in torch.unique(groups):
         members = torch.nonzero(groups == group_id, as_tuple=False).flatten()
-        for horizon in range(q_prediction.shape[1]):
-            ids = members[q_valid[members, horizon]]
-            if len(ids) < 2:
-                continue
-            truth = q_target[ids, horizon]
-            pred = q_prediction[ids, horizon]
-            difference = truth[:, None] - truth[None, :]
-            left, right = torch.where(difference > config.training.push_rank_margin)
-            if len(left):
-                pair_correct += int((pred[left] > pred[right]).sum())
-                pair_total += int(len(left))
-        ids = members[q_valid[members, -1]]
-        if len(ids):
-            truth = q_target[ids, -1]
-            chosen = int(torch.argmax(q_prediction[ids, -1]))
-            regrets.append(float(truth.max() - truth[chosen]))
+        ids = members[rank_valid[members]]
+        if not len(ids):
+            continue
+        order = lexicographic_order_matrix(rank_key[ids])
+        left, right = torch.where(order > 0)
+        if len(left):
+            pair_correct += int((score[ids[left]] > score[ids[right]]).sum())
+            pair_total += int(len(left))
+        chosen_local = int(torch.argmax(score[ids]))
+        chosen = ids[chosen_local]
+        # A candidate is lexicographically best when no other candidate dominates it.
+        top1_best.append(float(not bool((order[:, chosen_local] > 0).any())))
+        available_improvement = bool((target[ids] > 0.5).any())
+        if available_improvement:
+            top1_improvement.append(float(target[chosen] > 0.5))
+
+    top1_best_rate = float(np.mean(top1_best)) if top1_best else float("nan")
+    top1_improvement_rate = (
+        float(np.mean(top1_improvement)) if top1_improvement else float("nan")
+    )
     result = {
-        "push_evaluator_q_mae": float((q_prediction[q_valid] - q_target[q_valid]).abs().mean()),
         "push_evaluator_pairwise_ranking_accuracy": (
             pair_correct / pair_total if pair_total else float("nan")
         ),
         "push_evaluator_pairwise_count": float(pair_total),
-        "push_evaluator_top1_regret": float(np.mean(regrets)) if regrets else float("nan"),
+        "push_evaluator_top1_best_rate": top1_best_rate,
+        "push_evaluator_top1_improvement_rate": top1_improvement_rate,
+        "push_evaluator_top1_miss_rate": (
+            1.0 - top1_best_rate if np.isfinite(top1_best_rate) else float("nan")
+        ),
+        "push_evaluator_value_loss": weighted_value_loss / supervised,
+        "push_evaluator_loss": weighted_loss / supervised,
+        "push_evaluator_evaluated_count": float(supervised),
         "push_evaluator_logged_group_count": float(torch.unique(groups).numel()),
+        "push_evaluator_logged_empty_group_count": (
+            group_offset - float(torch.unique(groups).numel())
+        ),
+        "push_evaluator_validation_seconds": time.monotonic() - started,
     }
-    if bool(safety_valid.any()):
-        safety_score = safety_prediction[safety_valid]
-        safety_truth = safety_target[safety_valid]
-        safety_class = safety_score >= 0.5
-        result["push_evaluator_safety_accuracy"] = float((safety_class == safety_truth).float().mean())
-        result["push_evaluator_safety_fraction"] = float(safety_truth.float().mean())
-        positive_accuracy = (safety_class[safety_truth]).float().mean()
-        negative_accuracy = (~safety_class[~safety_truth]).float().mean()
-        result["push_evaluator_safety_balanced_accuracy"] = float(
-            (positive_accuracy + negative_accuracy) / 2
-        )
-        result["push_evaluator_safety_auroc"] = float(
-            _binary_auroc_rank(safety_score.double(), safety_truth)
-        )
-    else:
-        result["push_evaluator_safety_accuracy"] = float("nan")
-        result["push_evaluator_safety_fraction"] = float("nan")
-    result["push_evaluator_loss"] = weighted_loss / evaluated
-    result["push_evaluator_evaluated_count"] = float(evaluated)
-    result["push_evaluator_logged_empty_group_count"] = group_offset - result["push_evaluator_logged_group_count"]
-    result["push_evaluator_validation_seconds"] = time.monotonic() - started
     return result
 
 
@@ -325,7 +332,7 @@ def _main() -> None:
         raise RuntimeError("Formal PUSH evaluator training requires a non-empty val split")
     print(f"[push-evaluator-init] train_groups={len(dataset)} "
           f"validation_groups={len(validation_dataset)}; "
-          "offline Q1-Q5 + safety supervision; fine-tuning yanx27 PointNet++", flush=True)
+          "single-head structural PUSH value + within-state ranking; fine-tuning yanx27 PointNet++", flush=True)
     model = StandalonePushModel(config.model).to(device)
     pretrain_checkpoint = args.pretrain_checkpoint or config.training.pretrain_checkpoint
     if not pretrain_checkpoint and not args.resume:
@@ -340,12 +347,9 @@ def _main() -> None:
             flush=True,
         )
     loss_function = PushEffectivenessLoss(
-        q_weight=config.training.push_q_loss_weight,
+        value_weight=config.training.push_value_loss_weight,
         rank_weight=config.training.push_rank_loss_weight,
-        safety_weight=config.training.push_safety_loss_weight,
-        auxiliary_weight=config.training.push_aux_loss_weight,
-        rank_margin=config.training.push_rank_margin,
-        delta_scales=config.training.push_delta_scales,
+        score_temperature=config.training.push_score_temperature,
     )
     optimizer = torch.optim.AdamW(
         push_optimizer_groups(model, config), weight_decay=config.optimizer.weight_decay,
@@ -396,6 +400,7 @@ def _main() -> None:
         "periodic_validation_scene_count": len(periodic_validation_scenes),
         "final_validation_scene_count": len(validation_scenes),
         "selection_metric": "push_evaluator_pairwise_ranking_accuracy",
+        "selection_policy": "95% significant ranking gain with safety/loss regression guards",
     }, {"config": signature,
         "periodic_scenes": periodic_validation_scenes, "final_scenes": validation_scenes}, scheduler=scheduler)
     step = checkpoints.restore(args.resume, optimizer) if args.resume else 0
@@ -455,7 +460,8 @@ def _main() -> None:
           f"validation_batch={config.training.validation_batch_size}, "
           f"workers={config.training.num_workers}; waiting for first batch", flush=True)
     print(f"[push-evaluator-train] scheduler: warmup({config.scheduler.warmup_steps}) + cosine; "
-          f"eta excludes validation; best checkpoint uses within-state ranking; output: {config.output_dir}", flush=True)
+             f"eta excludes validation; best checkpoint requires significant ranking gain without "
+             f"material safety/loss regression; output: {config.output_dir}", flush=True)
     model.train()
     if args.resume and checkpoints.validation_due(step, validation_interval):
         print(f"[resume] periodic validation at step={step} is pending; validating before training", flush=True)

@@ -52,20 +52,18 @@ def test_degenerate_metric_populations_are_explicit(labels):
 def test_window_mean_is_action_weighted_and_eta_excludes_validation(tmp_path,capsys):
     clock = [100.]
     logger = PushTrainingProgress(tmp_path,maximum=20,initial_step=10,clock=lambda:clock[0])
-    logger.add(.2,2,1,components={'q':.1,'rank':.2,'safety':.3,'auxiliary':.4})
+    logger.add(.2,2,1,components={'value':.1,'rank':.2})
     clock[0] += 2
     logger.pause()
     clock[0] += 100  # Deliberately long validation must not inflate s/step or ETA.
     logger.resume()
-    logger.add(.8,6,2,components={'q':.5,'rank':.6,'safety':.7,'auxiliary':.8})
+    logger.add(.8,6,2,components={'value':.5,'rank':.6})
     clock[0] += 2
     record = logger.log(12,1e-4)
     assert record['loss']==pytest.approx(.65)
-    assert record['safe_fraction']==3/8
-    assert record['q_loss']==pytest.approx(.4)
+    assert record['improved_fraction']==3/8
+    assert record['value_loss']==pytest.approx(.4)
     assert record['rank_loss']==pytest.approx(.5)
-    assert record['safety_loss']==pytest.approx(.6)
-    assert record['auxiliary_loss']==pytest.approx(.7)
     assert record['window_steps']==2
     assert record['seconds_per_step']==2
     assert record['eta_train_seconds']==16
@@ -73,7 +71,7 @@ def test_window_mean_is_action_weighted_and_eta_excludes_validation(tmp_path,cap
     output = capsys.readouterr().out
     assert 'eta: 00:00:16' in output
     assert '[0000012/0000020]' in output and 'lr: 1.000e-04' in output
-    assert 'Q: 0.4000' in output and 'safe BCE: 0.6000' in output
+    assert 'value: 0.4000' in output
     assert json.loads((tmp_path/'train_metrics.jsonl').read_text())==record
     logger.add(.4,1,1)
     clock[0] += 1
@@ -103,7 +101,7 @@ def test_validation_progress_finishes_and_counts_empty_groups(monkeypatch):
     assert '100%' in output.getvalue()
     assert result['push_evaluator_evaluated_count']==2
     assert result['push_evaluator_logged_empty_group_count']==1
-    assert result['push_evaluator_safety_fraction']==.5
+    assert result['push_evaluator_value_loss'] >= 0
 
 
 def test_resume_preserves_optimizer_but_discards_old_metric_best(tmp_path,capsys):

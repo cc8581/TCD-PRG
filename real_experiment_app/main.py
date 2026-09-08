@@ -1112,9 +1112,7 @@ class MainWindow(QMainWindow):
                 f"接触点      {np.round(action['push_contact_world'], 4).tolist()}",
                 f"推动方向    {np.round(action['push_direction_world'], 4).tolist()}",
                 f"推动距离    {action['push_distance_m']:.3f} m",
-                f"Q1～Q5      {np.round(action.get('q_value', []), 4).tolist()}",
-                f"剩余预算    {action.get('q_horizon', '?')}",
-                f"安全评分    {action.get('safety_probability', float('nan')):.4f}",
+                f"单步推动价值 {action['push_value']:.4f}",
             ]
         else:
             lines += [

@@ -412,10 +412,7 @@ class TCDPRGPolicy(ManipulationPolicy):
                 push_contact_world=array("contact_world"),
                 push_direction_world=array("direction_world"),
                 push_distance_m=float(array("push_distance_m")),
-                effective_probability=float(array("effective_probability")),
-                q_value=array("push_q_value"),
-                q_horizon=int(array("push_q_horizon")),
-                safety_probability=float(array("push_safety_probability")),
+                push_value=float(array("push_value")),
             )
         else:
             action.update(
@@ -470,11 +467,9 @@ class TCDPRGPolicy(ManipulationPolicy):
             ).flatten()
             if not len(indices):
                 continue
-            ranking_score = (
-                tensors["effective_probability"]
-                if action_type == ActionType.PUSH
-                else tensors["proposal_score"]
-            )
+            ranking_score = tensors[
+                "push_value" if action_type == ActionType.PUSH else "proposal_score"
+            ]
             if action_type == ActionType.PUSH and not bool(
                 torch.isfinite(ranking_score[0, indices]).all()
             ):

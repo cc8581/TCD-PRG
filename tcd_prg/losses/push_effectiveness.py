@@ -1,4 +1,4 @@
-"""Finite-horizon Stage-C value, ranking, safety and physical-effect objective."""
+"""Single-head Stage-C PUSH-value objective."""
 
 from __future__ import annotations
 
@@ -6,121 +6,132 @@ import torch
 from torch import Tensor, nn
 
 
+def lexicographic_order_matrix(keys: Tensor, eps: float = 1e-6) -> Tensor:
+    """Return [N,N] order: +1 row better, -1 worse, 0 tied."""
+    if keys.ndim != 2:
+        raise ValueError("rank keys must be [N,K]")
+    count = keys.shape[0]
+    order = torch.zeros((count, count), dtype=torch.int8, device=keys.device)
+    undecided = torch.ones((count, count), dtype=torch.bool, device=keys.device)
+    undecided.fill_diagonal_(False)
+    difference = keys[:, None, :] - keys[None, :, :]
+    for column in range(keys.shape[1]):
+        delta = difference[..., column]
+        decisive = undecided & (delta.abs() > float(eps))
+        order[decisive & (delta > 0)] = 1
+        order[decisive & (delta < 0)] = -1
+        undecided &= ~decisive
+    return order
+
+
 class PushEffectivenessLoss(nn.Module):
-    """New Stage-C objective; the historical class name remains an import alias."""
+    """Supervise only one scalar ``push_value``; no safety or auxiliary heads."""
 
     def __init__(
         self,
         *,
-        q_weight: float = 1.0,
-        rank_weight: float = 0.25,
-        safety_weight: float = 0.5,
-        auxiliary_weight: float = 0.1,
-        rank_margin: float = 0.02,
-        delta_scales: tuple[float, ...] = (10.0, 1.0, 1.0, 5.0, 1.0),
+        value_weight: float = 1.0,
+        rank_weight: float = 1.0,
+        score_temperature: float = 0.1,
     ) -> None:
         super().__init__()
-        if len(delta_scales) != 5 or any(value <= 0 for value in delta_scales):
-            raise ValueError("PUSH delta scales must contain five positive values")
-        if min(q_weight, rank_weight, safety_weight, auxiliary_weight, rank_margin) < 0:
-            raise ValueError("PUSH loss weights and rank margin must be nonnegative")
-        self.q_weight = float(q_weight)
+        if min(value_weight, rank_weight) < 0 or score_temperature <= 0:
+            raise ValueError("PUSH value/rank weights must be nonnegative and temperature positive")
+        self.value_weight = float(value_weight)
         self.rank_weight = float(rank_weight)
-        self.safety_weight = float(safety_weight)
-        self.auxiliary_weight = float(auxiliary_weight)
-        self.rank_margin = float(rank_margin)
-        self.register_buffer("delta_scales", torch.tensor(delta_scales, dtype=torch.float32))
+        self.score_temperature = float(score_temperature)
 
-    def _ranking(self, prediction: Tensor, target: Tensor, valid: Tensor, group: Tensor) -> Tensor:
-        terms = []
-        for group_id in torch.unique(group):
-            members = torch.nonzero(group == group_id, as_tuple=False).flatten()
-            if len(members) < 2:
+    def _ordinal(self, score: Tensor, target: Tensor, valid: Tensor) -> Tensor:
+        if not bool(valid.any()):
+            return score.sum() * 0.0
+        score = score[valid]
+        target = target[valid]
+        positive = target > 0.5
+        negative = target < -0.5
+        neutral = ~(positive | negative)
+        terms: list[Tensor] = []
+        normalizer = score.new_tensor(2.0).log()
+        if bool(positive.any()):
+            terms.append(
+                torch.nn.functional.softplus(-score[positive] / self.score_temperature)
+                / normalizer
+            )
+        if bool(negative.any()):
+            terms.append(
+                torch.nn.functional.softplus(score[negative] / self.score_temperature)
+                / normalizer
+            )
+        if bool(neutral.any()):
+            terms.append(
+                torch.nn.functional.smooth_l1_loss(
+                    score[neutral], torch.zeros_like(score[neutral]), reduction="none"
+                )
+            )
+        return torch.cat(terms).mean() if terms else score.sum() * 0.0
+
+    def _ranking(
+        self,
+        score: Tensor,
+        rank_key: Tensor,
+        rank_valid: Tensor,
+        group_index: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        terms: list[Tensor] = []
+        pair_count = score.new_zeros(())
+        normalizer = score.new_tensor(2.0).log()
+        for group_id in torch.unique(group_index):
+            members = torch.nonzero(group_index == group_id, as_tuple=False).flatten()
+            ids = members[rank_valid[members]]
+            if len(ids) < 2:
                 continue
-            for horizon in range(prediction.shape[1]):
-                ids = members[valid[members, horizon]]
-                if len(ids) < 2:
-                    continue
-                truth = target[ids, horizon]
-                difference = truth[:, None] - truth[None, :]
-                left, right = torch.where(difference > self.rank_margin)
-                if len(left):
-                    predicted_difference = prediction[ids[left], horizon] - prediction[ids[right], horizon]
-                    # RankNet supplies a smooth, confidence-dependent gradient.
-                    # Normalizing by log(2) keeps a tied prediction at exactly 1
-                    # without the 1 / margin gradient amplification of the old
-                    # normalized hinge.
-                    temperature = max(5.0 * self.rank_margin, 0.05)
-                    term = torch.nn.functional.softplus(
-                        -predicted_difference / temperature
-                    ) / prediction.new_tensor(2.0).log()
-                    terms.append(term.mean())
-        return torch.stack(terms).mean() if terms else prediction.sum() * 0.0
+            order = lexicographic_order_matrix(rank_key[ids])
+            left, right = torch.where(order > 0)
+            if len(left):
+                difference = score[ids[left]] - score[ids[right]]
+                terms.append(
+                    (
+                        torch.nn.functional.softplus(
+                            -difference / self.score_temperature
+                        )
+                        / normalizer
+                    ).mean()
+                )
+                pair_count += float(len(left))
+        loss = torch.stack(terms).mean() if terms else score.sum() * 0.0
+        return loss, pair_count
 
     def forward(
         self,
         prediction: dict[str, Tensor],
         *,
-        q_target: Tensor,
-        q_valid: Tensor,
-        safety_target: Tensor,
-        safety_valid: Tensor,
-        auxiliary_target: Tensor,
-        auxiliary_valid: Tensor,
+        value_target: Tensor,
+        value_valid: Tensor,
+        rank_key: Tensor,
+        rank_valid: Tensor,
         group_index: Tensor,
     ) -> dict[str, Tensor]:
-        q_prediction = prediction["q_value"]
-        if q_prediction.shape != q_target.shape or q_valid.shape != q_target.shape:
-            raise ValueError("PUSH Q prediction/target/mask shapes must align")
-        if not bool(q_valid.any()):
-            raise RuntimeError("Stage-C batch contains no valid offline Q targets")
-        q_loss = torch.nn.functional.smooth_l1_loss(
-            q_prediction[q_valid], q_target[q_valid], reduction="mean"
-        )
-        rank_loss = self._ranking(q_prediction, q_target, q_valid, group_index)
-        if not bool(safety_valid.any()):
-            raise RuntimeError("Stage-C batch contains no valid safety targets")
-        safety_logit = prediction["safety_logit"][safety_valid]
-        safety_label = safety_target[safety_valid].float()
-        safety_terms = torch.nn.functional.binary_cross_entropy_with_logits(
-            safety_logit, safety_label, reduction="none"
-        )
-        positive = safety_label.sum()
-        negative = safety_label.numel() - positive
-        if bool((positive > 0) & (negative > 0)):
-            # Equal aggregate weight for safe and unsafe actions prevents the
-            # observed all-safe classifier from attaining the majority baseline.
-            weights = torch.where(
-                safety_label.bool(),
-                safety_label.new_tensor(safety_label.numel() / 2) / positive,
-                safety_label.new_tensor(safety_label.numel() / 2) / negative,
-            )
-            safety_loss = (safety_terms * weights).mean()
-        else:
-            safety_loss = safety_terms.mean()
-        aux_mask = auxiliary_valid[:, None] & torch.isfinite(auxiliary_target)
-        if bool(aux_mask.any()):
-            scaled_target = auxiliary_target / self.delta_scales.to(auxiliary_target)
-            scaled_prediction = prediction["potential_delta"] / self.delta_scales.to(
-                prediction["potential_delta"]
-            )
-            auxiliary_loss = torch.nn.functional.smooth_l1_loss(
-                scaled_prediction[aux_mask], scaled_target[aux_mask], reduction="mean"
-            )
-        else:
-            auxiliary_loss = prediction["potential_delta"].sum() * 0.0
-        total = (
-            self.q_weight * q_loss
-            + self.rank_weight * rank_loss
-            + self.safety_weight * safety_loss
-            + self.auxiliary_weight * auxiliary_loss
-        )
+        score = prediction["push_value"]
+        if score.shape != value_target.shape or value_valid.shape != value_target.shape:
+            raise ValueError("PUSH value score/target/mask shapes must align")
+        if rank_valid.shape != value_target.shape:
+            raise ValueError("PUSH rank-valid mask must align with value target")
+        if rank_key.shape[:1] != score.shape or rank_key.ndim != 2:
+            raise ValueError("PUSH rank keys must be [A,K]")
+        if group_index.shape != score.shape:
+            raise ValueError("PUSH group index must align with action score")
+        if bool(value_valid.any()):
+            if not bool(torch.isfinite(value_target[value_valid]).all()):
+                raise ValueError("valid PUSH value targets must be finite")
+            if not bool(torch.isfinite(rank_key[rank_valid]).all()):
+                raise ValueError("valid PUSH rank keys must be finite")
+
+        value_loss = self._ordinal(score, value_target, value_valid)
+        rank_loss, pair_count = self._ranking(score, rank_key, rank_valid, group_index)
+        total = self.value_weight * value_loss + self.rank_weight * rank_loss
         return {
             "push_effectiveness": total,
-            "push_q_huber": q_loss.detach(),
+            "push_value_ordinal": value_loss.detach(),
             "push_rank": rank_loss.detach(),
-            "push_safety_bce": safety_loss.detach(),
-            "push_auxiliary_huber": auxiliary_loss.detach(),
-            "push_q_supervised_count": q_valid.sum().detach().float(),
-            "push_safety_supervised_count": safety_valid.sum().detach().float(),
+            "push_value_supervised_count": value_valid.sum().detach().float(),
+            "push_rank_pair_count": pair_count.detach(),
         }

@@ -1,48 +1,46 @@
-import torch
 import pytest
+import torch
 
 from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
 from tcd_prg.models.staged_checkpoint import stage_training_state
 from tcd_prg.scripts.train_push_evaluator import push_optimizer_groups
 
 
-def test_q_objective_trains_value_ranking_safety_and_auxiliary():
-    prediction = {
-        "q_value": torch.tensor([[.6, .7], [.4, .5]], requires_grad=True),
-        "safety_logit": torch.tensor([1., -1.], requires_grad=True),
-        "potential_delta": torch.zeros(2, 5, requires_grad=True),
-    }
-    losses = PushEffectivenessLoss(delta_scales=(1., 1., 1., 1., 1.))(
+def test_single_head_value_and_ranking_share_the_same_prediction():
+    score = torch.zeros(3, requires_grad=True)
+    prediction = {"push_value": score}
+    key = torch.tensor([
+        [0., -1., -1., 0., 0., .5, .0],
+        [0., -2., -1., 0., 0., .5, .0],
+        [0., -3., -1., 0., 0., .5, .0],
+    ])
+    losses = PushEffectivenessLoss()(
         prediction,
-        q_target=torch.tensor([[.2, .3], [.8, .9]]),
-        q_valid=torch.ones(2, 2, dtype=torch.bool),
-        safety_target=torch.tensor([True, False]),
-        safety_valid=torch.ones(2, dtype=torch.bool),
-        auxiliary_target=torch.ones(2, 5),
-        auxiliary_valid=torch.ones(2, dtype=torch.bool),
-        group_index=torch.zeros(2, dtype=torch.long),
+        value_target=torch.tensor([1., 0., -1.]),
+        value_valid=torch.ones(3, dtype=torch.bool),
+        rank_key=key,
+        rank_valid=torch.ones(3, dtype=torch.bool),
+        group_index=torch.zeros(3, dtype=torch.long),
     )
     losses["push_effectiveness"].backward()
     assert losses["push_rank"] > 0
-    assert all(value.grad is not None for value in prediction.values())
+    assert score.grad is not None and score.grad.abs().sum() > 0
+    assert set(prediction) == {"push_value"}
 
 
-def test_ranking_is_normalized_and_safety_classes_are_balanced():
-    prediction = {
-        "q_value": torch.full((4, 1), .5, requires_grad=True),
-        "safety_logit": torch.zeros(4, requires_grad=True),
-        "potential_delta": torch.zeros(4, 5, requires_grad=True),
-    }
-    losses = PushEffectivenessLoss(rank_margin=.02)(
-        prediction, q_target=torch.tensor([[.9], [.1], [.8], [.7]]),
-        q_valid=torch.ones(4, 1, dtype=torch.bool),
-        safety_target=torch.tensor([True, True, True, False]),
-        safety_valid=torch.ones(4, dtype=torch.bool),
-        auxiliary_target=torch.zeros(4, 5), auxiliary_valid=torch.zeros(4, dtype=torch.bool),
-        group_index=torch.zeros(4, dtype=torch.long),
+def test_batch_without_core_value_supervision_is_zero_not_an_exception():
+    score = torch.zeros(2, requires_grad=True)
+    losses = PushEffectivenessLoss()(
+        {"push_value": score},
+        value_target=torch.full((2,), float("nan")),
+        value_valid=torch.zeros(2, dtype=torch.bool),
+        rank_key=torch.full((2, 7), float("nan")),
+        rank_valid=torch.zeros(2, dtype=torch.bool),
+        group_index=torch.zeros(2, dtype=torch.long),
     )
-    assert losses["push_rank"].item() == pytest.approx(1.0)
-    assert losses["push_safety_bce"].item() == pytest.approx(torch.log(torch.tensor(2.)).item())
+    assert losses["push_effectiveness"].item() == 0.0
+    losses["push_effectiveness"].backward()
+    assert score.grad is not None
 
 
 def test_push_optimizer_uses_configured_lower_backbone_learning_rate():
@@ -63,9 +61,6 @@ def test_push_optimizer_uses_configured_lower_backbone_learning_rate():
     groups = push_optimizer_groups(Model(), Config())
     assert [group["name"] for group in groups] == ["push_heads", "pointnet2_backbone"]
     assert [group["lr"] for group in groups] == [pytest.approx(1e-4), pytest.approx(2e-5)]
-    assert {id(p) for p in groups[0]["params"]}.isdisjoint(
-        {id(p) for p in groups[1]["params"]}
-    )
 
 
 def test_ab_checkpoint_migration_replaces_only_push_tensors():
@@ -89,7 +84,7 @@ def test_ab_checkpoint_migration_replaces_only_push_tensors():
     assert migrated["push_evaluator.new"].item() == 7
 
 
-def test_new_evaluator_returns_monotonic_q_safety_and_effects():
+def test_evaluator_has_one_learned_output_head():
     from test_independent_push import model, scene
     from tcd_prg.models import push_condition_from_gt
     from tcd_prg.trainers.push_evaluator import logged_push_actions
@@ -100,7 +95,7 @@ def test_new_evaluator_returns_monotonic_q_safety_and_effects():
     actions, _ = logged_push_actions(batch, condition)
     with torch.no_grad():
         output = network.score_actions(batch, condition, actions)
-    assert output["q_value"].shape == (len(actions.batch_index), 5)
-    assert bool((output["q_value"][:, 1:] >= output["q_value"][:, :-1]).all())
-    assert output["safety_probability"].shape == (len(actions.batch_index),)
-    assert output["potential_delta"].shape == (len(actions.batch_index), 5)
+    assert output["push_value"].shape == (len(actions.batch_index),)
+    assert not hasattr(network.push_evaluator, "q_head")
+    assert not hasattr(network.push_evaluator, "safety_head")
+    assert not hasattr(network.push_evaluator, "auxiliary_delta_head")

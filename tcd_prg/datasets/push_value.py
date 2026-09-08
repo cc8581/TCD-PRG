@@ -14,8 +14,7 @@ from tcd_prg.constants import ActionType, OutcomeCode
 
 
 PUSH_VALUE_SCHEMA_VERSION = 1  # State-sidecar schema retained for compatibility.
-PUSH_ACTION_VALUE_SCHEMA_VERSION = 3
-PUSH_VALUE_HORIZONS = 5
+PUSH_ACTION_VALUE_SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,30 +92,167 @@ def write_state_values(path: str | Path, values: StateValues) -> None:
     _atomic_h5(Path(path), writer)
 
 
+def _ragged_state_values(values: np.ndarray, offsets: np.ndarray, index: int) -> np.ndarray:
+    return values[int(offsets[index]) : int(offsets[index + 1])]
+
+
+def _lexicographic_compare_numpy(left: np.ndarray, right: np.ndarray, eps: float = 1e-6) -> int:
+    """Return +1 / 0 / -1 when ``left`` is better / tied / worse."""
+    for lhs, rhs in zip(left.tolist(), right.tolist(), strict=True):
+        difference = float(lhs) - float(rhs)
+        if abs(difference) > eps:
+            return 1 if difference > 0 else -1
+    return 0
+
+
+def _structural_state_progress_keys(
+    scene: h5py.Group,
+    raw_relation_names: tuple[str, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build an auditable lexicographic task-progress key for every state.
+
+    Higher is better.  Components are *not* summed or weighted:
+
+    0. terminal/direct task goal reached;
+    1. negative dependency-blocker count (direct + propagated prerequisites);
+    2. negative direct task-blocker count;
+    3. negative task-region-pressed flag;
+    4. negative target-pressed flag;
+    5. target visible ratio;
+    6. clipped verified-grasp progress (tie-break only).
+
+    The dependency closure is identical to ``TaskOrientedClutterAdapter``:
+    direct task blockers are expanded upward through support/contact relations.
+    This means removing a top prerequisite receives positive progress even when
+    the target still has zero immediately executable grasps.
+    """
+    required_relations = {"support", "contact", "block_path"}
+    missing = required_relations - set(raw_relation_names)
+    if missing:
+        raise ValueError(f"raw relation vocabulary is missing {sorted(missing)}")
+    raw_index = {name: raw_relation_names.index(name) for name in raw_relation_names}
+
+    states = scene["states"]
+    state_task = states["task_index"][:].astype(np.int64)
+    state_count = len(state_task)
+    target_by_task = scene["catalog/task_object_index"][:].astype(np.int64)
+    relation = states["relation_graph"][:].astype(np.float32)
+    object_pose = states["object_pose"][:].astype(np.float32)
+    if relation.shape[0] != state_count or object_pose.shape[0] != state_count:
+        raise ValueError("state relation/object-pose arrays do not align")
+
+    occlusion_values = states["occlusion_blockers"][:].astype(np.int64)
+    occlusion_offsets = states["occlusion_blocker_offsets"][:].astype(np.int64)
+    task_occ_values = states["task_occlusion_blockers"][:].astype(np.int64)
+    task_occ_offsets = states["task_occlusion_blocker_offsets"][:].astype(np.int64)
+
+    direct_goal = states["direct_goal_valid"][:].astype(bool)
+    terminal_goal = states["terminal_goal_valid"][:].astype(bool)
+    task_pressed = states["task_pressed"][:].astype(bool)
+    region_pressed = states["task_region_pressed"][:].astype(bool)
+    visibility = states["target_visible_ratio"][:].astype(np.float32)
+    verified = states["verified_positive_grasp_count"][:].astype(np.float32)
+    required = states["required_grasp_count"][:].astype(np.float32)
+
+    keys = np.full((state_count, 7), np.nan, np.float32)
+    valid = (
+        np.isfinite(visibility)
+        & np.isfinite(verified)
+        & np.isfinite(required)
+        & (verified >= 0)
+        & (required > 0)
+    )
+    support_channel = raw_index["support"]
+    contact_channel = raw_index["contact"]
+    block_path_channel = raw_index["block_path"]
+
+    for state_id in range(state_count):
+        task_index = int(state_task[state_id])
+        if task_index < 0 or task_index >= len(target_by_task):
+            valid[state_id] = False
+            continue
+        target_object = int(target_by_task[task_index])
+        raw_relation = relation[state_id]
+        object_count = raw_relation.shape[0]
+        if not 0 <= target_object < object_count:
+            valid[state_id] = False
+            continue
+
+        occlusion = _ragged_state_values(
+            occlusion_values, occlusion_offsets, state_id
+        ).astype(np.int64, copy=False)
+        task_occlusion = _ragged_state_values(
+            task_occ_values, task_occ_offsets, state_id
+        ).astype(np.int64, copy=False)
+        approach = np.flatnonzero(
+            raw_relation[:, target_object, block_path_channel] > 0.5
+        ).astype(np.int64)
+        direct = np.zeros(object_count, dtype=bool)
+        direct[task_occlusion[(task_occlusion >= 0) & (task_occlusion < object_count)]] = True
+        direct[occlusion[(occlusion >= 0) & (occlusion < object_count)]] = True
+        direct[approach] = True
+
+        dependency = direct.copy()
+        frontier = list(np.flatnonzero(direct))
+        while frontier:
+            dependent = int(frontier.pop())
+            above = (
+                raw_relation[dependent, :, support_channel] > 0.5
+            ) | (
+                (raw_relation[dependent, :, contact_channel] > 0.5)
+                & (
+                    object_pose[state_id, :, 2]
+                    > object_pose[state_id, dependent, 2] + 0.005
+                )
+            )
+            for prerequisite in np.flatnonzero(above & ~dependency):
+                dependency[int(prerequisite)] = True
+                frontier.append(int(prerequisite))
+
+        grasp_progress = float(np.clip(verified[state_id] / required[state_id], 0.0, 1.0))
+        keys[state_id] = np.asarray(
+            [
+                float(direct_goal[state_id] or terminal_goal[state_id]),
+                -float(dependency.sum()),
+                -float(direct.sum()),
+                -float(region_pressed[state_id]),
+                -float(task_pressed[state_id]),
+                float(np.clip(visibility[state_id], 0.0, 1.0)),
+                grasp_progress,
+            ],
+            np.float32,
+        )
+    valid &= np.isfinite(keys).all(-1)
+    return keys, valid
+
+
 def build_action_value_sidecar(
     scene_label_path: str | Path,
     output_path: str | Path,
     *,
-    gamma: float = 0.95,
-    horizons: int = PUSH_VALUE_HORIZONS,
+    raw_relation_names: tuple[str, ...],
 ) -> None:
-    """Build finite-horizon values from verified successful trajectories.
+    """Build single-step structural PUSH-value supervision.
 
-    Both PUSH and PICK_REMOVE transitions contribute to continuation values,
-    while only PUSH rows are emitted as Stage-C supervision.  Stage-B is not
-    consulted.  Demonstrated sequence actions are positive; unsafe and observed
-    no-improvement actions outside every successful sequence are negative.
-    Improved alternatives outside the demonstrated trajectories remain unknown.
+    Only executed, linked PUSH transitions with a valid post-state and without
+    an explicitly invalid/unsafe outcome supervise the evaluator.  Safety is
+    *not* a target: such transitions are simply excluded because deployment
+    safety is handled by deterministic certification.
+
+    The model never receives the after-state.  The after-state exists only here,
+    offline, to define the target order for the current ``(state, action)``.
     """
-
-    if not 0.0 < gamma <= 1.0 or horizons <= 0:
-        raise ValueError("finite-horizon values require gamma in (0,1] and positive horizons")
     with h5py.File(scene_label_path, "r", swmr=True) as handle:
         if len(handle.keys()) != 1:
             raise ValueError("scene label file must contain exactly one scene group")
         scene = handle[next(iter(handle.keys()))]
         states, actions = scene["states"], scene["actions"]
         state_count = len(states["task_index"])
+        state_task = states["task_index"][:].astype(np.int64)
+        state_key, state_key_valid = _structural_state_progress_keys(
+            scene, tuple(raw_relation_names)
+        )
+
         action_type = actions["action_type"][:].astype(np.int8)
         executed = actions["executed"][:].astype(bool)
         outcome = actions["outcome_code"][:].astype(np.int8)
@@ -124,108 +260,106 @@ def build_action_value_sidecar(
         to_state = actions["to_state"][:].astype(np.int64)
         after_valid = actions["after_state_valid"][:].astype(bool)
         task = actions["task_index"][:].astype(np.int64)
-        state_task = states["task_index"][:].astype(np.int64)
-        potential_delta = actions["potential_delta"][:].astype(np.float32)
-        potential_valid = actions["potential_after_valid"][:].astype(bool)
-        part_of_sequence = actions["part_of_success_sequence"][:].astype(bool)
-        terminal = states["terminal_goal_valid"][:].astype(bool)
-        if "direct_goal_valid" in states:
-            terminal |= states["direct_goal_valid"][:].astype(bool)
+        potential_improved = (
+            actions["potential_improved"][:].astype(bool)
+            if "potential_improved" in actions
+            else np.zeros(len(action_type), dtype=bool)
+        )
 
-    base = np.full(state_count, np.nan, np.float32)
-    base[terminal] = 1.0
-    values = np.repeat(base[None], horizons + 1, axis=0)
-    preparation = (action_type == int(ActionType.PUSH)) | (
-        action_type == int(ActionType.PICK_REMOVE)
-    )
+    clipped_from = from_state.clip(0, max(state_count - 1, 0))
+    clipped_to = to_state.clip(0, max(state_count - 1, 0))
     linked = (
-        preparation
-        & executed
+        executed
         & after_valid
         & (from_state >= 0)
         & (from_state < state_count)
         & (to_state >= 0)
         & (to_state < state_count)
-        & (task == state_task[from_state.clip(0, state_count - 1)])
-        & (task == state_task[to_state.clip(0, state_count - 1)])
+        & (task == state_task[clipped_from])
+        & (task == state_task[clipped_to])
     )
-    safe = executed & ~np.isin(
+    # This is a data-validity filter, not a learned safety target.
+    execution_valid = ~np.isin(
         outcome,
         np.asarray(
             [OutcomeCode.UNSTABLE, OutcomeCode.OUT_OF_WORKSPACE, OutcomeCode.OTHER_INVALID],
             np.int8,
         ),
     )
-    action_q = np.full((len(action_type), horizons), np.nan, np.float32)
-    for horizon in range(1, horizons + 1):
-        valid_edge = (
-            linked
-            & safe
-            & part_of_sequence
-            & np.isfinite(values[horizon - 1, to_state.clip(0, state_count - 1)])
+    value_valid = (
+        linked
+        & execution_valid
+        & state_key_valid[clipped_from]
+        & state_key_valid[clipped_to]
+    )
+
+    value_target = np.full(len(action_type), np.nan, np.float32)
+    before_key = np.full((len(action_type), state_key.shape[1]), np.nan, np.float32)
+    after_key = np.full_like(before_key, np.nan)
+    for action_index in np.flatnonzero(value_valid):
+        source = int(from_state[action_index])
+        target = int(to_state[action_index])
+        before_key[action_index] = state_key[source]
+        after_key[action_index] = state_key[target]
+        value_target[action_index] = float(
+            _lexicographic_compare_numpy(state_key[target], state_key[source])
         )
-        continuation = np.full(len(action_type), np.nan, np.float32)
-        continuation[valid_edge] = gamma * values[
-            horizon - 1, to_state[valid_edge]
-        ]
-        # A demonstrated action that needs more remaining steps has value zero
-        # for this horizon.  This is a budget label, not a failed-action label.
-        demonstrated = preparation & executed & part_of_sequence
-        continuation[demonstrated & ~valid_edge] = 0.0
-        known_negative = preparation & executed & ~part_of_sequence & (
-            ~safe | (outcome == int(OutcomeCode.NO_IMPROVEMENT))
-        )
-        continuation[known_negative] = 0.0
-        action_q[:, horizon - 1] = continuation
-        next_value = base.copy()
-        for action_index in np.flatnonzero(np.isfinite(continuation)):
-            state_id = int(from_state[action_index])
-            if state_id < 0 or state_id >= state_count:
-                continue
-            candidate = continuation[action_index]
-            if not np.isfinite(next_value[state_id]) or candidate > next_value[state_id]:
-                next_value[state_id] = candidate
-        values[horizon] = next_value
 
     push = (action_type == int(ActionType.PUSH)) & executed
     action_ids = np.flatnonzero(push).astype(np.int64)
 
     def writer(output: h5py.File) -> None:
         output.attrs["schema_version"] = PUSH_ACTION_VALUE_SCHEMA_VERSION
-        output.attrs["value_definition"] = "verified_success_trajectory_finite_horizon_v1"
-        output.attrs["horizons"] = int(horizons)
-        output.attrs["gamma"] = float(gamma)
+        output.attrs["value_definition"] = "one_step_structural_task_progress_lexicographic_v1"
         output.attrs["teacher"] = "none"
+        output.attrs["learned_heads"] = "push_value_only"
+        output.attrs["rank_key_definition"] = (
+            "goal,-dependency_blockers,-direct_blockers,-task_region_pressed,"
+            "-target_pressed,target_visibility,verified_grasp_progress"
+        )
         output.create_dataset("action_id", data=action_ids, compression="gzip")
         output.create_dataset("from_state", data=from_state[push], compression="gzip")
         output.create_dataset("to_state", data=to_state[push], compression="gzip")
-        output.create_dataset("q_value", data=action_q[push], compression="gzip")
-        output.create_dataset("q_valid", data=np.isfinite(action_q[push]), compression="gzip")
-        output.create_dataset("safe", data=safe[push], compression="gzip")
-        output.create_dataset("safety_valid", data=np.ones(len(action_ids), bool), compression="gzip")
-        output.create_dataset("potential_delta", data=potential_delta[push], compression="gzip")
-        output.create_dataset("potential_valid", data=potential_valid[push], compression="gzip")
+        output.create_dataset("value_target", data=value_target[push], compression="gzip")
+        output.create_dataset("value_valid", data=value_valid[push], compression="gzip")
+        output.create_dataset("before_rank_key", data=before_key[push], compression="gzip")
+        output.create_dataset("after_rank_key", data=after_key[push], compression="gzip")
+        output.create_dataset("outcome_code", data=outcome[push], compression="gzip")
+        # Diagnostic only: never fed to the model/loss.
         output.create_dataset(
-            "part_of_success_sequence", data=part_of_sequence[push], compression="gzip"
+            "dataset_potential_improved", data=potential_improved[push], compression="gzip"
         )
 
     _atomic_h5(Path(output_path), writer)
 
 
 class PushActionValueStore:
-    """Read-only per-scene action-value lookup used by Stage-C collators."""
+    """Read-only single-head Stage-C supervision lookup."""
 
-    def __init__(self, root: str | Path, horizons: int = PUSH_VALUE_HORIZONS) -> None:
+    def __init__(self, root: str | Path, horizons: int | None = None) -> None:
+        del horizons
         self.root = Path(root)
-        self.horizons = int(horizons)
 
     def load_scene(self, scene_id: int) -> dict[str, np.ndarray]:
         path = self.root / f"scene_{int(scene_id):04d}.h5"
         with h5py.File(path, "r", swmr=True) as handle:
             if int(handle.attrs.get("schema_version", -1)) != PUSH_ACTION_VALUE_SCHEMA_VERSION:
-                raise RuntimeError(f"Unsupported action-value schema: {path}")
-            if int(handle.attrs.get("horizons", -1)) != self.horizons:
-                raise RuntimeError(f"Action-value horizon mismatch: {path}")
+                raise RuntimeError(
+                    f"Unsupported action-value schema: {path}; rebuild Stage-C structural sidecars"
+                )
+            if str(handle.attrs.get("value_definition", "")) != (
+                "one_step_structural_task_progress_lexicographic_v1"
+            ):
+                raise RuntimeError(f"Action-value definition mismatch: {path}")
+            if str(handle.attrs.get("teacher", "")) != "none":
+                raise RuntimeError(f"Stage-C structural sidecar must not contain a teacher: {path}")
+            required = {
+                "action_id", "value_target", "value_valid",
+                "before_rank_key", "after_rank_key",
+            }
+            missing = required - set(handle.keys())
+            if missing:
+                raise RuntimeError(f"Stage-C sidecar is missing {sorted(missing)}: {path}")
             return {name: handle[name][:] for name in handle.keys()}
 
 

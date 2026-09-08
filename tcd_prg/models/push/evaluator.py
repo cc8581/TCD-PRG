@@ -1,4 +1,4 @@
-"""Instance-aware finite-horizon PUSH value evaluator."""
+"""Instance-aware single-head PUSH value evaluator."""
 
 import torch
 from torch import nn
@@ -8,9 +8,7 @@ from .pointnet2 import PushPointNet2
 
 
 class PushEffectivenessEvaluator(nn.Module):
-    """Predict task value, safety and physical effects for complete PUSH actions."""
-
-    horizons = 5
+    """Predict one scalar task-environment value for each complete PUSH action."""
 
     def __init__(self, feature_dim=256, num_categories=64, num_task_regions=64, *, initialize_backbone=True):
         super().__init__()
@@ -28,11 +26,7 @@ class PushEffectivenessEvaluator(nn.Module):
             nn.Linear(7 * d + 10, 2 * d), nn.GELU(), nn.LayerNorm(2 * d),
             nn.Linear(2 * d, d), nn.GELU(),
         )
-        self.q_head = nn.Linear(d, self.horizons)
-        with torch.no_grad():
-            self.q_head.bias[1:].fill_(-4.0)
-        self.safety_head = nn.Linear(d, 1)
-        self.auxiliary_delta_head = nn.Linear(d, 5)
+        self.value_head = nn.Linear(d, 1)
         self.feature_dim = d
         self.backbone = None
         if initialize_backbone:
@@ -78,26 +72,13 @@ class PushEffectivenessEvaluator(nn.Module):
         attention = torch.softmax(torch.stack(scores), 0)
         return (torch.stack(tokens) * attention[:, None]).sum(0)
 
-    @staticmethod
-    def _monotonic_q(raw):
-        current = torch.sigmoid(raw[:, :1])
-        values = [current]
-        for index in range(1, raw.shape[1]):
-            current = current + (1.0 - current) * torch.sigmoid(raw[:, index:index + 1])
-            values.append(current)
-        return torch.cat(values, -1)
-
     def forward(self, sensor, condition, actions: PushActions):
         xyz = sensor["xyz"]
         condition.validate(xyz.shape[1])
         actions.validate(len(xyz), condition.object_valid.shape[1])
         if not len(actions.batch_index):
-            empty = self.q_head.weight.sum().expand(0)
-            return {
-                "q_value": empty.reshape(0, self.horizons), "safety_logit": empty,
-                "safety_probability": empty, "potential_delta": empty.reshape(0, 5),
-                "effective_logit": empty, "effective_probability": empty,
-            }
+            empty = self.value_head.weight.sum().expand(0)
+            return {"push_value": empty}
         if not bool(condition.target_valid[actions.batch_index].all()):
             raise ValueError("PUSH requires a visible target")
         if not bool(condition.object_valid[actions.batch_index, actions.object].all()):
@@ -183,17 +164,5 @@ class PushEffectivenessEvaluator(nn.Module):
         # Callers align supervision with the original (possibly interleaved)
         # action order, not with the scene grouping used above.
         shared = self.trunk(torch.cat(rows)[torch.cat(row_ids).argsort()])
-        q_value = self._monotonic_q(self.q_head(shared))
-        safety_logit = self.safety_head(shared).squeeze(-1)
-        safety_probability = torch.sigmoid(safety_logit)
-        probability = q_value[:, -1]
-        return {
-            "q_value": q_value,
-            "safety_logit": safety_logit,
-            "safety_probability": safety_probability,
-            "potential_delta": self.auxiliary_delta_head(shared),
-            # Compatibility alias for downstream candidate containers. It is
-            # the full-budget Q, not the obsolete potential-improved target.
-            "effective_logit": torch.logit(probability.clamp(1e-6, 1 - 1e-6)),
-            "effective_probability": probability,
-        }
+        push_value = self.value_head(shared).squeeze(-1)
+        return {"push_value": push_value}

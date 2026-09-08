@@ -133,6 +133,9 @@ def test_training_entry_survives_final_validation_failure_and_resumes(tmp_path,m
                                                  max_optimizer_steps=2,
                                                  validation_interval=1,pretrain_checkpoint=None))
     monkeypatch.setattr(entry,'load_config',lambda *args:config)
+    monkeypatch.setattr(entry,'compiled_fps',lambda: (lambda *args, **kwargs: None))
+    monkeypatch.setattr('tcd_prg.trainers.push_sampling.sample_push_training_input',
+                        lambda sensor, condition, actions, count: (sensor, condition, actions))
     monkeypatch.setattr(entry,'create_adapter',lambda *args,**kwargs:SimpleNamespace(scene_splits={'val':(1,)}))
     ready = {'loss':False}
     class GuardedSamples(list):
@@ -147,8 +150,7 @@ def test_training_entry_survives_final_validation_failure_and_resumes(tmp_path,m
     real_loss = entry.PushEffectivenessLoss
     def fixed_loss(*args,**kwargs):
         assert not args and set(kwargs) == {
-            'q_weight', 'rank_weight', 'safety_weight', 'auxiliary_weight',
-            'rank_margin', 'delta_scales'
+            'value_weight', 'rank_weight', 'score_temperature'
         }
         ready['loss'] = True
         return real_loss(*args,**kwargs)
@@ -187,14 +189,14 @@ def test_training_entry_survives_final_validation_failure_and_resumes(tmp_path,m
 
 def test_new_objective_uses_only_explicit_valid_masks():
     from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
-    q = torch.zeros(2, 5, requires_grad=True)
-    safety = torch.zeros(2, requires_grad=True)
-    delta = torch.zeros(2, 5, requires_grad=True)
+    score = torch.zeros(2, requires_grad=True)
     loss = PushEffectivenessLoss()(
-        {'q_value':q, 'safety_logit':safety, 'potential_delta':delta},
-        q_target=torch.ones(2,5), q_valid=torch.tensor([[True]*5,[False]*5]),
-        safety_target=torch.tensor([True,False]), safety_valid=torch.tensor([True,False]),
-        auxiliary_target=torch.ones(2,5), auxiliary_valid=torch.tensor([True,False]),
+        {'push_value':score},
+        value_target=torch.tensor([1.0, float('nan')]),
+        value_valid=torch.tensor([True,False]),
+        rank_key=torch.tensor([[0.,-1.,-1.,0.,0.,.5,.0],
+                               [float('nan')]*7]),
+        rank_valid=torch.tensor([True,False]),
         group_index=torch.tensor([0,0]))['push_effectiveness']
     loss.backward()
-    assert q.grad[1].abs().sum() == 0 and safety.grad[1] == 0 and delta.grad[1].abs().sum() == 0
+    assert score.grad[1] == 0
