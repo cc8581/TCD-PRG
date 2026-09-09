@@ -56,7 +56,7 @@ def test_removing_indirect_top_blocker_is_positive_even_when_grasp_count_stays_z
     _scene(source)
     build_push_improvement_sidecar(source, output, raw_relation_names=RELATIONS)
     with h5py.File(output, "r") as result:
-        assert int(result.attrs["schema_version"]) == 7
+        assert int(result.attrs["schema_version"]) == 8
         np.testing.assert_array_equal(
             result.attrs["component_eps"],
             np.asarray([0, 0, 0, 0, 0, 0.01, 1e-6]),

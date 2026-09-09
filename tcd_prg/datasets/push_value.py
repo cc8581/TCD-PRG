@@ -20,7 +20,7 @@ from tcd_prg.push_improvement import (
 
 
 PUSH_VALUE_SCHEMA_VERSION = 1  # State-sidecar schema retained for compatibility.
-PUSH_IMPROVEMENT_SCHEMA_VERSION = 7
+PUSH_IMPROVEMENT_SCHEMA_VERSION = 8
 
 
 @dataclass(frozen=True, slots=True)

@@ -7,12 +7,16 @@ from tcd_prg.push_improvement import improvement_event
 from tcd_prg.scripts.train_push_evaluator import push_optimizer_groups
 
 
-def test_binary_event_ignores_small_visibility_and_vetoes_structural_regression():
+def test_binary_event_ignores_small_changes_and_rejects_conflicting_evidence():
     before = [0, -2, -1, 0, 0, .50, 0]
     assert not improvement_event(before, [0, -2, -1, 0, 0, .505, 0])[0]
     assert improvement_event(before, [0, -2, -1, 0, 0, .52, 0])[0]
     assert not improvement_event(before, [0, -3, -1, 0, 0, .70, 0])[0]
-    assert improvement_event(before, [1, -3, -1, 0, 0, .70, 0])[0]
+    assert not improvement_event(before, [1, -3, -1, 0, 0, .70, 0])[0]
+    assert not improvement_event(before, [0, -2, -1, 0, 0, .52, -.2])[0]
+    assert not improvement_event(before, [0, -2, -1, 0, 0, .48, .2])[0]
+    assert improvement_event(before, [1, -2, -1, 0, 0, .52, .2])[0]
+    assert not improvement_event([1, -2, -1, 0, 0, .50, 0], [0, -2, 0, 0, 0, .60, .2])[0]
 
 
 def test_single_head_binary_bce_uses_improvement_logit():

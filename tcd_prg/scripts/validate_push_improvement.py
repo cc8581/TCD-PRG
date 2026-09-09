@@ -54,10 +54,10 @@ def main() -> None:
             raise RuntimeError(f"scene {scene_id}: valid targets must be binary")
         if np.any(~np.isfinite(delta[valid])) or np.any(np.isfinite(delta[~valid])):
             raise RuntimeError(f"scene {scene_id}: component-delta validity mismatch")
-        strong_reason = reasons & 0b00011111 != 0
-        structural_regression = regressions & 0b00011111 != 0
-        if np.any((target > 0.5) & structural_regression & ~strong_reason):
-            raise RuntimeError(f"scene {scene_id}: weak improvement overrode structural regression")
+        if np.any(valid & (target > 0.5) & (reasons == 0)):
+            raise RuntimeError(f"scene {scene_id}: positive target has no improvement event")
+        if np.any(valid & (target > 0.5) & (regressions != 0)):
+            raise RuntimeError(f"scene {scene_id}: conflicting transition was labeled improved")
         push_total += len(expected_ids); valid_total += int(valid.sum())
         improved += int((valid & (target > 0.5)).sum())
         not_improved += int((valid & (target <= 0.5)).sum())
