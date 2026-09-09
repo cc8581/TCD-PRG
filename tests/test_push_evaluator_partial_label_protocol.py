@@ -33,7 +33,7 @@ def test_unknown_top1_is_indeterminate_not_negative() -> None:
             "contact_world": torch.tensor([[0.30, 0.0, 0.0], [0.0, 0.0, 0.0], [0.10, 0.0, 0.0]]),
             "direction_world": torch.tensor([[1.0, 0.0, 0.0]] * 3),
             "proposal_score": torch.tensor([0.9, 0.8, 0.7]),
-            "push_value": torch.tensor([0.99, 0.90, 0.10]),
+            "improvement_probability": torch.tensor([0.99, 0.90, 0.10]),
         }
     ]
     positive, _, known = proposal_known_outcome_masks(

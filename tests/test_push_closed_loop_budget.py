@@ -11,7 +11,7 @@ from tcd_prg.planners.tcd_policy import EncodedPolicyState, TCDPRGPolicy
 from tcd_prg.runtime import _apply_training_augmentation
 
 
-def test_decoder_uses_same_single_push_value_for_every_nonzero_budget():
+def test_decoder_uses_same_single_improvement_logit_for_every_nonzero_budget():
     from test_independent_push import model, scene
     from tcd_prg.trainers.push_evaluator import logged_push_actions
 
@@ -19,7 +19,7 @@ def test_decoder_uses_same_single_push_value_for_every_nonzero_budget():
     network = model().eval()
     condition = push_condition_from_gt(batch, 4)
     actions, _ = logged_push_actions(batch, condition)
-    push = {"actions": actions, "push_value": torch.tensor([.2, .8])}
+    push = {"actions": actions, "improvement_logit": torch.tensor([.2, .8])}
     sensor = network._sensor(batch)
     first, _ = decode_push_candidates(
         sensor, condition, push, network.push.config, remaining_preparation_actions=1
@@ -31,7 +31,9 @@ def test_decoder_uses_same_single_push_value_for_every_nonzero_budget():
         sensor, condition, push, network.push.config, remaining_preparation_actions=0
     )
     torch.testing.assert_close(first[0]["proposal_score"], fifth[0]["proposal_score"])
-    torch.testing.assert_close(first[0]["proposal_score"], torch.tensor([.8, .2]))
+    torch.testing.assert_close(
+        first[0]["proposal_score"], torch.sigmoid(torch.tensor([.8, .2]))
+    )
     assert not len(exhausted[0]["object"])
 
 

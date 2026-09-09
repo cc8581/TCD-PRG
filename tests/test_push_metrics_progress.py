@@ -52,18 +52,17 @@ def test_degenerate_metric_populations_are_explicit(labels):
 def test_window_mean_is_action_weighted_and_eta_excludes_validation(tmp_path,capsys):
     clock = [100.]
     logger = PushTrainingProgress(tmp_path,maximum=20,initial_step=10,clock=lambda:clock[0])
-    logger.add(.2,2,1,components={'value':.1,'rank':.2})
+    logger.add(.2,2,1,components={'bce':.2})
     clock[0] += 2
     logger.pause()
     clock[0] += 100  # Deliberately long validation must not inflate s/step or ETA.
     logger.resume()
-    logger.add(.8,6,2,components={'value':.5,'rank':.6})
+    logger.add(.8,6,2,components={'bce':.8})
     clock[0] += 2
     record = logger.log(12,1e-4)
     assert record['loss']==pytest.approx(.65)
     assert record['improved_fraction']==3/8
-    assert record['value_loss']==pytest.approx(.4)
-    assert record['rank_loss']==pytest.approx(.5)
+    assert record['bce_loss']==pytest.approx(.65)
     assert record['window_steps']==2
     assert record['seconds_per_step']==2
     assert record['eta_train_seconds']==16
@@ -71,7 +70,7 @@ def test_window_mean_is_action_weighted_and_eta_excludes_validation(tmp_path,cap
     output = capsys.readouterr().out
     assert 'eta: 00:00:16' in output
     assert '[0000012/0000020]' in output and 'lr: 1.000e-04' in output
-    assert 'value: 0.4000' in output
+    assert 'bce: 0.6500' in output
     assert json.loads((tmp_path/'train_metrics.jsonl').read_text())==record
     logger.add(.4,1,1)
     clock[0] += 1
@@ -82,7 +81,7 @@ def test_window_mean_is_action_weighted_and_eta_excludes_validation(tmp_path,cap
 def test_validation_progress_finishes_and_counts_empty_groups(monkeypatch):
     from test_independent_push import scene,model
     from tcd_prg.config import TCDPRGConfig,ModelConfig
-    from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
+    from tcd_prg.losses.push_effectiveness import PushImprovementLoss
     from tcd_prg.scripts import train_push_evaluator as entry
     from tqdm import tqdm
     output=io.StringIO()
@@ -96,12 +95,12 @@ def test_validation_progress_finishes_and_counts_empty_groups(monkeypatch):
     empty['candidate_mask'].zero_()
     result=entry._evaluate(model(),[scene(),empty],device=torch.device('cpu'),
                            config=TCDPRGConfig(model=ModelConfig(instance_queries=4)),
-                           loss_function=PushEffectivenessLoss(),phase='test')
+                           loss_function=PushImprovementLoss(),phase='test')
     assert bars[0].n==bars[0].total==2 and bars[0].disable
     assert '100%' in output.getvalue()
     assert result['push_evaluator_evaluated_count']==2
-    assert result['push_evaluator_logged_empty_group_count']==1
-    assert result['push_evaluator_value_loss'] >= 0
+    assert result['push_evaluator_logged_group_count']==1
+    assert result['push_evaluator_loss'] >= 0
 
 
 def test_resume_preserves_optimizer_but_discards_old_metric_best(tmp_path,capsys):
@@ -110,7 +109,7 @@ def test_resume_preserves_optimizer_but_discards_old_metric_best(tmp_path,capsys
     model,optimizer=tiny_training()
     update(model,optimizer)
     checkpoint=PushTrainingCheckpoint(tmp_path/'best.pt',model,{}, {})
-    checkpoint.consider_best({'push_evaluator_pairwise_ranking_accuracy':.9},1)
+    checkpoint.consider_best({'push_evaluator_auprc':.9},1)
     checkpoint.save_latest(optimizer,1)
     payload=torch.load(checkpoint.latest,weights_only=False)
     payload.pop('push_metric_protocol_version')

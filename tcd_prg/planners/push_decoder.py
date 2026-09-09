@@ -1,4 +1,4 @@
-"""Rank rule-generated PUSH actions by the single learned core value."""
+"""Rank rule-generated PUSH actions by learned improvement probability."""
 import math
 import torch
 from torch import Tensor
@@ -45,9 +45,10 @@ def decode_push_candidates(
     if not 0 <= int(remaining_preparation_actions) <= 5:
         raise ValueError("remaining_preparation_actions must lie in [0,5]")
     actions = push["actions"]
-    score_all = push.get("push_value")
-    if score_all is None:
-        raise RuntimeError("Stage-C PUSH output is missing push_value")
+    logits_all = push.get("improvement_logit")
+    if logits_all is None:
+        raise RuntimeError("Stage-C PUSH output is missing improvement_logit")
+    probability_all = logits_all.sigmoid()
     pre, final = [], []
     for b in range(len(sensor["xyz"])):
         ids = torch.nonzero(actions.batch_index == b, as_tuple=False).flatten()
@@ -55,10 +56,10 @@ def decode_push_candidates(
             ids = ids[:0]
         # No learned safety gate. Deterministic certification in ClosedLoopPlanner
         # rejects invalid actions and immediately tries the next ranked candidate.
-        ids = ids[score_all[ids].argsort(descending=True, stable=True)]
+        ids = ids[probability_all[ids].argsort(descending=True, stable=True)]
         ids = ids[: config.max_push_candidates]
         a = actions.select(ids)
-        score = score_all[ids]
+        score = probability_all[ids]
         k = len(ids)
         angle = torch.atan2(a.direction_world[:, 1], a.direction_world[:, 0]).remainder(
             2 * math.pi
@@ -90,7 +91,7 @@ def decode_push_candidates(
             "direction_score": torch.ones_like(score),
             "utility": score,
             "proposal_score": score,
-            "push_value": score,
+            "improvement_probability": score,
         }
         pre.append(row)
         keep = push_nms_mask(row, config)

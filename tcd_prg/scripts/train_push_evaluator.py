@@ -17,16 +17,18 @@ from tqdm import tqdm
 
 from tcd_prg.config import load_config
 from tcd_prg.datasets import ActionStateGroupDataset
-from tcd_prg.losses.push_effectiveness import (
-    PushEffectivenessLoss, lexicographic_order_matrix,
-)
+from tcd_prg.datasets.push_value import PUSH_IMPROVEMENT_SCHEMA_VERSION
+from tcd_prg.datasets.push_value import PushImprovementStore
+from tcd_prg.losses.push_effectiveness import PushImprovementLoss
 from tcd_prg.models import StandalonePushModel
+from tcd_prg.push_improvement import PUSH_IMPROVEMENT_DEFINITION
 from tcd_prg.models.staged_checkpoint import load_push_evaluator
 from tcd_prg.trainers.push_checkpoint import PushTrainingCheckpoint
 from tcd_prg.trainers.push_progress import PushTrainingProgress, append_record, print_validation_summary
 from tcd_prg.trainers.push_scheduler import PushLRScheduler
 from tcd_prg.trainers.push_sampling import compiled_fps
 from tcd_prg.runtime import PushValueBatchCollator, create_adapter
+from tcd_prg.observation.cached import ObservationCacheMissError
 from tcd_prg.trainers import (
     push_effectiveness_batch_loss,
 )
@@ -57,12 +59,51 @@ def push_optimizer_groups(model: StandalonePushModel, config) -> list[dict[str, 
     ]
 
 
+def _restrict_to_cached_informative_overfit_groups(dataset, root: str, limit: int) -> None:
+    """Select fixed cache-only groups containing both binary classes."""
+    store = PushImprovementStore(root)
+    payloads: dict[int, dict[str, np.ndarray]] = {}
+    selected = []
+    for index, unit in enumerate(dataset.units):
+        try:
+            sample = dataset[index]
+        except ObservationCacheMissError:
+            continue
+        payload = payloads.setdefault(unit.scene_id, store.load_scene(unit.scene_id))
+        action_ids = np.asarray(payload["action_id"], np.int64)
+        candidates = np.asarray(sample.candidates.candidate_action_ids, np.int64)
+        locations = np.searchsorted(action_ids, candidates)
+        matched = locations < len(action_ids)
+        if len(action_ids):
+            matched &= action_ids[np.minimum(locations, len(action_ids) - 1)] == candidates
+        valid_locations = locations[matched]
+        valid_locations = valid_locations[np.asarray(payload["improvement_valid"])[valid_locations]]
+        if len(valid_locations) < 2:
+            continue
+        labels = np.asarray(payload["improvement_target"])[valid_locations]
+        if not (bool((labels == 0).any()) and bool((labels == 1).any())):
+            continue
+        selected.append(unit)
+        if len(selected) >= limit:
+            break
+    if len(selected) < limit:
+        raise RuntimeError(
+            f"Only {len(selected)} cached informative PUSH groups were found; requested {limit}"
+        )
+    dataset.units = tuple(selected)
+    dataset.selected_group_count = len(selected)
+    print(
+        f"[push-overfit] fixed {len(selected)} cached groups containing both classes",
+        flush=True,
+    )
+
+
 def accumulated_batches(model, loader, *, device, config, loss_function, optimizer):
-    """Accumulate only microbatches that contain core PUSH-value supervision."""
+    """Accumulate only microbatches that contain valid binary supervision."""
     limit = config.training.gradient_accumulation_steps
     micro = actions = positives = 0
     loss_sum = data_seconds = 0.0
-    component_sums = dict(value=0.0, rank=0.0)
+    component_sums = dict(bce=0.0)
     optimizer.zero_grad(set_to_none=True)
     finished = time.monotonic()
     for cpu_batch in loader:
@@ -75,18 +116,17 @@ def accumulated_batches(model, loader, *, device, config, loss_function, optimiz
             loss_function=loss_function,
             scene_sample_points=config.training.push_fps_points,
         )
-        valid = details["value_valid"]
+        valid = details["improvement_valid"]
         count = int(valid.sum())
         if count:
-            if not torch.isfinite(loss) or not torch.isfinite(details["push_value"]).all():
-                raise RuntimeError("Non-finite PUSH core-value training values/loss")
+            if not torch.isfinite(loss) or not torch.isfinite(details["improvement_logit"]).all():
+                raise RuntimeError("Non-finite PUSH improvement training values/loss")
             (loss * count).backward()
             micro += 1
             actions += count
-            positives += int((details["value_target"][valid] > 0.5).sum())
+            positives += int((details["improvement_target"][valid] > 0.5).sum())
             loss_sum += float(loss.detach()) * count
-            component_sums["value"] += float(details["push_value_ordinal"]) * count
-            component_sums["rank"] += float(details["push_rank"]) * count
+            component_sums["bce"] += float(details["push_improvement_bce"]) * count
         if micro == limit:
             for parameter in model.push_evaluator.parameters():
                 if parameter.grad is not None:
@@ -117,133 +157,85 @@ def accumulated_batches(model, loader, *, device, config, loss_function, optimiz
 
 
 @torch.no_grad()
-def _evaluate(
-    model: StandalonePushModel,
-    loader: DataLoader,
-    *,
-    device: torch.device,
-    config,
-    loss_function: PushEffectivenessLoss,
-    phase: str = "periodic",
-    use_batch_norm_batch_statistics: bool = False,
-) -> dict[str, float]:
-    """Validate the single learned PUSH score on logged one-step transitions."""
+def _evaluate(model, loader, *, device, config, loss_function, phase="periodic",
+              use_batch_norm_batch_statistics=False) -> dict[str, float]:
+    """Evaluate binary PUSH improvement on actions and state-level selection."""
     model.eval()
     if use_batch_norm_batch_statistics:
         for module in model.push_evaluator.modules():
             if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
                 module.train()
-    started = time.monotonic()
-    scores: list[torch.Tensor] = []
-    targets: list[torch.Tensor] = []
-    valids: list[torch.Tensor] = []
-    rank_keys: list[torch.Tensor] = []
-    rank_valids: list[torch.Tensor] = []
-    group_ids: list[torch.Tensor] = []
-    weighted_loss = 0.0
-    weighted_value_loss = 0.0
-    supervised = 0
-    group_offset = 0
-    with tqdm(
-        total=len(loader),
-        desc=f"Val [push_evaluator] [{phase}]",
-        unit="batch",
-        dynamic_ncols=True,
-        mininterval=1.0,
-    ) as progress:
+    started=time.monotonic(); logits=[]; targets=[]; groups=[]; supervised=0; group_offset=0
+    weighted_loss=0.0
+    with tqdm(total=len(loader),desc=f"Val [push_evaluator] [{phase}]",unit="batch",
+              dynamic_ncols=True,mininterval=1.0) as progress:
         for cpu_batch in loader:
-            batch = _device(cpu_batch, device)
-            loss, details = push_effectiveness_batch_loss(
-                model,
-                batch,
-                instance_queries=config.model.instance_queries,
-                loss_function=loss_function,
-                scene_sample_points=config.training.push_fps_points,
-            )
-            score = details["push_value"].detach().float().cpu()
-            target = details["value_target"].detach().float().cpu()
-            valid = details["value_valid"].detach().bool().cpu()
-            key = details["rank_key"].detach().float().cpu()
-            rank_valid = details["rank_valid"].detach().bool().cpu()
-            local_group = details["effective_group_index"].detach().long().cpu()
-            if not torch.isfinite(score).all() or not torch.isfinite(loss):
-                raise RuntimeError("Non-finite PUSH core-value validation prediction/loss")
-            count = int(valid.sum())
+            batch=_device(cpu_batch,device)
+            loss,details=push_effectiveness_batch_loss(
+                model,batch,instance_queries=config.model.instance_queries,
+                loss_function=loss_function,scene_sample_points=config.training.push_fps_points)
+            logit=details["improvement_logit"].detach().float().cpu()
+            target=details["improvement_target"].detach().float().cpu()
+            valid=details["improvement_valid"].detach().bool().cpu()
+            local_group=details["effective_group_index"].detach().long().cpu()
+            if not torch.isfinite(logit).all() or not torch.isfinite(loss):
+                raise RuntimeError("Non-finite PUSH improvement validation value")
+            count=int(valid.sum())
             if count:
-                scores.append(score)
-                targets.append(target)
-                valids.append(valid)
-                rank_keys.append(key)
-                rank_valids.append(rank_valid)
-                group_ids.append(local_group + group_offset)
-                weighted_loss += float(loss.detach()) * count
-                weighted_value_loss += float(details["push_value_ordinal"]) * count
-                supervised += count
-            sensor = batch.get("model_inputs", batch)
-            group_offset += int(sensor["point_mask"].shape[0])
-            progress.set_postfix(
-                actions=supervised,
-                loss=weighted_loss / max(supervised, 1),
-                refresh=False,
-            )
+                logits.append(logit[valid]);targets.append(target[valid])
+                groups.append(local_group[valid]+group_offset)
+                weighted_loss+=float(loss)*count;supervised+=count
+            sensor=batch.get("model_inputs",batch);group_offset+=int(sensor["point_mask"].shape[0])
+            progress.set_postfix(actions=supervised,loss=weighted_loss/max(supervised,1),refresh=False)
             progress.update(1)
-
-    if not supervised:
-        raise RuntimeError("Validation split contains no valid structural PUSH-value targets")
-    score = torch.cat(scores)
-    target = torch.cat(targets)
-    valid = torch.cat(valids)
-    rank_key = torch.cat(rank_keys)
-    rank_valid = torch.cat(rank_valids)
-    groups = torch.cat(group_ids)
-    print(f"Val [push_evaluator]  aggregating: {supervised} supervised actions", flush=True)
-
-    pair_correct = pair_total = 0
-    top1_best: list[float] = []
-    top1_improvement: list[float] = []
-    for group_id in torch.unique(groups):
-        members = torch.nonzero(groups == group_id, as_tuple=False).flatten()
-        ids = members[rank_valid[members]]
-        if not len(ids):
-            continue
-        order = lexicographic_order_matrix(rank_key[ids])
-        left, right = torch.where(order > 0)
-        if len(left):
-            pair_correct += int((score[ids[left]] > score[ids[right]]).sum())
-            pair_total += int(len(left))
-        chosen_local = int(torch.argmax(score[ids]))
-        chosen = ids[chosen_local]
-        # A candidate is lexicographically best when no other candidate dominates it.
-        top1_best.append(float(not bool((order[:, chosen_local] > 0).any())))
-        available_improvement = bool((target[ids] > 0.5).any())
-        if available_improvement:
-            top1_improvement.append(float(target[chosen] > 0.5))
-
-    top1_best_rate = float(np.mean(top1_best)) if top1_best else float("nan")
-    top1_improvement_rate = (
-        float(np.mean(top1_improvement)) if top1_improvement else float("nan")
-    )
-    result = {
-        "push_evaluator_pairwise_ranking_accuracy": (
-            pair_correct / pair_total if pair_total else float("nan")
-        ),
-        "push_evaluator_pairwise_count": float(pair_total),
-        "push_evaluator_top1_best_rate": top1_best_rate,
-        "push_evaluator_top1_improvement_rate": top1_improvement_rate,
-        "push_evaluator_top1_miss_rate": (
-            1.0 - top1_best_rate if np.isfinite(top1_best_rate) else float("nan")
-        ),
-        "push_evaluator_value_loss": weighted_value_loss / supervised,
-        "push_evaluator_loss": weighted_loss / supervised,
-        "push_evaluator_evaluated_count": float(supervised),
-        "push_evaluator_logged_group_count": float(torch.unique(groups).numel()),
-        "push_evaluator_logged_empty_group_count": (
-            group_offset - float(torch.unique(groups).numel())
-        ),
-        "push_evaluator_validation_seconds": time.monotonic() - started,
+    if not supervised: raise RuntimeError("Validation contains no valid PUSH improvement targets")
+    logit=torch.cat(logits);target=torch.cat(targets);group=torch.cat(groups);prob=logit.sigmoid()
+    positive=target.bool();negative=~positive
+    order=torch.argsort(prob,descending=True,stable=True); sorted_prob=prob[order]
+    sorted_y=target[order];tp=sorted_y.cumsum(0);fp=(1-sorted_y).cumsum(0)
+    precision_curve=tp/(tp+fp);recall_curve=tp/max(int(positive.sum()),1)
+    distinct=torch.ones_like(sorted_prob,dtype=torch.bool)
+    distinct[:-1]=sorted_prob[:-1]!=sorted_prob[1:]
+    boundaries=torch.where(distinct)[0]
+    if not bool(positive.any() and negative.any()):
+        auroc=auprc=float("nan")
+    else:
+        previous_recall=torch.cat((recall_curve.new_zeros(1),recall_curve[boundaries[:-1]]))
+        auprc=float(((recall_curve[boundaries]-previous_recall)*precision_curve[boundaries]).sum())
+        ascending=torch.argsort(prob,stable=True);ascending_prob=prob[ascending]
+        _,counts=torch.unique_consecutive(ascending_prob,return_counts=True)
+        ends=counts.cumsum(0).float();starts=ends-counts.float()+1
+        sorted_average_ranks=torch.repeat_interleave((starts+ends)/2,counts)
+        average_ranks=torch.empty_like(prob);average_ranks[ascending]=sorted_average_ranks
+        pos_count=int(positive.sum());neg_count=int(negative.sum())
+        auroc=float((average_ranks[positive].sum()-pos_count*(pos_count+1)/2)/(pos_count*neg_count))
+    f1_curve=2*precision_curve*recall_curve/(precision_curve+recall_curve).clamp_min(1e-12)
+    candidate_f1=f1_curve[boundaries];best_index=int(candidate_f1.argmax())
+    boundary=int(boundaries[best_index]);best_f1=float(candidate_f1[best_index])
+    best_threshold=float(sorted_prob[boundary]);best_precision=float(precision_curve[boundary])
+    best_recall=float(recall_curve[boundary]);tn=int(negative.sum())-int(fp[boundary])
+    specificity=tn/max(int(negative.sum()),1)
+    top1=[];top3=[];random1=[]
+    for gid in torch.unique(group):
+        ids=torch.where(group==gid)[0]
+        if not bool(positive[ids].any()): continue
+        ranked=ids[torch.argsort(prob[ids],descending=True,stable=True)]
+        top1.append(float(positive[ranked[0]]));top3.append(float(positive[ranked[:3]].any()))
+        random1.append(float(positive[ids].float().mean()))
+    return {
+        "push_evaluator_auroc":auroc,"push_evaluator_auprc":auprc,
+        "push_evaluator_threshold":best_threshold,"push_evaluator_f1":best_f1,
+        "push_evaluator_precision":best_precision,"push_evaluator_recall":best_recall,
+        "push_evaluator_balanced_accuracy":(best_recall+specificity)/2,
+        "push_evaluator_top1_improvement_rate":float(np.mean(top1)) if top1 else float("nan"),
+        "push_evaluator_top3_contains_improvement_rate":float(np.mean(top3)) if top3 else float("nan"),
+        "push_evaluator_random_top1_improvement_rate":float(np.mean(random1)) if random1 else float("nan"),
+        "push_evaluator_loss":weighted_loss/supervised,
+        "push_evaluator_positive_rate":float(target.mean()),
+        "push_evaluator_evaluated_count":float(supervised),
+        "push_evaluator_logged_group_count":float(torch.unique(group).numel()),
+        "push_evaluator_validation_seconds":time.monotonic()-started,
     }
-    return result
-
 
 def _main() -> None:
     parser = argparse.ArgumentParser()
@@ -291,10 +283,21 @@ def _main() -> None:
     dataset = ActionStateGroupDataset(
         adapter,
         split="train",
-        max_groups=config.training.max_train_groups,
+        max_groups=(
+            None if config.training.push_overfit_validate_train
+            else config.training.max_train_groups
+        ),
         allowed_strata=config.training.allowed_action_strata,
         global_grasp_mode="never",
     )
+    if config.training.push_overfit_validate_train:
+        if config.training.max_train_groups is None:
+            raise RuntimeError("PUSH overfit diagnostic requires training.max_train_groups")
+        _restrict_to_cached_informative_overfit_groups(
+            dataset,
+            config.training.push_improvement_root,
+            int(config.training.max_train_groups),
+        )
     validation_scenes = tuple(int(value) for value in adapter.scene_splits["val"])
     requested_scenes = config.training.validation_scene_count
     if requested_scenes is None or requested_scenes >= len(validation_scenes):
@@ -308,31 +311,37 @@ def _main() -> None:
                 ).permutation(validation_scenes)[: int(requested_scenes)]
             )
         )
-    validation_dataset = ActionStateGroupDataset(
-        adapter,
-        split="val",
-        scene_ids=frozenset(periodic_validation_scenes),
-        max_groups=config.training.max_validation_groups,
-        allowed_strata=config.training.allowed_action_strata,
-        global_grasp_mode="never",
-    )
-    final_validation_dataset = ActionStateGroupDataset(
-        adapter,
-        split="val",
-        scene_ids=frozenset(validation_scenes),
-        # A bounded validation set marks a diagnostic run.  Formal configs use
-        # None and therefore still evaluate the complete validation split.
-        max_groups=config.training.max_validation_groups,
-        allowed_strata=config.training.allowed_action_strata,
-        global_grasp_mode="never",
-    )
+    if config.training.push_overfit_validate_train:
+        validation_dataset = dataset
+        final_validation_dataset = dataset
+        periodic_validation_scenes = tuple(sorted({item.scene_id for item in dataset.units}))
+        validation_scenes = periodic_validation_scenes
+    else:
+        validation_dataset = ActionStateGroupDataset(
+            adapter,
+            split="val",
+            scene_ids=frozenset(periodic_validation_scenes),
+            max_groups=config.training.max_validation_groups,
+            allowed_strata=config.training.allowed_action_strata,
+            global_grasp_mode="never",
+        )
+        final_validation_dataset = ActionStateGroupDataset(
+            adapter,
+            split="val",
+            scene_ids=frozenset(validation_scenes),
+            # A bounded validation set marks a diagnostic run. Formal configs use
+            # None and therefore still evaluate the complete validation split.
+            max_groups=config.training.max_validation_groups,
+            allowed_strata=config.training.allowed_action_strata,
+            global_grasp_mode="never",
+        )
     if not len(dataset):
         raise RuntimeError("PUSH evaluator training requires a non-empty training split")
     if not len(validation_dataset):
         raise RuntimeError("Formal PUSH evaluator training requires a non-empty val split")
     print(f"[push-evaluator-init] train_groups={len(dataset)} "
           f"validation_groups={len(validation_dataset)}; "
-          "single-head structural PUSH value + within-state ranking; fine-tuning yanx27 PointNet++", flush=True)
+          "single-head binary PUSH improvement with BCE; fine-tuning yanx27 PointNet++", flush=True)
     model = StandalonePushModel(config.model).to(device)
     pretrain_checkpoint = args.pretrain_checkpoint or config.training.pretrain_checkpoint
     if not pretrain_checkpoint and not args.resume:
@@ -346,10 +355,8 @@ def _main() -> None:
             "optimizer and step start fresh",
             flush=True,
         )
-    loss_function = PushEffectivenessLoss(
-        value_weight=config.training.push_value_loss_weight,
-        rank_weight=config.training.push_rank_loss_weight,
-        score_temperature=config.training.push_score_temperature,
+    loss_function = PushImprovementLoss(
+        pos_weight=config.training.push_improvement_pos_weight
     )
     optimizer = torch.optim.AdamW(
         push_optimizer_groups(model, config), weight_decay=config.optimizer.weight_decay,
@@ -399,8 +406,10 @@ def _main() -> None:
         "training_scene_sampling": {"operator": "pytorch3d.compiled_fps", "points": fps_points},
         "periodic_validation_scene_count": len(periodic_validation_scenes),
         "final_validation_scene_count": len(validation_scenes),
-        "selection_metric": "push_evaluator_pairwise_ranking_accuracy",
-        "selection_policy": "95% significant ranking gain with safety/loss regression guards",
+        "selection_metric": "push_evaluator_auprc",
+        "selection_policy": "highest binary improvement AUPRC",
+        "push_improvement_schema_version": PUSH_IMPROVEMENT_SCHEMA_VERSION,
+        "push_improvement_definition": PUSH_IMPROVEMENT_DEFINITION,
     }, {"config": signature,
         "periodic_scenes": periodic_validation_scenes, "final_scenes": validation_scenes}, scheduler=scheduler)
     step = checkpoints.restore(args.resume, optimizer) if args.resume else 0
@@ -435,7 +444,7 @@ def _main() -> None:
                                 loss_function=loss_function, phase=phase)
             if phase == "periodic":
                 checkpoints.consider_best(metrics, step)
-            best_score = checkpoints.best_metrics["push_evaluator_pairwise_ranking_accuracy"] if checkpoints.best_metrics else float("nan")
+            best_score = checkpoints.best_metrics["push_evaluator_auprc"] if checkpoints.best_metrics else float("nan")
             print_validation_summary(metrics, step, best_score, phase)
             append_record(Path(args.output).parent / "validation_metrics.jsonl",
                           {"optimizer_step": step, "phase": phase,
@@ -460,8 +469,8 @@ def _main() -> None:
           f"validation_batch={config.training.validation_batch_size}, "
           f"workers={config.training.num_workers}; waiting for first batch", flush=True)
     print(f"[push-evaluator-train] scheduler: warmup({config.scheduler.warmup_steps}) + cosine; "
-             f"eta excludes validation; best checkpoint requires significant ranking gain without "
-             f"material safety/loss regression; output: {config.output_dir}", flush=True)
+             f"eta excludes validation; objective is binary BCE only; "
+             f"best checkpoint uses AUPRC; output: {config.output_dir}", flush=True)
     model.train()
     if args.resume and checkpoints.validation_due(step, validation_interval):
         print(f"[resume] periodic validation at step={step} is pending; validating before training", flush=True)

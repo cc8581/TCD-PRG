@@ -10,50 +10,10 @@ import torch
 
 from tcd_prg.models.staged_checkpoint import PUSH_EVALUATOR_PROTOCOL_VERSION, PUSH_ARCHITECTURE, validate_push_checkpoint
 
-PUSH_METRIC_PROTOCOL_VERSION = 5
-SELECTION_METRIC = "push_evaluator_pairwise_ranking_accuracy"
-RANK_GAIN_Z = 1.96
-MAX_METRIC_REGRESSION = {
-    "push_evaluator_top1_best_rate": 0.01,
-    "push_evaluator_top1_improvement_rate": 0.01,
-    "push_evaluator_loss": 0.005,
-    "push_evaluator_value_loss": 0.005,
-    "push_evaluator_top1_miss_rate": 0.005,
-}
-
-
-def _meaningful_rank_gain(candidate, incumbent):
-    """Require a 95% two-sample binomial margin, not a noisy point increase."""
-    score = float(candidate[SELECTION_METRIC])
-    best = float(incumbent[SELECTION_METRIC])
-    candidate_count = float(candidate.get("push_evaluator_pairwise_count", 0))
-    incumbent_count = float(incumbent.get("push_evaluator_pairwise_count", 0))
-    if candidate_count <= 0 or incumbent_count <= 0:
-        # Compatibility for synthetic/legacy callers that did not record counts.
-        return score > best
-    standard_error = math.sqrt(
-        score * (1.0 - score) / candidate_count
-        + best * (1.0 - best) / incumbent_count
-    )
-    return score - best > RANK_GAIN_Z * standard_error
-
-
-def _has_no_material_regression(candidate, incumbent):
-    for name, tolerance in MAX_METRIC_REGRESSION.items():
-        if name not in candidate or name not in incumbent:
-            continue
-        value, best = float(candidate[name]), float(incumbent[name])
-        if not (math.isfinite(value) and math.isfinite(best)):
-            return False
-        lower_is_better = name in {
-            "push_evaluator_loss", "push_evaluator_value_loss",
-            "push_evaluator_top1_miss_rate",
-        }
-        if lower_is_better and value > best + tolerance:
-            return False
-        if not lower_is_better and value < best - tolerance:
-            return False
-    return True
+PUSH_METRIC_PROTOCOL_VERSION = 7
+SELECTION_METRIC = "push_evaluator_auprc"
+def _metric_improved(candidate, incumbent):
+    return float(candidate[SELECTION_METRIC]) > float(incumbent[SELECTION_METRIC])
 
 
 def resume_compatibility(signature):
@@ -165,9 +125,7 @@ class PushTrainingCheckpoint:
         if not math.isfinite(score):
             return
         if self.best_metrics is not None:
-            if not _meaningful_rank_gain(metrics, self.best_metrics):
-                return
-            if not _has_no_material_regression(metrics, self.best_metrics):
+            if not _metric_improved(metrics, self.best_metrics):
                 return
         self.best_state = {k: v.detach().cpu().clone()
                            for k, v in self.model.push_evaluator.state_dict().items()}
@@ -176,7 +134,7 @@ class PushTrainingCheckpoint:
 
     def save_best(self, final_metrics=None):
         if self.best_state is None:
-            raise RuntimeError("PUSH evaluator validation did not produce a finite ranking score")
+            raise RuntimeError("PUSH evaluator validation did not produce a finite AUPRC")
         payload = self._payload(self.best_state, self.best_step)
         payload["validation_metrics"] = self.best_metrics
         if final_metrics is not None:

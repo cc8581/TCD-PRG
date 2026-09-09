@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import torch
 from tcd_prg.models.push.pointnet2 import PushPointNet2
 from tcd_prg.trainers.push_evaluator import push_effectiveness_batch_loss
-from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
+from tcd_prg.losses.push_effectiveness import PushImprovementLoss
 from tcd_prg.scripts.train_push_evaluator import accumulated_batches
 from test_independent_push import scene, model
 
@@ -12,7 +12,7 @@ def test_pointnet_backbone_receives_effect_gradients_and_updates():
     torch.manual_seed(7)
     m=model(); b=scene(); opt=torch.optim.AdamW(m.parameters(),lr=.001)
     before={k:v.clone() for k,v in m.push_evaluator.backbone.named_parameters()}
-    loss,_=push_effectiveness_batch_loss(m,b,instance_queries=4,loss_function=PushEffectivenessLoss())
+    loss,_=push_effectiveness_batch_loss(m,b,instance_queries=4,loss_function=PushImprovementLoss())
     loss.backward()
     for part in (m.push_evaluator.backbone.network.sa1,m.push_evaluator.backbone.network.sa4,
                  m.push_evaluator.backbone.network.fp1,m.push_evaluator.trunk):
@@ -24,9 +24,9 @@ def test_pointnet_backbone_receives_effect_gradients_and_updates():
 def test_fixed_input_repeats_and_ignores_external_perception_features():
     m=model().eval();b=scene()
     with torch.no_grad():
-        a=push_effectiveness_batch_loss(m,b,instance_queries=4,loss_function=PushEffectivenessLoss())[1]['push_value']
+        a=push_effectiveness_batch_loss(m,b,instance_queries=4,loss_function=PushImprovementLoss())[1]['improvement_logit']
         b['geometry_feature'].fill_(float('nan'))
-        c=push_effectiveness_batch_loss(m,b,instance_queries=4,loss_function=PushEffectivenessLoss())[1]['push_value']
+        c=push_effectiveness_batch_loss(m,b,instance_queries=4,loss_function=PushImprovementLoss())[1]['improvement_logit']
     assert torch.equal(a,c)
 
 
@@ -45,13 +45,13 @@ def test_accumulation_matches_action_weighted_batch_and_flushes_tail(monkeypatch
     config=SimpleNamespace(training=SimpleNamespace(gradient_accumulation_steps=2, push_fps_points=32),model=SimpleNamespace(instance_queries=4))
     opt=torch.optim.SGD(m.parameters(),lr=.01)
     batches=accumulated_batches(m,[first,empty,second,first],device=torch.device('cpu'),config=config,
-                                loss_function=PushEffectivenessLoss(),optimizer=opt)
+                                loss_function=PushImprovementLoss(),optimizer=opt)
     rng = torch.get_rng_state()
     _,count,_,_,components=next(batches);assert count==3
-    assert set(components) == {'value', 'rank'}
+    assert set(components) == {'bce'}
     torch.set_rng_state(rng)  # Match upstream random FPS choices for the reference.
-    l1,_=push_effectiveness_batch_loss(reference,first,instance_queries=4,loss_function=PushEffectivenessLoss())
-    l2,_=push_effectiveness_batch_loss(reference,second,instance_queries=4,loss_function=PushEffectivenessLoss())
+    l1,_=push_effectiveness_batch_loss(reference,first,instance_queries=4,loss_function=PushImprovementLoss())
+    l2,_=push_effectiveness_batch_loss(reference,second,instance_queries=4,loss_function=PushImprovementLoss())
     ((2*l1+l2)/3).backward()
     for p,q in zip(m.parameters(),reference.parameters()):
         torch.testing.assert_close(p.grad,q.grad,atol=2e-6,rtol=2e-4)
@@ -63,7 +63,7 @@ def test_accumulation_matches_action_weighted_batch_and_flushes_tail(monkeypatch
 def test_encoder_runs_once_for_multiple_actions():
     m=model();calls=[]
     hook=m.push_evaluator.backbone.register_forward_hook(lambda *args:calls.append(1))
-    push_effectiveness_batch_loss(m,scene(),instance_queries=4,loss_function=PushEffectivenessLoss())
+    push_effectiveness_batch_loss(m,scene(),instance_queries=4,loss_function=PushImprovementLoss())
     hook.remove();assert len(calls)==1
 
 
@@ -84,12 +84,12 @@ def test_multiple_scenes_share_backbone_call_and_receive_gradients():
     batch['rgb'].requires_grad_()
     try:
         loss,details=push_effectiveness_batch_loss(m,batch,instance_queries=4,
-                                                 loss_function=PushEffectivenessLoss())
+                                                 loss_function=PushImprovementLoss())
         loss.backward()
     finally:
         hook.remove()
     assert calls==[(2,batch['xyz'].shape[1],3)]
-    assert details['push_value'].shape==(4,)
+    assert details['improvement_logit'].shape==(4,)
     assert torch.isfinite(batch['rgb'].grad).all()
     assert (batch['rgb'].grad.abs().flatten(1).sum(1)>0).all()
     assert any(p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum()>0
@@ -223,8 +223,8 @@ def test_source_checksum_accepts_git_line_endings_but_rejects_edits(tmp_path):
 def test_inactive_push_keeps_ab_parameter_layout_and_rng():
     # Stage-C remains lazy during A/B construction; checkpoint migration is
     # responsible for replacing only its inactive tensors.
-    from tcd_prg.models.push import PushEffectivenessEvaluator
-    current=PushEffectivenessEvaluator(16,initialize_backbone=False)
+    from tcd_prg.models.push import PushImprovementEvaluator
+    current=PushImprovementEvaluator(16,initialize_backbone=False)
     assert current.backbone is None
     assert current.value_head.out_features == 1
     assert not hasattr(current, "safety_head")
@@ -232,19 +232,19 @@ def test_inactive_push_keeps_ab_parameter_layout_and_rng():
 
 
 def test_combined_deployment_loads_same_pointnet_without_using_a_encoder(tmp_path):
-    from tcd_prg.models.push import PushEffectivenessEvaluator
+    from tcd_prg.models.push import PushImprovementEvaluator
     from tcd_prg.models import push_condition_from_gt
     from tcd_prg.models.tcd_prg import TCDPRGModel
     from tcd_prg.models.staged_checkpoint import load_push_evaluator
     from tcd_prg.trainers.push_checkpoint import PushTrainingCheckpoint
     m=model().eval();b=scene();b['push_condition']=push_condition_from_gt(b,4)
     check=PushTrainingCheckpoint(tmp_path/'new.pt',m,{}, {})
-    check.consider_best({'push_evaluator_pairwise_ranking_accuracy':.5},1)
+    check.consider_best({'push_evaluator_auprc':.5},1)
     # No encoder is present: the public combined C boundary must not touch A.
-    combined=SimpleNamespace(push=m.push,push_evaluator=PushEffectivenessEvaluator(16,initialize_backbone=False).eval())
+    combined=SimpleNamespace(push=m.push,push_evaluator=PushImprovementEvaluator(16,initialize_backbone=False).eval())
     load_push_evaluator(combined,check.output)
     with torch.no_grad():
         expected=m(b)['push']
         actual=TCDPRGModel.forward_push_from_condition(combined,m._sensor(b),b['push_condition'])
     assert torch.equal(expected['actions'].contact_world,actual['actions'].contact_world)
-    assert torch.equal(expected['push_value'],actual['push_value'])
+    assert torch.equal(expected['improvement_logit'],actual['improvement_logit'])

@@ -1,4 +1,4 @@
-"""Build single-step structural PUSH-value targets from before/after states."""
+"""Build binary PUSH-improvement targets from before/after states."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from tcd_prg.config import load_config
-from tcd_prg.datasets.push_value import build_action_value_sidecar
+from tcd_prg.datasets.push_value import build_push_improvement_sidecar
 from tcd_prg.runtime import create_adapter
 
 
@@ -24,11 +24,11 @@ def main() -> None:
     adapter = create_adapter(config, allow_render=False)
     scene_ids = tuple(args.scene_id or adapter.snapshot_scene_ids)
     output_root = Path(args.output_root)
-    for scene_id in tqdm(scene_ids, desc="PUSH structural value", unit="scene"):
+    for scene_id in tqdm(scene_ids, desc="PUSH improvement", unit="scene"):
         output = output_root / f"scene_{scene_id:04d}.h5"
         if output.is_file() and not args.overwrite:
             continue
-        build_action_value_sidecar(
+        build_push_improvement_sidecar(
             adapter._path_by_scene[int(scene_id)],
             output,
             raw_relation_names=tuple(adapter.raw_relation_names),

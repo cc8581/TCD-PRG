@@ -39,7 +39,7 @@ class DenseCandidateGenerator:
             "contact_score": torch.empty(0, device=device),
             "utility": torch.empty(0, device=device),
             "direction_residual": torch.empty(0, 2, device=device),
-            "push_value": torch.empty(0, device=device),
+            "improvement_probability": torch.empty(0, device=device),
         }
 
     @staticmethod
@@ -225,7 +225,9 @@ class DenseCandidateGenerator:
         if not bool(getattr(model, "push_evaluator_ready", False)):
             # Unloaded evaluation weights must never authorize a PUSH selection.
             for decoded in decoded_push_rows:
-                decoded["push_value"] = torch.full_like(decoded["push_value"], float("nan"))
+                decoded["improvement_probability"] = torch.full_like(
+                    decoded["improvement_probability"], float("nan")
+                )
         for batch_row in range(sensor["xyz"].shape[0]):
             xyz = sensor["xyz"][batch_row]
             point_mask = sensor["point_mask"][batch_row]
@@ -255,7 +257,7 @@ class DenseCandidateGenerator:
             contact_score_parts: list[Tensor] = []
             utility_parts: list[Tensor] = []
             direction_residual_parts: list[Tensor] = []
-            push_value_parts: list[Tensor] = []
+            improvement_probability_parts: list[Tensor] = []
 
             # Terminal task grasp candidates belong to the predicted target query.
             task = output["task_grasp"]
@@ -310,7 +312,7 @@ class DenseCandidateGenerator:
                 direction_residual_parts.append(
                     torch.full((len(selected), 2), float("nan"), device=xyz.device)
                 )
-                push_value_parts.append(torch.full_like(task_score[selected], float("nan")))
+                improvement_probability_parts.append(torch.full_like(task_score[selected], float("nan")))
 
             # Generic remove grasps are assigned to predicted object queries.
             global_head = output["global_grasp"]
@@ -391,7 +393,7 @@ class DenseCandidateGenerator:
                 direction_residual_parts.append(
                     torch.full((len(selected), 2), float("nan"), device=xyz.device)
                 )
-                push_value_parts.append(torch.full_like(candidate_score[local], float("nan")))
+                improvement_probability_parts.append(torch.full_like(candidate_score[local], float("nan")))
 
             decoded_push = decoded_push_rows[batch_row]
             if len(decoded_push["point_index"]):
@@ -429,7 +431,7 @@ class DenseCandidateGenerator:
                 contact_score_parts.append(decoded_push["contact_score"])
                 utility_parts.append(decoded_push["utility"])
                 direction_residual_parts.append(decoded_push["direction_residual"])
-                push_value_parts.append(decoded_push["push_value"])
+                improvement_probability_parts.append(decoded_push["improvement_probability"])
 
             def joined(
                 parts: list[Tensor],
@@ -460,7 +462,9 @@ class DenseCandidateGenerator:
                     "contact_score": joined(contact_score_parts, (0,), xyz.dtype),
                     "utility": joined(utility_parts, (0,), xyz.dtype),
                     "direction_residual": joined(direction_residual_parts, (0, 2), xyz.dtype),
-                    "push_value": joined(push_value_parts, (0,), xyz.dtype),
+                    "improvement_probability": joined(
+                        improvement_probability_parts, (0,), xyz.dtype
+                    ),
                 }
             )
 
@@ -476,7 +480,7 @@ class DenseCandidateGenerator:
             "contact_score": float("nan"),
             "utility": float("nan"),
             "direction_residual": float("nan"),
-            "push_value": float("nan"),
+            "improvement_probability": float("nan"),
             "proposal_score": -1.0,
             "contact_world": float("nan"),
             "direction_world": float("nan"),

@@ -412,7 +412,7 @@ class TCDPRGPolicy(ManipulationPolicy):
                 push_contact_world=array("contact_world"),
                 push_direction_world=array("direction_world"),
                 push_distance_m=float(array("push_distance_m")),
-                push_value=float(array("push_value")),
+                improvement_probability=float(array("improvement_probability")),
             )
         else:
             action.update(
@@ -468,12 +468,14 @@ class TCDPRGPolicy(ManipulationPolicy):
             if not len(indices):
                 continue
             ranking_score = tensors[
-                "push_value" if action_type == ActionType.PUSH else "proposal_score"
+                "improvement_probability"
+                if action_type == ActionType.PUSH
+                else "proposal_score"
             ]
             if action_type == ActionType.PUSH and not bool(
                 torch.isfinite(ranking_score[0, indices]).all()
             ):
-                raise RuntimeError("PUSH selection requires a loaded PushEffectivenessEvaluator")
+                raise RuntimeError("PUSH selection requires a loaded PushImprovementEvaluator")
             order = indices[ranking_score[0, indices].argsort(descending=True, stable=True)]
             for index_tensor in order:
                 index = int(index_tensor)

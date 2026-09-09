@@ -5,7 +5,7 @@ import torch
 
 from tcd_prg.constants import PUSH_DISTANCE_M
 from tcd_prg.evaluators.push_effectiveness import push_effectiveness_metrics
-from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
+from tcd_prg.losses.push_effectiveness import PushImprovementLoss
 from tcd_prg.models.push_condition import PushCondition
 from tcd_prg.planners.push_decoder import proposal_recall_counts
 
@@ -37,23 +37,16 @@ def test_proposal_recall_uses_fixed_gt_denominator_and_ignores_unknown() -> None
     assert total == 2
 
 
-def test_effectiveness_loss_uses_structural_value_masks() -> None:
+def test_improvement_loss_uses_binary_validity_mask() -> None:
     score = torch.zeros(3, requires_grad=True)
-    losses = PushEffectivenessLoss()(
-        {"push_value": score},
-        value_target=torch.tensor([1.0, -1.0, float("nan")]),
-        value_valid=torch.tensor([True, True, False]),
-        rank_key=torch.tensor([
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
-            [0.0, -1.0, -1.0, 0.0, 0.0, 0.5, 0.0],
-            [float("nan")] * 7,
-        ]),
-        rank_valid=torch.tensor([True, True, False]),
-        group_index=torch.tensor([0,0,0]),
+    losses = PushImprovementLoss()(
+        {"improvement_logit": score},
+        improvement_target=torch.tensor([1.0, 0.0, 0.0]),
+        improvement_valid=torch.tensor([True, True, False]),
     )
-    losses["push_effectiveness"].backward()
+    losses["push_improvement"].backward()
     assert score.grad[2] == 0
-    assert losses["push_value_supervised_count"] == 2
+    assert losses["push_improvement_supervised_count"] == 2
 
 
 def test_effectiveness_metrics_report_binary_and_state_ranking_quality() -> None:

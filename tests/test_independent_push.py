@@ -5,7 +5,7 @@ from tcd_prg.config import ModelConfig
 from tcd_prg.constants import ActionType, CandidateStatus
 from tcd_prg.models import StandalonePushModel, push_condition_from_gt
 from tcd_prg.models.push import PushActions
-from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
+from tcd_prg.losses.push_effectiveness import PushImprovementLoss
 from tcd_prg.trainers.push_evaluator import logged_push_actions, push_effectiveness_batch_loss
 from tcd_prg.models.staged_checkpoint import load_push_evaluator, PUSH_EVALUATOR_PROTOCOL_VERSION, PUSH_ARCHITECTURE
 from tcd_prg.planners.push_decoder import decode_push_candidates
@@ -19,9 +19,6 @@ def scene():
                      square+torch.tensor([-.02, 0., .12]), square+torch.tensor([1., 0., .2])])[None]
     ids = torch.arange(4).repeat_interleave(len(square))[None]
     value = torch.tensor([[1.0, -1.0, 0.0]])
-    rank_key = torch.tensor([[[0., -1., -1., 0., 0., .6, .2],
-                              [0., -2., -1., 0., 0., .4, .2],
-                              [0., -3., -1., 0., 0., .3, .2]]])
     return dict(xyz=xyz, rgb=torch.zeros_like(xyz), point_mask=torch.ones_like(ids, dtype=torch.bool),
                 instance_id=ids, object_mask=torch.ones(1, 4, dtype=torch.bool),
                 target_mask=ids == 0, region_valid=ids == 0, region_target=ids == 0,
@@ -31,8 +28,7 @@ def scene():
                 action_type=torch.full((1, 3), int(ActionType.PUSH)),
                 evaluation_status=torch.tensor([[1, 0, int(CandidateStatus.UNKNOWN_UNTESTED)]]),
                 action_improves_state=torch.tensor([[True, False, True]]),
-                push_value_target=value, push_value_valid=torch.tensor([[True, True, False]]),
-                push_rank_key=rank_key, push_rank_valid=torch.tensor([[True, True, False]]),
+                push_improvement_target=torch.tensor([[1.0, 0.0, 0.0]]), push_improvement_valid=torch.tensor([[True, True, False]]),
                 potential_delta=torch.zeros(1, 3, 5),
                 potential_after_valid=torch.ones(1, 3, dtype=torch.bool),
                 acted_object=torch.tensor([[1, 1, 1]]),
@@ -54,10 +50,10 @@ def test_training_never_calls_rule_generator_or_rejects_far_contact(monkeypatch)
     actions, valid = logged_push_actions(batch, condition)
     assert len(actions.object) == 2
     assert torch.equal(actions.contact_world[0], batch["action_parameters"]["push_contact_world"][0, 0])
-    loss, details = push_effectiveness_batch_loss(m, batch, instance_queries=4, loss_function=PushEffectivenessLoss())
+    loss, details = push_effectiveness_batch_loss(m, batch, instance_queries=4, loss_function=PushImprovementLoss())
     loss.backward()
     assert torch.isfinite(loss)
-    assert details["push_value"].shape == (2,)
+    assert details["improvement_logit"].shape == (2,)
     assert any(p.grad is not None for p in m.push_evaluator.parameters())
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in m.push_evaluator.backbone.parameters())
     assert not list(m.push.parameters())
@@ -76,10 +72,10 @@ def test_rules_keep_multiple_above_objects_and_do_not_read_gt_actions():
     out = m(batch)
     assert torch.equal(out["push"]["actions"].contact_world, actions.contact_world)
     direct = m.score_actions(batch, condition, actions)
-    assert torch.allclose(direct["push_value"], out["push"]["push_value"])
+    assert torch.allclose(direct["improvement_logit"], out["push"]["improvement_logit"])
     pre, final = decode_push_candidates(out["sensor"], condition, out["push"], m.push.config)
     assert len(pre[0]["object"]) <= 32
-    assert torch.all(pre[0]["push_value"][:-1] >= pre[0]["push_value"][1:])
+    assert torch.all(pre[0]["improvement_probability"][:-1] >= pre[0]["improvement_probability"][1:])
 
 
 def test_gt_and_rule_action_contract_is_identical():
@@ -98,7 +94,7 @@ def test_gt_and_rule_action_contract_is_identical():
     for field in a.__dataclass_fields__:
         assert torch.allclose(getattr(logged, field), getattr(a, field))
     left, right = m.score_actions(batch, condition, logged), m.score_actions(batch, condition, a)
-    assert torch.allclose(left["push_value"], right["push_value"])
+    assert torch.allclose(left["improvement_logit"], right["improvement_logit"])
 
 
 def test_evaluator_can_overfit_opposite_outcomes_for_same_contact():
@@ -108,13 +104,13 @@ def test_evaluator_can_overfit_opposite_outcomes_for_same_contact():
     initial = None
     for _ in range(60):
         optimizer.zero_grad()
-        loss, details = push_effectiveness_batch_loss(m, batch, instance_queries=4, loss_function=PushEffectivenessLoss())
+        loss, details = push_effectiveness_batch_loss(m, batch, instance_queries=4, loss_function=PushImprovementLoss())
         if initial is None:
             initial = loss.item()
         loss.backward()
         optimizer.step()
     assert loss.item() < initial
-    assert details["push_value"][0] > details["push_value"][1]
+    assert details["improvement_logit"][0] > details["improvement_logit"][1]
 
 
 def test_checkpoint_is_independent_and_rejects_old_weights(tmp_path):
@@ -135,7 +131,7 @@ def test_empty_actions_and_invalid_direction():
     batch, m = scene(), model()
     condition = push_condition_from_gt(batch, 4)
     empty = PushActions.empty(batch["xyz"])
-    assert m.score_actions(batch, condition, empty)["push_value"].shape == (0,)
+    assert m.score_actions(batch, condition, empty)["improvement_logit"].shape == (0,)
     invalid = PushActions(torch.tensor([0]), torch.tensor([1]), torch.zeros(1, 3),
                           torch.zeros(1, 3), torch.tensor([.15]))
     with pytest.raises(ValueError, match="unit"):

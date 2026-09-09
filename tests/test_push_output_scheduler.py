@@ -120,44 +120,30 @@ def test_legacy_push_checkpoint_phase_is_recovered_from_boundary_and_log(tmp_pat
 
 def test_validation_short_labels(capsys):
     metrics = {'push_evaluator_' + key: value for key, value in {
-        'loss': .6783, 'pairwise_ranking_accuracy': .5906,
-        'value_loss': .072, 'top1_best_rate': .61,
-        'top1_improvement_rate': .58, 'top1_miss_rate': .39}.items()}
+        'loss': .6783, 'auroc': .5906, 'auprc': .572,
+        'top1_improvement_rate': .58, 'random_top1_improvement_rate': .39,
+        'top3_contains_improvement_rate': .81, 'f1': .62}.items()}
     print_validation_summary(metrics, 5000, .60)
     output = capsys.readouterr().out
     assert output.startswith('Val [push_evaluator] [0005000]  loss: 0.6783')
-    assert 'rank: 59.1%' in output and 'value loss: 0.0720' in output
+    assert 'AUROC: 59.1%' in output and 'AUPRC: 57.2%' in output
     assert '{' not in output and 'push_evaluator_' not in output
     print_validation_summary(metrics, 10000, .60, 'final')
-    assert 'best rank(subset)' in capsys.readouterr().out
+    assert 'best AUPRC(subset)' in capsys.readouterr().out
 
 
-def test_checkpoint_rejects_ranking_noise_and_joint_metric_regression(tmp_path):
+def test_checkpoint_selects_highest_auprc(tmp_path):
     from test_push_review_regressions import tiny_training
 
-    def metrics(rank, *, best=.60, improvement=.57, loss=.62, value=.23, miss=.13):
-        return {
-            'push_evaluator_pairwise_ranking_accuracy': rank,
-            'push_evaluator_pairwise_count': 12121.,
-            'push_evaluator_top1_best_rate': best,
-            'push_evaluator_top1_improvement_rate': improvement,
-            'push_evaluator_loss': loss,
-            'push_evaluator_value_loss': value,
-            'push_evaluator_top1_miss_rate': miss,
-        }
+    def metrics(auprc):
+        return {'push_evaluator_auprc': auprc}
 
     model, _ = tiny_training()
     checkpoint = PushTrainingCheckpoint(tmp_path / 'best.pt', model, {}, {})
     checkpoint.consider_best(metrics(.498309), 1000)
-    checkpoint.consider_best(metrics(.498391, best=.529, improvement=.500, loss=.639), 3000)
-    assert checkpoint.best_step == 1000
-
-    # About 1.3 percentage points are needed for independent 12,121-pair samples.
-    checkpoint.consider_best(metrics(.505), 4000)
-    assert checkpoint.best_step == 1000
+    checkpoint.consider_best(metrics(.498391), 3000)
+    assert checkpoint.best_step == 3000
+    checkpoint.consider_best(metrics(.495), 4000)
+    assert checkpoint.best_step == 3000
     checkpoint.consider_best(metrics(.52), 5000)
-    assert checkpoint.best_step == 5000
-
-    # Even a significant rank gain must not hide degraded top-1 structural quality.
-    checkpoint.consider_best(metrics(.54, best=.55), 6000)
     assert checkpoint.best_step == 5000

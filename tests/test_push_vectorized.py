@@ -27,10 +27,10 @@ def test_interleaved_scenes_match_single_action_outputs_and_gradients():
     for i in range(4):
         torch.manual_seed(5)
         expected.append(reference.score_actions(batch,condition,subset(actions,slice(i,i+1))))
-    for key in ('push_value',):
+    for key in ('improvement_logit',):
         torch.testing.assert_close(actual[key],torch.cat([v[key] for v in expected]),atol=2e-5,rtol=2e-4)
-    actual['push_value'].sum().backward()
-    sum(v['push_value'].sum() for v in expected).backward()
+    actual['improvement_logit'].sum().backward()
+    sum(v['improvement_logit'].sum() for v in expected).backward()
     for (name,p),(_,q) in zip(network.named_parameters(),reference.named_parameters()):
         if p.grad is not None:
             assert torch.isfinite(p.grad).all(),name

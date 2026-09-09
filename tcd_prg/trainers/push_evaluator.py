@@ -1,4 +1,4 @@
-"""Logged-action-only Stage-C core-value training. Rules stay inference-only."""
+"""Logged-action-only binary PUSH-improvement training."""
 import torch
 from tcd_prg.constants import PUSH_DISTANCE_M, ActionType, CandidateStatus
 from tcd_prg.models import push_condition_from_gt
@@ -65,29 +65,22 @@ def push_effectiveness_batch_loss(
             prediction = model.score_actions(batch, condition, actions)
         losses = loss_function(
             prediction,
-            value_target=batch["push_value_target"][valid],
-            value_valid=batch["push_value_valid"][valid],
-            rank_key=batch["push_rank_key"][valid],
-            rank_valid=batch["push_rank_valid"][valid],
-            group_index=actions.batch_index,
+            improvement_target=batch["push_improvement_target"][valid],
+            improvement_valid=batch["push_improvement_valid"][valid],
         )
-        loss = losses["push_effectiveness"]
+        loss = losses["push_improvement"]
     else:
         loss = sum(parameter.sum() * 0.0 for parameter in model.push_evaluator.parameters())
-        prediction = {"push_value": loss.expand(0)}
+        prediction = {"improvement_logit": loss.expand(0)}
         losses = {
-            "push_effectiveness": loss,
-            "push_value_ordinal": loss.detach(),
-            "push_rank": loss.detach(),
-            "push_value_supervised_count": loss.detach(),
-            "push_rank_pair_count": loss.detach(),
+            "push_improvement": loss,
+            "push_improvement_bce": loss.detach(),
+            "push_improvement_supervised_count": loss.detach(),
         }
     return loss, {
         **losses,
         **prediction,
-        "value_target": batch["push_value_target"][valid],
-        "value_valid": batch["push_value_valid"][valid].bool(),
-        "rank_key": batch["push_rank_key"][valid],
-        "rank_valid": batch["push_rank_valid"][valid].bool(),
+        "improvement_target": batch["push_improvement_target"][valid],
+        "improvement_valid": batch["push_improvement_valid"][valid].bool(),
         "effective_group_index": actions.batch_index,
     }

@@ -2,7 +2,7 @@ import h5py
 import numpy as np
 
 from tcd_prg.constants import ActionType, OutcomeCode
-from tcd_prg.datasets.push_value import build_action_value_sidecar
+from tcd_prg.datasets.push_value import build_push_improvement_sidecar
 
 
 RELATIONS = ("near", "contact", "support", "occlude", "block_path")
@@ -54,25 +54,42 @@ def test_removing_indirect_top_blocker_is_positive_even_when_grasp_count_stays_z
     source = tmp_path / "scene_0000.h5"
     output = tmp_path / "value.h5"
     _scene(source)
-    build_action_value_sidecar(source, output, raw_relation_names=RELATIONS)
+    build_push_improvement_sidecar(source, output, raw_relation_names=RELATIONS)
     with h5py.File(output, "r") as result:
-        assert int(result.attrs["schema_version"]) == 5
+        assert int(result.attrs["schema_version"]) == 7
+        np.testing.assert_array_equal(
+            result.attrs["component_eps"],
+            np.asarray([0, 0, 0, 0, 0, 0.01, 1e-6]),
+        )
         assert result.attrs["teacher"] == "none"
-        assert bool(result["value_valid"][0])
-        assert float(result["value_target"][0]) == 1.0
-        before = result["before_rank_key"][0]
-        after = result["after_rank_key"][0]
-        # Immediate grasp progress remains identical (both zero).
-        assert before[-1] == after[-1] == 0.0
-        # Dependency blocker burden improves from 2 to 1.
-        assert before[1] == -2.0 and after[1] == -1.0
+        assert bool(result["improvement_valid"][0])
+        assert float(result["improvement_target"][0]) == 1.0
+        delta = result["component_delta"][0]
+        assert delta[-1] == 0.0
+        assert delta[1] == 1.0
 
 
 def test_unsafe_transition_is_excluded_not_learned_as_negative(tmp_path):
     source = tmp_path / "scene_0000.h5"
     output = tmp_path / "value.h5"
     _scene(source, unsafe=True)
-    build_action_value_sidecar(source, output, raw_relation_names=RELATIONS)
+    build_push_improvement_sidecar(source, output, raw_relation_names=RELATIONS)
     with h5py.File(output, "r") as result:
-        assert not bool(result["value_valid"][0])
-        assert np.isnan(result["value_target"][0])
+        assert not bool(result["improvement_valid"][0])
+        assert float(result["improvement_target"][0]) == 0.0
+
+
+def test_subpercent_visibility_change_is_neutral(tmp_path):
+    source = tmp_path / "scene_0000.h5"
+    output = tmp_path / "value.h5"
+    _scene(source)
+    with h5py.File(source, "r+") as handle:
+        handle["scene_0000/states/target_visible_ratio"][:] = [0.2, 0.205]
+        # Keep blocker structure identical so visibility is the first possible
+        # differing component.
+        handle["scene_0000/states/relation_graph"][0] = (
+            handle["scene_0000/states/relation_graph"][1]
+        )
+    build_push_improvement_sidecar(source, output, raw_relation_names=RELATIONS)
+    with h5py.File(output, "r") as result:
+        assert float(result["improvement_target"][0]) == 0.0

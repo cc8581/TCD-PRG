@@ -177,7 +177,7 @@ class PushValueBatchCollator:
     def __call__(self, samples: list[Any]) -> dict[str, Any]:
         import numpy as np
         import torch
-        from tcd_prg.datasets.push_value import PushActionValueStore
+        from tcd_prg.datasets.push_value import PushImprovementStore
 
         # Stage C first learns the core causal mapping on a deployment-matched
         # clean sensor distribution. The old shared RGB/geometric augmentation
@@ -185,15 +185,13 @@ class PushValueBatchCollator:
         batch = UnifiedBatchCollator(
             self.config, training=False, include_graspnet=False
         )(samples)
-        root = self.config.training.push_value_root
+        root = self.config.training.push_improvement_root
         if not root:
-            raise RuntimeError("Stage-C training requires training.push_value_root")
-        store = PushActionValueStore(root)
+            raise RuntimeError("Stage-C training requires training.push_improvement_root")
+        store = PushImprovementStore(root)
         shape = batch["candidate_action_id"].shape
-        value = torch.full(shape, float("nan"), dtype=torch.float32)
-        value_valid = torch.zeros(shape, dtype=torch.bool)
-        rank_key = torch.full((*shape, 7), float("nan"), dtype=torch.float32)
-        rank_valid = torch.zeros(shape, dtype=torch.bool)
+        target = torch.zeros(shape, dtype=torch.float32)
+        target_valid = torch.zeros(shape, dtype=torch.bool)
         scene_payloads: dict[int, dict[str, Any]] = {}
         for row, sample in enumerate(samples):
             scene_id = int(sample.observation.scene_id)
@@ -202,7 +200,7 @@ class PushValueBatchCollator:
             payload = scene_payloads[scene_id]
             action_ids = np.asarray(payload["action_id"], np.int64)
             if len(action_ids) and np.any(action_ids[1:] <= action_ids[:-1]):
-                raise RuntimeError("Stage-C action-value IDs must be strictly increasing")
+                raise RuntimeError("Stage-C improvement action IDs must be strictly increasing")
             candidates = np.asarray(sample.candidates.candidate_action_ids, np.int64)
             if len(action_ids):
                 locations = np.searchsorted(action_ids, candidates)
@@ -213,17 +211,11 @@ class PushValueBatchCollator:
                 matched = np.zeros_like(candidates, dtype=bool)
             for local in np.flatnonzero(matched):
                 source = int(locations[local])
-                value[row, local] = float(payload["value_target"][source])
-                value_valid[row, local] = bool(payload["value_valid"][source])
-                rank_key[row, local] = torch.from_numpy(
-                    np.asarray(payload["after_rank_key"][source], np.float32)
-                )
-                rank_valid[row, local] = bool(payload["value_valid"][source])
+                target[row, local] = float(payload["improvement_target"][source])
+                target_valid[row, local] = bool(payload["improvement_valid"][source])
         batch.update(
-            push_value_target=value,
-            push_value_valid=value_valid,
-            push_rank_key=rank_key,
-            push_rank_valid=rank_valid,
+            push_improvement_target=target,
+            push_improvement_valid=target_valid,
         )
         return batch
 

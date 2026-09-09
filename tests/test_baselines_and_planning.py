@@ -83,7 +83,7 @@ def test_dense_generator_handles_a_scene_with_no_candidate() -> None:
         "attention_point_index": torch.zeros(1, 2, dtype=torch.long),
         "object_logits": torch.zeros(1, 2, 1),
     }
-    push = {"actions": PushActions.empty(batch["xyz"]), "push_value": torch.empty(0)}
+    push = {"actions": PushActions.empty(batch["xyz"]), "improvement_logit": torch.empty(0)}
     encoded = _predicted_encoded(torch.ones(1, 1, 4), batch["object_mask"])
 
     class Model:

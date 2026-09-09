@@ -206,12 +206,12 @@ def push_candidate_ranking_counts(
         known_candidate_count += known.sum().to(reference.dtype)
         if not bool(positive.any()):
             continue
-        push_value = row.get("push_value")
-        if push_value is None or len(push_value) != len(positive):
-            raise ValueError("candidate row is missing push_value")
-        if not bool(torch.isfinite(push_value).all()):
-            raise ValueError("push_value contains non-finite values")
-        order = push_value.argsort(descending=True, stable=True)
+        probability = row.get("improvement_probability")
+        if probability is None or len(probability) != len(positive):
+            raise ValueError("candidate row is missing improvement_probability")
+        if not bool(torch.isfinite(probability).all()):
+            raise ValueError("improvement_probability contains non-finite values")
+        order = probability.argsort(descending=True, stable=True)
         positive_sets += 1.0
         top1 = order[:1]
         if bool(known[top1].all()):

@@ -63,7 +63,7 @@ def test_best_is_immediate_and_resume_preserves_optimizer_next_update(tmp_path):
     model, optimizer = tiny_training()
     update(model, optimizer)
     check = PushTrainingCheckpoint(tmp_path/'best.pt', model, {}, {'population':3})
-    check.consider_best({'push_evaluator_pairwise_ranking_accuracy':.8},1)
+    check.consider_best({'push_evaluator_auprc':.8},1)
     assert check.output.is_file()  # Before final validation, or any later training.
     check.save_latest(optimizer,1)
     stored = torch.load(check.output,weights_only=False)
@@ -76,7 +76,7 @@ def test_best_is_immediate_and_resume_preserves_optimizer_next_update(tmp_path):
     update(restored,new_optimizer)
     for a,b in zip(model.push_evaluator.parameters(),restored.push_evaluator.parameters()):
         assert torch.equal(a,b)
-    check.consider_best({'push_evaluator_pairwise_ranking_accuracy':.5},2)
+    check.consider_best({'push_evaluator_auprc':.5},2)
     assert torch.load(check.output,weights_only=False)['optimizer_steps']==1
     load_push_evaluator(restored,check.output)
     assert restored.push_evaluator_ready
@@ -101,10 +101,10 @@ def test_atomic_failure_keeps_published_checkpoint(tmp_path,monkeypatch):
 def test_resume_retains_best_published_after_last_snapshot(tmp_path):
     model, optimizer = tiny_training()
     check = PushTrainingCheckpoint(tmp_path/'best.pt',model,{}, {})
-    check.consider_best({'push_evaluator_pairwise_ranking_accuracy':.6},1)
+    check.consider_best({'push_evaluator_auprc':.6},1)
     check.save_latest(optimizer,1)
     update(model,optimizer)
-    check.consider_best({'push_evaluator_pairwise_ranking_accuracy':.9},2)
+    check.consider_best({'push_evaluator_auprc':.9},2)
     expected = {k:v.clone() for k,v in check.best_state.items()}
     restored, new_optimizer = tiny_training()
     other = PushTrainingCheckpoint(check.output,restored,{}, {})
@@ -147,14 +147,12 @@ def test_training_entry_survives_final_validation_failure_and_resumes(tmp_path,m
         assert Path(cfg.output_dir) == tmp_path.resolve()
         return lambda samples:samples[0]
     monkeypatch.setattr(entry,'PushValueBatchCollator',collator)
-    real_loss = entry.PushEffectivenessLoss
+    real_loss = entry.PushImprovementLoss
     def fixed_loss(*args,**kwargs):
-        assert not args and set(kwargs) == {
-            'value_weight', 'rank_weight', 'score_temperature'
-        }
+        assert not args and set(kwargs) == {'pos_weight'}
         ready['loss'] = True
         return real_loss(*args,**kwargs)
-    monkeypatch.setattr(entry,'PushEffectivenessLoss',fixed_loss)
+    monkeypatch.setattr(entry,'PushImprovementLoss',fixed_loss)
     real_evaluate = entry._evaluate
     calls = []
     def evaluate(*args,**kwargs):
@@ -174,7 +172,7 @@ def test_training_entry_survives_final_validation_failure_and_resumes(tmp_path,m
     assert payload['optimizer_steps']==2
     assert payload['scheduler']['last_epoch']==2
     assert (tmp_path/'resolved_config.yaml').is_file()
-    assert payload['selection_metric']=='push_evaluator_pairwise_ranking_accuracy'
+    assert payload['selection_metric']=='push_evaluator_auprc'
     assert 'positive_count' not in payload and 'negative_count' not in payload
     assert not hasattr(entry,'_counts') and not hasattr(entry,'_count_loader')
     monkeypatch.setattr(entry,'_evaluate',real_evaluate)
@@ -188,15 +186,11 @@ def test_training_entry_survives_final_validation_failure_and_resumes(tmp_path,m
 
 
 def test_new_objective_uses_only_explicit_valid_masks():
-    from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
+    from tcd_prg.losses.push_effectiveness import PushImprovementLoss
     score = torch.zeros(2, requires_grad=True)
-    loss = PushEffectivenessLoss()(
-        {'push_value':score},
-        value_target=torch.tensor([1.0, float('nan')]),
-        value_valid=torch.tensor([True,False]),
-        rank_key=torch.tensor([[0.,-1.,-1.,0.,0.,.5,.0],
-                               [float('nan')]*7]),
-        rank_valid=torch.tensor([True,False]),
-        group_index=torch.tensor([0,0]))['push_effectiveness']
+    loss = PushImprovementLoss()(
+        {'improvement_logit':score},
+        improvement_target=torch.tensor([1.0, 0.0]),
+        improvement_valid=torch.tensor([True,False]))['push_improvement']
     loss.backward()
     assert score.grad[1] == 0

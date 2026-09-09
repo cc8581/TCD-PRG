@@ -54,7 +54,7 @@ def test_training_fps_uses_requested_count(count):
 def test_training_and_validation_use_the_same_configured_count():
     from torch import nn
     from test_independent_push import model
-    from tcd_prg.losses.push_effectiveness import PushEffectivenessLoss
+    from tcd_prg.losses.push_effectiveness import PushImprovementLoss
     from tcd_prg.trainers.push_evaluator import push_effectiveness_batch_loss
     class FeatureProbe(nn.Module):
         def __init__(self):
@@ -77,12 +77,12 @@ def test_training_and_validation_use_the_same_configured_count():
                              model=SimpleNamespace(instance_queries=4))
     opt = torch.optim.SGD(m.parameters(), lr=.001)
     updates = list(accumulated_batches(m, [batch], device=torch.device('cpu'), config=config,
-                                      loss_function=PushEffectivenessLoss(), optimizer=opt))
+                                      loss_function=PushImprovementLoss(), optimizer=opt))
     assert len(updates) == 1 and updates[0][1:3] == (4, 2)
     assert probe.shapes == [(2, 1024, 3)]
     assert torch.equal(batch['xyz'], original)
     with torch.no_grad():
         push_effectiveness_batch_loss(
-            m.eval(), batch, instance_queries=4, loss_function=PushEffectivenessLoss(),
+            m.eval(), batch, instance_queries=4, loss_function=PushImprovementLoss(),
             scene_sample_points=config.training.push_fps_points)
     assert probe.shapes[-1] == (2, config.training.push_fps_points, 3)

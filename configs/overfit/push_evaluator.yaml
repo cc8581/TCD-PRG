@@ -6,9 +6,18 @@ defaults:
 training:
   seed: 2026
   deterministic: true
-  batch_size: 1
-  max_optimizer_steps: 200
-  validation_interval: 20
+  batch_size: 4
+  max_optimizer_steps: 2000
+  validation_interval: 200
   num_workers: 0
-  max_train_groups: 64
-  max_validation_groups: 64
+  max_train_groups: 200
+  max_validation_groups: 200
+  push_overfit_validate_train: true
+
+optimizer:
+  learning_rate: 0.001
+  backbone_learning_rate: 0.0001
+  weight_decay: 0.0
+
+scheduler:
+  warmup_steps: 100

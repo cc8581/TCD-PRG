@@ -22,7 +22,7 @@ from .backbones import (
     TaskConditionedPointTransformer,
 )
 from .graspnet import FrozenGraspNetProposalGenerator
-from .push import PushEffectivenessEvaluator, RulePushGenerator
+from .push import PushImprovementEvaluator, RulePushGenerator
 from .region import TaskRegionHead
 from .stageb_condition import StageBCondition
 from .push_condition import PushCondition
@@ -165,7 +165,7 @@ class TCDPRGModel(nn.Module):
         )
         self.push = RulePushGenerator(c)
         self.push_evaluator_ready = False
-        self.push_evaluator = PushEffectivenessEvaluator(
+        self.push_evaluator = PushImprovementEvaluator(
             c.feature_dim, c.num_categories, c.num_task_regions, initialize_backbone=False
         )
 

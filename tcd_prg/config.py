@@ -425,11 +425,12 @@ class TrainingConfig:
 
     # Stage-C only; required by its training entrypoint, unused by A/B.
     push_fps_points: int | None = None
-    # Stage-C single-head structural action-value sidecars.
-    push_value_root: str | None = None
-    push_value_loss_weight: float = 1.0
-    push_rank_loss_weight: float = 1.0
-    push_score_temperature: float = 0.1
+    # Stage-C binary PUSH-improvement sidecars and fixed dataset-level weight.
+    push_improvement_root: str | None = None
+    push_improvement_pos_weight: float | None = None
+    # Diagnostic only: evaluate the exact fixed training subset to test whether
+    # Stage C can memorize within-state ordering before a formal run.
+    push_overfit_validate_train: bool = False
 
 
 @dataclass(slots=True)
@@ -550,11 +551,9 @@ class TCDPRGConfig:
 
     def validate(self) -> None:
         training = self.training
-        for name in ("push_value_loss_weight", "push_rank_loss_weight"):
-            if float(getattr(training, name)) < 0:
-                raise ValueError(f"training.{name} cannot be negative")
-        if training.push_score_temperature <= 0:
-            raise ValueError("training.push_score_temperature must be positive")
+        if (training.push_improvement_pos_weight is not None
+                and training.push_improvement_pos_weight <= 0):
+            raise ValueError("training.push_improvement_pos_weight must be positive")
         augmentation = self.augmentation
         if augmentation.debug.save_first_batches < 0:
             raise ValueError("augmentation.debug.save_first_batches cannot be negative")

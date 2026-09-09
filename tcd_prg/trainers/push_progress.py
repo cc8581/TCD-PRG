@@ -1,4 +1,4 @@
-"""Core PUSH-value training/validation progress."""
+"""Binary PUSH-improvement training and validation progress."""
 import json
 import time
 from pathlib import Path
@@ -28,7 +28,7 @@ class PushTrainingProgress:
         self.last_step = initial_step
         self.initial_step = initial_step
         self.loss_sum = 0.0
-        self.component_sums = dict(value=0.0, rank=0.0)
+        self.component_sums = dict(bce=0.0)
         self.actions = self.positive = 0
         self.diagnostics = dict(
             gradient_norm=0.0,
@@ -73,8 +73,7 @@ class PushTrainingProgress:
             max_optimizer_steps=self.maximum,
             window_steps=steps,
             loss=self.loss_sum / self.actions,
-            value_loss=self.component_sums["value"] / self.actions,
-            rank_loss=self.component_sums["rank"] / self.actions,
+            bce_loss=self.component_sums["bce"] / self.actions,
             improved_fraction=self.positive / self.actions,
             actions=self.actions,
             learning_rate=float(learning_rate),
@@ -88,8 +87,7 @@ class PushTrainingProgress:
             f"Train [push_evaluator] [{step:07d}/{self.maximum:07d}]",
             f"eta: {duration(record['eta_train_seconds'])}",
             f"loss: {record['loss']:.4f}",
-            f"value: {record['value_loss']:.4f}",
-            f"rank: {record['rank_loss']:.4f}",
+            f"bce: {record['bce_loss']:.4f}",
             f"improved: {record['improved_fraction']:.1%}",
             f"lr: {learning_rate:.3e}",
             f"grad: {record['gradient_norm']:.3f}->{record['gradient_norm_after_clip']:.3f}",
@@ -113,13 +111,15 @@ def print_validation_summary(metrics, step, best_score, phase="periodic"):
     fields = [
         f"Val [push_evaluator] [{step:07d}]",
         f"loss: {metrics['push_evaluator_loss']:.4f}",
-        f"rank: {metrics['push_evaluator_pairwise_ranking_accuracy']:.1%}",
-        f"best rank: {best_score:.1%}",
-        f"top1 best: {metrics['push_evaluator_top1_best_rate']:.1%}",
-        f"top1 improve: {metrics['push_evaluator_top1_improvement_rate']:.1%}",
-        f"value loss: {metrics['push_evaluator_value_loss']:.4f}",
+        f"AUROC: {metrics['push_evaluator_auroc']:.1%}",
+        f"AUPRC: {metrics['push_evaluator_auprc']:.1%}",
+        f"best AUPRC: {best_score:.1%}",
+        f"top1 improve: {metrics['push_evaluator_top1_improvement_rate']:.1%} "
+        f"(random {metrics.get('push_evaluator_random_top1_improvement_rate', float('nan')):.1%})",
+        f"top3 improve: {metrics['push_evaluator_top3_contains_improvement_rate']:.1%}",
+        f"F1: {metrics['push_evaluator_f1']:.1%}",
     ]
     if phase == "final":
         fields.append("split: full validation")
-        fields[3] = f"best rank(subset): {best_score:.1%}"
+        fields[4] = f"best AUPRC(subset): {best_score:.1%}"
     print("  ".join(fields), flush=True)

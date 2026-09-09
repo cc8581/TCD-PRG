@@ -69,7 +69,7 @@ def test_policy_heads_match_training_contract(tiny_batch) -> None:
         "target_crop_points",
     } <= set(output["task_grasp"])
     assert "object_logits" in output["global_grasp"]
-    assert output["push"]["push_value"].ndim == 1
+    assert output["push"]["improvement_logit"].ndim == 1
     assert "approach_logits" not in output["push"]
     assert "risk_logits" not in output["push"]
     assert "pick_remove" not in output

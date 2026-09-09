@@ -1,6 +1,6 @@
 """Independent, end-to-end PointNet++ PUSH evaluator; no perception weights."""
 from torch import nn
-from .push import PushEffectivenessEvaluator, RulePushGenerator
+from .push import PushImprovementEvaluator, RulePushGenerator
 
 
 class StandalonePushModel(nn.Module):
@@ -8,7 +8,7 @@ class StandalonePushModel(nn.Module):
         super().__init__()
         self.push = RulePushGenerator(config)
         self.push_evaluator_ready = False
-        self.push_evaluator = PushEffectivenessEvaluator(
+        self.push_evaluator = PushImprovementEvaluator(
             config.feature_dim, config.num_categories, config.num_task_regions)
 
     @staticmethod

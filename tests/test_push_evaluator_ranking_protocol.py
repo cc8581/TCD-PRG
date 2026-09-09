@@ -32,7 +32,7 @@ def test_candidate_ranking_is_conditioned_on_proposal_success() -> None:
             "contact_world": torch.tensor([[0.10, 0.0, 0.0], [0.0, 0.0, 0.0]]),
             "direction_world": torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
             "proposal_score": torch.tensor([0.9, 0.8]),
-            "push_value": torch.tensor([0.1, 0.9]),
+            "improvement_probability": torch.tensor([0.1, 0.9]),
         }
     ]
     masks = proposal_positive_match_masks(
@@ -52,7 +52,7 @@ def test_proposal_miss_is_not_charged_to_evaluator() -> None:
             "contact_world": torch.tensor([[0.30, 0.0, 0.0]]),
             "direction_world": torch.tensor([[1.0, 0.0, 0.0]]),
             "proposal_score": torch.tensor([0.9]),
-            "push_value": torch.tensor([0.9]),
+            "improvement_probability": torch.tensor([0.9]),
         }
     ]
     masks = proposal_positive_match_masks(

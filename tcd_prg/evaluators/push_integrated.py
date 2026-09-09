@@ -84,7 +84,7 @@ def integrated_push_proposal_counts(
         getattr(wrapped_stage_c, "push_evaluator_ready", False)
     ):
         raise RuntimeError(
-            "Integrated PUSH evaluation requires a loaded PushEffectivenessEvaluator"
+            "Integrated PUSH evaluation requires a loaded PushImprovementEvaluator"
         )
     targets = build_instance_targets(dict(batch), config.model.instance_queries)
     matcher = InstanceSetLoss(matching_points=config.model.instance_matching_points)

@@ -1,4 +1,4 @@
-"""Versioned offline state/action values for finite-horizon Stage-C training."""
+"""Offline state metadata and binary Stage-C PUSH-improvement labels."""
 
 from __future__ import annotations
 
@@ -11,10 +11,16 @@ import h5py
 import numpy as np
 
 from tcd_prg.constants import ActionType, OutcomeCode
+from tcd_prg.push_improvement import (
+    PUSH_IMPROVEMENT_COMPONENT_EPS,
+    PUSH_IMPROVEMENT_COMPONENT_NAMES,
+    PUSH_IMPROVEMENT_DEFINITION,
+    improvement_event,
+)
 
 
 PUSH_VALUE_SCHEMA_VERSION = 1  # State-sidecar schema retained for compatibility.
-PUSH_ACTION_VALUE_SCHEMA_VERSION = 5
+PUSH_IMPROVEMENT_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,15 +100,6 @@ def write_state_values(path: str | Path, values: StateValues) -> None:
 
 def _ragged_state_values(values: np.ndarray, offsets: np.ndarray, index: int) -> np.ndarray:
     return values[int(offsets[index]) : int(offsets[index + 1])]
-
-
-def _lexicographic_compare_numpy(left: np.ndarray, right: np.ndarray, eps: float = 1e-6) -> int:
-    """Return +1 / 0 / -1 when ``left`` is better / tied / worse."""
-    for lhs, rhs in zip(left.tolist(), right.tolist(), strict=True):
-        difference = float(lhs) - float(rhs)
-        if abs(difference) > eps:
-            return 1 if difference > 0 else -1
-    return 0
 
 
 def _structural_state_progress_keys(
@@ -226,13 +223,13 @@ def _structural_state_progress_keys(
     return keys, valid
 
 
-def build_action_value_sidecar(
+def build_push_improvement_sidecar(
     scene_label_path: str | Path,
     output_path: str | Path,
     *,
     raw_relation_names: tuple[str, ...],
 ) -> None:
-    """Build single-step structural PUSH-value supervision.
+    """Build binary single-step PUSH-improvement supervision.
 
     Only executed, linked PUSH transitions with a valid post-state and without
     an explicitly invalid/unsafe outcome supervise the evaluator.  Safety is
@@ -286,44 +283,55 @@ def build_action_value_sidecar(
             np.int8,
         ),
     )
-    value_valid = (
+    improvement_valid = (
         linked
         & execution_valid
         & state_key_valid[clipped_from]
         & state_key_valid[clipped_to]
     )
 
-    value_target = np.full(len(action_type), np.nan, np.float32)
-    before_key = np.full((len(action_type), state_key.shape[1]), np.nan, np.float32)
-    after_key = np.full_like(before_key, np.nan)
-    for action_index in np.flatnonzero(value_valid):
+    improvement_target = np.zeros(len(action_type), np.float32)
+    component_delta = np.full((len(action_type), state_key.shape[1]), np.nan, np.float32)
+    improvement_reason_mask = np.zeros(len(action_type), np.uint8)
+    regression_mask = np.zeros(len(action_type), np.uint8)
+    for action_index in np.flatnonzero(improvement_valid):
         source = int(from_state[action_index])
         target = int(to_state[action_index])
-        before_key[action_index] = state_key[source]
-        after_key[action_index] = state_key[target]
-        value_target[action_index] = float(
-            _lexicographic_compare_numpy(state_key[target], state_key[source])
+        improved, positive, regression, delta = improvement_event(
+            state_key[source], state_key[target]
+        )
+        improvement_target[action_index] = float(improved)
+        component_delta[action_index] = delta
+        improvement_reason_mask[action_index] = sum(
+            (1 << index) for index in np.flatnonzero(positive)
+        )
+        regression_mask[action_index] = sum(
+            (1 << index) for index in np.flatnonzero(regression)
         )
 
     push = (action_type == int(ActionType.PUSH)) & executed
     action_ids = np.flatnonzero(push).astype(np.int64)
 
     def writer(output: h5py.File) -> None:
-        output.attrs["schema_version"] = PUSH_ACTION_VALUE_SCHEMA_VERSION
-        output.attrs["value_definition"] = "one_step_structural_task_progress_lexicographic_v1"
+        output.attrs["schema_version"] = PUSH_IMPROVEMENT_SCHEMA_VERSION
+        output.attrs["improvement_definition"] = PUSH_IMPROVEMENT_DEFINITION
         output.attrs["teacher"] = "none"
-        output.attrs["learned_heads"] = "push_value_only"
-        output.attrs["rank_key_definition"] = (
+        output.attrs["learned_heads"] = "improvement_logit_only"
+        output.attrs["component_definition"] = (
             "goal,-dependency_blockers,-direct_blockers,-task_region_pressed,"
             "-target_pressed,target_visibility,verified_grasp_progress"
         )
+        output.attrs["component_eps"] = np.asarray(PUSH_IMPROVEMENT_COMPONENT_EPS, np.float64)
+        output.attrs["visibility_eps"] = PUSH_IMPROVEMENT_COMPONENT_EPS[5]
+        output.attrs["components"] = ",".join(PUSH_IMPROVEMENT_COMPONENT_NAMES)
         output.create_dataset("action_id", data=action_ids, compression="gzip")
         output.create_dataset("from_state", data=from_state[push], compression="gzip")
         output.create_dataset("to_state", data=to_state[push], compression="gzip")
-        output.create_dataset("value_target", data=value_target[push], compression="gzip")
-        output.create_dataset("value_valid", data=value_valid[push], compression="gzip")
-        output.create_dataset("before_rank_key", data=before_key[push], compression="gzip")
-        output.create_dataset("after_rank_key", data=after_key[push], compression="gzip")
+        output.create_dataset("improvement_target", data=improvement_target[push], compression="gzip")
+        output.create_dataset("improvement_valid", data=improvement_valid[push], compression="gzip")
+        output.create_dataset("component_delta", data=component_delta[push], compression="gzip")
+        output.create_dataset("improvement_reason_mask", data=improvement_reason_mask[push], compression="gzip")
+        output.create_dataset("regression_mask", data=regression_mask[push], compression="gzip")
         output.create_dataset("outcome_code", data=outcome[push], compression="gzip")
         # Diagnostic only: never fed to the model/loss.
         output.create_dataset(
@@ -333,7 +341,7 @@ def build_action_value_sidecar(
     _atomic_h5(Path(output_path), writer)
 
 
-class PushActionValueStore:
+class PushImprovementStore:
     """Read-only single-head Stage-C supervision lookup."""
 
     def __init__(self, root: str | Path, horizons: int | None = None) -> None:
@@ -343,19 +351,21 @@ class PushActionValueStore:
     def load_scene(self, scene_id: int) -> dict[str, np.ndarray]:
         path = self.root / f"scene_{int(scene_id):04d}.h5"
         with h5py.File(path, "r", swmr=True) as handle:
-            if int(handle.attrs.get("schema_version", -1)) != PUSH_ACTION_VALUE_SCHEMA_VERSION:
+            if int(handle.attrs.get("schema_version", -1)) != PUSH_IMPROVEMENT_SCHEMA_VERSION:
                 raise RuntimeError(
-                    f"Unsupported action-value schema: {path}; rebuild Stage-C structural sidecars"
+                    f"Unsupported improvement schema: {path}; rebuild Stage-C binary sidecars"
                 )
-            if str(handle.attrs.get("value_definition", "")) != (
-                "one_step_structural_task_progress_lexicographic_v1"
-            ):
-                raise RuntimeError(f"Action-value definition mismatch: {path}")
+            if str(handle.attrs.get("improvement_definition", "")) != PUSH_IMPROVEMENT_DEFINITION:
+                raise RuntimeError(f"Action-improvement definition mismatch: {path}")
+            stored_eps = np.asarray(handle.attrs.get("component_eps", []), np.float64)
+            expected_eps = np.asarray(PUSH_IMPROVEMENT_COMPONENT_EPS, np.float64)
+            if stored_eps.shape != expected_eps.shape or not np.array_equal(stored_eps, expected_eps):
+                raise RuntimeError(f"Action-improvement thresholds mismatch: {path}")
             if str(handle.attrs.get("teacher", "")) != "none":
                 raise RuntimeError(f"Stage-C structural sidecar must not contain a teacher: {path}")
             required = {
-                "action_id", "value_target", "value_valid",
-                "before_rank_key", "after_rank_key",
+                "action_id", "improvement_target", "improvement_valid",
+                "component_delta", "improvement_reason_mask", "regression_mask",
             }
             missing = required - set(handle.keys())
             if missing:

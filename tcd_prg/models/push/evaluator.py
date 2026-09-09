@@ -7,7 +7,7 @@ from .actions import PushActions
 from .pointnet2 import PushPointNet2
 
 
-class PushEffectivenessEvaluator(nn.Module):
+class PushImprovementEvaluator(nn.Module):
     """Predict one scalar task-environment value for each complete PUSH action."""
 
     def __init__(self, feature_dim=256, num_categories=64, num_task_regions=64, *, initialize_backbone=True):
@@ -78,7 +78,7 @@ class PushEffectivenessEvaluator(nn.Module):
         actions.validate(len(xyz), condition.object_valid.shape[1])
         if not len(actions.batch_index):
             empty = self.value_head.weight.sum().expand(0)
-            return {"push_value": empty}
+            return {"improvement_logit": empty}
         if not bool(condition.target_valid[actions.batch_index].all()):
             raise ValueError("PUSH requires a visible target")
         if not bool(condition.object_valid[actions.batch_index, actions.object].all()):
@@ -164,5 +164,5 @@ class PushEffectivenessEvaluator(nn.Module):
         # Callers align supervision with the original (possibly interleaved)
         # action order, not with the scene grouping used above.
         shared = self.trunk(torch.cat(rows)[torch.cat(row_ids).argsort()])
-        push_value = self.value_head(shared).squeeze(-1)
-        return {"push_value": push_value}
+        improvement_logit = self.value_head(shared).squeeze(-1)
+        return {"improvement_logit": improvement_logit}
