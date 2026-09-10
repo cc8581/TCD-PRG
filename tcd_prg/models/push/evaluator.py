@@ -23,7 +23,8 @@ class PushImprovementEvaluator(nn.Module):
             nn.Linear(d + 12, d), nn.GELU(), nn.Linear(d, 1)
         )
         self.trunk = nn.Sequential(
-            nn.Linear(7 * d + 10, 2 * d), nn.GELU(), nn.LayerNorm(2 * d),
+            nn.Linear(7 * d + 10, 4 * d), nn.GELU(), nn.LayerNorm(4 * d),
+            nn.Linear(4 * d, 2 * d), nn.GELU(), nn.LayerNorm(2 * d),
             nn.Linear(2 * d, d), nn.GELU(),
         )
         self.value_head = nn.Linear(d, 1)
