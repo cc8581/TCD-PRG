@@ -1,11 +1,26 @@
-# PUSH: yanx27 PointNet++ transfer learning
+# PUSH: selectable PTv3 / PointNet++ geometry backbone
+
+Stage C uses official Point Transformer V3 by default. Select the backbone in
+`configs/stage/push_evaluator.yaml`:
+
+```yaml
+training:
+  push_backbone: point_transformer_v3  # primary
+  # push_backbone: pointnet2           # controlled fallback
+```
+
+Both adapters expose the same dense `XYZRGB -> per-point feature` contract to
+the instance-aware PUSH head. Checkpoints record the chosen backbone and refuse
+cross-backbone loading. PTv3 uses `backbone.source_root`, voxel size, patch size,
+FlashAttention setting and optional pretraining fields from the same resolved
+configuration.
+
+## PointNet++ fallback dependency and published weights
 
 The backbone is imported directly from yanx27/Pointnet_Pointnet2_pytorch, not a
 locally simplified PointNet++. Model and utility source files are unchanged and
 SHA-256 checked before import. This is a third-party implementation, not the
 original paper authors' TensorFlow release.
-
-## Dependency and published weights
 
 From the project root, install the pinned upstream checkout once:
 
@@ -21,8 +36,8 @@ These dependencies are local and ignored by the parent repository; runtime never
 downloads files. The original TensorFlow checkout under pointnet2_official, if
 present, is reference material only and is never imported.
 
-`python train.py --stage push_evaluator` starts fresh PUSH training by strictly
-loading every upstream network tensor, including BatchNorm buffers. PUSH fusion,
+When `training.push_backbone=pointnet2`, fresh PUSH training strictly loads
+every upstream network tensor, including BatchNorm buffers. PUSH fusion,
 head and the 128-to-feature_dim projection start randomly. Missing or altered
 upstream files/weights cause errors, never random fallback. No perception
 checkpoint or frozen perception encoder is involved.
@@ -127,23 +142,16 @@ termination failures; a successful termination request is not itself proof that
 the process has finished exiting. A/B launch and training paths are unchanged.
 
 Scene encoding batches all action-bearing scenes with the same visible point
-count into one upstream PointNet++ call. Fixed-size clouds therefore share one
-call per batch; variable-size clouds are grouped by count rather than padded
-through an upstream network that has no padding mask. Scenes without actions are
-not encoded. Training BatchNorm now uses the whole count group, so optimization
-is not numerically equivalent to the former per-scene calls. Upstream random FPS
-also depends on batch composition: evaluation repeats for an identical batch,
-but regrouping scenes need not reproduce single-scene scores exactly. Parameter
-shapes and checkpoint format are unchanged. Restart training to use this change;
-an already running Python process retains its imported implementation.
+count into one selected-backbone call. Fixed-size clouds therefore share one
+call per batch; variable-size clouds are grouped by count. Scenes without actions
+are not encoded.
 
-PUSH protocol: 5; architecture: `yanx27_pointnet2_sem_seg_s3dis_v1`.
-Protocol-4 simplified-network weights and older PUSH weights are rejected without
-migration. New checkpoints contain the complete upstream network, BN buffers,
-projection and head. Deployment requires upstream source but does not reread the
-S3DIS pretraining checkpoint. `--pretrain-checkpoint` initializes a fine-tuned
-protocol-5 PUSH evaluator; `--resume` restores its weights, optimizer, scheduler
-and best selection. Neither overwrites those weights with S3DIS initialization.
+PointNet++ checkpoints retain their legacy architecture identifier. PTv3 uses a
+separate architecture identifier, contains the complete PTv3 adapter and PUSH
+head, and cannot be loaded under the PointNet++ selection (or vice versa).
+`--pretrain-checkpoint` initializes a same-backbone PUSH evaluator; `--resume`
+restores its weights, optimizer, scheduler
+and best selection. Neither overwrites those weights with backbone initialization.
 Resume begins a newly shuffled pass, not exact interrupted-loader replay.
 
 Stage A/B code, configuration and initialization layout are unchanged. The combined

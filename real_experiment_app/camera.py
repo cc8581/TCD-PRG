@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 from typing import Protocol
 
@@ -23,7 +22,8 @@ class LegacyMechEyeCamera:
                  sdk_windows_root: Path):
         import sys
         root = str(sdk_windows_root.resolve())
-        if root not in sys.path: sys.path.insert(0, root)
+        if root not in sys.path:
+            sys.path.insert(0, root)
         self.camera_id = camera_id
         self._ip = ip
         self._camera = None

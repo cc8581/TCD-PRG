@@ -6,6 +6,8 @@ from argparse import Namespace
 from pathlib import Path
 
 import train
+import train_grasp
+import train_perception
 from scripts.launch_ddp_windows import _worker
 from train import PROJECT, _parse_args, _training_arguments
 
@@ -16,6 +18,7 @@ def test_launcher_path_arguments_have_local_config_defaults(tmp_path) -> None:
         "dataset_root: D:/datasets/scenes\n"
         "acronym_root: D:/datasets/acronym\n"
         "functional_region_root: D:/datasets/regions\n"
+        "push_improvement_root: D:/datasets/push-improvement\n"
         "pybullet_python: D:/envs/gapg/python.exe\n",
         encoding="utf-8",
     )
@@ -25,6 +28,7 @@ def test_launcher_path_arguments_have_local_config_defaults(tmp_path) -> None:
     assert args.dataset_root == Path("D:/datasets/scenes")
     assert args.acronym_root == Path("D:/datasets/acronym")
     assert args.functional_region_root == Path("D:/datasets/regions")
+    assert args.push_improvement_root == Path("D:/datasets/push-improvement")
     assert args.pybullet_python == "D:/envs/gapg/python.exe"
     assert args.gpus == 1
     assert args.output_dir.parent == PROJECT / "outputs"
@@ -45,6 +49,16 @@ def test_single_stage_default_output_uses_stage_timestamp(tmp_path) -> None:
     args = _parse_args(["--paths-config", str(paths), "--stage", "perception"])
     assert args.output_dir.parent == Path("D:/outputs")
     assert args.output_dir.name.startswith("perception_")
+
+
+def test_fixed_stage_entrypoints_reject_stage_override(monkeypatch) -> None:
+    import pytest
+
+    for module, name in ((train_grasp, "train_grasp.py"),
+                         (train_perception, "train_perception.py")):
+        monkeypatch.setattr(sys, "argv", [name, "--stage", "push_evaluator"])
+        with pytest.raises(SystemExit, match="fixes --stage"):
+            module.main()
 
 
 def test_formal_launcher_defaults_and_user_override_order(tmp_path) -> None:

@@ -179,7 +179,7 @@ class PushValueBatchCollator:
         import torch
         from tcd_prg.datasets.push_value import PushImprovementStore
 
-        # Stage C first learns the core causal mapping on a deployment-matched
+        # Stage C first learns successful-path membership on a deployment-matched
         # clean sensor distribution. The old shared RGB/geometric augmentation
         # polluted PointNet++ BN statistics and is intentionally not applied here.
         batch = UnifiedBatchCollator(

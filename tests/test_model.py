@@ -75,6 +75,27 @@ def test_policy_heads_match_training_contract(tiny_batch) -> None:
     assert "pick_remove" not in output
 
 
+def test_deployment_grasp_mode_skips_push_and_remove_heads(tiny_batch) -> None:
+    config = _config()
+    model = TCDPRGModel(config).eval()
+    with torch.no_grad():
+        output = model(tiny_batch, forward_mode="full_without_push")
+        candidates = DenseCandidateGenerator(config).generate(
+            model, tiny_batch, output, include_push=False
+        )
+    assert output["push"] is None
+    assert output["global_grasp"] is None
+    valid_types = candidates["type"][candidates["valid"]]
+    assert all(int(kind) == int(ActionType.TASK_GRASP) for kind in valid_types)
+    with torch.no_grad():
+        output["push"] = model.forward_push_from_condition(
+            output["sensor"], output["push_condition"]
+        )
+        scored = DenseCandidateGenerator(config).generate(model, tiny_batch, output)
+    scored_types = scored["type"][scored["valid"]]
+    assert all(int(kind) != int(ActionType.PICK_REMOVE) for kind in scored_types)
+
+
 def test_perception_returns_push_condition(tiny_batch) -> None:
     output = TCDPRGModel(_config()).eval()(tiny_batch, forward_mode="perception")
     condition = output["push_condition"]

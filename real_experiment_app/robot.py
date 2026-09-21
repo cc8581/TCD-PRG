@@ -1,24 +1,27 @@
+# ruff: noqa: E501
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 from typing import Any
+
 import numpy as np
 
-from .transforms import (model_pose_to_robot_pose, offset_model_pose,
-                         pose7_to_matrix, push_pose)
+from .transforms import model_pose_to_robot_pose, offset_model_pose, push_pose
+from .workflow import PUSH_DISTANCE_M
 
 
 class FR5Robot:
     def __init__(self, settings: dict, sdk_windows_root: Path, tcp_transform: np.ndarray):
         root = str(sdk_windows_root.resolve())
-        if root not in sys.path: sys.path.insert(0, root)
+        if root not in sys.path:
+            sys.path.insert(0, root)
         self.settings, self.tcp_transform = settings, tcp_transform
         self.controller = None
 
     def _build_controller(self):
-        from grasp_system.robot.robot_controller import RobotController
         from grasp_system.config.robot_config import RobotConfig
+        from grasp_system.robot.robot_controller import RobotController
         settings = self.settings
         RobotConfig.TOOL_ID = int(settings["tool_id"])
         RobotConfig.USER_ID = int(settings.get("user_id", 0))
@@ -34,9 +37,11 @@ class FR5Robot:
         RobotConfig.GRIPPER_DEVICE = int(settings.get("gripper_device", 0))
         RobotConfig.GRIPPER_SOFTVERSION = int(settings.get("gripper_softversion", 0))
         RobotConfig.GRIPPER_BUS = int(settings.get("gripper_bus", 0))
-        RobotConfig.GRIPPER_CONFIG_ON_CONNECT = bool(settings.get("gripper_config_on_connect", True))
+        RobotConfig.GRIPPER_CONFIG_ON_CONNECT = bool(
+            settings.get("gripper_config_on_connect", True))
         RobotConfig.GRIPPER_RESET_ON_CONNECT = bool(settings.get("gripper_reset_on_connect", True))
-        RobotConfig.GRIPPER_ACTIVATE_ON_CONNECT = bool(settings.get("gripper_activate_on_connect", True))
+        RobotConfig.GRIPPER_ACTIVATE_ON_CONNECT = bool(
+            settings.get("gripper_activate_on_connect", True))
         RobotConfig.GRIPPER_ACTIVATE_DELAY = float(settings.get("gripper_activate_delay_s", 3.0))
         self.controller = RobotController(str(settings["ip"]))
 
@@ -45,7 +50,8 @@ class FR5Robot:
             self._build_controller()
         except (ImportError, ModuleNotFoundError) as error:
             raise RuntimeError("未找到 Fairino Python SDK，无法连接 FR5") from error
-        if not self.controller.connect(): return False
+        if not self.controller.connect():
+            return False
         # Connection and servo power are intentionally separate operator steps.
         return True
 
@@ -135,26 +141,51 @@ class FR5Robot:
 
     def _move(self, model_pose, speed=None):
         pose = model_pose_to_robot_pose(model_pose, self.tcp_transform).tolist()
+        self._move_robot_pose(pose, speed)
+
+    def _move_robot_pose(self, pose, speed=None):
+        """Gate an FR5 TCP pose through workspace and IK before sending it."""
+        pose = list(map(float, pose))
+        self._validate_robot_tcp_position(np.asarray(pose[:3], dtype=np.float64) * 0.001)
         if not self.controller.check_pose_reachable(pose):
             raise RuntimeError(f"FR5 IK has no solution: {pose}")
         error = self.controller.move_l(pose, vel=speed or self.settings["speed_percent"])
-        if error: raise RuntimeError(f"FR5 MoveL failed: {error}")
+        if error:
+            raise RuntimeError(f"FR5 MoveL failed: {error}")
+
+    def _validate_robot_tcp_position(self, point_m: np.ndarray) -> None:
+        low = np.asarray(self.settings["motion_workspace_min_m"], dtype=np.float64)
+        high = np.asarray(self.settings["motion_workspace_max_m"], dtype=np.float64)
+        if low.shape != (3,) or high.shape != (3,):
+            raise ValueError("机械臂运动安全区配置必须为 XYZ")
+        if np.any(point_m < low) or np.any(point_m > high):
+            raise RuntimeError(f"实际机器人 TCP 超出机械臂运动安全区: {point_m.tolist()}")
+
+    @staticmethod
+    def _require_gripper_success(error, operation: str) -> None:
+        if error:
+            raise RuntimeError(f"AG-160-95 {operation} failed: {error}")
 
     def _set_width(self, width_m: float):
         maximum = float(self.settings["gripper_max_width_m"])
-        command_width = max(0., min(maximum, width_m-float(self.settings["gripper_close_margin_m"])))
+        command_width = max(
+            0., min(maximum, width_m-float(self.settings["gripper_close_margin_m"])))
         closed = float(self.settings["gripper_closed_position"])
         opened = float(self.settings["gripper_open_position"])
         position_percent = int(round(closed+(opened-closed)*command_width/maximum))
         error = self.controller._move_gripper(position_percent, int(self.settings["gripper_force"]))
-        if error: raise RuntimeError(f"AG-160-95 command failed: {error}")
+        if error:
+            raise RuntimeError(f"AG-160-95 command failed: {error}")
 
     def _grasp(self, action):
         pose = np.asarray(action["grasp_pose_world"], np.float64)
         pre = offset_model_pose(pose, [0,0,-float(self.settings["pregrasp_distance_m"])])
-        self.controller.gripper_open(); self._move(pre); self._move(pose)
+        self._require_gripper_success(self.controller.gripper_open(), "open")
+        self._move(pre)
+        self._move(pose)
         self._set_width(float(action["grasp_width_m"]))
-        lift = pose.copy(); lift[2] += float(self.settings["lift_distance_m"])
+        lift = pose.copy()
+        lift[2] += float(self.settings["lift_distance_m"])
         self._move(lift)
 
     def execute(self, action: dict[str,Any]) -> None:
@@ -164,9 +195,8 @@ class FR5Robot:
             self._grasp(action)
             if kind == 1:
                 destination = list(map(float, self.settings["removal_pose_mm_rpy_deg"]))
-                error = self.controller.move_l(destination, vel=self.settings["speed_percent"])
-                if error: raise RuntimeError(f"PICK_REMOVE transport failed: {error}")
-                self.controller.gripper_open()
+                self._move_robot_pose(destination)
+                self._require_gripper_success(self.controller.gripper_open(), "release")
             return
         if kind == 0:
             contact = np.asarray(action["push_contact_world"],np.float64)
@@ -174,8 +204,11 @@ class FR5Robot:
             direction /= max(np.linalg.norm(direction),1e-12)
             final = push_pose(contact,direction)
             pre = push_pose(contact-direction*float(self.settings["push_retreat_m"]),direction)
-            end = push_pose(contact+direction*float(self.settings["push_distance_m"]),direction)
-            self.controller.gripper_close(); self._move(pre); self._move(final); self._move(end)
+            end = push_pose(contact + direction * PUSH_DISTANCE_M, direction)
+            self._require_gripper_success(self.controller.gripper_close(), "close")
+            self._move(pre)
+            self._move(final)
+            self._move(end)
             self._move(pre)
             return
         raise ValueError(f"Unknown action type {kind}")
@@ -198,7 +231,8 @@ class FR5Robot:
                 position + np.asarray([0, 0, float(self.settings["lift_distance_m"])]),
             ]
             if kind == 1:
-                positions.append(np.asarray(self.settings["removal_pose_mm_rpy_deg"][:3], dtype=np.float64) * .001)
+                positions.append(np.asarray(
+                    self.settings["removal_pose_mm_rpy_deg"][:3], dtype=np.float64) * .001)
         elif kind == 0:
             position = np.asarray(action.get("push_contact_world"), dtype=np.float64)
             direction = np.asarray(action.get("push_direction_world"), dtype=np.float64)
@@ -208,17 +242,36 @@ class FR5Robot:
             positions = [
                 position,
                 position - direction * float(self.settings["push_retreat_m"]),
-                position + direction * float(self.settings["push_distance_m"]),
+                position + direction * PUSH_DISTANCE_M,
             ]
         else:
             raise ValueError(f"Unknown action type {kind}")
-        low = np.asarray(self.settings["motion_workspace_min_m"], dtype=np.float64)
-        high = np.asarray(self.settings["motion_workspace_max_m"], dtype=np.float64)
-        if low.shape != (3,) or high.shape != (3,):
-            raise ValueError("机械臂运动安全区配置必须为 XYZ")
-        for point in positions:
-            if np.any(point < low) or np.any(point > high):
-                raise RuntimeError(f"动作轨迹点超出机械臂运动安全区: {np.asarray(point).tolist()}")
+        # Preflight every actual commanded TCP, including the configured TCP
+        # compensation, before the first physical motion starts.
+        robot_positions = []
+        if kind in (1, 2):
+            model_poses = [
+                pose,
+                offset_model_pose(pose, [0, 0, -float(self.settings["pregrasp_distance_m"])]),
+                np.r_[positions[2], pose[3:]],
+            ]
+            robot_positions.extend(
+                model_pose_to_robot_pose(item, self.tcp_transform)[:3] * 0.001
+                for item in model_poses
+            )
+            if kind == 1:
+                robot_positions.append(
+                    np.asarray(self.settings["removal_pose_mm_rpy_deg"][:3], dtype=np.float64)
+                    * 0.001
+                )
+        else:
+            model_poses = [push_pose(point, direction) for point in positions]
+            robot_positions.extend(
+                model_pose_to_robot_pose(item, self.tcp_transform)[:3] * 0.001
+                for item in model_poses
+            )
+        for point in robot_positions:
+            self._validate_robot_tcp_position(np.asarray(point, dtype=np.float64))
 
 
 def build_robot(config):

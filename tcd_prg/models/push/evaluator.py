@@ -3,14 +3,26 @@
 import torch
 from torch import nn
 
+from tcd_prg.config import BackboneConfig
+
 from .actions import PushActions
-from .pointnet2 import PushPointNet2
+from .backbone import build_push_backbone
 
 
 class PushImprovementEvaluator(nn.Module):
     """Predict one scalar task-environment value for each complete PUSH action."""
 
-    def __init__(self, feature_dim=256, num_categories=64, num_task_regions=64, *, initialize_backbone=True):
+    def __init__(
+        self,
+        feature_dim=256,
+        num_categories=64,
+        num_task_regions=64,
+        *,
+        backbone_backend="point_transformer_v3",
+        backbone_config=None,
+        activation_checkpointing=False,
+        initialize_backbone=True,
+    ):
         super().__init__()
         d = feature_dim
         self.point_encoder = nn.Sequential(nn.Linear(d + 3, d), nn.LayerNorm(d), nn.GELU())
@@ -29,13 +41,21 @@ class PushImprovementEvaluator(nn.Module):
         )
         self.value_head = nn.Linear(d, 1)
         self.feature_dim = d
+        self.backbone_backend = backbone_backend
+        self.backbone_config = backbone_config or BackboneConfig()
+        self.activation_checkpointing = activation_checkpointing
         self.backbone = None
         if initialize_backbone:
             self.initialize_backbone()
 
     def initialize_backbone(self):
         if self.backbone is None:
-            self.backbone = PushPointNet2(self.feature_dim).to(self.trunk[0].weight.device)
+            self.backbone = build_push_backbone(
+                self.backbone_backend,
+                self.feature_dim,
+                self.backbone_config,
+                activation_checkpointing=self.activation_checkpointing,
+            ).to(self.trunk[0].weight.device)
             self.backbone.train(self.training)
 
     @staticmethod

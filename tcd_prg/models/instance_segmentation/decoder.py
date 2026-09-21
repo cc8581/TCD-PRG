@@ -30,6 +30,7 @@ class InstanceQueryOutput:
     object_mask: Tensor                 # [B,Q]
     centers_world: Tensor               # [B,Q,3]
     aux_outputs: tuple[InstanceAuxOutput, ...] = ()
+    point_offsets: Tensor | None = None  # [B,N,3], point -> instance centroid
 
 
 class _DecoderBlock(nn.Module):
@@ -179,4 +180,7 @@ class InstanceMaskDecoder(nn.Module):
             object_mask=object_mask,
             centers_world=centers,
             aux_outputs=tuple(auxiliary),
+            # Reuse the learned point projection so existing Stage-A checkpoints
+            # retain the exact same parameter keys and can still be loaded.
+            point_offsets=self.mask_memory(memory)[..., :3],
         )

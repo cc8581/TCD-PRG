@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """Record an externally measured tabletop plane in the experiment config."""
 
 from __future__ import annotations

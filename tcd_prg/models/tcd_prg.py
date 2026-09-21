@@ -89,6 +89,7 @@ class TCDPRGModel(nn.Module):
         ablation: AblationConfig | None = None,
         backbone_config: BackboneConfig | None = None,
         graspnet_config: GraspNetConfig | None = None,
+        push_backbone: str = "point_transformer_v3",
     ) -> None:
         super().__init__()
         self.config = config or ModelConfig()
@@ -166,7 +167,13 @@ class TCDPRGModel(nn.Module):
         self.push = RulePushGenerator(c)
         self.push_evaluator_ready = False
         self.push_evaluator = PushImprovementEvaluator(
-            c.feature_dim, c.num_categories, c.num_task_regions, initialize_backbone=False
+            c.feature_dim,
+            c.num_categories,
+            c.num_task_regions,
+            backbone_backend=push_backbone,
+            backbone_config=backbone_config,
+            activation_checkpointing=c.activation_checkpointing,
+            initialize_backbone=False,
         )
 
     @staticmethod
@@ -655,7 +662,7 @@ class TCDPRGModel(nn.Module):
             return self.forward_push(batch)
         if forward_mode == "global_grasp":
             return self.forward_global_grasp(batch)
-        if forward_mode != "full":
+        if forward_mode not in {"full", "full_without_push"}:
             raise ValueError(f"Unsupported forward_mode={forward_mode}")
 
         encoded, sensor, task = self._encode_scene(batch)
@@ -668,11 +675,17 @@ class TCDPRGModel(nn.Module):
             task["task_region_id"],
         )
         task_grasp = self.forward_task_grasp_from_condition(sensor, condition)
-        global_grasp = self._forward_global_grasp(encoded, sensor)
+        global_grasp = (
+            self._forward_global_grasp(encoded, sensor)
+            if forward_mode == "full" else None
+        )
         push_condition = self._push_condition(encoded, region, task)
         push_sensor = dict(sensor)
         push_sensor["geometry_feature"] = encoded.scene_point_features
-        push = self.forward_push_from_condition(push_sensor, push_condition)
+        push = (
+            self.forward_push_from_condition(push_sensor, push_condition)
+            if forward_mode == "full" else None
+        )
         return {
             "stageb_condition": condition,
             "push_condition": push_condition,

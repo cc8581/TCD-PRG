@@ -224,7 +224,9 @@ def test_inactive_push_keeps_ab_parameter_layout_and_rng():
     # Stage-C remains lazy during A/B construction; checkpoint migration is
     # responsible for replacing only its inactive tensors.
     from tcd_prg.models.push import PushImprovementEvaluator
-    current=PushImprovementEvaluator(16,initialize_backbone=False)
+    current=PushImprovementEvaluator(
+        16, backbone_backend="pointnet2", initialize_backbone=False
+    )
     assert current.backbone is None
     assert current.value_head.out_features == 1
     assert not hasattr(current, "safety_head")
@@ -241,7 +243,12 @@ def test_combined_deployment_loads_same_pointnet_without_using_a_encoder(tmp_pat
     check=PushTrainingCheckpoint(tmp_path/'new.pt',m,{}, {})
     check.consider_best({'push_evaluator_auprc':.5},1)
     # No encoder is present: the public combined C boundary must not touch A.
-    combined=SimpleNamespace(push=m.push,push_evaluator=PushImprovementEvaluator(16,initialize_backbone=False).eval())
+    combined=SimpleNamespace(
+        push=m.push,
+        push_evaluator=PushImprovementEvaluator(
+            16, backbone_backend="pointnet2", initialize_backbone=False
+        ).eval(),
+    )
     load_push_evaluator(combined,check.output)
     with torch.no_grad():
         expected=m(b)['push']

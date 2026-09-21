@@ -84,7 +84,10 @@ def main() -> None:
         if not args.push_evaluator_checkpoint:
             raise ValueError("learned PUSH inference requires --push-evaluator-checkpoint")
         device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
-        model = TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet).to(
+        model = TCDPRGModel(
+            config.model, config.ablation, config.backbone, config.graspnet,
+            config.training.push_backbone,
+        ).to(
             device
         )
         config.model.task_grasp_probability_threshold = load_staged_tcd_prg(

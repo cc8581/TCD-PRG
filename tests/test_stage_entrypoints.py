@@ -55,6 +55,8 @@ def test_single_stage_explicit_config_is_respected() -> None:
 
 def test_push_evaluator_command_is_independent_of_perception(tmp_path) -> None:
     args = train._parse_args(["--stage", "all"])
+    args.push_improvement_root = tmp_path / "push-improvement"
+    args.push_improvement_root.mkdir()
     proposal = tmp_path / "perception" / "perception_best.pt"
     output = tmp_path / "push_evaluator" / "push_evaluator_best.pt"
     command = train._push_evaluator_command(args, output)
@@ -74,6 +76,8 @@ def test_all_stage_launcher_runs_push_evaluator_after_perception_and_grasp(tmp_p
     args = train._parse_args(
         ["--stage", "all", "--output-dir", str(tmp_path / "out")]
     )
+    args.push_improvement_root = tmp_path / "push-improvement"
+    args.push_improvement_root.mkdir()
     monkeypatch.setattr(
         train,
         "_resolve_paths",
@@ -133,7 +137,7 @@ def test_staged_checkpoint_root_resolves_portable_relative_layout(tmp_path) -> N
 def test_stagec_optimizer_step_does_not_require_encoder() -> None:
     config = TCDPRGConfig()
     config.training.stage = "push"
-    model = StandalonePushModel(config.model)
+    model = StandalonePushModel(config.model, push_backbone="pointnet2")
     groups = build_optimizer_parameter_groups(model, config)
     assert [group["name"] for group in groups] == ["new_modules"]
     optimizer = torch.optim.AdamW(groups)

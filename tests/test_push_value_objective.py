@@ -3,20 +3,56 @@ import torch
 
 from tcd_prg.losses.push_effectiveness import PushImprovementLoss
 from tcd_prg.models.staged_checkpoint import stage_training_state
-from tcd_prg.push_improvement import improvement_event
 from tcd_prg.scripts.train_push_evaluator import push_optimizer_groups
+from tcd_prg.trainers.push_evaluator import balanced_binary_supervision
 
 
-def test_binary_event_ignores_small_changes_and_rejects_conflicting_evidence():
-    before = [0, -2, -1, 0, 0, .50, 0]
-    assert not improvement_event(before, [0, -2, -1, 0, 0, .505, 0])[0]
-    assert improvement_event(before, [0, -2, -1, 0, 0, .52, 0])[0]
-    assert not improvement_event(before, [0, -3, -1, 0, 0, .70, 0])[0]
-    assert not improvement_event(before, [1, -3, -1, 0, 0, .70, 0])[0]
-    assert not improvement_event(before, [0, -2, -1, 0, 0, .52, -.2])[0]
-    assert not improvement_event(before, [0, -2, -1, 0, 0, .48, .2])[0]
-    assert improvement_event(before, [1, -2, -1, 0, 0, .52, .2])[0]
-    assert not improvement_event([1, -2, -1, 0, 0, .50, 0], [0, -2, 0, 0, 0, .60, .2])[0]
+def test_training_ratio_undersamples_negatives_without_repeating_positives():
+    target = torch.tensor([1, 1, 0, 0, 0, 0, 0, 0], dtype=torch.float32)
+    selected = balanced_binary_supervision(
+        target, torch.ones(8, dtype=torch.bool), 1.0 / 3.0
+    )
+    assert selected[:2].all()
+    assert int((selected & (target == 1)).sum()) == 2
+    assert int((selected & (target == 0)).sum()) == 4
+
+
+def test_negative_only_microbatch_is_retained_for_balanced_training():
+    target = torch.zeros(5)
+    selected = balanced_binary_supervision(
+        target, torch.ones(5, dtype=torch.bool), 1.0 / 3.0
+    )
+    assert selected.all()
+
+
+def test_reweighting_uses_all_samples_and_configurable_positive_weight():
+    score = torch.zeros(4, requires_grad=True)
+    losses = PushImprovementLoss(pos_weight=6.25)(
+        {"improvement_logit": score},
+        improvement_target=torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        improvement_valid=torch.ones(4, dtype=torch.bool),
+    )
+    assert losses["push_improvement_supervised_count"] == 4
+    losses["push_improvement"].backward()
+    assert torch.count_nonzero(score.grad) == 4
+
+
+def test_combined_mode_can_undersample_then_reweight():
+    target = torch.tensor([1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=torch.float32)
+    selected = balanced_binary_supervision(
+        target, torch.ones(12, dtype=torch.bool), 0.2
+    )
+    assert int((selected & (target == 1)).sum()) == 2
+    assert int((selected & (target == 0)).sum()) == 8
+    score = torch.zeros(12, requires_grad=True)
+    losses = PushImprovementLoss(pos_weight=6.25)(
+        {"improvement_logit": score},
+        improvement_target=target,
+        improvement_valid=selected,
+    )
+    assert losses["push_improvement_supervised_count"] == 10
+    losses["push_improvement"].backward()
+    assert torch.count_nonzero(score.grad) == 10
 
 
 def test_single_head_binary_bce_uses_improvement_logit():
@@ -56,8 +92,13 @@ def test_push_optimizer_uses_configured_lower_backbone_learning_rate():
         class optimizer:
             learning_rate = 1e-4
             backbone_learning_rate = 2e-5
+        class training:
+            push_backbone = "point_transformer_v3"
     groups = push_optimizer_groups(Model(), Config())
-    assert [group["name"] for group in groups] == ["push_heads", "pointnet2_backbone"]
+    assert [group["name"] for group in groups] == [
+        "push_heads",
+        "point_transformer_v3_backbone",
+    ]
     assert [group["lr"] for group in groups] == [pytest.approx(1e-4), pytest.approx(2e-5)]
 
 
@@ -83,9 +124,12 @@ def test_ab_checkpoint_migration_replaces_only_push_tensors():
 
 def test_evaluator_has_one_learned_output_head():
     from test_independent_push import model, scene
+
     from tcd_prg.models import push_condition_from_gt
     from tcd_prg.trainers.push_evaluator import logged_push_actions
-    batch = scene(); network = model().eval()
+
+    batch = scene()
+    network = model().eval()
     condition = push_condition_from_gt(batch, 4)
     actions, _ = logged_push_actions(batch, condition)
     with torch.no_grad():

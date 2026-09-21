@@ -169,15 +169,15 @@ tcd-prg-build-stageb --config configs/stage/grasp.yaml `
 tcd-prg-train --config configs/stage/grasp.yaml `
   output_dir=outputs/grasp
 
-# PUSH: train only the independent evaluator on logged evaluated actions
-python train_push_evaluator.py --config configs/stage/push_evaluator.yaml `
-  --perception-checkpoint outputs/perception/perception_best.pt `
-  --output outputs/push_evaluator/push_evaluator_best.pt
+# PUSH: independent evaluator; PTv3 is primary, PointNet++ is configurable fallback
+python train.py --stage push_evaluator `
+  --output-dir outputs/push_evaluator
 ```
 
-PUSH generation is inference-only geometry. The evaluator checkpoint contains only
-its trainable weights and a fingerprint of the frozen perception geometry. Old
-proposal-dependent PUSH checkpoints are incompatible. See [PUSH pipeline](docs/push_pipeline.md).
+PUSH generation is inference-only geometry. The evaluator checkpoint contains its
+selected geometry backbone and trainable PUSH head, and records the backbone
+architecture so PTv3 and PointNet++ weights cannot be mixed. Old proposal-dependent
+PUSH checkpoints are incompatible. See [PUSH pipeline](docs/push_pipeline.md).
 
 To start a new run from every parameter in a same-stage checkpoint without
 restoring its optimizer, scheduler, AMP scaler, RNG state, best metric or step,

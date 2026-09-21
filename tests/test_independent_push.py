@@ -38,7 +38,9 @@ def scene():
 
 
 def model():
-    return StandalonePushModel(ModelConfig(feature_dim=16, instance_queries=4))
+    return StandalonePushModel(
+        ModelConfig(feature_dim=16, instance_queries=4), push_backbone="pointnet2"
+    )
 
 
 def test_training_never_calls_rule_generator_or_rejects_far_contact(monkeypatch):

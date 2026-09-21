@@ -8,7 +8,11 @@ import json
 
 import torch
 
-from tcd_prg.models.staged_checkpoint import PUSH_EVALUATOR_PROTOCOL_VERSION, PUSH_ARCHITECTURE, validate_push_checkpoint
+from tcd_prg.models.staged_checkpoint import (
+    PUSH_EVALUATOR_PROTOCOL_VERSION,
+    push_architecture,
+    validate_push_checkpoint,
+)
 
 PUSH_METRIC_PROTOCOL_VERSION = 7
 SELECTION_METRIC = "push_evaluator_auprc"
@@ -16,7 +20,7 @@ def _metric_improved(candidate, incumbent):
     return float(candidate[SELECTION_METRIC]) > float(incumbent[SELECTION_METRIC])
 
 
-def resume_compatibility(signature):
+def resume_compatibility(signature, *, ignore_learning_rates=False):
     signature = copy.deepcopy(signature)
     config = signature.get("config", {})
     # Output location and terminal frequency do not change the training objective.
@@ -27,6 +31,10 @@ def resume_compatibility(signature):
     # Allow reducing it after an OOM while keeping all objective-defining fields
     # (including gradient accumulation) under strict compatibility checks.
     config.get("training", {}).pop("batch_size", None)
+    if ignore_learning_rates:
+        optimizer = config.get("optimizer", {})
+        optimizer.pop("learning_rate", None)
+        optimizer.pop("backbone_learning_rate", None)
     return signature
 
 
@@ -61,8 +69,10 @@ class PushTrainingCheckpoint:
         self.pending_validation_step = 0
 
     def _payload(self, state, step):
+        backend = self.model.push_evaluator.backbone_backend
         return {**self.metadata, "model": state, "optimizer_steps": step,
-                "push_architecture": PUSH_ARCHITECTURE,
+                "push_architecture": push_architecture(backend),
+                "push_backbone": backend,
                 "training_stage": "push_evaluator",
                 "push_evaluator_protocol_version": PUSH_EVALUATOR_PROTOCOL_VERSION,
                 "push_metric_protocol_version": PUSH_METRIC_PROTOCOL_VERSION,
@@ -141,11 +151,17 @@ class PushTrainingCheckpoint:
             payload["final_validation_metrics"] = final_metrics
         atomic_save(payload, self.output)
 
-    def restore(self, path, optimizer):
+    def restore(self, path, optimizer, *, override_learning_rates=False):
         payload = torch.load(path, map_location="cpu", weights_only=False)
         validate_push_checkpoint(self.model, payload)
         if ("optimizer" not in payload or payload.get("resume_signature") is None or
-                resume_compatibility(payload["resume_signature"]) != resume_compatibility(self.resume_signature)):
+                resume_compatibility(
+                    payload["resume_signature"],
+                    ignore_learning_rates=override_learning_rates,
+                ) != resume_compatibility(
+                    self.resume_signature,
+                    ignore_learning_rates=override_learning_rates,
+                )):
             raise RuntimeError("PUSH resume requires a matching training configuration and a _last checkpoint")
         if payload.get("push_metric_protocol_version") != PUSH_METRIC_PROTOCOL_VERSION:
             raise RuntimeError("PUSH metric protocol mismatch")
@@ -155,7 +171,12 @@ class PushTrainingCheckpoint:
         self.model.push_evaluator.load_state_dict(payload["model"], strict=True)
         optimizer.load_state_dict(payload["optimizer"])
         if self.scheduler is not None:
-            self.scheduler.load_state_dict(payload["scheduler"])
+            if override_learning_rates:
+                # Keep Adam moments and the global optimizer step, but apply the
+                # newly configured base rates at the same cosine-schedule point.
+                self.scheduler.set_step(int(payload["optimizer_steps"]))
+            else:
+                self.scheduler.load_state_dict(payload["scheduler"])
         self.best_state = payload["best_state"]
         self.best_metrics = payload["best_metrics"]
         self.best_step = payload["best_step"]

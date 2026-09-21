@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import math
+
 import numpy as np
 
 
 def quaternion_xyzw_to_matrix(q) -> np.ndarray:
     x, y, z, w = np.asarray(q, np.float64)
-    n = math.sqrt(x*x + y*y + z*z + w*w)
+    n = math.sqrt(x * x + y * y + z * z + w * w)
     if n < 1e-12:
         raise ValueError("Quaternion has zero norm")
-    x, y, z, w = x/n, y/n, z/n, w/n
-    return np.asarray([
-        [1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
-        [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
-        [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)],
-    ], np.float64)
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.asarray(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        np.float64,
+    )
 
 
 def matrix_to_quaternion_xyzw(r: np.ndarray) -> np.ndarray:
@@ -22,20 +26,16 @@ def matrix_to_quaternion_xyzw(r: np.ndarray) -> np.ndarray:
     trace = float(np.trace(r))
     if trace > 0:
         s = math.sqrt(trace + 1.0) * 2
-        q = [(r[2,1]-r[1,2])/s, (r[0,2]-r[2,0])/s,
-             (r[1,0]-r[0,1])/s, 0.25*s]
-    elif r[0,0] > r[1,1] and r[0,0] > r[2,2]:
-        s = math.sqrt(1+r[0,0]-r[1,1]-r[2,2])*2
-        q = [0.25*s, (r[0,1]+r[1,0])/s, (r[0,2]+r[2,0])/s,
-             (r[2,1]-r[1,2])/s]
-    elif r[1,1] > r[2,2]:
-        s = math.sqrt(1+r[1,1]-r[0,0]-r[2,2])*2
-        q = [(r[0,1]+r[1,0])/s, 0.25*s, (r[1,2]+r[2,1])/s,
-             (r[0,2]-r[2,0])/s]
+        q = [(r[2, 1] - r[1, 2]) / s, (r[0, 2] - r[2, 0]) / s, (r[1, 0] - r[0, 1]) / s, 0.25 * s]
+    elif r[0, 0] > r[1, 1] and r[0, 0] > r[2, 2]:
+        s = math.sqrt(1 + r[0, 0] - r[1, 1] - r[2, 2]) * 2
+        q = [0.25 * s, (r[0, 1] + r[1, 0]) / s, (r[0, 2] + r[2, 0]) / s, (r[2, 1] - r[1, 2]) / s]
+    elif r[1, 1] > r[2, 2]:
+        s = math.sqrt(1 + r[1, 1] - r[0, 0] - r[2, 2]) * 2
+        q = [(r[0, 1] + r[1, 0]) / s, 0.25 * s, (r[1, 2] + r[2, 1]) / s, (r[0, 2] - r[2, 0]) / s]
     else:
-        s = math.sqrt(1+r[2,2]-r[0,0]-r[1,1])*2
-        q = [(r[0,2]+r[2,0])/s, (r[1,2]+r[2,1])/s, 0.25*s,
-             (r[1,0]-r[0,1])/s]
+        s = math.sqrt(1 + r[2, 2] - r[0, 0] - r[1, 1]) * 2
+        q = [(r[0, 2] + r[2, 0]) / s, (r[1, 2] + r[2, 1]) / s, 0.25 * s, (r[1, 0] - r[0, 1]) / s]
     q = np.asarray(q, np.float64)
     return q / np.linalg.norm(q)
 
@@ -60,21 +60,23 @@ def rpy_degrees_to_matrix(rpy) -> np.ndarray:
     cr, sr = math.cos(roll), math.sin(roll)
     cp, sp = math.cos(pitch), math.sin(pitch)
     cy, sy = math.cos(yaw), math.sin(yaw)
-    return np.asarray([
-        [cy*cp, cy*sp*sr-sy*cr, cy*sp*cr+sy*sr],
-        [sy*cp, sy*sp*sr+cy*cr, sy*sp*cr-cy*sr],
-        [-sp, cp*sr, cp*cr],
-    ])
+    return np.asarray(
+        [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ]
+    )
 
 
 def matrix_to_rpy_degrees(r: np.ndarray) -> np.ndarray:
     r = np.asarray(r, np.float64)
-    pitch = math.atan2(-r[2,0], math.hypot(r[0,0], r[1,0]))
+    pitch = math.atan2(-r[2, 0], math.hypot(r[0, 0], r[1, 0]))
     if abs(math.cos(pitch)) > 1e-7:
-        roll = math.atan2(r[2,1], r[2,2])
-        yaw = math.atan2(r[1,0], r[0,0])
+        roll = math.atan2(r[2, 1], r[2, 2])
+        yaw = math.atan2(r[1, 0], r[0, 0])
     else:
-        roll = math.atan2(-r[1,2], r[1,1])
+        roll = math.atan2(-r[1, 2], r[1, 1])
         yaw = 0.0
     return np.degrees([roll, pitch, yaw])
 
@@ -106,10 +108,12 @@ def offset_model_pose(model_pose, local_xyz_m) -> np.ndarray:
 def push_pose(contact, direction) -> np.ndarray:
     z = np.asarray(direction, np.float64)
     z /= max(np.linalg.norm(z), 1e-12)
-    reference = np.array([0., 0., 1.])
+    reference = np.array([0.0, 0.0, 1.0])
     if abs(float(np.dot(z, reference))) > 0.9:
-        reference = np.array([0., 1., 0.])
-    x = np.cross(reference, z); x /= np.linalg.norm(x)
+        reference = np.array([0.0, 1.0, 0.0])
+    x = np.cross(reference, z)
+    x /= np.linalg.norm(x)
     y = np.cross(z, x)
-    return np.r_[np.asarray(contact, np.float64), matrix_to_quaternion_xyzw(np.column_stack((x,y,z)))]
-
+    return np.r_[
+        np.asarray(contact, np.float64), matrix_to_quaternion_xyzw(np.column_stack((x, y, z)))
+    ]

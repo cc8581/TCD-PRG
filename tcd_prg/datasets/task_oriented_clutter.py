@@ -1237,6 +1237,108 @@ class TaskOrientedClutterAdapter(DatasetAdapter):
         )
         return self.observation_provider.is_available(request)
 
+    def observations_available(
+        self, keys: list[tuple[int, int, int]]
+    ) -> dict[tuple[int, int, int], bool]:
+        """Check many cache requests while opening each scene source only once."""
+        by_scene: dict[int, list[tuple[int, int, int]]] = {}
+        for key in keys:
+            by_scene.setdefault(int(key[0]), []).append(key)
+        result: dict[tuple[int, int, int], bool] = {}
+        for scene_id, scene_keys in by_scene.items():
+            with h5py.File(self._h5_path(scene_id), "r", swmr=True) as handle:
+                scene = self._scene_group(handle, scene_id)
+                states = scene["states"]
+                object_count = len(scene["catalog/object_index"])
+                actions = scene["actions"]
+                from_state = actions["from_state"][:]
+                to_state = actions["to_state"][:]
+                action_type = actions["action_type"][:]
+                payload_index = actions["payload_index"][:]
+                after_state_valid = actions["after_state_valid"][:]
+                action_task = actions["task_index"][:]
+                sequence_depth = states["sequence_depth"][:]
+                acted_object = np.full(len(action_type), -1, dtype=np.int64)
+                pick_payload = actions["pick_remove/acted_object"][:]
+                for action_index in np.flatnonzero(
+                    action_type == int(ActionType.PICK_REMOVE)
+                ):
+                    acted_object[action_index] = int(
+                        pick_payload[int(payload_index[action_index])]
+                    )
+                task_state_active: dict[int, dict[int, np.ndarray]] = {}
+
+                def active_for_task(task_index: int) -> dict[int, np.ndarray]:
+                    cached = task_state_active.get(task_index)
+                    if cached is not None:
+                        return cached
+                    predecessors: dict[int, list[int]] = defaultdict(list)
+                    for index, target in enumerate(to_state):
+                        source, target = int(from_state[index]), int(target)
+                        if (
+                            after_state_valid[index]
+                            and target >= 0
+                            and int(action_task[index]) == task_index
+                            and sequence_depth[source] < sequence_depth[target]
+                        ):
+                            predecessors[target].append(index)
+                    memo: dict[int, frozenset[int]] = {
+                        int(state): frozenset()
+                        for state in np.flatnonzero(sequence_depth == 0)
+                    }
+                    visiting: set[int] = set()
+
+                    def removed(state: int) -> frozenset[int]:
+                        if state in memo:
+                            return memo[state]
+                        if state in visiting:
+                            raise ValueError("Cycle in depth-monotone transition graph")
+                        visiting.add(state)
+                        histories = []
+                        for transition_index in predecessors.get(state, []):
+                            history = set(removed(int(from_state[transition_index])))
+                            if int(action_type[transition_index]) == int(ActionType.PICK_REMOVE):
+                                history.add(int(acted_object[transition_index]))
+                            histories.append(frozenset(history))
+                        visiting.remove(state)
+                        memo[state] = (
+                            frozenset().union(*histories) if histories else frozenset()
+                        )
+                        return memo[state]
+
+                    state_active = {}
+                    for _, state_id, state_task in scene_keys:
+                        if state_task != task_index:
+                            continue
+                        inactive = removed(state_id)
+                        active = np.ones(object_count, dtype=bool)
+                        if inactive:
+                            active[np.fromiter(inactive, dtype=np.int64)] = False
+                        state_active[state_id] = active
+                    task_state_active[task_index] = state_active
+                    return state_active
+
+                with np.load(
+                    self.scene_root / f"scene_{scene_id:04d}" / "scene.npz",
+                    allow_pickle=False,
+                ) as raw_scene:
+                    for key in scene_keys:
+                        _, state_id, task_index = key
+                        object_pose = states["object_pose"][state_id].astype(np.float32)
+                        count = len(object_pose)
+                        request = self._make_observation_request(
+                            scene_id=scene_id,
+                            state_id=state_id,
+                            object_pose=object_pose,
+                            active=active_for_task(task_index)[state_id],
+                            h5_names=tuple(str(x) for x in raw_scene["object_h5_name"][:count]),
+                            model_ids=tuple(str(x) for x in raw_scene["object_model_id"][:count]),
+                            object_scales=raw_scene["object_scale"][:count].astype(np.float32),
+                            render_seed=int(states["observation_render_seed"][state_id]),
+                        )
+                        result[key] = self.observation_provider.is_available(request)
+        return result
+
     @lru_cache(maxsize=64)
     def _object_match_files(self, scene_id: int) -> tuple[str, ...]:
         """Cache the existing per-object grasp-library links for one scene."""

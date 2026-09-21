@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-import os
-import tempfile
-import yaml
+
 import numpy as np
+import yaml
 
 from .transforms import xyz_rpy_to_matrix
 
@@ -17,9 +18,13 @@ class AppConfig:
     raw: dict[str, Any]
 
     @classmethod
-    def load(cls, path: str | Path) -> "AppConfig":
+    def load(cls, path: str | Path) -> AppConfig:
         path = Path(path).resolve()
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        physics = raw.setdefault("physics", {})
+        if physics.get("parallel_workers") is None:
+            logical = os.cpu_count() or 1
+            physics["parallel_workers"] = max(1, min(logical // 2, 8))
         return cls(path, raw)
 
     def resolve(self, value: str) -> Path:
@@ -73,6 +78,7 @@ class AppConfig:
         tcp = self.raw["robot"]["model_tcp_to_robot_tcp"]
         if "matrix" in tcp:
             value = np.asarray(tcp["matrix"], np.float64)
-            if value.shape != (4, 4): raise ValueError("TCP matrix must be 4x4")
+            if value.shape != (4, 4):
+                raise ValueError("TCP matrix must be 4x4")
             return value
-        return xyz_rpy_to_matrix(tcp.get("xyz_mm_rpy_deg", [0,0,0,0,0,0]), 0.001)
+        return xyz_rpy_to_matrix(tcp.get("xyz_mm_rpy_deg", [0, 0, 0, 0, 0, 0]), 0.001)

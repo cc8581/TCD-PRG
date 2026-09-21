@@ -1,4 +1,4 @@
-"""Build binary PUSH-improvement targets from before/after states."""
+"""Build binary PUSH successful-sequence-membership targets."""
 
 from __future__ import annotations
 

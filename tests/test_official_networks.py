@@ -23,6 +23,22 @@ class _FakeOfficialPTv3(nn.Module):
         return SimpleNamespace(feat=self.projection(data["feat"]))
 
 
+class _FakeSonataPTv3(nn.Module):
+    kwargs = None
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__()
+        type(self).kwargs = kwargs
+        self.projection = nn.Linear(9, 512)
+        self.embedding = SimpleNamespace(stem=nn.Identity())
+        self.enc = SimpleNamespace(**{
+            f"enc{stage}": SimpleNamespace(
+                down=SimpleNamespace(norm=nn.Sequential(nn.BatchNorm1d(channels)))
+            )
+            for stage, channels in enumerate((96, 192, 384, 512), start=1)
+        })
+
+
 def test_ptv3_adapter_voxelizes_and_restores_dense_point_alignment(monkeypatch) -> None:
     monkeypatch.setattr(
         ptv3_adapter, "_load_official_model", lambda source_root: _FakeOfficialPTv3
@@ -73,6 +89,32 @@ def test_ptv3_adapter_packs_variable_scene_lengths_after_grid_sample(monkeypatch
     # Evaluation follows official GridSample semantics deterministically: the
     # first point in an occupied voxel is used as its representative.
     assert torch.equal(data["coord"][0], xyz[0, 0])
+
+
+def test_sonata_profile_matches_encoder_and_builds_xyz_rgb_normal_features(monkeypatch) -> None:
+    monkeypatch.setattr(
+        ptv3_adapter, "_load_official_model", lambda source_root: _FakeSonataPTv3
+    )
+    backbone = ptv3_adapter.PointTransformerV3SceneGeometryBackbone(
+        dim=16, source_root="unused", grid_size_m=0.01,
+        enable_flash_attention=False, patch_size=32,
+        activation_checkpointing=False, profile="sonata",
+    ).eval()
+    kwargs = _FakeSonataPTv3.kwargs
+    assert kwargs["in_channels"] == 9
+    assert kwargs["enc_depths"] == (3, 3, 3, 12, 3)
+    assert kwargs["enc_channels"] == (48, 96, 192, 384, 512)
+    assert kwargs["enc_num_head"] == (3, 6, 12, 24, 32)
+    assert kwargs["enc_patch_size"] == (1024,) * 5
+    assert kwargs["cls_mode"] is True
+
+    xy = torch.tensor([[[-1.0, -1.0, 0.0], [0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.5, -0.5, 0.0]]])
+    data, _, _ = backbone._voxelize(
+        xy, torch.full_like(xy, 0.5), torch.ones(1, 4, dtype=torch.bool)
+    )
+    assert data["feat"].shape[-1] == 9
+    normals = data["feat"][:, 6:]
+    assert torch.allclose(normals.norm(dim=-1), torch.ones(len(normals)), atol=1e-5)
 
 
 def test_task_and_global_grasp_use_one_shared_frozen_graspnet_adapter() -> None:

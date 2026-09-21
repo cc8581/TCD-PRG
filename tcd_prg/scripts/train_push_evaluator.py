@@ -44,7 +44,7 @@ def _device(value: Any, device: torch.device) -> Any:
 
 
 def push_optimizer_groups(model: StandalonePushModel, config) -> list[dict[str, Any]]:
-    """Keep the pretrained PointNet++ step size separate from random PUSH heads."""
+    """Keep the geometry-backbone step size separate from random PUSH heads."""
     backbone = list(model.push_evaluator.backbone.parameters())
     backbone_ids = {id(parameter) for parameter in backbone}
     heads = [
@@ -55,7 +55,11 @@ def push_optimizer_groups(model: StandalonePushModel, config) -> list[dict[str, 
         raise RuntimeError("PUSH optimizer requires nonempty backbone and head parameter groups")
     return [
         {"params": heads, "lr": config.optimizer.learning_rate, "name": "push_heads"},
-        {"params": backbone, "lr": config.optimizer.backbone_learning_rate, "name": "pointnet2_backbone"},
+        {
+            "params": backbone,
+            "lr": config.optimizer.backbone_learning_rate,
+            "name": f"{config.training.push_backbone}_backbone",
+        },
     ]
 
 
@@ -98,6 +102,130 @@ def _restrict_to_cached_informative_overfit_groups(dataset, root: str, limit: in
     )
 
 
+def _restrict_to_distribution_matched_groups(
+    dataset, root: str, limit: int, target_fraction: float, seed: int,
+    manifest_path: str | None = None,
+) -> None:
+    """Choose a fixed cached subset matching the full action-label distribution."""
+    manifest = Path(manifest_path) if manifest_path else None
+    if manifest is not None and manifest.is_file():
+        saved = json.loads(manifest.read_text(encoding="utf-8"))
+        if (
+            int(saved["source_group_count"]) != len(dataset.units)
+            or int(saved["selected_group_count"]) != limit
+            or float(saved["target_fraction"]) != target_fraction
+        ):
+            raise RuntimeError("PUSH balance experiment subset manifest mismatch")
+        dataset.units = tuple(dataset.units[int(i)] for i in saved["indices"])
+        dataset.selected_group_count = len(dataset.units)
+        print(
+            "[push-balance-experiment] reused fixed subset; "
+            f"positive={saved['positive']}/{saved['total']} "
+            f"({saved['positive'] / saved['total']:.4%})",
+            flush=True,
+        )
+        return
+    store = PushImprovementStore(root)
+    payloads: dict[int, dict[str, np.ndarray]] = {}
+    candidates: list[tuple[int, object, int, int]] = []
+    rng = np.random.default_rng(seed)
+    # Published units are scene ordered and the current immutable observation
+    # cache is a prefix. Scan that cache-resident prefix; randomize the final
+    # combination rather than probing uncached scenes across the full corpus.
+    scan_order = range(len(dataset.units))
+    pool_size = min(len(dataset.units), max(limit * 5, limit))
+    for index in scan_order:
+        unit = dataset.units[int(index)]
+        try:
+            sample = dataset[int(index)]
+        except ObservationCacheMissError:
+            continue
+        payload = payloads.setdefault(unit.scene_id, store.load_scene(unit.scene_id))
+        action_ids = np.asarray(payload["action_id"], np.int64)
+        ids = np.asarray(sample.candidates.candidate_action_ids, np.int64)
+        locations = np.searchsorted(action_ids, ids)
+        matched = locations < len(action_ids)
+        if len(action_ids):
+            matched &= action_ids[np.minimum(locations, len(action_ids) - 1)] == ids
+        locations = locations[matched]
+        valid = np.asarray(payload["improvement_valid"])[locations].astype(bool)
+        labels = np.asarray(payload["improvement_target"])[locations][valid]
+        if len(labels):
+            candidates.append((int(index), unit, int(labels.sum()), len(labels)))
+        if len(candidates) >= pool_size:
+            break
+    if len(candidates) < limit:
+        raise RuntimeError(
+            f"Only {len(candidates)} cached labeled groups found; requested {limit}"
+        )
+    best = None
+    trials = max(2000, limit * 20)
+    for _ in range(trials):
+        chosen = rng.choice(len(candidates), limit, replace=False)
+        positive = sum(candidates[int(i)][2] for i in chosen)
+        total = sum(candidates[int(i)][3] for i in chosen)
+        error = abs(positive / total - target_fraction)
+        if best is None or error < best[0]:
+            best = (error, chosen, positive, total)
+    assert best is not None
+    dataset.units = tuple(candidates[int(i)][1] for i in best[1])
+    dataset.selected_group_count = len(dataset.units)
+    if manifest is not None:
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            json.dumps({
+                "source_group_count": len(scan_order),
+                "selected_group_count": limit,
+                "target_fraction": target_fraction,
+                "positive": best[2],
+                "total": best[3],
+                "indices": [candidates[int(i)][0] for i in best[1]],
+            }, indent=2),
+            encoding="utf-8",
+        )
+    print(
+        "[push-balance-experiment] fixed "
+        f"{len(dataset.units)} cached groups; positive={best[2]}/{best[3]} "
+        f"({best[2] / best[3]:.4%}), target={target_fraction:.4%}",
+        flush=True,
+    )
+
+
+def _require_cached_observations(adapter, *datasets) -> None:
+    """Fail before model initialization unless every selected state is cache-resident."""
+    keys = sorted({
+        (int(unit.scene_id), int(unit.state_id), int(unit.task_index))
+        for dataset in datasets for unit in dataset.units
+    })
+    started = time.monotonic()
+    bulk = getattr(adapter, "observations_available", None)
+    if bulk is not None:
+        availability = bulk(keys)
+        if set(availability) != set(keys):
+            raise RuntimeError("Stage-C bulk cache preflight returned incomplete keys")
+        missing = sorted(key for key in keys if not availability[key])
+    else:
+        missing = [key for key in keys if not adapter.observation_available(*key)]
+    print(
+        f"[push-cache-preflight] checked={len(keys)}/{len(keys)} missing={len(missing)}",
+        flush=True,
+    )
+    if missing:
+        examples = ", ".join(
+            f"scene={scene} state={state} task={task}"
+            for scene, state, task in missing[:10]
+        )
+        raise ObservationCacheMissError(
+            f"Stage-C cache preflight found {len(missing)}/{len(keys)} missing observations; "
+            f"first entries: {examples}"
+        )
+    print(
+        f"[push-cache-preflight] complete: {len(keys)} unique state-task observations "
+        f"available in {time.monotonic() - started:.1f}s",
+        flush=True,
+    )
+
+
 def accumulated_batches(model, loader, *, device, config, loss_function, optimizer):
     """Accumulate only microbatches that contain valid binary supervision."""
     limit = config.training.gradient_accumulation_steps
@@ -115,6 +243,8 @@ def accumulated_batches(model, loader, *, device, config, loss_function, optimiz
             instance_queries=config.model.instance_queries,
             loss_function=loss_function,
             scene_sample_points=config.training.push_fps_points,
+            class_balance_mode=config.training.push_class_balance_mode,
+            positive_fraction=config.training.push_positive_fraction,
         )
         valid = details["improvement_valid"]
         count = int(valid.sum())
@@ -247,6 +377,10 @@ def _main() -> None:
     parser.add_argument("--output", default="outputs/push_evaluator.pt")
     parser.add_argument("--resume", help="Continue weights, optimizer and steps from a *_last.pt checkpoint; reshuffle data.")
     parser.add_argument(
+        "--resume-with-new-lr", action="store_true",
+        help="On resume, retain weights/Adam moments/step but use learning rates from the current config.",
+    )
+    parser.add_argument(
         "--checkpoint-interval", type=int, default=100,
         help="Deprecated compatibility option; PUSH restart snapshots are validation transactions.",
     )
@@ -262,17 +396,19 @@ def _main() -> None:
     if config.dataset.scene_points > 0 and fps_points > config.dataset.scene_points:
         parser.error("training.push_fps_points must not exceed dataset.scene_points")
     if config.training.perception_checkpoint:
-        parser.error("PointNet++ PUSH does not use training.perception_checkpoint; remove it")
+        parser.error("Standalone PUSH does not use training.perception_checkpoint; remove it")
     if config.training.amp:
-        parser.error("PointNet++ PUSH currently uses FP32; set training.amp=false")
+        parser.error("PUSH evaluator currently uses FP32; set training.amp=false")
     if args.checkpoint_interval <= 0:
         parser.error("--checkpoint-interval must be positive")
     if args.resume and (args.pretrain_checkpoint or config.training.pretrain_checkpoint):
         parser.error("--resume and pretrain_checkpoint are mutually exclusive")
+    if args.resume_with_new_lr and not args.resume:
+        parser.error("--resume-with-new-lr requires --resume")
     seed_everything(config.training.seed, config.training.deterministic)
     # Batched relation GEMMs change reduction order. Use full FP32 throughout
     # this independent stage so cuDNN TF32 does not amplify those small changes
-    # in the PointNet++ backward pass. A/B entry points are unaffected.
+    # in the PUSH-backbone backward pass. A/B entry points are unaffected.
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
@@ -284,7 +420,10 @@ def _main() -> None:
         adapter,
         split="train",
         max_groups=(
-            None if config.training.push_overfit_validate_train
+            None if (
+                config.training.push_overfit_validate_train
+                or config.training.push_experiment_target_positive_fraction is not None
+            )
             else config.training.max_train_groups
         ),
         allowed_strata=config.training.allowed_action_strata,
@@ -297,6 +436,17 @@ def _main() -> None:
             dataset,
             config.training.push_improvement_root,
             int(config.training.max_train_groups),
+        )
+    elif config.training.push_experiment_target_positive_fraction is not None:
+        if config.training.max_train_groups is None:
+            raise RuntimeError("Distribution-matched experiment requires max_train_groups")
+        _restrict_to_distribution_matched_groups(
+            dataset,
+            config.training.push_improvement_root,
+            int(config.training.max_train_groups),
+            float(config.training.push_experiment_target_positive_fraction),
+            int(config.training.seed),
+            config.training.push_experiment_subset_manifest,
         )
     validation_scenes = tuple(int(value) for value in adapter.scene_splits["val"])
     requested_scenes = config.training.validation_scene_count
@@ -317,36 +467,73 @@ def _main() -> None:
         periodic_validation_scenes = tuple(sorted({item.scene_id for item in dataset.units}))
         validation_scenes = periodic_validation_scenes
     else:
-        validation_dataset = ActionStateGroupDataset(
-            adapter,
-            split="val",
-            scene_ids=frozenset(periodic_validation_scenes),
-            max_groups=config.training.max_validation_groups,
-            allowed_strata=config.training.allowed_action_strata,
-            global_grasp_mode="never",
-        )
         final_validation_dataset = ActionStateGroupDataset(
             adapter,
             split="val",
             scene_ids=frozenset(validation_scenes),
             # A bounded validation set marks a diagnostic run. Formal configs use
             # None and therefore still evaluate the complete validation split.
-            max_groups=config.training.max_validation_groups,
+            max_groups=(
+                None
+                if config.training.push_experiment_target_positive_fraction is not None
+                else config.training.max_validation_groups
+            ),
             allowed_strata=config.training.allowed_action_strata,
             global_grasp_mode="never",
         )
+        if config.training.push_experiment_target_positive_fraction is not None:
+            if config.training.max_validation_groups is None:
+                raise RuntimeError(
+                    "Distribution-matched experiment requires max_validation_groups"
+                )
+            # Training and validation must each match the corpus action-level
+            # prevalence.  Reuse one fixed validation subset across every
+            # candidate so the hyperparameter comparison is paired.
+            manifest = config.training.push_experiment_subset_manifest
+            validation_manifest = f"{manifest}.validation" if manifest else None
+            _restrict_to_distribution_matched_groups(
+                final_validation_dataset,
+                config.training.push_improvement_root,
+                int(config.training.max_validation_groups),
+                float(config.training.push_experiment_target_positive_fraction),
+                int(config.training.seed) + 1,
+                validation_manifest,
+            )
+            validation_dataset = final_validation_dataset
+            periodic_validation_scenes = tuple(
+                sorted({item.scene_id for item in validation_dataset.units})
+            )
+        else:
+            validation_dataset = ActionStateGroupDataset(
+                adapter,
+                split="val",
+                scene_ids=frozenset(periodic_validation_scenes),
+                max_groups=config.training.max_validation_groups,
+                allowed_strata=config.training.allowed_action_strata,
+                global_grasp_mode="never",
+            )
     if not len(dataset):
         raise RuntimeError("PUSH evaluator training requires a non-empty training split")
     if not len(validation_dataset):
         raise RuntimeError("Formal PUSH evaluator training requires a non-empty val split")
+    _require_cached_observations(adapter, dataset, final_validation_dataset)
     print(f"[push-evaluator-init] train_groups={len(dataset)} "
           f"validation_groups={len(validation_dataset)}; "
-          "single-head binary PUSH improvement with BCE; fine-tuning yanx27 PointNet++", flush=True)
-    model = StandalonePushModel(config.model).to(device)
+          "single-head binary PUSH improvement with BCE; "
+          f"backbone={config.training.push_backbone}", flush=True)
+    model = StandalonePushModel(
+        config.model,
+        config.backbone,
+        config.training.push_backbone,
+    ).to(device)
     pretrain_checkpoint = args.pretrain_checkpoint or config.training.pretrain_checkpoint
     if not pretrain_checkpoint and not args.resume:
-        provenance = model.push_evaluator.backbone.load_pretrained()
-        print(f"[pretrain] loaded complete yanx27 S3DIS network: {provenance}", flush=True)
+        load_pretrained = getattr(model.push_evaluator.backbone, "load_pretrained", None)
+        provenance = load_pretrained() if load_pretrained is not None else {
+            "backend": config.training.push_backbone,
+            "initialization": "random",
+        }
+        print(f"[pretrain] backbone initialization: {provenance}", flush=True)
     if pretrain_checkpoint:
         load_push_evaluator(model, pretrain_checkpoint)
         print(
@@ -355,9 +542,16 @@ def _main() -> None:
             "optimizer and step start fresh",
             flush=True,
         )
-    loss_function = PushImprovementLoss(
-        pos_weight=config.training.push_improvement_pos_weight
+    training_loss_function = PushImprovementLoss(
+        pos_weight=(
+            config.training.push_improvement_pos_weight
+            if config.training.push_class_balance_mode in {
+                "reweight", "reweight_undersample"
+            }
+            else None
+        )
     )
+    validation_loss_function = PushImprovementLoss(pos_weight=None)
     optimizer = torch.optim.AdamW(
         push_optimizer_groups(model, config), weight_decay=config.optimizer.weight_decay,
     )
@@ -412,7 +606,9 @@ def _main() -> None:
         "push_improvement_definition": PUSH_IMPROVEMENT_DEFINITION,
     }, {"config": signature,
         "periodic_scenes": periodic_validation_scenes, "final_scenes": validation_scenes}, scheduler=scheduler)
-    step = checkpoints.restore(args.resume, optimizer) if args.resume else 0
+    step = checkpoints.restore(
+        args.resume, optimizer, override_learning_rates=args.resume_with_new_lr
+    ) if args.resume else 0
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
     (Path(config.output_dir) / "resolved_config.yaml").write_text(
         yaml.safe_dump(asdict(config), allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -432,6 +628,12 @@ def _main() -> None:
     )
     if args.resume:
         print(f"[resume] restored optimizer and step={step}", flush=True)
+        if args.resume_with_new_lr:
+            rates = ", ".join(
+                f"{group.get('name', index)}={group['lr']:.6g}"
+                for index, group in enumerate(optimizer.param_groups)
+            )
+            print(f"[resume] applied configured learning rates at schedule step {step}: {rates}", flush=True)
     last_validation_step = checkpoints.last_completed_validation_step
     validation_interval = max(0, int(config.training.validation_interval))
     log_interval = max(1, int(config.logging.log_interval))
@@ -441,7 +643,7 @@ def _main() -> None:
         progress.pause()
         try:
             metrics = _evaluate(model, loader, device=device, config=config,
-                                loss_function=loss_function, phase=phase)
+                                loss_function=validation_loss_function, phase=phase)
             if phase == "periodic":
                 checkpoints.consider_best(metrics, step)
             best_score = checkpoints.best_metrics["push_evaluator_auprc"] if checkpoints.best_metrics else float("nan")
@@ -480,7 +682,8 @@ def _main() -> None:
     while step < config.training.max_optimizer_steps:
         made_progress = False
         for mean_loss, count, positives, data_seconds, components in accumulated_batches(
-            model, loader, device=device, config=config, loss_function=loss_function,
+            model, loader, device=device, config=config,
+            loss_function=training_loss_function,
             optimizer=optimizer,
         ):
             made_progress = True

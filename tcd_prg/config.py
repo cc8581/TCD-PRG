@@ -423,14 +423,26 @@ class TrainingConfig:
     )
 
 
+    # Stage-C only. PTv3 is the primary PUSH geometry backbone; PointNet++ is
+    # retained as an explicitly selected fallback for controlled comparisons.
+    push_backbone: str = "point_transformer_v3"
     # Stage-C only; required by its training entrypoint, unused by A/B.
     push_fps_points: int | None = None
     # Stage-C binary PUSH-improvement sidecars and fixed dataset-level weight.
     push_improvement_root: str | None = None
     push_improvement_pos_weight: float | None = None
+    # Training-only class balancing. ``reweight_undersample`` applies both.
+    # Validation always uses the natural data distribution. The fraction is
+    # the desired positive share (1/3 => 1:2).
+    push_class_balance_mode: str = "reweight"
+    push_positive_fraction: float = 1.0 / 3.0
     # Diagnostic only: evaluate the exact fixed training subset to test whether
     # Stage C can memorize within-state ordering before a formal run.
     push_overfit_validate_train: bool = False
+    # Diagnostic sweep only: select max_train_groups whose action-level label
+    # fraction matches this target. Formal training leaves it null.
+    push_experiment_target_positive_fraction: float | None = None
+    push_experiment_subset_manifest: str | None = None
 
 
 @dataclass(slots=True)
@@ -551,9 +563,27 @@ class TCDPRGConfig:
 
     def validate(self) -> None:
         training = self.training
+        if training.push_backbone not in {"point_transformer_v3", "pointnet2"}:
+            raise ValueError(
+                "training.push_backbone must be point_transformer_v3 or pointnet2"
+            )
         if (training.push_improvement_pos_weight is not None
                 and training.push_improvement_pos_weight <= 0):
             raise ValueError("training.push_improvement_pos_weight must be positive")
+        if training.push_class_balance_mode not in {
+            "none", "reweight", "undersample", "reweight_undersample"
+        }:
+            raise ValueError(
+                "push_class_balance_mode must be none, reweight, undersample, "
+                "or reweight_undersample"
+            )
+        if not 0.0 < training.push_positive_fraction < 1.0:
+            raise ValueError("push_positive_fraction must be in (0,1)")
+        if (
+            training.push_experiment_target_positive_fraction is not None
+            and not 0.0 < training.push_experiment_target_positive_fraction < 1.0
+        ):
+            raise ValueError("push_experiment_target_positive_fraction must be in (0,1)")
         augmentation = self.augmentation
         if augmentation.debug.save_first_batches < 0:
             raise ValueError("augmentation.debug.save_first_batches cannot be negative")

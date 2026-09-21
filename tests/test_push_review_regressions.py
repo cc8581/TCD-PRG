@@ -48,7 +48,7 @@ def test_projection_overlap_handles_crossing_edges_and_reverse_containment():
 
 def tiny_training():
     # Exercise real AdamW moments, independently of expensive point encoding.
-    model = StandalonePushModel(ModelConfig(feature_dim=16))
+    model = StandalonePushModel(ModelConfig(feature_dim=16), push_backbone="pointnet2")
     optimizer = torch.optim.AdamW(model.push_evaluator.parameters(), lr=.001)
     return model, optimizer
 
@@ -129,6 +129,7 @@ def test_training_entry_survives_final_validation_failure_and_resumes(tmp_path,m
     config = TCDPRGConfig(model=ModelConfig(feature_dim=16,instance_queries=4),
                          backbone=BackboneConfig(backend='legacy',attention_points=8),
                          training=TrainingConfig(device='cpu',amp=False,batch_size=1,num_workers=0,
+                                                 push_backbone='pointnet2',
                                                  push_fps_points=32,
                                                  max_optimizer_steps=2,
                                                  validation_interval=1,pretrain_checkpoint=None))
@@ -137,6 +138,7 @@ def test_training_entry_survives_final_validation_failure_and_resumes(tmp_path,m
     monkeypatch.setattr('tcd_prg.trainers.push_sampling.sample_push_training_input',
                         lambda sensor, condition, actions, count: (sensor, condition, actions))
     monkeypatch.setattr(entry,'create_adapter',lambda *args,**kwargs:SimpleNamespace(scene_splits={'val':(1,)}))
+    monkeypatch.setattr(entry, '_require_cached_observations', lambda *args: None)
     ready = {'loss':False}
     class GuardedSamples(list):
         def __getitem__(self,index):

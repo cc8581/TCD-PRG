@@ -1,6 +1,7 @@
 """Logged-action-only binary PUSH-improvement training."""
 import torch
-from tcd_prg.constants import PUSH_DISTANCE_M, ActionType, CandidateStatus
+
+from tcd_prg.constants import PUSH_DISTANCE_M, ActionType
 from tcd_prg.models import push_condition_from_gt
 from tcd_prg.models.push import PushActions
 
@@ -18,7 +19,6 @@ def push_effectiveness_eligibility(batch, condition):
     return (
         batch["candidate_mask"].bool()
         & (batch["action_type"] == int(ActionType.PUSH))
-        & (batch["evaluation_status"] != int(CandidateStatus.UNKNOWN_UNTESTED))
         & represented
         & condition.target_valid[:, None]
         & torch.isfinite(p["push_contact_world"]).all(-1)
@@ -44,6 +44,25 @@ def logged_push_actions(batch, condition):
     return actions, valid
 
 
+def balanced_binary_supervision(target, valid, positive_fraction):
+    """Undersample negatives only when both classes occur in a microbatch."""
+    if positive_fraction is None:
+        return valid
+    positive = valid & (target > 0.5)
+    negative = valid & ~positive
+    positive_count = int(positive.sum())
+    selected = positive.clone()
+    if positive_count == 0:
+        return valid
+    negative_indices = torch.nonzero(negative, as_tuple=False).flatten()
+    negative_per_positive = (1.0 - positive_fraction) / positive_fraction
+    keep = min(len(negative_indices), round(positive_count * negative_per_positive))
+    if keep:
+        order = torch.randperm(len(negative_indices), device=target.device)[:keep]
+        selected[negative_indices[order]] = True
+    return selected
+
+
 def push_effectiveness_batch_loss(
     model,
     batch,
@@ -51,6 +70,8 @@ def push_effectiveness_batch_loss(
     instance_queries,
     loss_function,
     scene_sample_points=None,
+    class_balance_mode="none",
+    positive_fraction=None,
 ):
     condition = push_condition_from_gt(batch, instance_queries)
     actions, valid = logged_push_actions(batch, condition)
@@ -63,10 +84,16 @@ def push_effectiveness_batch_loss(
             prediction = model.score_actions(sensor, sampled_condition, sampled_actions)
         else:
             prediction = model.score_actions(batch, condition, actions)
+        target = batch["push_improvement_target"][valid]
+        target_valid = batch["push_improvement_valid"][valid].bool()
+        if class_balance_mode in {"undersample", "reweight_undersample"}:
+            target_valid = balanced_binary_supervision(
+                target, target_valid, positive_fraction
+            )
         losses = loss_function(
             prediction,
-            improvement_target=batch["push_improvement_target"][valid],
-            improvement_valid=batch["push_improvement_valid"][valid],
+            improvement_target=target,
+            improvement_valid=target_valid,
         )
         loss = losses["push_improvement"]
     else:
@@ -80,7 +107,11 @@ def push_effectiveness_batch_loss(
     return loss, {
         **losses,
         **prediction,
-        "improvement_target": batch["push_improvement_target"][valid],
-        "improvement_valid": batch["push_improvement_valid"][valid].bool(),
+        "improvement_target": target if len(actions.batch_index) else batch[
+            "push_improvement_target"
+        ][valid],
+        "improvement_valid": target_valid if len(actions.batch_index) else batch[
+            "push_improvement_valid"
+        ][valid].bool(),
         "effective_group_index": actions.batch_index,
     }

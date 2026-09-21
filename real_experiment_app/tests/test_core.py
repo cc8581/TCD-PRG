@@ -1,11 +1,12 @@
+# ruff: noqa: E501
 from pathlib import Path
 
 import numpy as np
 import pytest
 import yaml
 
-from real_experiment_app.config import AppConfig
 from real_experiment_app.camera import build_cameras
+from real_experiment_app.config import AppConfig
 from real_experiment_app.perception import (
     fuse_frames,
     remove_calibrated_table,
@@ -120,7 +121,8 @@ def test_operator_can_record_and_persist_table_calibration(tmp_path: Path):
 
 def test_enabled_cameras_need_unique_model_view_indices(tmp_path: Path):
     path = tmp_path / "settings.yaml"
-    path.write_text("robot:\n  sdk_windows_root: .\ncameras:\n  - {id: camera_0, enabled: true, ip: a, model_view_index: 2}\n  - {id: camera_1, enabled: true, ip: b, model_view_index: 2}\n", encoding="utf-8")
+    path.write_text(
+        "robot:\n  sdk_windows_root: .\ncameras:\n  - {id: camera_0, enabled: true, ip: a, model_view_index: 2}\n  - {id: camera_1, enabled: true, ip: b, model_view_index: 2}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="互不重复"):
         build_cameras(AppConfig.load(path))
 

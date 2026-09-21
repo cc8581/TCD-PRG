@@ -89,9 +89,7 @@ def fuse_frames(frames: list[RGBDFrame], segments, settings: dict) -> FusedScene
     xyzs, rgbs, views = [], [], []
     for capture_index, frame in enumerate(frames):
         view = capture_index if frame.model_view_index is None else int(frame.model_view_index)
-        xyz, rgb = _points(
-            frame, settings["depth_min_mm"], settings["depth_max_mm"]
-        )
+        xyz, rgb = _points(frame, settings["depth_min_mm"], settings["depth_max_mm"])
         xyzs.append(xyz)
         rgbs.append(rgb)
         views.append(np.full(len(xyz), view, np.int16))
@@ -127,10 +125,13 @@ def fuse_frames(frames: list[RGBDFrame], segments, settings: dict) -> FusedScene
 
     # -1 means "not assigned yet". The integrated InstanceQueryHead fills it.
     instance = np.full(len(xyz), -1, np.int64)
-    maximum_view = max(int(source.max()), max(
-        (i if frame.model_view_index is None else int(frame.model_view_index))
-        for i, frame in enumerate(frames)
-    ))
+    maximum_view = max(
+        int(source.max()),
+        max(
+            (i if frame.model_view_index is None else int(frame.model_view_index))
+            for i, frame in enumerate(frames)
+        ),
+    )
     camera_to_world = [np.eye(4, dtype=np.float32) for _ in range(maximum_view + 1)]
     for capture_index, frame in enumerate(frames):
         view = capture_index if frame.model_view_index is None else int(frame.model_view_index)

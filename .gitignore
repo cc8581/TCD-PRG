@@ -29,6 +29,7 @@ resolved_config.yaml
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.serena/
 configs/local_paths.yaml
 third_party/pointnet2_official/
 third_party/pointnet2_yanx27/

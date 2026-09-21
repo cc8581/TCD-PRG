@@ -1,15 +1,29 @@
-"""Independent, end-to-end PointNet++ PUSH evaluator; no perception weights."""
+"""Independent end-to-end PUSH evaluator with a selectable geometry backbone."""
 from torch import nn
+
+from tcd_prg.config import BackboneConfig
+
 from .push import PushImprovementEvaluator, RulePushGenerator
 
 
 class StandalonePushModel(nn.Module):
-    def __init__(self, config):
+    def __init__(
+        self,
+        config,
+        backbone_config=None,
+        push_backbone="point_transformer_v3",
+    ):
         super().__init__()
         self.push = RulePushGenerator(config)
         self.push_evaluator_ready = False
         self.push_evaluator = PushImprovementEvaluator(
-            config.feature_dim, config.num_categories, config.num_task_regions)
+            config.feature_dim,
+            config.num_categories,
+            config.num_task_regions,
+            backbone_backend=push_backbone,
+            backbone_config=backbone_config or BackboneConfig(),
+            activation_checkpointing=config.activation_checkpointing,
+        )
 
     @staticmethod
     def _sensor(batch):

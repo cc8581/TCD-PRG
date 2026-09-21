@@ -41,6 +41,13 @@ def test_far_logged_contact_remains_evaluator_supervision():
     assert bool(valid[0, 0])
 
 
+def test_unexecuted_push_is_eligible_for_sequence_membership_negative():
+    batch = _batch()
+    batch["evaluation_status"][:] = int(CandidateStatus.UNKNOWN_UNTESTED)
+    valid = push_effectiveness_eligibility(batch, _condition())
+    assert bool(valid[0, 0])
+
+
 def test_invisible_target_is_not_evaluator_supervision():
     valid = push_effectiveness_eligibility(_batch(), _condition(False))
     assert not bool(valid[0, 0])

@@ -66,6 +66,18 @@ def test_resume_output_changes_do_not_hide_objective_changes():
     assert resume_compatibility(old) != resume_compatibility(new)
 
 
+def test_resume_compatibility_can_ignore_only_learning_rate_changes():
+    old = {'config': {'optimizer': {'learning_rate': 1e-4,
+                                    'backbone_learning_rate': 2e-5,
+                                    'weight_decay': .01}}}
+    new = {'config': {'optimizer': {'learning_rate': 5e-3,
+                                    'backbone_learning_rate': 5e-3,
+                                    'weight_decay': .01}}}
+    assert resume_compatibility(old) != resume_compatibility(new)
+    assert (resume_compatibility(old, ignore_learning_rates=True)
+            == resume_compatibility(new, ignore_learning_rates=True))
+
+
 def test_push_validation_transaction_controls_resume_order(tmp_path):
     from test_push_review_regressions import tiny_training
 

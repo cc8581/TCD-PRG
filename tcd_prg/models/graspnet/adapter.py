@@ -5,6 +5,7 @@ pinned external dependency and deliberately kept outside the TCD-PRG state_dict:
 it is frozen, reproducible from its own checkpoint, and should not be duplicated by
 optimizer/EMA/checkpoint machinery.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -16,9 +17,9 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from tcd_prg.paths import project_path
 from tcd_prg.geometry.camera import graspnet_to_tcd_rotation
 from tcd_prg.geometry.se3 import parallel_jaw_rotation_distance
+from tcd_prg.paths import project_path
 
 
 def _load_official_graspnet(source_root: str | Path):
@@ -177,9 +178,7 @@ class FrozenGraspNetProposalGenerator(nn.Module):
             raise RuntimeError("Call prepare_finetuning(device) before creating the optimizer")
         return tuple(parameter for parameter in network.parameters() if parameter.requires_grad)
 
-    def official_training_loss(
-        self, dense_batch: dict[str, Any]
-    ) -> tuple[Tensor, dict[str, Any]]:
+    def official_training_loss(self, dense_batch: dict[str, Any]) -> tuple[Tensor, dict[str, Any]]:
         """Compute the upstream GraspNet loss from its complete dense label schema.
 
         Sparse TCD task-grasp poses are intentionally rejected: upstream training
@@ -264,9 +263,9 @@ class FrozenGraspNetProposalGenerator(nn.Module):
                 continue
             sample_valid[row] = True
             if len(valid) >= count:
-                position = torch.linspace(
-                    0, len(valid) - 1, count, device=valid.device
-                ).round().long()
+                position = (
+                    torch.linspace(0, len(valid) - 1, count, device=valid.device).round().long()
+                )
                 selected = valid[position]
             else:
                 selected = valid.repeat(math.ceil(count / len(valid)))[:count]
@@ -284,9 +283,7 @@ class FrozenGraspNetProposalGenerator(nn.Module):
             candidates = torch.nonzero(valid[row], as_tuple=False).flatten()
             if not len(points) or not len(candidates):
                 continue
-            distance = torch.cdist(
-                translation[row, candidates].float(), xyz[row, points].float()
-            )
+            distance = torch.cdist(translation[row, candidates].float(), xyz[row, points].float())
             result[row, candidates] = points[distance.argmin(-1)]
         return result
 
@@ -297,9 +294,7 @@ class FrozenGraspNetProposalGenerator(nn.Module):
         candidates = torch.nonzero(finite, as_tuple=False).flatten()
         if not len(candidates):
             return candidates
-        quality_order = candidates[
-            prediction[candidates, 0].argsort(descending=True, stable=True)
-        ]
+        quality_order = candidates[prediction[candidates, 0].argsort(descending=True, stable=True)]
         if selection_mode == "quality_topk":
             return quality_order[:requested]
         if selection_mode != "quality_diverse":
@@ -317,9 +312,7 @@ class FrozenGraspNetProposalGenerator(nn.Module):
         translation = prediction[pool, 13:16].float()
         translation_distance = torch.cdist(translation, translation)
         rotation_distance = torch.rad2deg(
-            parallel_jaw_rotation_distance(
-                rotation_tcd[:, None], rotation_tcd[None, :]
-            )
+            parallel_jaw_rotation_distance(rotation_tcd[:, None], rotation_tcd[None, :])
         )
         duplicate = (
             (translation_distance < self.diversity_translation_m)
@@ -369,12 +362,8 @@ class FrozenGraspNetProposalGenerator(nn.Module):
         # The pinned PointNet++ CUDA kernels only accept FP32 tensors.  Formal
         # training wraps the whole objective in autocast, so isolate the frozen
         # external network from AMP instead of disabling AMP for learned heads.
-        with torch.inference_mode(), torch.autocast(
-            device_type=xyz.device.type, enabled=False
-        ):
-            decoded = self.pred_decode(
-                network({"point_clouds": sampled.float()})
-            )
+        with torch.inference_mode(), torch.autocast(device_type=xyz.device.type, enabled=False):
+            decoded = self.pred_decode(network({"point_clouds": sampled.float()}))
 
         b, k = xyz.shape[0], requested_proposals
         dtype = xyz.dtype
@@ -389,9 +378,7 @@ class FrozenGraspNetProposalGenerator(nn.Module):
             if not row_valid[row] or prediction.numel() == 0:
                 continue
             prediction = prediction.to(device=xyz.device, dtype=dtype)
-            selected_indices = self._select_proposal_indices(
-                prediction, k, selection_mode
-            )
+            selected_indices = self._select_proposal_indices(prediction, k, selection_mode)
             selected = prediction[selected_indices]
             count = len(selected)
             score[row, :count] = selected[:, 0].clamp(0.0, 1.0)

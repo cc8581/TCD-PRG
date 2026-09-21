@@ -15,8 +15,13 @@ class PushImprovementLoss(nn.Module):
             raise ValueError("PUSH improvement pos_weight must be positive")
         self.pos_weight = pos_weight
 
-    def forward(self, prediction: dict[str, Tensor], *, improvement_target: Tensor,
-                improvement_valid: Tensor) -> dict[str, Tensor]:
+    def forward(
+        self,
+        prediction: dict[str, Tensor],
+        *,
+        improvement_target: Tensor,
+        improvement_valid: Tensor,
+    ) -> dict[str, Tensor]:
         logit = prediction["improvement_logit"]
         if logit.shape != improvement_target.shape or improvement_valid.shape != logit.shape:
             raise ValueError("PUSH improvement logit/target/mask shapes must align")

@@ -2,25 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
-from pathlib import Path
 import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 
 import h5py
 import numpy as np
 
-from tcd_prg.constants import ActionType, OutcomeCode
+from tcd_prg.constants import ActionType
 from tcd_prg.push_improvement import (
-    PUSH_IMPROVEMENT_COMPONENT_EPS,
-    PUSH_IMPROVEMENT_COMPONENT_NAMES,
     PUSH_IMPROVEMENT_DEFINITION,
-    improvement_event,
 )
 
-
 PUSH_VALUE_SCHEMA_VERSION = 1  # State-sidecar schema retained for compatibility.
-PUSH_IMPROVEMENT_SCHEMA_VERSION = 8
+PUSH_IMPROVEMENT_SCHEMA_VERSION = 9
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +30,7 @@ class StateValues:
     render_protocol_sha256: str
     task_grasp_probability_threshold: float = 0.5
 
-    def validate(self, state_count: int) -> "StateValues":
+    def validate(self, state_count: int) -> StateValues:
         for name in ("graspability", "directly_graspable", "valid"):
             if getattr(self, name).shape != (state_count,):
                 raise ValueError(f"state value {name} must be [{state_count}]")
@@ -92,7 +88,9 @@ def write_state_values(path: str | Path, values: StateValues) -> None:
         )
         handle.attrs["graspability_definition"] = "max_valid_stage_b_probability"
         handle.create_dataset("graspability", data=values.graspability, compression="gzip")
-        handle.create_dataset("directly_graspable", data=values.directly_graspable, compression="gzip")
+        handle.create_dataset(
+            "directly_graspable", data=values.directly_graspable, compression="gzip"
+        )
         handle.create_dataset("valid", data=values.valid, compression="gzip")
 
     _atomic_h5(Path(path), writer)
@@ -229,114 +227,56 @@ def build_push_improvement_sidecar(
     *,
     raw_relation_names: tuple[str, ...],
 ) -> None:
-    """Build binary single-step PUSH-improvement supervision.
+    """Build binary successful-sequence-membership PUSH supervision.
 
-    Only executed, linked PUSH transitions with a valid post-state and without
-    an explicitly invalid/unsafe outcome supervise the evaluator.  Safety is
-    *not* a target: such transitions are simply excluded because deployment
-    safety is handled by deterministic certification.
-
-    The model never receives the after-state.  The after-state exists only here,
-    offline, to define the target order for the current ``(state, action)``.
+    Every PUSH candidate is supervised.  An action is positive iff its global
+    action ID occurs in at least one published successful sequence; every other
+    PUSH action, including an unexecuted candidate, is negative.  Transition
+    outcome metrics and after-state deltas do not participate in this label.
     """
+    del raw_relation_names  # retained in the CLI/API to avoid a migration trap
     with h5py.File(scene_label_path, "r", swmr=True) as handle:
         if len(handle.keys()) != 1:
             raise ValueError("scene label file must contain exactly one scene group")
         scene = handle[next(iter(handle.keys()))]
-        states, actions = scene["states"], scene["actions"]
-        state_count = len(states["task_index"])
-        state_task = states["task_index"][:].astype(np.int64)
-        state_key, state_key_valid = _structural_state_progress_keys(
-            scene, tuple(raw_relation_names)
-        )
-
+        actions = scene["actions"]
         action_type = actions["action_type"][:].astype(np.int8)
         executed = actions["executed"][:].astype(bool)
-        outcome = actions["outcome_code"][:].astype(np.int8)
         from_state = actions["from_state"][:].astype(np.int64)
         to_state = actions["to_state"][:].astype(np.int64)
-        after_valid = actions["after_state_valid"][:].astype(bool)
-        task = actions["task_index"][:].astype(np.int64)
-        potential_improved = (
-            actions["potential_improved"][:].astype(bool)
-            if "potential_improved" in actions
-            else np.zeros(len(action_type), dtype=bool)
+        if "sequences" not in scene:
+            raise ValueError("scene is missing successful sequences")
+        sequences = scene["sequences"]
+        sequence_ids: list[np.ndarray] = []
+        for value_name, offset_name in (
+            ("policy_action_ids", "policy_action_offsets"),
+            ("terminal_action_ids", "terminal_action_offsets"),
+        ):
+            if value_name in sequences and offset_name in sequences:
+                sequence_ids.append(sequences[value_name][:].astype(np.int64))
+        successful_action_ids = (
+            np.unique(np.concatenate(sequence_ids)) if sequence_ids
+            else np.empty(0, np.int64)
         )
 
-    clipped_from = from_state.clip(0, max(state_count - 1, 0))
-    clipped_to = to_state.clip(0, max(state_count - 1, 0))
-    linked = (
-        executed
-        & after_valid
-        & (from_state >= 0)
-        & (from_state < state_count)
-        & (to_state >= 0)
-        & (to_state < state_count)
-        & (task == state_task[clipped_from])
-        & (task == state_task[clipped_to])
-    )
-    # This is a data-validity filter, not a learned safety target.
-    execution_valid = ~np.isin(
-        outcome,
-        np.asarray(
-            [OutcomeCode.UNSTABLE, OutcomeCode.OUT_OF_WORKSPACE, OutcomeCode.OTHER_INVALID],
-            np.int8,
-        ),
-    )
-    improvement_valid = (
-        linked
-        & execution_valid
-        & state_key_valid[clipped_from]
-        & state_key_valid[clipped_to]
-    )
-
-    improvement_target = np.zeros(len(action_type), np.float32)
-    component_delta = np.full((len(action_type), state_key.shape[1]), np.nan, np.float32)
-    improvement_reason_mask = np.zeros(len(action_type), np.uint8)
-    regression_mask = np.zeros(len(action_type), np.uint8)
-    for action_index in np.flatnonzero(improvement_valid):
-        source = int(from_state[action_index])
-        target = int(to_state[action_index])
-        improved, positive, regression, delta = improvement_event(
-            state_key[source], state_key[target]
-        )
-        improvement_target[action_index] = float(improved)
-        component_delta[action_index] = delta
-        improvement_reason_mask[action_index] = sum(
-            (1 << index) for index in np.flatnonzero(positive)
-        )
-        regression_mask[action_index] = sum(
-            (1 << index) for index in np.flatnonzero(regression)
-        )
-
-    push = (action_type == int(ActionType.PUSH)) & executed
+    push = action_type == int(ActionType.PUSH)
     action_ids = np.flatnonzero(push).astype(np.int64)
+    improvement_target = np.isin(action_ids, successful_action_ids).astype(np.float32)
+    improvement_valid = np.ones(len(action_ids), dtype=bool)
 
     def writer(output: h5py.File) -> None:
         output.attrs["schema_version"] = PUSH_IMPROVEMENT_SCHEMA_VERSION
         output.attrs["improvement_definition"] = PUSH_IMPROVEMENT_DEFINITION
         output.attrs["teacher"] = "none"
         output.attrs["learned_heads"] = "improvement_logit_only"
-        output.attrs["component_definition"] = (
-            "goal,-dependency_blockers,-direct_blockers,-task_region_pressed,"
-            "-target_pressed,target_visibility,verified_grasp_progress"
-        )
-        output.attrs["component_eps"] = np.asarray(PUSH_IMPROVEMENT_COMPONENT_EPS, np.float64)
-        output.attrs["visibility_eps"] = PUSH_IMPROVEMENT_COMPONENT_EPS[5]
-        output.attrs["components"] = ",".join(PUSH_IMPROVEMENT_COMPONENT_NAMES)
+        output.attrs["positive_definition"] = "union_of_published_successful_sequence_action_ids"
+        output.attrs["negative_definition"] = "all_other_push_candidates_including_unexecuted"
         output.create_dataset("action_id", data=action_ids, compression="gzip")
         output.create_dataset("from_state", data=from_state[push], compression="gzip")
         output.create_dataset("to_state", data=to_state[push], compression="gzip")
-        output.create_dataset("improvement_target", data=improvement_target[push], compression="gzip")
-        output.create_dataset("improvement_valid", data=improvement_valid[push], compression="gzip")
-        output.create_dataset("component_delta", data=component_delta[push], compression="gzip")
-        output.create_dataset("improvement_reason_mask", data=improvement_reason_mask[push], compression="gzip")
-        output.create_dataset("regression_mask", data=regression_mask[push], compression="gzip")
-        output.create_dataset("outcome_code", data=outcome[push], compression="gzip")
-        # Diagnostic only: never fed to the model/loss.
-        output.create_dataset(
-            "dataset_potential_improved", data=potential_improved[push], compression="gzip"
-        )
+        output.create_dataset("executed", data=executed[push], compression="gzip")
+        output.create_dataset("improvement_target", data=improvement_target, compression="gzip")
+        output.create_dataset("improvement_valid", data=improvement_valid, compression="gzip")
 
     _atomic_h5(Path(output_path), writer)
 
@@ -357,15 +297,11 @@ class PushImprovementStore:
                 )
             if str(handle.attrs.get("improvement_definition", "")) != PUSH_IMPROVEMENT_DEFINITION:
                 raise RuntimeError(f"Action-improvement definition mismatch: {path}")
-            stored_eps = np.asarray(handle.attrs.get("component_eps", []), np.float64)
-            expected_eps = np.asarray(PUSH_IMPROVEMENT_COMPONENT_EPS, np.float64)
-            if stored_eps.shape != expected_eps.shape or not np.array_equal(stored_eps, expected_eps):
-                raise RuntimeError(f"Action-improvement thresholds mismatch: {path}")
             if str(handle.attrs.get("teacher", "")) != "none":
-                raise RuntimeError(f"Stage-C structural sidecar must not contain a teacher: {path}")
+                raise RuntimeError(f"Stage-C sequence sidecar must not contain a teacher: {path}")
             required = {
                 "action_id", "improvement_target", "improvement_valid",
-                "component_delta", "improvement_reason_mask", "regression_mask",
+                "executed",
             }
             missing = required - set(handle.keys())
             if missing:

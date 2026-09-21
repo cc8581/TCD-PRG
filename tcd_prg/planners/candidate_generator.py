@@ -210,19 +210,25 @@ class DenseCandidateGenerator:
         output: dict[str, Any],
         *,
         remaining_preparation_actions: int = 5,
+        include_push: bool = True,
     ) -> dict[str, Tensor]:
         if not 0 <= int(remaining_preparation_actions) <= 5:
             raise ValueError("remaining_preparation_actions must lie in [0,5]")
         rows: list[dict[str, Tensor]] = []
         sensor = output.get("sensor", batch.get("model_inputs", batch))
-        _, decoded_push_rows = decode_push_candidates(
-            sensor,
-            output["push_condition"],
-            output["push"],
-            self.config,
-            remaining_preparation_actions=remaining_preparation_actions,
-        )
-        if not bool(getattr(model, "push_evaluator_ready", False)):
+        if include_push:
+            _, decoded_push_rows = decode_push_candidates(
+                sensor,
+                output["push_condition"],
+                output["push"],
+                self.config,
+                remaining_preparation_actions=remaining_preparation_actions,
+            )
+        else:
+            decoded_push_rows = [
+                self._empty_row(sensor["xyz"].device) for _ in range(sensor["xyz"].shape[0])
+            ]
+        if include_push and not bool(getattr(model, "push_evaluator_ready", False)):
             # Unloaded evaluation weights must never authorize a PUSH selection.
             for decoded in decoded_push_rows:
                 decoded["improvement_probability"] = torch.full_like(
@@ -316,6 +322,20 @@ class DenseCandidateGenerator:
 
             # Generic remove grasps are assigned to predicted object queries.
             global_head = output["global_grasp"]
+            if global_head is None:
+                # Deployment's grasp/PUSH branches never evaluate PICK_REMOVE.
+                # Empty tensors keep the trained full-mode decoder unchanged.
+                batch_size = sensor["xyz"].shape[0]
+                empty = (batch_size, 0)
+                global_head = {
+                    "translation_world": xyz.new_empty((*empty, 3)),
+                    "rotation_matrix": xyz.new_empty((*empty, 3, 3)),
+                    "quality_logit": xyz.new_empty(empty),
+                    "attention_point_index": torch.empty(empty, dtype=torch.long, device=xyz.device),
+                    "object_logits": xyz.new_empty((*empty, len(active))),
+                    "width_m": xyz.new_empty(empty),
+                    "valid": torch.zeros(empty, dtype=torch.bool, device=xyz.device),
+                }
             global_pose = torch.cat(
                 (
                     global_head["translation_world"][batch_row],

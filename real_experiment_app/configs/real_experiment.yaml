@@ -1,9 +1,9 @@
 tcd_prg:
   config: ../../configs/config.yaml
   paths_config: ../../configs/local_paths.yaml
-  perception_checkpoint: ../../outputs/perception_20260829_170103/best.pt
+  perception_checkpoint: ../../outputs/perception_20260920_foreground/perception_best.pt
   grasp_checkpoint: ../../outputs/grasp_20260829_223035/grasp_best.pt
-  push_evaluator_checkpoint: ""  # set this after a validated Stage-C run
+  push_evaluator_checkpoint: ../../outputs/push_evaluator_ptv3_posw625_us14_batch24_60k/model_last.pt
   device: cuda
 
 cameras:
@@ -51,7 +51,6 @@ robot:
     xyz_mm_rpy_deg: [0, 0, 0, 0, 0, 0]
   pregrasp_distance_m: 0.10
   lift_distance_m: 0.10
-  push_distance_m: 0.15
   push_retreat_m: 0.05
   gripper_max_width_m: 0.095
   gripper_close_margin_m: 0.003
@@ -81,3 +80,31 @@ robot:
 task:
   default_category_id: 0
   default_region_id: 0
+
+workflow:
+  mode: manual                 # V2 UI always advances stages explicitly
+  target_mode: specified       # V2 requires operator target confirmation
+  grasp_top_n: 36
+  push_top_k: 5
+  grasp_confidence_threshold: 0.5
+  display_max_points: 300000
+  overlap_margin_scale: 0.15
+  minimum_xy_overlap: 0.05
+  minimum_height_gap_scale: 0.08
+  scene_change_threshold_m: 0.005
+  repeated_action_contact_threshold_m: 0.02
+  repeated_action_direction_deg: 15.0
+
+physics:
+  python: D:/Anaconda/envs/gapg/python.exe
+  object_mass_kg: 0.20
+  object_friction: 0.50
+  table_friction: 0.60
+  restitution: 0.05
+  push_speed_m_s: 0.10
+  effective_displacement_m: 0.01
+  simulation_time_step_s: 0.0041666667
+  settle_steps: 60
+  request_timeout_s: 180
+  convex_parts: 8
+  parallel_workers: null       # default: min(logical CPU cores / 2, 8)

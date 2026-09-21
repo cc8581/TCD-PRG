@@ -122,10 +122,15 @@ def main() -> None:
         num_workers=config.training.validation_workers,
         collate_fn=UnifiedBatchCollator(config, training=False, include_graspnet=False),
     )
-    stage_a = TCDPRGModel(config.model, config.ablation, config.backbone, config.graspnet).to(
+    stage_a = TCDPRGModel(
+        config.model, config.ablation, config.backbone, config.graspnet,
+        config.training.push_backbone,
+    ).to(
         device
     )
-    stage_c = StandalonePushModel(config.model).to(device)
+    stage_c = StandalonePushModel(
+        config.model, config.backbone, config.training.push_backbone
+    ).to(device)
     load_perception_stage(stage_a, args.perception_checkpoint, config)
     load_push_evaluator(
         stage_c,

@@ -1,39 +1,58 @@
-# Fine-tune the complete yanx27 S3DIS PointNet++ evaluator; no perception weights.
+# Train the independent PUSH evaluator with PTv3 (primary) or PointNet++ (fallback).
 defaults:
   - ../config.yaml
   - _self_
 
+backbone:
+  pretrained_checkpoint: .deps/checkpoints/sonata_20251024.pth
+  pretrained_format: sonata
+  pretrained_sha256: "8aab33915ddfec2628da10ee1236ace7ed720b7ebba0dd9bc86f9ca7f9de102f"
+  pretrained_required: true
+  pretrained_min_parameter_fraction: 0.99
+  # Fine-tune Sonata and PUSH heads together from step 0 at the configured LR.
+  pretrained_freeze_steps: 0
+
 dataset:
-  # 仅覆盖 PushEvaluator 的原始场景点数，可调整为 4096 或 1024。
+  # Stage-C uses 1024 scene points for both loading and backbone input.
   # FPS 的网络输入点数由下面 training.push_fps_points 单独设置。
-  scene_points: 16384
+  scene_points: 1024
 
 optimizer:
-  learning_rate: 0.0001
+  # Train the selected geometry backbone and PUSH heads together.
+  learning_rate: 0.0005
+  backbone_learning_rate: 0.0005
   weight_decay: 0.01
 
 scheduler:
   warmup_steps: 2000
 
 training:
-  # build_push_improvement.py output: binary single-step improvement labels.
+  # Primary: point_transformer_v3. Controlled fallback: pointnet2.
+  push_backbone: point_transformer_v3
+  # build_push_improvement.py output: successful-sequence membership labels.
   push_improvement_root: runtime/push_improvement/action
-  push_improvement_pos_weight: null
+  # reweight/reweight_undersample 模式的正类 BCE 权重。
+  push_improvement_pos_weight: 6.25
+  # 正类权重 6.25 与负类欠采样同时启用；验证始终保留原始类别分布。
+  push_class_balance_mode: reweight_undersample
+  # 1/5 对应抽样后正负约 1:4。
+  push_positive_fraction: 0.2
   # 网络输入点数，可改为 1024 等；应不大于上面的 scene_points（0 表示不限）。
-  push_fps_points: 16384
-  pretrain_checkpoint: null       # null: load published yanx27 backbone; otherwise a new-protocol PUSH checkpoint.
+  push_fps_points: 1024
+  pretrain_checkpoint: null       # null: use configured backbone initialization; otherwise a matching PUSH checkpoint.
   stage: push_evaluator
-  max_optimizer_steps: 10000
-  validation_interval: 1000
+  max_optimizer_steps: 60000
+  validation_interval: 2000
   # 验证 batch 由代码固定为该值的 2 倍；RTX 3090 实测 32/64 在验证首批 OOM。
-  batch_size: 8
+  batch_size: 24
   gradient_accumulation_steps: 1
-  amp: false  # Explicit FP32 PointNet++ training.
+  amp: false  # Stage-C currently uses explicit FP32 training.
   max_train_groups: null
   max_validation_groups: null
   validation_scene_count: 20
-  allowed_action_strata: [push, push_failure]
-  action_batch_coverage_strata: [push, push_failure]
+  # Sequence-membership supervision includes unexecuted PUSH candidates too.
+  allowed_action_strata: []
+  action_batch_coverage_strata: []
   num_workers: 8
   pin_memory: true
 

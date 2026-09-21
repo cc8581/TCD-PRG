@@ -82,6 +82,11 @@ def _launcher_defaults(paths_config: Path) -> dict[str, str | Path | None]:
                 PROJECT / "runtime" / "cache" / "dataset_indexes",
             )
         ),
+        "push_improvement_root": _project_relative_path(
+            local.get(
+                "push_improvement_root", PROJECT / "runtime" / "push_improvement" / "action"
+            )
+        ),
         "gpus": 1,
         "output_root": _project_relative_path(
             local.get("output_root", PROJECT / "outputs")
@@ -210,6 +215,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=defaults["cache_index_directory"],
         help="Persistent dataset-index cache directory.",
     )
+    parser.add_argument(
+        "--push-improvement-root", type=Path,
+        default=defaults["push_improvement_root"],
+        help="Stage-C binary PUSH-improvement sidecar directory.",
+    )
     parser.add_argument("--gpus", type=int, default=defaults["gpus"], help="Number of local training GPUs.")
     parser.add_argument(
         "--output-dir",
@@ -321,6 +331,7 @@ def _pipeline_command(
         "--pybullet-python", str(args.pybullet_python),
         "--observation-cache-dir", str(args.observation_cache_dir),
         "--cache-index-directory", str(args.cache_index_directory),
+        "--push-improvement-root", str(args.push_improvement_root),
         "--gpus", str(args.gpus),
     ]
     for name in (
@@ -341,6 +352,11 @@ def _push_evaluator_command(
 ) -> list[str]:
     dataset, acronym, functional_region, pybullet_python, observation_cache = _resolve_paths(args)
     cache_index_directory = _resolve_cache_index_path(args)
+    push_improvement_root = args.push_improvement_root.expanduser().resolve()
+    if not push_improvement_root.is_dir():
+        raise FileNotFoundError(
+            f"Configured Stage-C improvement sidecar does not exist: {push_improvement_root}"
+        )
     overrides = [
         _quoted_override("dataset.root", dataset),
         _quoted_override("dataset.acronym_root", acronym),
@@ -348,6 +364,7 @@ def _push_evaluator_command(
         _quoted_override("observation.pybullet_python", pybullet_python),
         _quoted_override("cache.directory", observation_cache),
         _quoted_override("cache.index_directory", cache_index_directory),
+        _quoted_override("training.push_improvement_root", push_improvement_root),
     ]
     named_training_overrides = {
         "batch_size": "batch_size",

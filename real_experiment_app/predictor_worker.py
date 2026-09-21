@@ -34,9 +34,7 @@ def load_scene(path: str) -> FusedScene:
     with np.load(path, allow_pickle=False) as data:
         mapping = {
             int(k): int(v)
-            for k, v in zip(
-                data["category_keys"], data["category_values"], strict=True
-            )
+            for k, v in zip(data["category_keys"], data["category_values"], strict=True)
         }
         return FusedScene(
             data["xyz_m"].copy(),
@@ -84,6 +82,28 @@ def main():
                     "action": prediction.action,
                     "inference_seconds": prediction.inference_seconds,
                 }
+            elif command == "analyze":
+                scene = load_scene(request["scene"])
+                prediction = predictor.analyze(
+                    scene,
+                    int(request["target"]),
+                    int(request["category"]),
+                    int(request["region"]),
+                    progress=lambda update: respond({"event": "progress", "update": update}),
+                )
+                result = {
+                    "candidates": prediction.candidates,
+                    "inference_seconds": prediction.inference_seconds,
+                    "timings": prediction.timings,
+                    "target_query": prediction.target_query,
+                }
+            elif command == "generate_push_rules":
+                result = predictor.generate_push_rules(
+                    tuple(request["obstructions"]),
+                    adjacent_objects=tuple(request.get("adjacent_objects", ())),
+                )
+            elif command == "score_push_rules":
+                result = predictor.score_push_rules()
             elif command == "action_executed":
                 predictor.policy.update_after_action(request["action"], None)
                 result = True
@@ -97,10 +117,12 @@ def main():
                 raise ValueError(f"Unknown command {command}")
             respond({"ok": True, "result": result})
         except Exception as error:
-            respond({
-                "ok": False,
-                "error": f"{type(error).__name__}: {error}\n{traceback.format_exc()}",
-            })
+            respond(
+                {
+                    "ok": False,
+                    "error": f"{type(error).__name__}: {error}\n{traceback.format_exc()}",
+                }
+            )
 
 
 if __name__ == "__main__":

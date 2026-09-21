@@ -18,6 +18,15 @@ STAGE_PREFIXES = {
 
 PUSH_EVALUATOR_PROTOCOL_VERSION = 15
 PUSH_ARCHITECTURE = "instance_relation_pointnet2_binary_push_improvement_wide_head_v2"
+PUSH_PTV3_ARCHITECTURE = "instance_relation_ptv3_binary_push_improvement_wide_head_v1"
+
+
+def push_architecture(backend: str) -> str:
+    if backend == "pointnet2":
+        return PUSH_ARCHITECTURE
+    if backend == "point_transformer_v3":
+        return PUSH_PTV3_ARCHITECTURE
+    raise ValueError(f"Unsupported PUSH backbone: {backend}")
 
 
 def resolve_staged_checkpoint_root(root: str | Path) -> dict[str, Path]:
@@ -197,15 +206,22 @@ def load_staged_tcd_prg(
 
 
 def validate_push_checkpoint(model, payload):
+    backend = model.push_evaluator.backbone_backend
+    expected_architecture = push_architecture(backend)
     if (payload.get("training_stage") != "push_evaluator" or
             payload.get("push_evaluator_protocol_version") != PUSH_EVALUATOR_PROTOCOL_VERSION or
-            payload.get("push_architecture") != PUSH_ARCHITECTURE):
-        raise RuntimeError("PUSH requires a new PointNet++ checkpoint; old evaluator weights are unsupported")
+            payload.get("push_architecture") != expected_architecture):
+        raise RuntimeError(
+            "PUSH checkpoint is incompatible with configured "
+            f"backbone={backend}; old evaluator weights are unsupported"
+        )
     model.push_evaluator.initialize_backbone()
     expected = model.push_evaluator.state_dict()
     supplied = payload.get("model", {})
-    if set(expected) != set(supplied) or any(expected[k].shape != supplied[k].shape for k in expected):
-        raise RuntimeError("PUSH PointNet++ architecture mismatch")
+    if set(expected) != set(supplied) or any(
+        expected[key].shape != supplied[key].shape for key in expected
+    ):
+        raise RuntimeError(f"PUSH {backend} architecture mismatch")
 
 
 def load_push_evaluator(model, checkpoint):

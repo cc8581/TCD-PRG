@@ -47,6 +47,7 @@ def build_instance_targets(batch: dict[str, Tensor], query_count: int) -> dict[s
         # Loss-side hard-case diagnostic: >1 means category alone cannot identify
         # the requested physical instance.
         "same_category_target_count": same_category_count,
+        "xyz": batch["xyz"],
     }
 
 
@@ -180,6 +181,7 @@ class InstanceSetLoss(nn.Module):
         )
 
         matched = torch.nonzero(match.query_to_gt >= 0, as_tuple=False)
+        hard_negative_loss = output.mask_logits.sum() * 0.0
         if len(matched):
             rows, queries = matched[:, 0], matched[:, 1]
             gt = match.query_to_gt[rows, queries]
@@ -200,6 +202,29 @@ class InstanceSetLoss(nn.Module):
                 output.category_logits[rows, queries],
                 targets["category"][rows, gt],
             )
+            # Mine the most confidently included foreign-instance points near
+            # each matched GT object's observed extent. Easy negatives already
+            # contribute to the ordinary full-mask BCE above.
+            xyz = targets["xyz"][rows].float()
+            own = target.bool()
+            low = xyz.masked_fill(~own[..., None], float("inf")).amin(1) - 0.02
+            high = xyz.masked_fill(~own[..., None], -float("inf")).amax(1) + 0.02
+            nearby = ((xyz >= low[:, None]) & (xyz <= high[:, None])).all(-1)
+            visible_points = (
+                targets["mask"][rows] & targets["visible"][rows, :, None]
+            ).any(1)
+            foreign = nearby & visible_points & ~own
+            hard_scores = torch.nn.functional.softplus(pred_logits.float()).masked_fill(
+                ~foreign, -float("inf")
+            )
+            hardest = hard_scores.topk(min(32, n), dim=-1).values
+            selected = torch.isfinite(hardest)
+            has_foreign = selected.any(-1)
+            if has_foreign.any():
+                per_instance = hardest.masked_fill(~selected, 0.0).sum(-1) / (
+                    selected.sum(-1).clamp_min(1)
+                )
+                hard_negative_loss = per_instance[has_foreign].mean()
         else:
             zero = output.mask_logits.sum() * 0.0
             mask_loss = dice_loss = category_loss = zero
@@ -280,7 +305,34 @@ class InstanceSetLoss(nn.Module):
             if auxiliary_terms
             else final_loss.detach() * 0.0
         )
-        loss = final_loss + self.auxiliary_weight * auxiliary_loss
+        # PointGroup-style centroid-offset supervision: each labelled point
+        # predicts the vector to its own observed GT instance centroid.
+        offset_loss = output.mask_logits.sum() * 0.0
+        point_offsets = getattr(output, "point_offsets", None)
+        if point_offsets is not None:
+            masks = targets["mask"] & targets["visible"][..., None]
+            point_valid = masks.any(1)
+            if point_valid.any():
+                coords = targets["xyz"].float()
+                masks_float = masks.float()
+                gt_centers = torch.einsum("bon,bnd->bod", masks_float, coords) / (
+                    masks_float.sum(-1, keepdim=True).clamp_min(1.0)
+                )
+                point_instance = masks.long().argmax(1)
+                point_centers = gt_centers.gather(
+                    1, point_instance[..., None].expand(-1, -1, 3)
+                )
+                gt_offsets = point_centers - coords
+                predicted = point_offsets.float()
+                norm = (predicted - gt_offsets).abs().sum(-1)
+                gt_unit = torch.nn.functional.normalize(gt_offsets, dim=-1, eps=1e-8)
+                pred_unit = torch.nn.functional.normalize(predicted, dim=-1, eps=1e-8)
+                direction = 1.0 - (gt_unit * pred_unit).sum(-1)
+                offset_loss = (norm + direction)[point_valid].mean()
+        loss = (
+            final_loss + self.auxiliary_weight * auxiliary_loss
+            + 0.25 * hard_negative_loss + offset_loss
+        )
         return {
             "loss": loss,
             **values,

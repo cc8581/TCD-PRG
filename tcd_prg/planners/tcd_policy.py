@@ -246,6 +246,8 @@ class TCDPRGPolicy(ManipulationPolicy):
         self,
         batch: dict[str, Any],
         observation: SceneObservation | None,
+        *,
+        forward_mode: str = "full",
     ) -> EncodedPolicyState:
         device = {
             key: (
@@ -256,7 +258,7 @@ class TCDPRGPolicy(ManipulationPolicy):
             for key, nested in batch.items()
         }
         with torch.no_grad():
-            output = self.model(device)
+            output = self.model(device, forward_mode=forward_mode)
         state = EncodedPolicyState(observation, batch, device, output)
         task_inputs = batch.get("task_inputs", {})
         if "encoded" in output and "task_category_id" in task_inputs:
@@ -350,6 +352,7 @@ class TCDPRGPolicy(ManipulationPolicy):
         target_prompt_label: np.ndarray | None = None,
         continue_target: bool = False,
         enforce_target_confidence: bool = False,
+        include_push: bool = True,
     ) -> EncodedPolicyState:
         """Real entry: fused XYZRGB + task semantics + observable target identity."""
         batch = self._sensor_task_batch(
@@ -364,7 +367,9 @@ class TCDPRGPolicy(ManipulationPolicy):
             target_prompt_label=target_prompt_label,
             continue_target=continue_target,
         )
-        state = self._encode_batch(batch, None)
+        state = self._encode_batch(
+            batch, None, forward_mode="full" if include_push else "full_without_push"
+        )
         if enforce_target_confidence:
             self._validate_target_selection(state)
         return state
@@ -422,14 +427,19 @@ class TCDPRGPolicy(ManipulationPolicy):
             )
         return action
 
-    def generate_candidates(self, encoded: EncodedPolicyState) -> dict[str, Any]:
+    def generate_candidates(
+        self, encoded: EncodedPolicyState, *, include_push: bool = True
+    ) -> dict[str, Any]:
         with torch.no_grad():
             remaining = max(0, MAX_PREPARATION_ACTIONS - self.preparation_actions)
+            options = {"remaining_preparation_actions": remaining}
+            if not include_push:
+                options["include_push"] = False
             candidates = self.generator.generate(
                 self.model,
                 encoded.device_batch,
                 encoded.output,
-                remaining_preparation_actions=remaining,
+                **options,
             )
             task_mask = candidates["type"] == int(ActionType.TASK_GRASP)
             candidates["task_grasp_query_count"] = torch.full(

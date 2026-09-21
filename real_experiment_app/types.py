@@ -42,3 +42,9 @@ class FusedScene:
 class Prediction:
     action: dict[str, Any]
     inference_seconds: float
+    candidates: tuple[dict[str, Any], ...] = ()
+    timings: dict[str, float] | None = None
+    decision_path: tuple[str, ...] = ()
+    target_query: int | None = None
+    acted_query: int | None = None
+    status: str = "ready"
