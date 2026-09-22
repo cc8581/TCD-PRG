@@ -113,3 +113,28 @@ def test_nearly_planar_segment_falls_back_to_solid_voxels():
     assert len(geometry.target_meshes) == 0
     assert len(geometry.target_voxels) > 0
     assert len(geometry.environment_meshes) == 1
+
+
+def test_convex_hull_respects_mesh_max_points():
+    rng = np.random.default_rng(20260922)
+    obstacle = rng.normal(size=(5000, 3))
+    obstacle /= np.linalg.norm(obstacle, axis=1, keepdims=True)
+    obstacle = obstacle * rng.uniform(0.03, 0.08, size=(len(obstacle), 1))
+    obstacle += np.asarray([0.55, 0.05, 0.15])
+
+    target = cube([0.30, 0.0, 0.10], 0.06)
+    xyz = np.vstack((target, obstacle))
+    ids = np.asarray([1] * len(target) + [2] * len(obstacle), np.int64)
+
+    geometry = build_collision_geometry(
+        xyz,
+        ids,
+        1,
+        mode="convex_hull",
+        mesh_max_points=64,
+    )
+
+    assert len(geometry.environment_meshes) == 1
+    assert len(geometry.environment_meshes[0].vertices) <= 64
+    assert len(geometry.target_meshes) == 1
+    assert len(geometry.target_meshes[0].vertices) <= 64

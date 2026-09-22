@@ -2,6 +2,7 @@
 #include <moveit/move_group_interface/move_group_interface.hpp>
 #include <moveit/planning_scene_interface/planning_scene_interface.hpp>
 #include <moveit/collision_detection/collision_matrix.hpp>
+#include <moveit_msgs/msg/attached_collision_object.hpp>
 #include <moveit_msgs/msg/collision_object.hpp>
 #include <moveit_msgs/msg/planning_scene_components.hpp>
 #include <moveit_msgs/srv/get_planning_scene.hpp>
@@ -268,9 +269,40 @@ private:
     }
   }
 
+  void clearPreviousSceneObjects()
+  {
+    // A detached object is returned to the world by MoveIt. Therefore remove
+    // the attached body synchronously first, then synchronously remove the
+    // world object before loading the next perception scene.
+    const auto attached = scene_.getAttachedObjects({"tcd_target"});
+    if (attached.find("tcd_target") != attached.end()) {
+      moveit_msgs::msg::AttachedCollisionObject remove_attached;
+      remove_attached.object.id = "tcd_target";
+      remove_attached.object.operation = moveit_msgs::msg::CollisionObject::REMOVE;
+      if (!scene_.applyAttachedCollisionObject(remove_attached)) {
+        throw std::runtime_error("MoveIt rejected stale attached-target removal");
+      }
+      RCLCPP_INFO(
+        node_->get_logger(),
+        "Removed stale attached tcd_target before loading a fresh planning scene");
+    }
+
+    std::vector<moveit_msgs::msg::CollisionObject> removals;
+    removals.reserve(3);
+    for (const char* id : {"tcd_environment", "tcd_target", "tcd_table"}) {
+      moveit_msgs::msg::CollisionObject object;
+      object.id = id;
+      object.operation = moveit_msgs::msg::CollisionObject::REMOVE;
+      removals.push_back(std::move(object));
+    }
+    if (!scene_.applyCollisionObjects(removals)) {
+      throw std::runtime_error("MoveIt rejected previous collision-scene removal");
+    }
+  }
+
   void updateScene(const Request& request)
   {
-    scene_.removeCollisionObjects({"tcd_environment", "tcd_target", "tcd_table"});
+    clearPreviousSceneObjects();
     std::vector<moveit_msgs::msg::CollisionObject> objects;
     const auto add_geometry = [&](const auto& centers, const auto& meshes,
                                   const std::string& id, double voxel_size) {

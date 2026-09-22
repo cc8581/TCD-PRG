@@ -205,8 +205,14 @@ def _compact_mesh(vertices: np.ndarray, triangles: np.ndarray) -> TriangleMesh:
     return TriangleMesh(vertices[used], remap[triangles].astype(np.int32, copy=False))
 
 
-def _convex_hull_mesh(points: np.ndarray, padding_m: float) -> TriangleMesh:
-    points = np.unique(np.asarray(points, np.float64).reshape(-1, 3), axis=0)
+def _convex_hull_mesh(
+    points: np.ndarray,
+    padding_m: float,
+    mesh_max_points: int,
+) -> TriangleMesh:
+    # Bound both Qhull construction cost and the mesh sent through NPZ/ROS/FCL.
+    # Extreme points are retained by the deterministic sampler.
+    points = _deterministic_subsample(points, mesh_max_points)
     if len(points) < 4:
         raise ValueError("convex hull requires at least four unique points")
     _require_3d_extent(points)
@@ -266,20 +272,34 @@ def _obb_mesh(points: np.ndarray, padding_m: float) -> TriangleMesh:
 
 
 def _deterministic_subsample(points: np.ndarray, maximum: int) -> np.ndarray:
+    """Return at most ``maximum`` deterministic points while preserving extrema."""
     points = np.unique(np.asarray(points, np.float64).reshape(-1, 3), axis=0)
     if len(points) <= maximum:
         return points
-    order = np.lexsort((points[:, 2], points[:, 1], points[:, 0]))
-    positions = np.linspace(0, len(order) - 1, maximum, dtype=np.int64)
-    sampled = points[order[positions]]
-    anchors = np.asarray(
-        [
-            points[np.argmin(points[:, 0])], points[np.argmax(points[:, 0])],
-            points[np.argmin(points[:, 1])], points[np.argmax(points[:, 1])],
-            points[np.argmin(points[:, 2])], points[np.argmax(points[:, 2])],
-        ]
+
+    anchor_indices = np.unique(
+        np.asarray(
+            [
+                np.argmin(points[:, 0]), np.argmax(points[:, 0]),
+                np.argmin(points[:, 1]), np.argmax(points[:, 1]),
+                np.argmin(points[:, 2]), np.argmax(points[:, 2]),
+            ],
+            dtype=np.int64,
+        )
     )
-    return np.unique(np.vstack((sampled, anchors)), axis=0)
+    order = np.lexsort((points[:, 2], points[:, 1], points[:, 0]))
+    anchor_mask = np.zeros(len(points), dtype=bool)
+    anchor_mask[anchor_indices] = True
+    remaining = order[~anchor_mask[order]]
+
+    slots = max(0, int(maximum) - len(anchor_indices))
+    if slots and len(remaining):
+        count = min(slots, len(remaining))
+        positions = np.linspace(0, len(remaining) - 1, count, dtype=np.int64)
+        selected = np.concatenate((anchor_indices, remaining[positions]))
+    else:
+        selected = anchor_indices
+    return points[np.unique(selected)]
 
 
 def _alpha_shape_mesh(
@@ -339,7 +359,7 @@ def _mesh_for_mode(
     alpha_radius_m: float,
 ) -> TriangleMesh:
     if mode in {"hybrid", "convex_hull"}:
-        return _convex_hull_mesh(points, collision_padding_m)
+        return _convex_hull_mesh(points, collision_padding_m, mesh_max_points)
     if mode == "obb":
         return _obb_mesh(points, collision_padding_m)
     if mode == "alpha_shape":
@@ -354,7 +374,7 @@ def _mesh_for_mode(
             # Alpha complexes are parameter-sensitive for sparse/partial depth
             # data. Falling back to a closed convex hull is safer than silently
             # dropping an obstacle.
-            return _convex_hull_mesh(points, collision_padding_m)
+            return _convex_hull_mesh(points, collision_padding_m, mesh_max_points)
     raise ValueError(f"mode {mode!r} does not produce meshes")
 
 

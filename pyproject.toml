@@ -44,7 +44,7 @@ tcd-prg-export-paper = "tcd_prg.tools.export_paper:main"
 include = ["tcd_prg*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "real_experiment_app/motion_planning/tests"]
 addopts = "-ra"
 markers = ["real_data: requires the local TaskOrientedClutterSceneDataset", "slow: long-running validation"]
 
