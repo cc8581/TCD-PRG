@@ -96,6 +96,7 @@ def main():
                     "inference_seconds": prediction.inference_seconds,
                     "timings": prediction.timings,
                     "target_query": prediction.target_query,
+                    "target_instance": prediction.target_instance,
                 }
             elif command == "generate_push_rules":
                 result = predictor.generate_push_rules(

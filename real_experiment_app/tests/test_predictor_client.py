@@ -2,6 +2,8 @@ import io
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from real_experiment_app.predictor_client import PredictorClient
 
 
@@ -59,3 +61,16 @@ def test_adjacent_push_eligibility_is_sent_to_worker():
     assert sent == [("generate_push_rules", {
         "obstructions": [3, 7], "adjacent_objects": [7],
     })]
+
+
+def test_call_reports_exited_worker_before_writing_to_closed_stdin():
+    client = PredictorClient.__new__(PredictorClient)
+    stream = io.StringIO()
+    stream.close()
+    client.process = SimpleNamespace(
+        stdin=stream,
+        stdout=io.StringIO("worker failed\n"),
+        poll=lambda: 9,
+    )
+    with pytest.raises(RuntimeError, match="模型工作进程已退出.*exit code 9"):
+        client._call("perceive", scene="scene.npz")

@@ -1,0 +1,25 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: fr5_ag160_95_description
+    relative_path: urdf/fr5_ag160_95.urdf
+  srdf:
+    relative_path: config/fr5_ag160_95.srdf
+  package_settings:
+    author_name: cc
+    author_email: cc_sdu@163.com
+    generated_timestamp: 1789978797
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+      - velocity
+  modified_urdf:
+    xacros:
+      - control_xacro
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+      - velocity

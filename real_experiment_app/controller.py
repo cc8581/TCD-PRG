@@ -10,6 +10,7 @@ from .decision import DecisionSession
 from .perception import fuse_frames
 from .physics_client import PhysicsClient
 from .predictor_client import PredictorClient
+from .motion_planning import GraspMotionPlanningStage
 from .robot import build_robot
 from .transforms import xyz_rpy_to_matrix
 from .types import Prediction
@@ -47,6 +48,7 @@ class ExperimentController:
         self.manual_stage = "capture"
         self.manual_config_signature = None
         self.pending_task_grasp = None
+        self.motion_planner = None
 
     def connect_cameras(self) -> str:
         connected = []
@@ -146,6 +148,11 @@ class ExperimentController:
         )
 
     def load_model(self, progress: Callable[[str], None] | None = None) -> str:
+        if self.predictor is not None and callable(getattr(self.predictor, "is_alive", None)):
+            if not self.predictor.is_alive():
+                stale = self.predictor
+                self.predictor = None
+                stale.close()
         if self.predictor is None:
             if progress:
                 progress("正在加载TCD-PRG模型……")
@@ -173,6 +180,21 @@ class ExperimentController:
             raise RuntimeError("后台任务已取消")
         return existing
 
+    def _perceive_with_worker_recovery(self, scene):
+        """Retry perception once when the isolated model process lost its pipe."""
+        self.load_model()
+        try:
+            return self.predictor.perceive(scene)
+        except RuntimeError as error:
+            if "模型工作进程" not in str(error):
+                raise
+            stale = self.predictor
+            self.predictor = None
+            if stale is not None:
+                stale.close()
+            self.load_model()
+            return self.predictor.perceive(scene)
+
     def acquire(self):
         """Capture -> raw fuse -> integrated TCD-PRG instance perception."""
         if not self.cameras_connected:
@@ -185,9 +207,8 @@ class ExperimentController:
         stage = time.perf_counter()
         updated = fuse_frames(frames, None, self.config.raw["fusion"])
         self.cycle_timings["point_cloud_preprocess_s"] = time.perf_counter() - stage
-        self.load_model()
         stage = time.perf_counter()
-        updated = self.predictor.perceive(updated)
+        updated = self._perceive_with_worker_recovery(updated)
         self.cycle_timings["perception_s"] = time.perf_counter() - stage
         if self.last_scene_xyz is not None and self.active_task is not None:
             change = scene_change_m(self.last_scene_xyz, updated.xyz_m)
@@ -215,9 +236,8 @@ class ExperimentController:
         self.cycle_timings["point_cloud_preprocess_s"] = time.perf_counter() - stage
         self.scene = updated
         progress({"stage": "LOAD_OR_CAPTURE", "message": "点云融合与正式预处理完成"})
-        self.load_model()
         stage = time.perf_counter()
-        updated = self.predictor.perceive(updated)
+        updated = self._perceive_with_worker_recovery(updated)
         self.cycle_timings["perception_s"] = time.perf_counter() - stage
         if self.last_scene_xyz is not None and self.active_task is not None:
             change = scene_change_m(self.last_scene_xyz, updated.xyz_m)
@@ -254,9 +274,8 @@ class ExperimentController:
             raise RuntimeError(f"当前手动阶段为 {self.manual_stage}，不能执行感知")
         if self.scene is None:
             raise RuntimeError("请先加载或采集点云")
-        self.load_model()
         stage = time.perf_counter()
-        self.scene = self.predictor.perceive(self.scene)
+        self.scene = self._perceive_with_worker_recovery(self.scene)
         self.cycle_timings["perception_s"] = time.perf_counter() - stage
         self.prediction = self.manual_session = self.pending_task = None
         self.manual_stage = "select_target"
@@ -299,15 +318,19 @@ class ExperimentController:
         analysis.timings = {**self.cycle_timings, **(analysis.timings or {})}
         physics = self._ensure_worker("physics", lambda: PhysicsClient(self.config))
         self.manual_session = DecisionSession(
-            self.config.raw["workflow"], physics, self.scene, analysis
+            self.config.raw["workflow"], physics, self.scene, analysis,
+            self._motion_planning_stage(),
         )
         self.manual_config_signature = self._decision_config_signature()
         update = self.manual_session.check_target_grasp()
         if self.manual_session.result is not None:
             self.prediction = self._finish_manual_decision()
             self.manual_stage = "execute"
-        else:
+        elif self.manual_session.status == "running":
             self.manual_stage = "obstruction"
+        else:
+            self.prediction = self._finish_manual_decision()
+            self.manual_stage = "stopped"
         return update
 
     def manual_obstruction(self):
@@ -402,7 +425,8 @@ class ExperimentController:
                 analysis.timings = {**self.cycle_timings, **(analysis.timings or {})}
                 physics = self._ensure_worker("physics", lambda: PhysicsClient(self.config))
                 session = DecisionSession(
-                    self.config.raw.get("workflow", {}), physics, self.scene, analysis
+                    self.config.raw.get("workflow", {}), physics, self.scene, analysis,
+                    self._motion_planning_stage(),
                 )
                 for method in (session.check_target_grasp, session.infer_obstruction):
                     if session.result is not None or session.status != "running":
@@ -532,7 +556,18 @@ class ExperimentController:
         self.prediction = None
         self.scene = None
         try:
-            self.robot.execute(prediction.action)
+            plan_id = prediction.action.get("moveit_plan_id")
+            if plan_id:
+                planner = self._motion_planning_stage()
+                if planner is None:
+                    raise RuntimeError("动作包含 MoveIt 计划，但路径规划模块未启用")
+                result = planner.execute_saved(str(plan_id))
+                if not result.success or not result.executed:
+                    raise RuntimeError(
+                        f"MoveIt 已保存轨迹执行失败：{result.failed_stage}: {result.message}"
+                    )
+            else:
+                self.robot.execute(prediction.action)
             self.last_executed_action = dict(prediction.action)
         except Exception:
             self.task_finished = True
@@ -547,6 +582,14 @@ class ExperimentController:
         self.predictor.action_executed(prediction.action)
         self.task_finished = False
         return "动作执行完成；请重新采集场景"
+
+    def _motion_planning_stage(self):
+        settings = self.config.raw.get("motion_planning", {})
+        if not bool(settings.get("enabled", False)):
+            return None
+        if getattr(self, "motion_planner", None) is None:
+            self.motion_planner = GraspMotionPlanningStage(self.config)
+        return self.motion_planner
 
     def confirm_task_grasp(self, succeeded: bool) -> str:
         """Commit task completion only after the physical result is confirmed."""

@@ -207,6 +207,7 @@ class TCDPRGPredictor:
             result.timings,
             target_query=result.target_query,
             acted_query=int(action["acted_object"]),
+            target_instance=result.target_instance,
         )
 
     def _profiled_encode(self, encode):
@@ -324,6 +325,7 @@ class TCDPRGPredictor:
             timings={"model_encode_s": encoded_seconds,
                 "candidate_generation_s": candidate_seconds, **head_timings},
             target_query=target_query,
+            target_instance=(int(target) if int(target) >= 0 else None),
         )
 
     def _candidate_actions(self, generated, *, action_type: int) -> tuple[dict, ...]:

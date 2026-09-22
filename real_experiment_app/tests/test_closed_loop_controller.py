@@ -87,6 +87,7 @@ def controller():
     value.manual_stage = "capture"
     value.manual_config_signature = None
     value.pending_task_grasp = None
+    value.motion_planner = None
     return value
 
 
@@ -118,6 +119,26 @@ def test_offline_stop_does_not_attempt_robot_rpc():
     value.robot_connected = False
     value.stop()
     assert not hasattr(value.robot, "stopped")
+
+
+def test_manual_perception_replaces_an_exited_predictor_worker():
+    value = controller()
+    value.manual_stage = "perceive"
+    value.scene = SimpleNamespace(instance_ids=[], xyz_m=np.zeros((1, 3)))
+    closed = []
+    dead = SimpleNamespace(is_alive=lambda: False, close=lambda: closed.append(True))
+    healthy = SimpleNamespace(perceive=lambda scene: scene)
+    value.predictor = dead
+
+    def ensure(name, _factory):
+        assert name == "predictor"
+        value.predictor = healthy
+        return healthy
+
+    value._ensure_worker = ensure
+    assert value.perceive_scene() is value.scene
+    assert closed == [True]
+    assert value.predictor is healthy
 
 
 def test_manual_push_branch_orders_relation_rules_then_evaluator():

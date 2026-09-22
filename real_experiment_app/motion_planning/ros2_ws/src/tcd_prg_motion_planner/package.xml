@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>tcd_prg_motion_planner</name>
+  <version>0.1.0</version>
+  <description>Reusable collision-aware MoveIt planner for TCD-PRG grasp candidates.</description>
+  <maintainer email="cc@example.com">cc</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>rosidl_default_generators</build_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <member_of_group>rosidl_interface_packages</member_of_group>
+  <depend>geometry_msgs</depend>
+  <depend>moveit_core</depend>
+  <depend>moveit_msgs</depend>
+  <depend>moveit_ros_planning_interface</depend>
+  <depend>rclcpp</depend>
+  <depend>rclpy</depend>
+  <depend>shape_msgs</depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>moveit_configs_utils</exec_depend>
+  <exec_depend>fr5_ag160_95_moveit_config</exec_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

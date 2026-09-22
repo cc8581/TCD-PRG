@@ -61,11 +61,18 @@ class PredictorClient:
                 diagnostics.append(line)
 
     def _call(self, command: str, *, progress=None, **payload):
-        assert self.process.stdin is not None
-        self.process.stdin.write(
-            json.dumps({"command": command, **payload}, ensure_ascii=True) + "\n"
-        )
-        self.process.stdin.flush()
+        poll = getattr(self.process, "poll", None)
+        code = poll() if callable(poll) else None
+        stream = self.process.stdin
+        if code is not None or stream is None or stream.closed:
+            raise RuntimeError(
+                f"模型工作进程已退出（exit code {code}），请重新加载模型"
+            )
+        try:
+            stream.write(json.dumps({"command": command, **payload}, ensure_ascii=True) + "\n")
+            stream.flush()
+        except (OSError, ValueError) as error:
+            raise RuntimeError("模型工作进程通信管道已关闭，请重新加载模型") from error
         while True:
             response = self._read()
             if response.get("event") == "progress":
@@ -76,6 +83,15 @@ class PredictorClient:
         if not response.get("ok", False):
             raise RuntimeError(response.get("error", "model worker error"))
         return response.get("result")
+
+    def is_alive(self) -> bool:
+        stream = None if self.process is None else self.process.stdin
+        return bool(
+            self.process is not None
+            and self.process.poll() is None
+            and stream is not None
+            and not stream.closed
+        )
 
     def _save_scene(self, scene) -> None:
         np.savez_compressed(
@@ -137,6 +153,8 @@ class PredictorClient:
             candidates=tuple(result["candidates"]),
             timings=dict(result.get("timings") or {}),
             target_query=int(result["target_query"]),
+            target_instance=(None if result.get("target_instance") is None
+                             else int(result["target_instance"])),
         )
 
     def action_executed(self, action):

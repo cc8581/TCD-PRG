@@ -24,6 +24,12 @@ class PhysicsEvaluator(Protocol):
     ) -> list[dict]: ...
 
 
+class MotionPlanningStage(Protocol):
+    def plan_first(
+        self, scene: FusedScene, candidates: list[dict], target_instance: int
+    ) -> tuple[dict | None, tuple[dict, ...]]: ...
+
+
 class DecisionEngine:
     """Turns model candidates into one task action through explicit stages."""
 
@@ -46,7 +52,8 @@ class DecisionSession:
     """A resumable decision transaction used by both manual and auto modes."""
 
     def __init__(
-        self, settings: dict, physics: PhysicsEvaluator, scene: FusedScene, analysis: Prediction
+        self, settings: dict, physics: PhysicsEvaluator, scene: FusedScene, analysis: Prediction,
+        motion_planner: MotionPlanningStage | None = None,
     ):
         self.settings, self.physics, self.scene, self.analysis = settings, physics, scene, analysis
         started = time.perf_counter()
@@ -66,6 +73,8 @@ class DecisionSession:
         self.acted: int | None = None
         self.status = "running"
         self.reason = ""
+        self.motion_planner = motion_planner
+        self.motion_diagnostics: tuple[dict, ...] = ()
 
     def check_target_grasp(self) -> dict:
         top_n = int(self.settings.get("grasp_top_n", 36))
@@ -113,6 +122,20 @@ class DecisionSession:
         }))
         self.timings["target_grasp_collision_s"] = time.perf_counter() - stage
         self.path.append("TARGET_GRASP_AND_COLLISION")
+        if free and self.motion_planner is not None:
+            motion_started = time.perf_counter()
+            selected, self.motion_diagnostics = self.motion_planner.plan_first(
+                self.scene, free,
+                self.target if self.analysis.target_instance is None
+                else int(self.analysis.target_instance),
+            )
+            self.timings["target_grasp_motion_planning_s"] = time.perf_counter() - motion_started
+            if selected is None:
+                self.status = "operator_attention"
+                self.reason = "所有无碰撞抓取候选均未生成可执行的 MoveIt 路径"
+                free = []
+            else:
+                free = [selected]
         if free:
             selection_started = time.perf_counter()
             self.result, self.acted, self.status = dict(free[0]), self.target, "selected"
@@ -127,6 +150,7 @@ class DecisionSession:
             "grasp_generated_count": len(generated),
             "grasp_generation_status": self.grasp_generation_status,
             "adjacent_blockers": self.adjacent_blockers,
+            "motion_planning": self.motion_diagnostics,
         }
 
     def infer_obstruction(self) -> dict:
@@ -229,6 +253,7 @@ class DecisionSession:
                 self.target,
                 None,
                 "operator_attention",
+                self.analysis.target_instance,
             )
         return Prediction(
             dict(self.result),
@@ -238,4 +263,5 @@ class DecisionSession:
             tuple(self.path),
             self.target,
             self.acted,
+            target_instance=self.analysis.target_instance,
         )

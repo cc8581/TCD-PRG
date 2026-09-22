@@ -48,3 +48,4 @@ class Prediction:
     target_query: int | None = None
     acted_query: int | None = None
     status: str = "ready"
+    target_instance: int | None = None

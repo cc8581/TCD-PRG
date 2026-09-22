@@ -53,6 +53,40 @@ def test_target_grasp_wins_after_collision_check():
     assert result.timings["final_action_decision_s"] >= 0
 
 
+def test_motion_planner_tries_candidates_in_order_and_persists_saved_plan():
+    class Planner:
+        def plan_first(self, _scene, candidates, target):
+            assert target == 7
+            assert [item["candidate_index"] for item in candidates] == [2, 1]
+            selected = dict(candidates[1])
+            selected["moveit_plan_id"] = "saved-42"
+            return selected, ({"candidate_index": 2, "success": False},
+                              {"candidate_index": 1, "success": True})
+
+    candidates = (action(1, 2, 1, .7), action(2, 2, 1, .9))
+    session = DecisionSession(
+        {}, Physics(free=(1, 2)), scene(),
+        Prediction({}, .1, candidates, target_query=1, target_instance=7), Planner()
+    )
+    update = session.check_target_grasp()
+    assert update["selected"]["moveit_plan_id"] == "saved-42"
+    assert len(update["motion_planning"]) == 2
+
+
+def test_all_motion_plans_failed_stops_instead_of_selecting_push():
+    class Planner:
+        def plan_first(self, _scene, _candidates, _target):
+            return None, ({"candidate_index": 1, "success": False},)
+
+    session = DecisionSession(
+        {}, Physics(free=(1,)), scene(),
+        Prediction({}, .1, (action(1, 2, 1, .9),), target_query=1), Planner()
+    )
+    session.check_target_grasp()
+    assert session.status == "operator_attention"
+    assert "MoveIt" in session.reason
+
+
 def test_disconnected_target_explains_ambiguous_segmentation():
     from pathlib import Path
     with np.load(Path(__file__).parent / "fixtures" / "scene13_merged_query.npz") as data:
