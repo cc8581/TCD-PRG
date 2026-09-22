@@ -106,7 +106,15 @@ def main() -> None:
     if not candidates:
         raise RuntimeError("TCD-PRG produced no direction-valid target grasp candidate")
 
-    planner = WSLMoveItPlanner(timeout_s=90.0)
+    motion = app.raw.get("motion_planning", {})
+    planner = WSLMoveItPlanner(
+        distro=str(motion.get("wsl_distro", "Ubuntu-24.04")),
+        ros_workspace=str(motion.get(
+            "ros_workspace",
+            "/mnt/d/pycharm/Project/TCD-PRG/real_experiment_app/motion_planning/ros2_ws",
+        )),
+        timeout_s=float(motion.get("timeout_s", 90.0)),
+    )
     attempts = []
     selected = None
     for candidate in candidates[: args.max_candidates]:
@@ -117,10 +125,13 @@ def main() -> None:
             scene_instance_id=scene.instance_id,
             target_instance=target_query,
             pregrasp_distance_m=float(app.raw["robot"]["pregrasp_distance_m"]),
-            obstacle_voxel_size_m=0.02,
-            target_voxel_size_m=0.01,
-            collision_padding_m=0.0,
-            table_z_m=0.0,
+            obstacle_voxel_size_m=float(motion.get("voxel_size_m", 0.02)),
+            target_voxel_size_m=float(motion.get("target_voxel_size_m", 0.01)),
+            collision_padding_m=float(motion.get("collision_padding_m", 0.0)),
+            collision_geometry=str(motion.get("collision_geometry", "hybrid")),
+            mesh_max_points=int(motion.get("mesh_max_points", 2500)),
+            alpha_radius_m=float(motion.get("alpha_radius_m", 0.025)),
+            table_z_m=float(motion.get("table_z_m", 0.0)),
             execute=False,
         )
         attempts.append({
@@ -156,6 +167,7 @@ def main() -> None:
             "region": region,
             "operator_click_world_m": target_click.tolist(),
         },
+        "collision_geometry": str(motion.get("collision_geometry", "hybrid")),
         "predicted_candidate_count": len(candidates),
         "selected_candidate": _jsonable(selected),
         "attempts": attempts,

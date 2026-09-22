@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 
 from ..transforms import matrix_to_pose7, pose7_to_matrix
+from .collision_geometry import build_collision_geometry, pack_meshes, voxel_centers
 
 
 class MoveItPlanningError(RuntimeError):
@@ -34,6 +35,9 @@ class MoveItPlanningResult:
     executed: bool
     target_attached: bool
     obstacle_voxels: int
+    collision_geometry: str = ""
+    obstacle_meshes: int = 0
+    obstacle_triangles: int = 0
 
     @classmethod
     def from_json(cls, payload: dict) -> "MoveItPlanningResult":
@@ -50,6 +54,9 @@ class MoveItPlanningResult:
             executed=bool(payload.get("executed", False)),
             target_attached=bool(payload.get("target_attached", False)),
             obstacle_voxels=int(payload.get("obstacle_voxels", 0)),
+            collision_geometry=str(payload.get("collision_geometry", "")),
+            obstacle_meshes=int(payload.get("obstacle_meshes", 0)),
+            obstacle_triangles=int(payload.get("obstacle_triangles", 0)),
         )
 
 
@@ -57,54 +64,6 @@ def model_tcp_to_moveit_pose(model_pose, model_tcp_to_robot_tcp) -> np.ndarray:
     """Convert TCD-PRG model TCP [xyz,xyzw] to MoveIt's physical tcp_link pose."""
     transform = pose7_to_matrix(model_pose) @ np.asarray(model_tcp_to_robot_tcp, np.float64)
     return matrix_to_pose7(transform)
-
-
-def voxel_centers(
-    xyz_m: np.ndarray,
-    instance_id: np.ndarray,
-    target_instance: int,
-    voxel_size_m: float,
-    target_voxel_size_m: float | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build per-instance solid voxels and return environment then target."""
-    xyz = np.asarray(xyz_m, np.float64)
-    instance = np.asarray(instance_id, np.int64)
-    if xyz.ndim != 2 or xyz.shape[1] != 3 or instance.shape != (len(xyz),):
-        raise ValueError("scene XYZ and instance_id must have shapes [N,3] and [N]")
-    target_size = voxel_size_m if target_voxel_size_m is None else target_voxel_size_m
-    if (not np.isfinite(xyz).all() or not 0.005 <= voxel_size_m <= 0.10
-            or not 0.005 <= target_size <= 0.10):
-        raise ValueError("scene points must be finite and voxel size must lie in [0.005,0.10]")
-    def solid(points_xyz: np.ndarray, ids: np.ndarray, size: float) -> np.ndarray:
-        blocks = []
-        for object_id in np.unique(ids):
-            points = points_xyz[ids == object_id]
-            if not len(points):
-                continue
-            if int(object_id) < 0:
-                keys = np.floor(points / size).astype(np.int64)
-                blocks.append(np.unique(keys, axis=0))
-                continue
-            keys = np.floor(points / size).astype(np.int64)
-            columns = []
-            for column in np.unique(keys[:, :2], axis=0):
-                observed = keys[np.all(keys[:, :2] == column, axis=1), 2]
-                z = np.arange(int(observed.min()), int(observed.max()) + 1, dtype=np.int64)
-                columns.append(np.column_stack((
-                    np.full(len(z), column[0]), np.full(len(z), column[1]), z,
-                )))
-            if sum(len(column) for column in columns) > 50_000:
-                raise ValueError(f"instance {object_id} produces too many collision voxels")
-            blocks.append(np.concatenate(columns, axis=0))
-        if not blocks:
-            return np.empty((0, 3), np.float64)
-        unique = np.unique(np.concatenate(blocks), axis=0)
-        return (unique.astype(np.float64) + 0.5) * size
-
-    target_mask = instance == int(target_instance)
-    return solid(xyz[~target_mask], instance[~target_mask], voxel_size_m), solid(
-        xyz[target_mask], instance[target_mask], target_size
-    )
 
 
 def windows_to_wsl(path: str | Path) -> str:
@@ -158,37 +117,51 @@ class WSLMoveItPlanner:
         obstacle_voxel_size_m: float = 0.02,
         target_voxel_size_m: float = 0.01,
         collision_padding_m: float = 0.0,
+        collision_geometry: str = "hybrid",
+        mesh_max_points: int = 2500,
+        alpha_radius_m: float = 0.025,
         table_z_m: float = 0.0,
         execute: bool = False,
     ) -> MoveItPlanningResult:
         pose = model_tcp_to_moveit_pose(grasp_pose_model_xyzw, model_tcp_to_robot_tcp)
-        environment, target = voxel_centers(
-            scene_xyz_m, scene_instance_id, target_instance, obstacle_voxel_size_m,
-            target_voxel_size_m,
+        geometry = build_collision_geometry(
+            scene_xyz_m,
+            scene_instance_id,
+            target_instance,
+            mode=collision_geometry,
+            voxel_size_m=obstacle_voxel_size_m,
+            target_voxel_size_m=target_voxel_size_m,
+            collision_padding_m=collision_padding_m,
+            mesh_max_points=mesh_max_points,
+            alpha_radius_m=alpha_radius_m,
         )
         self.scratch_root.mkdir(parents=True, exist_ok=True)
         request_id = uuid.uuid4().hex
         request_path = self.scratch_root / f"request-{request_id}.npz"
         result_path = self.scratch_root / f"result-{request_id}.json"
-        np.savez_compressed(
-            request_path,
-            operation=np.uint8(0),
-            plan_id=np.asarray(""),
-            grasp_pose_xyzw=pose,
-            environment_centers_m=environment,
-            target_centers_m=target,
-            obstacle_voxel_size_m=np.float64(obstacle_voxel_size_m),
-            target_voxel_size_m=np.float64(target_voxel_size_m),
-            collision_padding_m=np.float64(collision_padding_m),
-            pregrasp_distance_m=np.float64(pregrasp_distance_m),
-            touch_links=np.asarray([
+        payload = {
+            "operation": np.uint8(0),
+            "plan_id": np.asarray(""),
+            "grasp_pose_xyzw": pose,
+            # Keep the historic key names so old/new ROS clients remain easy to inspect.
+            "environment_centers_m": geometry.environment_voxels,
+            "target_centers_m": geometry.target_voxels,
+            "collision_geometry": np.asarray(geometry.mode),
+            "obstacle_voxel_size_m": np.float64(obstacle_voxel_size_m),
+            "target_voxel_size_m": np.float64(target_voxel_size_m),
+            "collision_padding_m": np.float64(collision_padding_m),
+            "pregrasp_distance_m": np.float64(pregrasp_distance_m),
+            "touch_links": np.asarray([
                 "left_finger", "left_finger_pad", "right_finger", "right_finger_pad",
             ]),
-            attach_target_after_execute=np.bool_(True),
-            add_table=np.bool_(True),
-            table_z_m=np.float64(table_z_m),
-            table_size_m=np.asarray([1.2, 1.2, 0.04], np.float64),
-        )
+            "attach_target_after_execute": np.bool_(True),
+            "add_table": np.bool_(True),
+            "table_z_m": np.float64(table_z_m),
+            "table_size_m": np.asarray([1.2, 1.2, 0.04], np.float64),
+        }
+        payload.update(pack_meshes("environment", geometry.environment_meshes))
+        payload.update(pack_meshes("target", geometry.target_meshes))
+        np.savez_compressed(request_path, **payload)
         wsl_request = windows_to_wsl(request_path)
         wsl_result = windows_to_wsl(result_path)
         command = (

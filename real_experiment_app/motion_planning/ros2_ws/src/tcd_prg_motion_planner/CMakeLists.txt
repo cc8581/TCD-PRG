@@ -16,7 +16,7 @@ find_package(shape_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlanGrasp.srv"
-  DEPENDENCIES geometry_msgs moveit_msgs
+  DEPENDENCIES geometry_msgs moveit_msgs shape_msgs
 )
 
 add_executable(scene_grasp_planner src/scene_grasp_planner.cpp)

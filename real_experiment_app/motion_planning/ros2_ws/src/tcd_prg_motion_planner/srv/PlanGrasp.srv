@@ -5,8 +5,11 @@ uint8 operation
 string plan_id
 geometry_msgs/PoseStamped grasp_pose
 float64 pregrasp_distance_m
+string collision_geometry
 geometry_msgs/Point[] environment_centers
 geometry_msgs/Point[] target_centers
+shape_msgs/Mesh[] environment_meshes
+shape_msgs/Mesh[] target_meshes
 float64 obstacle_voxel_size_m
 float64 target_voxel_size_m
 float64 collision_padding_m

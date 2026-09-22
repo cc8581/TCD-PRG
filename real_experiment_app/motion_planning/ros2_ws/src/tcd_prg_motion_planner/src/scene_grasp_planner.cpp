@@ -6,6 +6,7 @@
 #include <moveit_msgs/msg/planning_scene_components.hpp>
 #include <moveit_msgs/srv/get_planning_scene.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <shape_msgs/msg/mesh.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
 #include <tcd_prg_motion_planner/srv/plan_grasp.hpp>
 
@@ -13,14 +14,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <iomanip>
 #include <future>
+#include <iomanip>
 #include <memory>
 #include <mutex>
-#include <unordered_map>
-#include <unordered_set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace
@@ -104,6 +105,26 @@ std::pair<double, double> poseError(
   b.normalize();
   const double dot = std::clamp(std::abs(a.dot(b)), 0.0, 1.0);
   return {position, 2.0 * std::acos(dot)};
+}
+
+bool validMesh(const shape_msgs::msg::Mesh& mesh)
+{
+  if (mesh.vertices.empty() || mesh.triangles.empty()) {
+    return false;
+  }
+  for (const auto& vertex : mesh.vertices) {
+    if (!std::isfinite(vertex.x) || !std::isfinite(vertex.y) || !std::isfinite(vertex.z)) {
+      return false;
+    }
+  }
+  for (const auto& triangle : mesh.triangles) {
+    for (const auto index : triangle.vertex_indices) {
+      if (index >= mesh.vertices.size()) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 std::string planId()
@@ -193,6 +214,11 @@ private:
     if (!(request.pregrasp_distance_m > 0.0 && request.pregrasp_distance_m <= 0.30)) {
       throw std::invalid_argument("pregrasp_distance_m must lie in (0, 0.30]");
     }
+    const std::unordered_set<std::string> valid_geometry_modes = {
+      "voxel", "hybrid", "convex_hull", "alpha_shape", "obb"};
+    if (valid_geometry_modes.find(request.collision_geometry) == valid_geometry_modes.end()) {
+      throw std::invalid_argument("collision_geometry is not supported");
+    }
     const auto valid_centers = [](const auto& centers) {
       return std::all_of(centers.begin(), centers.end(), [](const auto& point) {
         return std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z);
@@ -201,17 +227,27 @@ private:
     if (!valid_centers(request.environment_centers) || !valid_centers(request.target_centers)) {
       throw std::invalid_argument("collision centers must be finite");
     }
-    if ((!request.environment_centers.empty() || !request.target_centers.empty()) &&
+    const auto valid_meshes = [](const auto& meshes) {
+      return std::all_of(meshes.begin(), meshes.end(), [](const auto& mesh) {
+        return validMesh(mesh);
+      });
+    };
+    if (!valid_meshes(request.environment_meshes) || !valid_meshes(request.target_meshes)) {
+      throw std::invalid_argument("collision meshes are empty, non-finite, or malformed");
+    }
+    if (!request.environment_centers.empty() &&
         !(request.obstacle_voxel_size_m >= 0.005 && request.obstacle_voxel_size_m <= 0.10)) {
       throw std::invalid_argument("obstacle_voxel_size_m must lie in [0.005, 0.10]");
     }
-    if (!(request.target_voxel_size_m >= 0.005 && request.target_voxel_size_m <= 0.10)) {
+    if (!request.target_centers.empty() &&
+        !(request.target_voxel_size_m >= 0.005 && request.target_voxel_size_m <= 0.10)) {
       throw std::invalid_argument("target_voxel_size_m must lie in [0.005, 0.10]");
     }
     if (!(request.collision_padding_m >= 0.0 && request.collision_padding_m <= 0.05)) {
       throw std::invalid_argument("collision_padding_m must lie in [0, 0.05]");
     }
-    if (request.target_centers.empty() || request.touch_links.empty()) {
+    if ((request.target_centers.empty() && request.target_meshes.empty()) ||
+        request.touch_links.empty()) {
       throw std::invalid_argument("target geometry and touch_links are required");
     }
     std::unordered_set<std::string> unique_touch_links;
@@ -236,16 +272,17 @@ private:
   {
     scene_.removeCollisionObjects({"tcd_environment", "tcd_target", "tcd_table"});
     std::vector<moveit_msgs::msg::CollisionObject> objects;
-    const auto add_voxels = [&](const auto& centers, const std::string& id, double voxel_size) {
-      if (centers.empty()) {
+    const auto add_geometry = [&](const auto& centers, const auto& meshes,
+                                  const std::string& id, double voxel_size) {
+      if (centers.empty() && meshes.empty()) {
         return;
       }
-      moveit_msgs::msg::CollisionObject cloud;
-      cloud.header.frame_id = "base_link";
-      cloud.id = id;
-      cloud.operation = moveit_msgs::msg::CollisionObject::ADD;
-      cloud.primitives.reserve(centers.size());
-      cloud.primitive_poses.reserve(centers.size());
+      moveit_msgs::msg::CollisionObject object;
+      object.header.frame_id = "base_link";
+      object.id = id;
+      object.operation = moveit_msgs::msg::CollisionObject::ADD;
+      object.primitives.reserve(centers.size());
+      object.primitive_poses.reserve(centers.size());
       const double size = voxel_size + 2.0 * request.collision_padding_m;
       for (const auto& center : centers) {
         shape_msgs::msg::SolidPrimitive voxel;
@@ -254,13 +291,22 @@ private:
         geometry_msgs::msg::Pose pose;
         pose.position = center;
         pose.orientation.w = 1.0;
-        cloud.primitives.push_back(voxel);
-        cloud.primitive_poses.push_back(pose);
+        object.primitives.push_back(voxel);
+        object.primitive_poses.push_back(pose);
       }
-      objects.push_back(std::move(cloud));
+      object.meshes = meshes;
+      object.mesh_poses.resize(meshes.size());
+      for (auto& pose : object.mesh_poses) {
+        pose.orientation.w = 1.0;
+      }
+      objects.push_back(std::move(object));
     };
-    add_voxels(request.environment_centers, "tcd_environment", request.obstacle_voxel_size_m);
-    add_voxels(request.target_centers, "tcd_target", request.target_voxel_size_m);
+    add_geometry(
+      request.environment_centers, request.environment_meshes,
+      "tcd_environment", request.obstacle_voxel_size_m);
+    add_geometry(
+      request.target_centers, request.target_meshes,
+      "tcd_target", request.target_voxel_size_m);
     if (request.add_table) {
       moveit_msgs::msg::CollisionObject table;
       table.header.frame_id = "base_link";
@@ -280,8 +326,21 @@ private:
       objects.push_back(std::move(table));
     }
     if (!objects.empty() && !scene_.applyCollisionObjects(objects)) {
-      throw std::runtime_error("MoveIt rejected the point-cloud collision scene");
+      throw std::runtime_error("MoveIt rejected the collision scene");
     }
+    std::size_t triangle_count = 0;
+    for (const auto& mesh : request.environment_meshes) {
+      triangle_count += mesh.triangles.size();
+    }
+    for (const auto& mesh : request.target_meshes) {
+      triangle_count += mesh.triangles.size();
+    }
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "Collision geometry=%s env_voxels=%zu target_voxels=%zu meshes=%zu triangles=%zu",
+      request.collision_geometry.c_str(), request.environment_centers.size(),
+      request.target_centers.size(),
+      request.environment_meshes.size() + request.target_meshes.size(), triangle_count);
   }
 
   void plan(const Request& request, Response& response)

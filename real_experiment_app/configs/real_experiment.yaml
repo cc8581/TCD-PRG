@@ -82,9 +82,21 @@ motion_planning:
   wsl_distro: Ubuntu-24.04
   ros_workspace: /mnt/d/pycharm/Project/TCD-PRG/real_experiment_app/motion_planning/ros2_ws
   timeout_s: 90
+  # Collision representation choices:
+  #   hybrid       (recommended/default): convex hulls for environment, tighter
+  #                alpha-shape target, voxel fallback for unknown/degenerate points
+  #   convex_hull: one convex hull per instance (including unknown IDs)
+  #   alpha_shape: tighter concave mesh, with convex-hull fallback
+  #   obb:         PCA oriented bounding box per segmented instance
+  #   voxel:       legacy solidified box voxels only
+  collision_geometry: hybrid
   voxel_size_m: 0.02
   target_voxel_size_m: 0.01
   collision_padding_m: 0.0
+  # Alpha parameters are used by alpha_shape and by the target mesh in hybrid.
+  # Sparse/unstable alpha reconstruction falls back automatically.
+  alpha_radius_m: 0.025
+  mesh_max_points: 2500
   table_z_m: 0.0
 
 task:

@@ -36,6 +36,9 @@ class GraspMotionPlanningStage:
                 obstacle_voxel_size_m=float(settings.get("voxel_size_m", 0.02)),
                 target_voxel_size_m=float(settings.get("target_voxel_size_m", 0.01)),
                 collision_padding_m=float(settings.get("collision_padding_m", 0.0)),
+                collision_geometry=str(settings.get("collision_geometry", "hybrid")),
+                mesh_max_points=int(settings.get("mesh_max_points", 2500)),
+                alpha_radius_m=float(settings.get("alpha_radius_m", 0.025)),
                 table_z_m=float(settings.get("table_z_m", 0.0)),
                 execute=False,
             )
